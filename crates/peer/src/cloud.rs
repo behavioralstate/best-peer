@@ -1448,6 +1448,7 @@ impl Upstream for Cloud {
             .ok_or_else(|| BestError::internal(format!("deployment {deployment} names no member peer")))?;
         Ok(Route {
             base: format!("{}/deployments/{deployment}", member.endpoint),
+            path: d.engine.openai_path().into(),
             key: member.key(),
             transport: member.transport.clone(),
         })

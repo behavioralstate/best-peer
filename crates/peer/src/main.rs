@@ -1341,6 +1341,16 @@ mod tests {
         let seen = body(res).await;
         assert_eq!(seen["path"], "/v1/chat/completions");
         assert_eq!(seen["saw_credential"], false);
+        // The cloud forwards the endpoint and nothing else of the member's, before the member is asked.
+        let (s, e) = get_as(
+            &site.app,
+            &format!("/workspaces/{ws1}"),
+            &site.key,
+            &format!("/deployments/{dep}/api/tags"),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        assert_eq!(e["error"]["code"], "NOT_AN_ENDPOINT");
 
         // A placement names its cloud: by name, by the device, or not at all, which is refused with the clouds.
         let (s, e) = site.deploy(&ws2, "d2", None, 4, None).await;
@@ -2932,22 +2942,90 @@ mod tests {
         for gone in ["connection", "x-secret", "te", "x-api-key"] {
             assert!(!names.contains(&gone), "{gone} crossed: {names:?}");
         }
-        // The deployment's base itself, with or without the slash, is the engine's root.
-        for base in [format!("/deployments/{dep}"), format!("/deployments/{dep}/")] {
+        // Only the endpoint and what is under it reach the engine. The deployment's base itself, the engine's own
+        // API (which deletes and pulls models) and a path that merely starts with the same letters are refused
+        // with the endpoint named; the endpoint with or without a slash or a query after it passes.
+        for path in [
+            format!("/deployments/{dep}"),
+            format!("/deployments/{dep}/"),
+            format!("/deployments/{dep}?v1"),
+            format!("/deployments/{dep}/api/tags"),
+            format!("/deployments/{dep}/api/delete"),
+            format!("/deployments/{dep}/v1x/models"),
+        ] {
             let res = bed
                 .app
                 .clone()
                 .oneshot(
-                    Request::get(&base)
+                    Request::get(&path)
                         .header("X-Api-Key", &bed.key)
                         .body(Body::empty())
                         .unwrap(),
                 )
                 .await
                 .unwrap();
-            assert_eq!(res.status(), StatusCode::OK, "{base}");
-            assert_eq!(body(res).await["path"], "/", "{base}");
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{path}");
+            let b = body(res).await;
+            assert_eq!(b["error"]["code"], "NOT_AN_ENDPOINT", "{path}");
+            assert!(
+                b["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("/deployments/{dep}/v1")),
+                "{b}"
+            );
         }
+        for path in [
+            format!("/deployments/{dep}/v1"),
+            format!("/deployments/{dep}/v1/"),
+            format!("/deployments/{dep}/v1?x=1"),
+        ] {
+            let res = bed
+                .app
+                .clone()
+                .oneshot(
+                    Request::get(&path)
+                        .header("X-Api-Key", &bed.key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{path}");
+            assert!(body(res).await["path"].as_str().unwrap().starts_with("/v1"), "{path}");
+        }
+        // A method the OpenAI-compatible API does not use is refused, so nothing but reading and prompting passes.
+        let res = bed
+            .app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/deployments/{dep}/v1/models/x"))
+                    .header("X-Api-Key", &bed.key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(body(res).await["error"]["code"], "METHOD_NOT_ALLOWED");
+        // A prompt is bounded: what a file would weigh is refused before the engine is asked to hold it.
+        let heavy = vec![b'x'; 8 * 1024 * 1024 + 1];
+        let res = bed
+            .app
+            .clone()
+            .oneshot(
+                Request::post(format!("/deployments/{dep}/v1/chat/completions"))
+                    .header("X-Api-Key", &bed.key)
+                    .header(header::CONTENT_LENGTH, heavy.len())
+                    .body(Body::from(heavy))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let b = body(res).await;
+        assert_eq!(b["error"]["code"], "PAYLOAD_TOO_LARGE");
+        assert!(b["error"]["message"].as_str().unwrap().contains("not a file"), "{b}");
         let res = bed
             .app
             .clone()

@@ -349,15 +349,6 @@ impl Peer {
         format!("{}/deployments/{deployment}{}", self.endpoint, engine.openai_path())
     }
 
-    /// Where the door passes a prompt for a deployment: its engine's base on this host, while the deployment is
-    /// ready. Before that, after an undeploy was accepted, or for a deployment nobody made, the refusal says what to
-    /// do.
-    pub fn engine_upstream(&self, deployment: &str, who: &Credential) -> Result<String, BestError> {
-        let state = self.state.lock().unwrap();
-        let d = ready_deployment(&state, deployment, who)?;
-        Ok(self.engine_base(d.port))
-    }
-
     // ----- pull-image -----------------------------------------------------------------------------------------------
 
     /// A pull is a deploy's first step and needs the same scope.
@@ -1066,9 +1057,15 @@ impl Service for Peer {
 }
 
 impl Upstream for Peer {
+    /// Where the door passes a prompt for a deployment: its engine's base on this host, at the engine's
+    /// OpenAI-compatible path, while the deployment is ready. Before that, after an undeploy was accepted, or for a
+    /// deployment nobody made, the refusal says what to do.
     fn upstream_of(&self, deployment: &str, who: &Credential) -> Result<Route, BestError> {
+        let state = self.state.lock().unwrap();
+        let d = ready_deployment(&state, deployment, who)?;
         Ok(Route {
-            base: self.engine_upstream(deployment, who)?,
+            base: self.engine_base(d.port),
+            path: d.engine.openai_path().into(),
             key: None,
             transport: self.transport.clone(),
         })

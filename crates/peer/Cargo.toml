@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.7"
+http-body-util = "0.1"
 best-peer-docker = { path = "../docker" }
 best-peer-door = { path = "../door" }
 best-peer-engine = { path = "../engine" }
@@ -45,5 +46,4 @@ webpki-roots = "1"
 tower = { version = "0.5", features = ["util"] }
 
 [dev-dependencies]
-http-body-util = "0.1"
 tempfile = "3"

@@ -225,10 +225,13 @@ conversation with the model is not on it. `DeploymentReady` names the endpoint, 
 the door under the deployment (`<door>/deployments/<deployment>/v1`), and the model name to put in the request. A
 client prompts there with the engine's own API and the door's credential, sent as the door's `X-Api-Key` header or
 as the `Authorization: Bearer` the OpenAI-compatible clients send; the door checks it, passes the request to the
-engine as it is and the answer back as it comes, streaming included, and records nothing. Tokens are not turned into
-events: a token is not a fact about the machine, and the door's events say what the machine runs, never what the
-model answered. The pass-through is there so that the one credential means what a person expects: who may deploy on
-the machine is who may prompt it.
+engine as it is and the answer back as it comes, streaming included, and records nothing. Only that path, `/v1`,
+and what is under it pass, with GET and POST and a body of 8 MiB at most (a prompt with its context, never a
+file): the engine's own API (Ollama's `/api`, which pulls and deletes models) is not reached through the door,
+whatever the credential may do. Tokens are not turned into events: a
+token is not a fact about the machine, and the door's events say what the machine runs, never what the model
+answered. The pass-through is there so that the one credential means what a person expects: who may deploy on the
+machine is who may prompt it.
 
 Where the boundary lies: the engines' own ports are bound to loopback whatever the door listens on (in `native` mode
 the installed engine keeps its own bind), so the door is the one way in. Without the credential the endpoint
