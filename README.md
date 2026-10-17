@@ -201,6 +201,15 @@ on another host sits on a network you trust. The endpoint a `DeploymentReady` ev
 the deployment. A deployment made by a peer older than 0.0.4 is served through the door too, but its engine's port
 stays published as that peer bound it until it is undeployed and deployed again.
 
+A container runs confined, since a peer runs code it did not write: no capabilities, no new privileges, a ceiling on
+processes, and for a job a read-only filesystem with a private `/tmp`, no network and a ceiling on host memory.
+`BEST_PEER_JOB_NETWORK` (default `none`) is what a job may reach: `default` for the container engine's own network,
+or the name of a network you made; `BEST_PEER_JOB_MEMORY` (default `4G`) and `BEST_PEER_JOB_PIDS` (default 512) are a
+job's ceilings, `BEST_PEER_ENGINE_MEMORY` (default none) and `BEST_PEER_ENGINE_PIDS` (default 4096) an engine's;
+`none` for a ceiling is no ceiling. The engines keep their network, which they need to pull models, and a writable
+filesystem, which they keep the models on. Capabilities, privileges and a job's filesystem are never opened by a
+variable.
+
 ## Deploy
 
 Everything an agent needs is in the catalogues. `get-hardware-state` says what devices are here and what each offers;
@@ -212,8 +221,9 @@ names it), the devices are every cloud's peers', and every row and event carries
 The facts follow on the event stream under the command's correlation id, in order: `ImagePulling`, `ImagePulled`,
 `DeploymentStarted`, `WeightsLoading`, then `DeploymentReady` with the OpenAI-compatible endpoint prompts go to, or
 `DeploymentFailed`. What the engine does on its own later (`OutOfMemory`, `DeploymentEnded`) is told under the same
-correlation id. `run-job` runs an image once and tells `JobStarted` and `JobFinished` with the exit code;
-`undeploy-model` and `stop-job` end them.
+correlation id. `run-job` runs an image once, in a closed box (no network, nothing beyond its own filesystem,
+unless the operator allowed more), and tells `JobStarted` and `JobFinished` with the exit code; `undeploy-model` and
+`stop-job` end them.
 
 The peer's state is the fold of the events it told. After a restart it is rebuilt from the log and squared with what
 the engine still runs; a workload that ended while the peer was down is told so then.

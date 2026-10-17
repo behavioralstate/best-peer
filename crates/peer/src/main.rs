@@ -28,8 +28,8 @@ use std::time::Duration;
 use best_peer_door::{Auth, Door, EventLog, LocalApprover};
 use best_peer_engine::Engine;
 use best_peer_gpu::Gpu;
-use best_peer_runtime::Runtime;
-use lifecycle::{Images, Patience, Peer};
+use best_peer_runtime::{Confinement, Network, Runtime};
+use lifecycle::{Confine, Images, Patience, Peer};
 use tls::Tls;
 
 /// Where to listen, what to advertise and whether TLS serves it, from `BEST_PEER_LISTEN` (ip:port, default
@@ -66,6 +66,58 @@ pub fn config(
     Ok((listen, endpoint, tls))
 }
 
+/// How the containers are confined, from `BEST_PEER_JOB_NETWORK` (`none`, the default; `default` for the container
+/// engine's own network; or the name of a network the operator made), `BEST_PEER_JOB_MEMORY` (default `4G`) and
+/// `BEST_PEER_JOB_PIDS` (default 512) for a job, `BEST_PEER_ENGINE_MEMORY` (default none) and
+/// `BEST_PEER_ENGINE_PIDS` (default 4096) for an engine; `none` for a ceiling is no ceiling. What is not named stays
+/// closed: capabilities, privileges and a job's filesystem are never opened by a variable.
+pub fn confine(
+    job_network: Option<&str>,
+    job_memory: Option<&str>,
+    job_pids: Option<&str>,
+    engine_memory: Option<&str>,
+    engine_pids: Option<&str>,
+) -> Result<Confine, String> {
+    let memory = |name: &str, text: Option<&str>, default: Option<u64>| -> Result<Option<u64>, String> {
+        match text.map(str::trim) {
+            None => Ok(default),
+            Some("none") => Ok(None),
+            Some(t) => parse_memory(t)
+                .map(Some)
+                .map_err(|why| format!("{name}: {why}, or none")),
+        }
+    };
+    let pids = |name: &str, text: Option<&str>, default: u64| -> Result<Option<u64>, String> {
+        match text.map(str::trim) {
+            None => Ok(Some(default)),
+            Some("none") => Ok(None),
+            Some(t) => match t.parse::<u64>() {
+                Ok(n) if n > 0 => Ok(Some(n)),
+                _ => Err(format!(
+                    "{name} must be a number of processes above zero, or none, not {t:?}"
+                )),
+            },
+        }
+    };
+    let mut job = Confinement::default();
+    job.network = match job_network.map(str::trim) {
+        None | Some("none") => Network::None,
+        Some("default") => Network::Default,
+        Some(name) if !name.is_empty() => Network::Named(name.into()),
+        Some(_) => {
+            return Err(
+                "BEST_PEER_JOB_NETWORK must be none, default or the name of a network the container engine has".into(),
+            )
+        }
+    };
+    job.memory_bytes = memory("BEST_PEER_JOB_MEMORY", job_memory, job.memory_bytes)?;
+    job.pids = pids("BEST_PEER_JOB_PIDS", job_pids, 512)?;
+    let mut engine = Confinement::serving();
+    engine.memory_bytes = memory("BEST_PEER_ENGINE_MEMORY", engine_memory, None)?;
+    engine.pids = pids("BEST_PEER_ENGINE_PIDS", engine_pids, 4096)?;
+    Ok(Confine { job, engine })
+}
+
 /// The peer's data directory: `BEST_PEER_DATA`, else `.best-peer` in the home directory. Never a relative path:
 /// the server and the operator's shell must resolve the same directory, or `best-peer approve` finds no token.
 fn data_dir() -> PathBuf {
@@ -94,6 +146,7 @@ pub async fn peer(
     images: Images,
     patience: Patience,
     holdings: Arc<holdings::Holdings>,
+    confine: Confine,
 ) -> Arc<Peer> {
     // Subscribed before the rebuild, so an exit told while the state is being rebuilt is not lost.
     let events = runtime.events();
@@ -108,6 +161,7 @@ pub async fn peer(
             log,
             images,
             patience,
+            confine,
         )
         .with_holdings(holdings),
     );
@@ -339,6 +393,14 @@ async fn peer_app(endpoint: &str, dir: &std::path::Path, log: Arc<EventLog>, aut
         ..Patience::default()
     };
     let holdings = Arc::new(holdings::Holdings::default());
+    let confine = confine(
+        std::env::var("BEST_PEER_JOB_NETWORK").ok().as_deref(),
+        std::env::var("BEST_PEER_JOB_MEMORY").ok().as_deref(),
+        std::env::var("BEST_PEER_JOB_PIDS").ok().as_deref(),
+        std::env::var("BEST_PEER_ENGINE_MEMORY").ok().as_deref(),
+        std::env::var("BEST_PEER_ENGINE_PIDS").ok().as_deref(),
+    )
+    .unwrap_or_else(|why| fail(&why));
     let peer = peer(
         endpoint,
         &engine_host,
@@ -349,6 +411,7 @@ async fn peer_app(endpoint: &str, dir: &std::path::Path, log: Arc<EventLog>, aut
         images,
         patience,
         holdings.clone(),
+        confine,
     )
     .await;
     let ctx = Arc::new(context(endpoint, dir, auth.clone(), holdings));
@@ -655,6 +718,7 @@ mod tests {
                 unload: Duration::from_secs(1),
             },
             holdings.clone(),
+            Confine::default(),
         )
         .await;
         let auth = auth.unwrap_or_else(|| {
@@ -939,6 +1003,7 @@ mod tests {
             Images::default(),
             Patience::default(),
             holdings.clone(),
+            Confine::default(),
         )
         .await;
         let auth = auth.unwrap_or_else(|| {
@@ -2598,6 +2663,7 @@ mod tests {
             Images::default(),
             Patience::default(),
             holdings.clone(),
+            Confine::default(),
         )
         .await;
         let auth = Arc::new(Auth::ephemeral(
@@ -2749,6 +2815,13 @@ mod tests {
         assert_eq!(spec.image.0, "ollama/ollama");
         assert_eq!(spec.devices, vec!["gpu-0".into()]);
         assert_eq!(spec.ports, vec![11434]);
+        assert_eq!(
+            spec.confinement,
+            Confinement::serving(),
+            "an engine keeps its network and a writable root, with no capabilities and no new privileges"
+        );
+        assert_eq!(spec.confinement.network, Network::Default);
+        assert!(spec.confinement.drop_capabilities && !spec.confinement.read_only_root);
         assert_eq!(
             bed.engine.loaded_at("http://engines.local:41434"),
             vec!["llama3.2:3b"],
@@ -3061,6 +3134,41 @@ mod tests {
         assert_eq!(parse_memory("1073741824").unwrap(), 1 << 30);
         assert!(parse_memory("lots").unwrap_err().contains("40G"));
         assert!(parse_memory("4X").unwrap_err().contains("unit"));
+    }
+
+    #[test]
+    fn the_confinement_is_closed_unless_the_operator_opens_something_by_name() {
+        let c = confine(None, None, None, None, None).unwrap();
+        assert_eq!(c.job, Confinement::default());
+        assert_eq!(c.engine, Confinement::serving());
+        assert_eq!(c.job.network, Network::None);
+        assert_eq!(c.job.memory_bytes, Some(4 << 30));
+        assert_eq!(c.job.pids, Some(512));
+        assert_eq!(c.engine.memory_bytes, None);
+        assert_eq!(c.engine.pids, Some(4096));
+        let c = confine(Some("default"), Some("8G"), Some("none"), Some("16G"), Some("100")).unwrap();
+        assert_eq!(c.job.network, Network::Default);
+        assert_eq!(c.job.memory_bytes, Some(8 << 30));
+        assert_eq!(c.job.pids, None);
+        assert_eq!(c.engine.memory_bytes, Some(16 << 30));
+        assert_eq!(c.engine.pids, Some(100));
+        assert!(
+            c.job.drop_capabilities && c.job.no_new_privileges && c.job.read_only_root,
+            "what was not named stays closed"
+        );
+        let c = confine(Some("best-peer"), Some("none"), None, None, None).unwrap();
+        assert_eq!(c.job.network, Network::Named("best-peer".into()));
+        assert_eq!(c.job.memory_bytes, None);
+        for (why, args) in [
+            ("BEST_PEER_JOB_NETWORK", (Some(" "), None, None, None, None)),
+            ("BEST_PEER_JOB_MEMORY", (None, Some("lots"), None, None, None)),
+            ("BEST_PEER_JOB_PIDS", (None, None, Some("0"), None, None)),
+            ("BEST_PEER_ENGINE_MEMORY", (None, None, None, Some("4X"), None)),
+            ("BEST_PEER_ENGINE_PIDS", (None, None, None, None, Some("many"))),
+        ] {
+            let err = confine(args.0, args.1, args.2, args.3, args.4).unwrap_err();
+            assert!(err.contains(why), "{err}");
+        }
     }
 
     #[tokio::test]
@@ -3486,7 +3594,18 @@ mod tests {
         let job = started["job"].as_str().unwrap().to_string();
         assert!(job.starts_with("job-"));
         let container = ContainerId(started["container"].as_str().unwrap().into());
-        assert_eq!(bed.runtime.spec_of(&container).unwrap().args, vec!["echo", "hi"]);
+        let spec = bed.runtime.spec_of(&container).unwrap();
+        assert_eq!(spec.args, vec!["echo", "hi"]);
+        // A job runs code the peer did not write: a closed box unless the operator opened something by name.
+        assert_eq!(spec.confinement, Confinement::default());
+        assert_eq!(spec.confinement.network, Network::None);
+        assert!(
+            spec.confinement.drop_capabilities
+                && spec.confinement.no_new_privileges
+                && spec.confinement.read_only_root
+                && spec.confinement.pids.is_some()
+                && spec.confinement.memory_bytes.is_some()
+        );
         assert_eq!(bed.query("get-workloads").await["jobs"][0]["phase"], "running");
         // The engine ends it: the exit is told, and the memory is free.
         bed.runtime.stop(&container).await.unwrap();

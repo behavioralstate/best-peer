@@ -15,7 +15,7 @@ use best_peer_door::auth::{holder_of_hash, Credential};
 use best_peer_door::{BestError, Emitter, Envelope, EventLog};
 use best_peer_engine::{Engine, EngineError, Kind};
 use best_peer_gpu::{Compute, DeviceId, Gpu, Host};
-use best_peer_runtime::{ContainerId, Event as RuntimeEvent, Runtime, RuntimeError, Spec};
+use best_peer_runtime::{Confinement, ContainerId, Event as RuntimeEvent, Runtime, RuntimeError, Spec};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
@@ -38,6 +38,26 @@ impl Images {
         match kind {
             Kind::Ollama => self.ollama.as_deref(),
             Kind::Vllm => self.vllm.as_deref(),
+        }
+    }
+}
+
+/// How the containers are confined, as the operator set it. A job runs code the peer did not write, so it gets no
+/// network, no capabilities, a read-only filesystem and ceilings on memory and processes unless the operator
+/// loosened one of those (`BEST_PEER_JOB_NETWORK`, `BEST_PEER_JOB_MEMORY`, `BEST_PEER_JOB_PIDS`); an engine keeps
+/// its network and a writable filesystem, which it needs for the models, under the same capability and privilege
+/// rules and its own ceilings (`BEST_PEER_ENGINE_MEMORY`, `BEST_PEER_ENGINE_PIDS`).
+#[derive(Clone, Debug)]
+pub struct Confine {
+    pub job: Confinement,
+    pub engine: Confinement,
+}
+
+impl Default for Confine {
+    fn default() -> Self {
+        Self {
+            job: Confinement::default(),
+            engine: Confinement::serving(),
         }
     }
 }
@@ -81,6 +101,7 @@ pub struct Peer {
     engine_host: String,
     images: Images,
     patience: Patience,
+    confine: Confine,
     pub state: Mutex<State>,
     /// Runtime events for containers the state did not know when they arrived, by container.
     unowned: Mutex<HashMap<ContainerId, RuntimeEvent>>,
@@ -143,6 +164,7 @@ impl Peer {
         log: Arc<EventLog>,
         images: Images,
         patience: Patience,
+        confine: Confine,
     ) -> Self {
         Self {
             gpu,
@@ -156,6 +178,7 @@ impl Peer {
             engine_host: engine_host.into(),
             images,
             patience,
+            confine,
             state: Mutex::new(State::default()),
             unowned: Mutex::new(HashMap::new()),
             tasks: Mutex::new(Vec::new()),
@@ -462,6 +485,7 @@ impl Peer {
                 vec![device.clone()]
             },
             ports: vec![recipe.port],
+            confinement: self.confine.engine.clone(),
         };
         let started = match self.runtime.start(spec).await {
             Ok(s) => s,
@@ -793,6 +817,7 @@ impl Peer {
             env: vec![],
             devices,
             ports: vec![],
+            confinement: self.confine.job.clone(),
         };
         match self.runtime.start(spec).await {
             Ok(started) => {
