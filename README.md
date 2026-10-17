@@ -292,7 +292,12 @@ nothing. Reading is every key's: the hardware state, and its own workloads and e
 --may deploy` grants scopes; `--memory 40G` sets the most device memory the key's workloads may hold together,
 counted across its deployments, jobs and commands admitted but not yet started. Every command document says which
 scope it needs. A command the key may not send is refused at ingest with `FORBIDDEN` and what it was approved for;
-a deploy or a job past the share with `SHARE_EXCEEDED`, what is held and the room left; a workload another key
+a deploy or a job past the share with `SHARE_EXCEEDED`, what is held and the room left; a second deployment from
+a key that holds a share with `DEPLOYMENTS_EXCEEDED`, counted across the door like the share, every workspace's
+included (`BEST_PEER_DEPLOYMENTS_PER_HOLDER`, default 1, since what a deployment claims in `memory_bytes` is its own
+word); such a key sees and uses the accelerators alone, the host's CPU and memory being the operator's, and
+`get-hardware-state` shows it only those, and a job from it without `memory_bytes`, which would run on the host, is
+refused with `JOB_NEEDS_DEVICE`; a workload another key
 started, by name, whether the command, the endpoint or the events are asked for, and a refusal names only what the
 key may see. `get-workloads` shows a key its own, with `held_bytes` against `share_bytes`; `DeploymentStarted` and
 `JobStarted` name the `holder`, an opaque id of the credential, never the key. Another sign-in is another holder,

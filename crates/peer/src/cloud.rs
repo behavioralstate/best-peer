@@ -26,7 +26,8 @@ use crate::domain::Service;
 use crate::endpoint::{Route, Upstream};
 use crate::holdings::Holdings;
 use crate::lifecycle::{
-    any_compute, mine, new_id, not_yours, parse, place, ready_deployment, require, within_share, workloads_view,
+    accelerators, any_compute, mine, new_id, not_yours, parse, place, ready_deployment, require, shared,
+    within_deployments, within_share, workloads_view,
 };
 use crate::member::{Member, Refusal};
 use crate::state::{JobPhase, Phase, Reservation, State};
@@ -220,8 +221,8 @@ impl Cloud {
         let weak = Arc::downgrade(&cloud);
         holdings.add(move |holder| {
             weak.upgrade()
-                .map(|c| c.state.lock().unwrap().held_by(holder))
-                .unwrap_or(0)
+                .map(|c| c.state.lock().unwrap().holdings_of(holder))
+                .unwrap_or_default()
         });
         cloud
     }
@@ -1055,8 +1056,9 @@ impl Cloud {
 
 #[async_trait]
 impl Service for Cloud {
-    async fn hardware_state(&self) -> Result<Value, BestError> {
+    async fn hardware_state(&self, who: &Credential) -> Result<Value, BestError> {
         let (host, peers) = self.combined().await;
+        let host = if shared(who) { accelerators(&host) } else { host };
         let mut v = crate::domain::host_state(&host);
         if let Some(devices) = v["devices"].as_array_mut() {
             for d in devices {
@@ -1129,12 +1131,15 @@ impl Service for Cloud {
             return Ok(());
         }
         let (host, peers) = self.combined().await;
+        let host = if shared(&who) { accelerators(&host) } else { host };
         // One admission at a time across the door, and what the credential holds is read before the state is
         // locked, since the door's holdings read this state too.
         let _admitting = self.holdings.admitting();
         let held = self.holdings.held_by(&who.holder());
+        let running = self.holdings.deployments_of(&who.holder());
         let mut state = self.state.lock().unwrap();
         within_share(held, &who, data.memory_bytes)?;
+        within_deployments(running, &who, self.holdings.deployments_per_holder())?;
         let (device, compute) = place(
             &host,
             &state,
@@ -1283,10 +1288,18 @@ impl Service for Cloud {
             )
             .with_details(json!({ "field": "memory_bytes" })));
         }
+        if shared(&who) && data.memory_bytes.is_none() {
+            return Err(BestError::bad_request(
+                "JOB_NEEDS_DEVICE",
+                "this credential runs jobs on the accelerators alone, where its share counts them: send memory_bytes, the device memory the job needs",
+            )
+            .with_details(json!({ "field": "memory_bytes" })));
+        }
         if self.already_placed(&key).is_some() {
             return Ok(());
         }
         let (host, peers) = self.combined().await;
+        let host = if shared(&who) { accelerators(&host) } else { host };
         let _admitting = self.holdings.admitting();
         let held = self.holdings.held_by(&who.holder());
         let mut state = self.state.lock().unwrap();

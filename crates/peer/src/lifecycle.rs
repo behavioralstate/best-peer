@@ -175,8 +175,8 @@ impl Peer {
         let weak = Arc::downgrade(self);
         self.holdings.add(move |holder| {
             weak.upgrade()
-                .map(|p| p.state.lock().unwrap().held_by(holder))
-                .unwrap_or(0)
+                .map(|p| p.state.lock().unwrap().holdings_of(holder))
+                .unwrap_or_default()
         });
     }
 
@@ -339,6 +339,14 @@ impl Peer {
             .map_err(|e| BestError::internal(format!("the accelerator library failed: {e}")))
     }
 
+    /// The hardware as `who` may use it: every device for a credential approved for all, the accelerators alone
+    /// for one with a share, whose deployments run on an accelerator or not at all, since the host's own CPU and
+    /// memory are the operator's.
+    async fn hardware_for(&self, who: &Credential) -> Result<Host, BestError> {
+        let host = self.hardware().await?;
+        Ok(if shared(who) { accelerators(&host) } else { host })
+    }
+
     /// The base URL the peer itself reaches an engine at.
     fn engine_base(&self, port: u16) -> String {
         format!("http://{}:{port}", self.engine_host)
@@ -386,13 +394,15 @@ impl Peer {
     pub async fn admit_deploy(&self, cmd: Envelope, who: Credential, key: String) -> Result<(), BestError> {
         require(&who, "deploy")?;
         let data: DeployData = parse(&cmd.data)?;
-        let host = self.hardware().await?;
+        let host = self.hardware_for(&who).await?;
         // One admission at a time across the door, and what the credential holds is read before the state is
         // locked, since the door's holdings read this state too.
         let _admitting = self.holdings.admitting();
         let held = self.holdings.held_by(&who.holder());
+        let running = self.holdings.deployments_of(&who.holder());
         let mut state = self.state.lock().unwrap();
         within_share(held, &who, data.memory_bytes)?;
+        within_deployments(running, &who, self.holdings.deployments_per_holder())?;
         let (device, compute) = place(
             &host,
             &state,
@@ -724,8 +734,15 @@ impl Peer {
             )
             .with_details(json!({ "field": "memory_bytes" })));
         }
+        if shared(&who) && data.memory_bytes.is_none() {
+            return Err(BestError::bad_request(
+                "JOB_NEEDS_DEVICE",
+                "this credential runs jobs on the accelerators alone, where its share counts them: send memory_bytes, the device memory the job needs",
+            )
+            .with_details(json!({ "field": "memory_bytes" })));
+        }
         let host = match data.memory_bytes {
-            Some(_) => Some(self.hardware().await?),
+            Some(_) => Some(self.hardware_for(&who).await?),
             None => None,
         };
         let _admitting = self.holdings.admitting();
@@ -1016,8 +1033,8 @@ impl Peer {
 
 #[async_trait]
 impl Service for Peer {
-    async fn hardware_state(&self) -> Result<Value, BestError> {
-        Ok(crate::domain::host_state(&self.hardware().await?))
+    async fn hardware_state(&self, who: &Credential) -> Result<Value, BestError> {
+        Ok(crate::domain::host_state(&self.hardware_for(who).await?))
     }
 
     fn workloads(&self, who: &Credential) -> Result<Value, BestError> {
@@ -1176,6 +1193,41 @@ pub(crate) fn within_share(held: u64, who: &Credential, needed: u64) -> Result<(
         ),
     )
     .with_details(json!({ "share_bytes": share, "held_bytes": held, "needed_bytes": needed, "room_bytes": share.saturating_sub(held) })))
+}
+
+/// Whether `who` holds a share of this peer rather than all of it: approved for a share of memory, or for less than
+/// every scope. Such a credential runs on the accelerators alone and holds a bounded number of deployments.
+pub(crate) fn shared(who: &Credential) -> bool {
+    who.grant.memory_bytes.is_some() || !who.grant.is_all()
+}
+
+/// `host` without the devices that offer the CPU alone.
+pub(crate) fn accelerators(host: &Host) -> Host {
+    Host {
+        driver: host.driver.clone(),
+        devices: host
+            .devices
+            .iter()
+            .filter(|d| d.compute.iter().any(|c| *c != Compute::Cpu))
+            .cloned()
+            .collect(),
+        observed_at: host.observed_at,
+    }
+}
+
+/// A credential with a share runs `ceiling` deployments at once across the door, `running` of them already, every
+/// workspace counted: one more is refused with what it runs.
+pub(crate) fn within_deployments(running: usize, who: &Credential, ceiling: usize) -> Result<(), BestError> {
+    if !shared(who) || running < ceiling {
+        return Ok(());
+    }
+    Err(BestError::bad_request(
+        "DEPLOYMENTS_EXCEEDED",
+        format!(
+            "this credential may run {ceiling} deployment(s) at once and runs {running} across this door, every workspace counted: undeploy one first (get-workloads on each door you use lists them), or ask for more"
+        ),
+    )
+    .with_details(json!({ "deployments": ceiling, "running": running })))
 }
 
 /// A workload another credential holds is not this one's to end.

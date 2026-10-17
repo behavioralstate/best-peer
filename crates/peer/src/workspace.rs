@@ -999,11 +999,11 @@ impl Clouds for Workspace {
 
 #[async_trait]
 impl Service for Workspace {
-    async fn hardware_state(&self) -> Result<Value, BestError> {
+    async fn hardware_state(&self, who: &Credential) -> Result<Value, BestError> {
         let mut devices = Vec::new();
         let mut peers = Vec::new();
         for c in self.live_clouds() {
-            let mut v = c.hardware_state().await?;
+            let mut v = c.hardware_state(who).await?;
             if let Some(d) = v["devices"].as_array_mut() {
                 devices.append(d);
             }
