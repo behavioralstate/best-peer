@@ -7,7 +7,7 @@ use std::io::BufRead;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use best_peer_engine::{Engine, EngineError, Kind, Progress};
+use best_peer_engine::{Engine, EngineError, Kind, Progress, Source};
 
 #[derive(Clone)]
 pub struct HttpEngine {
@@ -88,6 +88,28 @@ impl HttpEngine {
         }
     }
 
+    /// A model in Ollama's store is served without the registry: `POST /api/show` says whether it is there (404
+    /// says not), and `POST /api/generate` with no prompt loads it into memory, so the deployment is ready to answer.
+    fn serve_ollama(&self, base: &str, model: &str, progress: &Progress) -> Result<(), EngineError> {
+        self.agent
+            .post(format!("{base}/api/show"))
+            .config()
+            .timeout_global(Some(Duration::from_secs(30)))
+            .build()
+            .send_json(serde_json::json!({ "model": model }))
+            .map_err(|e| match e {
+                ureq::Error::StatusCode(404) => EngineError::ModelNotFound(model.into()),
+                other => EngineError::Engine(other.to_string()),
+            })?;
+        progress(Some(0));
+        self.agent
+            .post(format!("{base}/api/generate"))
+            .send_json(serde_json::json!({ "model": model, "stream": false }))
+            .map_err(|e| EngineError::Engine(format!("the model is in the store but did not load: {e}")))?;
+        progress(Some(100));
+        Ok(())
+    }
+
     /// `POST /api/generate` with `keep_alive: 0` makes Ollama drop the model from memory.
     fn unload_ollama(&self, base: &str, model: &str) -> Result<(), EngineError> {
         self.agent
@@ -161,12 +183,20 @@ impl Engine for HttpEngine {
         }
     }
 
-    async fn load(&self, kind: Kind, base: &str, model: &str, progress: Progress) -> Result<(), EngineError> {
+    async fn load(
+        &self,
+        kind: Kind,
+        base: &str,
+        model: &str,
+        source: Source,
+        progress: Progress,
+    ) -> Result<(), EngineError> {
         let me = self.clone();
         let (base, model) = (base.to_string(), model.to_string());
-        tokio::task::spawn_blocking(move || match kind {
-            Kind::Ollama => me.pull_ollama(&base, &model, &progress),
-            Kind::Vllm => me.served_by_vllm(&base, &model),
+        tokio::task::spawn_blocking(move || match (kind, source) {
+            (Kind::Ollama, Source::Registry) => me.pull_ollama(&base, &model, &progress),
+            (Kind::Ollama, Source::Store) => me.serve_ollama(&base, &model, &progress),
+            (Kind::Vllm, _) => me.served_by_vllm(&base, &model),
         })
         .await
         .map_err(|e| EngineError::Engine(format!("the load did not complete: {e}")))?

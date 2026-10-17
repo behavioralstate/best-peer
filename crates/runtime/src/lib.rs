@@ -34,6 +34,16 @@ pub struct Spec {
     pub ports: Vec<u16>,
     /// What the container may not do on the host, and how much of the host it may take.
     pub confinement: Confinement,
+    /// Directories of the host the container sees, where the operator shares one (a store of models).
+    pub mounts: Vec<Mount>,
+}
+
+/// A directory of the host at a path in the container, read-only unless said otherwise.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mount {
+    pub host: String,
+    pub container: String,
+    pub read_only: bool,
 }
 
 /// How a container is confined: what it may not do on the host, and how much of the host it may take. A peer runs
@@ -346,6 +356,7 @@ mod tests {
             devices: vec![device.into()],
             ports: vec![11434],
             confinement: Confinement::default(),
+            mounts: vec![],
         }
     }
 

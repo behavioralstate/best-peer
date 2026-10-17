@@ -68,13 +68,15 @@ pub fn config(
 
 /// How the containers are confined, from `BEST_PEER_JOB_NETWORK` (`none`, the default; `default` for the container
 /// engine's own network; or the name of a network the operator made), `BEST_PEER_JOB_MEMORY` (default `4G`) and
-/// `BEST_PEER_JOB_PIDS` (default 512) for a job, `BEST_PEER_ENGINE_MEMORY` (default none) and
-/// `BEST_PEER_ENGINE_PIDS` (default 4096) for an engine; `none` for a ceiling is no ceiling. What is not named stays
-/// closed: capabilities, privileges and a job's filesystem are never opened by a variable.
+/// `BEST_PEER_JOB_PIDS` (default 512) for a job, `BEST_PEER_NETWORK` (the engine's own by default, or the name of a
+/// network the operator made: never none, since the peer reaches the engine over it), `BEST_PEER_ENGINE_MEMORY`
+/// (default none) and `BEST_PEER_ENGINE_PIDS` (default 4096) for an engine; `none` for a ceiling is no ceiling.
+/// What is not named stays closed: capabilities, privileges and a job's filesystem are never opened by a variable.
 pub fn confine(
     job_network: Option<&str>,
     job_memory: Option<&str>,
     job_pids: Option<&str>,
+    engine_network: Option<&str>,
     engine_memory: Option<&str>,
     engine_pids: Option<&str>,
 ) -> Result<Confine, String> {
@@ -113,9 +115,31 @@ pub fn confine(
     job.memory_bytes = memory("BEST_PEER_JOB_MEMORY", job_memory, job.memory_bytes)?;
     job.pids = pids("BEST_PEER_JOB_PIDS", job_pids, 512)?;
     let mut engine = Confinement::serving();
+    engine.network = match engine_network.map(str::trim) {
+        None | Some("default") => Network::Default,
+        Some(name) if !name.is_empty() && name != "none" => Network::Named(name.into()),
+        Some(_) => {
+            return Err(
+                "BEST_PEER_NETWORK must be default or the name of a network the container engine has: the peer reaches an engine over its network, so none is no network to reach it on".into(),
+            )
+        }
+    };
     engine.memory_bytes = memory("BEST_PEER_ENGINE_MEMORY", engine_memory, None)?;
     engine.pids = pids("BEST_PEER_ENGINE_PIDS", engine_pids, 4096)?;
     Ok(Confine { job, engine })
+}
+
+/// The store of models every engine container sees read-only, from `BEST_PEER_MODEL_STORE`: an absolute path, since
+/// the container engine, not the peer, resolves it; none when unset. Whether it exists is the container engine's
+/// to say when a deploy starts.
+pub fn model_store(text: Option<&str>) -> Result<Option<String>, String> {
+    match text.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(p) if std::path::Path::new(p).is_absolute() => Ok(Some(p.to_string())),
+        Some(p) => Err(format!(
+            "BEST_PEER_MODEL_STORE must be an absolute path to a directory of models, not {p:?}"
+        )),
+    }
 }
 
 /// The peer's data directory: `BEST_PEER_DATA`, else `.best-peer` in the home directory. Never a relative path:
@@ -233,6 +257,17 @@ fn main() {
 /// Whether a host name or address is this machine's loopback.
 fn is_loopback(host: &str) -> bool {
     host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Where the engines' ports are bound for `engine_host`: that very loopback address when it is one, so an operator
+/// who keeps the engines on an address of their own (`127.0.77.1`) finds them there and nowhere else on loopback;
+/// `127.0.0.1` for `localhost`; every interface for a host elsewhere.
+fn bind_ip_for(engine_host: &str) -> String {
+    match engine_host.parse::<std::net::IpAddr>() {
+        Ok(ip) if ip.is_loopback() => ip.to_string(),
+        _ if is_loopback(engine_host) => "127.0.0.1".into(),
+        _ => "0.0.0.0".into(),
+    }
 }
 
 /// The hardware the peer places workloads on, by `BEST_PEER_GPU`: `nvml` (the default) reads the NVIDIA cards
@@ -374,15 +409,13 @@ async fn peer_app(endpoint: &str, dir: &std::path::Path, log: Arc<EventLog>, aut
     // another host (BEST_PEER_ENGINE_HOST not loopback) publishes them on that host's interfaces, as loopback there
     // is not here.
     let engine_host = std::env::var("BEST_PEER_ENGINE_HOST").unwrap_or_else(|_| "127.0.0.1".into());
-    let bind_ip = if is_loopback(&engine_host) {
-        "127.0.0.1"
-    } else {
-        "0.0.0.0"
-    };
-    let (runtime, engine) = engines(bind_ip, &engine_host).await;
+    let bind_ip = bind_ip_for(&engine_host);
+    let (runtime, engine) = engines(&bind_ip, &engine_host).await;
     let images = Images {
         ollama: std::env::var("BEST_PEER_OLLAMA_IMAGE").ok(),
         vllm: std::env::var("BEST_PEER_VLLM_IMAGE").ok(),
+        model_store: model_store(std::env::var("BEST_PEER_MODEL_STORE").ok().as_deref())
+            .unwrap_or_else(|why| fail(&why)),
     };
     let seconds = |name: &str, default: u64| {
         Duration::from_secs(std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default))
@@ -397,6 +430,7 @@ async fn peer_app(endpoint: &str, dir: &std::path::Path, log: Arc<EventLog>, aut
         std::env::var("BEST_PEER_JOB_NETWORK").ok().as_deref(),
         std::env::var("BEST_PEER_JOB_MEMORY").ok().as_deref(),
         std::env::var("BEST_PEER_JOB_PIDS").ok().as_deref(),
+        std::env::var("BEST_PEER_NETWORK").ok().as_deref(),
         std::env::var("BEST_PEER_ENGINE_MEMORY").ok().as_deref(),
         std::env::var("BEST_PEER_ENGINE_PIDS").ok().as_deref(),
     )
@@ -700,6 +734,31 @@ mod tests {
         engine_host: &str,
         auth: Option<Arc<Auth>>,
     ) -> Bed {
+        bed_set_up(
+            gpu,
+            log,
+            runtime,
+            engine,
+            engine_host,
+            auth,
+            Images::default(),
+            Confine::default(),
+        )
+        .await
+    }
+
+    /// The same, with the operator's say over the engines and the confinement given.
+    #[allow(clippy::too_many_arguments)]
+    async fn bed_set_up(
+        gpu: Arc<best_peer_gpu::Fake>,
+        log: Arc<EventLog>,
+        runtime: Arc<best_peer_runtime::Fake>,
+        engine: Arc<best_peer_engine::Fake>,
+        engine_host: &str,
+        auth: Option<Arc<Auth>>,
+        images: Images,
+        confine: Confine,
+    ) -> Bed {
         for image in ["ollama/ollama", "vllm/vllm-openai", "busybox", "ollama/ollama:0.6"] {
             runtime.registry_has(best_peer_runtime::ImageRef(image.into()));
         }
@@ -711,14 +770,14 @@ mod tests {
             runtime.clone(),
             engine.clone(),
             log.clone(),
-            Images::default(),
+            images,
             Patience {
                 ready: Duration::from_secs(1),
                 load: Duration::from_secs(1),
                 unload: Duration::from_secs(1),
             },
             holdings.clone(),
-            Confine::default(),
+            confine,
         )
         .await;
         let auth = auth.unwrap_or_else(|| {
@@ -2822,6 +2881,11 @@ mod tests {
         );
         assert_eq!(spec.confinement.network, Network::Default);
         assert!(spec.confinement.drop_capabilities && !spec.confinement.read_only_root);
+        assert!(
+            spec.mounts.is_empty(),
+            "no store was shared: the engine pulls as it would"
+        );
+        assert!(!spec.env.iter().any(|(k, _)| k == "OLLAMA_MODELS"));
         assert_eq!(
             bed.engine.loaded_at("http://engines.local:41434"),
             vec!["llama3.2:3b"],
@@ -3136,9 +3200,89 @@ mod tests {
         assert!(parse_memory("4X").unwrap_err().contains("unit"));
     }
 
+    #[tokio::test]
+    async fn a_shared_store_of_models_is_mounted_read_only_into_every_engine_on_the_network_the_operator_named() {
+        let confined = confine(None, None, None, Some("best-peer"), None, None).unwrap();
+        let images = Images {
+            model_store: Some("/srv/models".into()),
+            ..Images::default()
+        };
+        let bed = bed_set_up(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+            Arc::new(best_peer_engine::Fake::new()),
+            "engines.local",
+            None,
+            images,
+            confined,
+        )
+        .await;
+        let dep = bed.deployed("d1", "llama3.2:3b", 8).await;
+        let spec = bed.runtime.spec_of(&bed.container_of(&dep)).unwrap();
+        assert_eq!(
+            spec.mounts,
+            vec![best_peer_runtime::Mount {
+                host: "/srv/models".into(),
+                container: "/models".into(),
+                read_only: true
+            }]
+        );
+        assert!(
+            spec.env.contains(&("OLLAMA_MODELS".into(), "/models".into())),
+            "the engine is pointed at the store: {:?}",
+            spec.env
+        );
+        assert_eq!(spec.confinement.network, Network::Named("best-peer".into()));
+        // A job shares nothing of it.
+        let (s, _) = bed.send("j1", "RunJob", "run-job", json!({ "image": "busybox" })).await;
+        assert_eq!(s, StatusCode::CREATED);
+        let started = bed.events_of("j1", "JobStarted").await;
+        let container = ContainerId(started.last().unwrap().data["container"].as_str().unwrap().into());
+        assert!(bed.runtime.spec_of(&container).unwrap().mounts.is_empty());
+        // The store is an absolute path or nothing; the engines' network is never none.
+        assert_eq!(model_store(None).unwrap(), None);
+        assert_eq!(model_store(Some(" ")).unwrap(), None);
+        assert_eq!(
+            model_store(Some("/srv/models")).unwrap().as_deref(),
+            Some("/srv/models")
+        );
+        assert!(model_store(Some("models")).unwrap_err().contains("absolute"));
+        // With a store the engine is never asked to pull: what is there is served, what is not fails at once.
+        let started = bed.events_of("d1", "DeploymentReady").await;
+        let port = started.iter().find(|e| e.r#type == "DeploymentStarted").unwrap().data["port"]
+            .as_u64()
+            .unwrap();
+        let base = format!("http://engines.local:{port}");
+        assert_eq!(bed.engine.loaded_at(&base), vec!["llama3.2:3b"]);
+        assert!(bed.engine.pulled_at(&base).is_empty(), "a store is never pulled into");
+        bed.engine.missing("nobody/none:1b");
+        let (s, _) = bed.deploy("d2", "nobody/none:1b", "ollama", 1).await;
+        assert_eq!(s, StatusCode::CREATED);
+        let failed = bed.events_of("d2", "DeploymentFailed").await;
+        let why = &failed.last().unwrap().data;
+        assert!(why["reason"].as_str().unwrap().contains("nobody/none:1b"), "{why}");
+        assert!(why["fix"].as_str().unwrap().contains("store"), "{why}");
+        // The engines' ports are bound at the loopback address the operator named, or everywhere for a host elsewhere.
+        assert_eq!(bind_ip_for("127.0.0.1"), "127.0.0.1");
+        assert_eq!(bind_ip_for("127.0.77.1"), "127.0.77.1");
+        assert_eq!(bind_ip_for("localhost"), "127.0.0.1");
+        assert_eq!(bind_ip_for("engines.local"), "0.0.0.0");
+        assert!(confine(None, None, None, Some("none"), None, None)
+            .unwrap_err()
+            .contains("BEST_PEER_NETWORK"));
+        assert_eq!(
+            confine(None, None, None, Some("default"), None, None)
+                .unwrap()
+                .engine
+                .network,
+            Network::Default
+        );
+    }
+
     #[test]
     fn the_confinement_is_closed_unless_the_operator_opens_something_by_name() {
-        let c = confine(None, None, None, None, None).unwrap();
+        let c = confine(None, None, None, None, None, None).unwrap();
         assert_eq!(c.job, Confinement::default());
         assert_eq!(c.engine, Confinement::serving());
         assert_eq!(c.job.network, Network::None);
@@ -3146,7 +3290,15 @@ mod tests {
         assert_eq!(c.job.pids, Some(512));
         assert_eq!(c.engine.memory_bytes, None);
         assert_eq!(c.engine.pids, Some(4096));
-        let c = confine(Some("default"), Some("8G"), Some("none"), Some("16G"), Some("100")).unwrap();
+        let c = confine(
+            Some("default"),
+            Some("8G"),
+            Some("none"),
+            None,
+            Some("16G"),
+            Some("100"),
+        )
+        .unwrap();
         assert_eq!(c.job.network, Network::Default);
         assert_eq!(c.job.memory_bytes, Some(8 << 30));
         assert_eq!(c.job.pids, None);
@@ -3156,17 +3308,18 @@ mod tests {
             c.job.drop_capabilities && c.job.no_new_privileges && c.job.read_only_root,
             "what was not named stays closed"
         );
-        let c = confine(Some("best-peer"), Some("none"), None, None, None).unwrap();
+        let c = confine(Some("best-peer"), Some("none"), None, None, None, None).unwrap();
         assert_eq!(c.job.network, Network::Named("best-peer".into()));
         assert_eq!(c.job.memory_bytes, None);
         for (why, args) in [
-            ("BEST_PEER_JOB_NETWORK", (Some(" "), None, None, None, None)),
-            ("BEST_PEER_JOB_MEMORY", (None, Some("lots"), None, None, None)),
-            ("BEST_PEER_JOB_PIDS", (None, None, Some("0"), None, None)),
-            ("BEST_PEER_ENGINE_MEMORY", (None, None, None, Some("4X"), None)),
-            ("BEST_PEER_ENGINE_PIDS", (None, None, None, None, Some("many"))),
+            ("BEST_PEER_JOB_NETWORK", (Some(" "), None, None, None, None, None)),
+            ("BEST_PEER_JOB_MEMORY", (None, Some("lots"), None, None, None, None)),
+            ("BEST_PEER_JOB_PIDS", (None, None, Some("0"), None, None, None)),
+            ("BEST_PEER_NETWORK", (None, None, None, Some(""), None, None)),
+            ("BEST_PEER_ENGINE_MEMORY", (None, None, None, None, Some("4X"), None)),
+            ("BEST_PEER_ENGINE_PIDS", (None, None, None, None, None, Some("many"))),
         ] {
-            let err = confine(args.0, args.1, args.2, args.3, args.4).unwrap_err();
+            let err = confine(args.0, args.1, args.2, args.3, args.4, args.5).unwrap_err();
             assert!(err.contains(why), "{err}");
         }
     }

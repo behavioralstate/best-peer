@@ -3,8 +3,8 @@
 //! by the NVIDIA container toolkit when its id is an NVML UUID (`GPU-...`); other accelerators wait for their own
 //! adapter. A container is confined as its spec says, in the engine's own words: capabilities dropped, no new
 //! privileges, a read-only root with a private `/tmp`, ceilings on processes and on memory with swap counted in,
-//! and its network. Containers are removed by the engine when they exit. Thin; proven on a host by hand, never
-//! unit-tested.
+//! and its network; a mount is a bind. Containers are removed by the engine when they exit. Thin; proven on a host
+//! by hand, never unit-tested.
 
 use std::collections::HashMap;
 
@@ -207,6 +207,12 @@ impl Runtime for DockerRuntime {
                 },
                 // An init as PID 1 reaps and forwards signals, so a stop reaches an image that did not expect to be it.
                 init: Some(true),
+                binds: (!spec.mounts.is_empty()).then(|| {
+                    spec.mounts
+                        .iter()
+                        .map(|m| format!("{}:{}:{}", m.host, m.container, if m.read_only { "ro" } else { "rw" }))
+                        .collect()
+                }),
                 ..Default::default()
             }),
             ..Default::default()
