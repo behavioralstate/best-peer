@@ -72,10 +72,11 @@ The peer makes itself a certificate at first start, keeps it in its data folder 
 (`NODE_EXTRA_CA_CERTS=<file>` for a Node client, `SSL_CERT_FILE=<file>` for a Python one, `--cacert <file>` for
 curl). A certificate of your own, from your CA or a public one for a name you hold, is
 `BEST_PEER_TLS_CERT=<chain.pem> BEST_PEER_TLS_KEY=<key.pem>`; the peer checks nothing about it beyond that it
-loads. An `http://` endpoint still works, with a warning at start: the credential then travels in the clear, so keep
-that to a VPN. There is no relay in the peer, so across the internet the address is one you make reachable (a static
-IP with a port forward, a Tailscale IP), and the firewall lets in 7777 and nothing else: prompts go through the door
-too, on that port, with the door's credential. The engines' own ports stay on loopback whatever the door listens on.
+loads. An `http://` endpoint is served on loopback alone: off it the credential would travel in the clear, and the
+peer refuses to start, saying what to set. There is no relay in the peer, so across the internet the address is one
+you make reachable (a static IP with a port forward, a Tailscale IP), and the firewall lets in 7777 and nothing
+else: prompts go through the door too, on that port, with the door's credential. The engines' own ports stay on
+loopback whatever the door listens on.
 
 **3. Admit the agent.** The person connecting says to their client "sign me in `<name>`, start from
 `https://<address>:7777/.well-known/best`"; their client shows them a code like `8BB9-CB44`, and they send it to you.

@@ -36,7 +36,9 @@ use tls::Tls;
 /// loopback), `BEST_PEER_ENDPOINT` (the consumer-facing base URL) and `BEST_PEER_TLS_CERT` with `BEST_PEER_TLS_KEY`
 /// (the operator's certificate; an `https://` endpoint without them is served with one the peer makes). The endpoint
 /// defaults to the listen address only when that address is one a consumer can use: a peer listening on every
-/// interface has no address of its own to advertise, so it refuses to start until told what it is called.
+/// interface has no address of its own to advertise, so it refuses to start until told what it is called. A
+/// cleartext endpoint is served on loopback alone: off it the credential would travel in the clear, so the peer
+/// refuses to start and says what to set.
 pub fn config(
     listen: Option<&str>,
     endpoint: Option<&str>,
@@ -62,6 +64,11 @@ pub fn config(
         None if cert.is_some() => format!("https://{listen}"),
         None => format!("http://{listen}"),
     };
+    if endpoint.starts_with("http://") && !listen.ip().is_loopback() {
+        return Err(format!(
+            "BEST_PEER_ENDPOINT is {endpoint}, cleartext, and BEST_PEER_LISTEN is {listen}, not loopback: the credential would travel unencrypted; make BEST_PEER_ENDPOINT https:// (the peer makes its own certificate) or listen on loopback"
+        ));
+    }
     let tls = Tls::decide(&endpoint, cert, key)?;
     Ok((listen, endpoint, tls))
 }
@@ -292,9 +299,6 @@ async fn serve() {
             tracing::info!(certificate = %s.file.display(), "https with a certificate this peer made: a client that pins it reads this file")
         }
         Some(s) => tracing::info!(certificate = %s.file.display(), "https with the operator's certificate"),
-        None if !listen.ip().is_loopback() => {
-            tracing::warn!(%endpoint, "the endpoint is cleartext and not loopback: credentials will travel unencrypted; make BEST_PEER_ENDPOINT https:// before anyone but you uses it")
-        }
         None => {}
     }
     tracing::info!(%listen, %endpoint, data = %dir.display(), "best-peer is serving its door");
@@ -2562,6 +2566,20 @@ mod tests {
         assert!(config(None, Some("peer.example.com"), None, None)
             .unwrap_err()
             .contains("https://"));
+        // Cleartext off loopback is refused, whether the endpoint was said or defaulted; on loopback it is served.
+        for (listen, endpoint) in [
+            (Some("192.168.1.9:7777"), Some("http://192.168.1.9:7777")),
+            (Some("192.168.1.9:7777"), None),
+            (Some("0.0.0.0:7777"), Some("http://peer.example.com:7777")),
+        ] {
+            let why = config(listen, endpoint, None, None).unwrap_err();
+            assert!(why.contains("cleartext") && why.contains("https://"), "{why}");
+        }
+        let (_, endpoint, tls) = config(Some("127.0.0.1:7781"), Some("http://127.0.0.1:7781"), None, None).unwrap();
+        assert_eq!((endpoint.as_str(), tls), ("http://127.0.0.1:7781", Tls::Off));
+        let (_, endpoint, tls) =
+            config(Some("192.168.1.9:7777"), Some("https://192.168.1.9:7777"), None, None).unwrap();
+        assert_eq!((endpoint.as_str(), tls), ("https://192.168.1.9:7777", Tls::Own));
     }
 
     #[test]
