@@ -441,10 +441,18 @@ fn parse_duration(text: &str) -> Result<Duration, String> {
 
 /// The admin token and the record of the running peer, from the data directory, for the two commands the person at
 /// the machine runs; a form posted to the door's `path` with the token as the proof, and the door's answer whatever
-/// its status, since a refusal says why in its body.
+/// its status, since a refusal says why in its body. Both files are read as plain files, never through a link, and
+/// the token goes to an address of this machine only, so running these with more rights than the peer's own user
+/// sends nothing that user could not read, and nowhere else.
 fn as_the_authority(path: &str, mut form: Vec<(&str, String)>) -> (u16, serde_json::Value) {
     let dir = data_dir();
-    let token = std::fs::read_to_string(dir.join("admin-token"))
+    if std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        fail(&format!(
+            "{} is a link: the data directory is read where it is, never through a link",
+            dir.display()
+        ));
+    }
+    let token = tls::read_plain(&dir.join("admin-token"), 4096)
         .map(|t| t.trim().to_string())
         .unwrap_or_else(|e| {
             fail(&format!(
@@ -458,7 +466,7 @@ fn as_the_authority(path: &str, mut form: Vec<(&str, String)>) -> (u16, serde_js
             dir.display()
         ))
     });
-    let addr = record.dial();
+    let addr = record.dial_here().unwrap_or_else(|why| fail(&why));
     form.push(("proof", token));
     let body = serde_urlencoded::to_string(&form).unwrap_or_else(|e| fail(&format!("cannot encode the request: {e}")));
     let req = axum::http::Request::post(path)

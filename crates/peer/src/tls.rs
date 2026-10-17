@@ -74,7 +74,7 @@ impl Record {
     }
 
     pub fn read(dir: &Path) -> std::io::Result<Self> {
-        let text = std::fs::read_to_string(dir.join(Self::FILE))?;
+        let text = read_plain(&dir.join(Self::FILE), 1 << 20)?;
         serde_json::from_str(&text).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
@@ -88,6 +88,47 @@ impl Record {
         };
         SocketAddr::new(ip, self.listen.port())
     }
+
+    /// Where `approve` connects, when that is an address of this machine: the token never leaves it, whoever wrote
+    /// the record.
+    pub fn dial_here(&self) -> Result<SocketAddr, String> {
+        let addr = self.dial();
+        match std::net::UdpSocket::bind(SocketAddr::new(addr.ip(), 0)) {
+            Ok(_) => Ok(addr),
+            Err(_) => Err(format!(
+                "the record of the running peer names {addr}, which is not an address of this machine: the admin token goes nowhere else"
+            )),
+        }
+    }
+}
+
+/// A file's text when it is the file itself, at most `limit` bytes: never a link to another, by name or by a second
+/// hard link, so a command run with more rights than the data directory's owner reads nothing that owner did not write.
+pub fn read_plain(path: &Path, limit: u64) -> std::io::Result<String> {
+    use std::io::Read;
+    let refuse = |why: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{}: {why}", path.display()));
+    let named = std::fs::symlink_metadata(path)?;
+    if !named.file_type().is_file() {
+        return Err(refuse("not a plain file"));
+    }
+    let file = std::fs::File::open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = file.metadata()?;
+        if (opened.dev(), opened.ino()) != (named.dev(), named.ino()) {
+            return Err(refuse("replaced while it was opened"));
+        }
+        if opened.nlink() != 1 {
+            return Err(refuse("a hard link to another file"));
+        }
+    }
+    let mut text = String::new();
+    file.take(limit + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > limit {
+        return Err(refuse("larger than it can be"));
+    }
+    Ok(text)
 }
 
 /// The names the peer's own certificate carries: this machine's loopback by its three names, the host the endpoint
@@ -476,5 +517,40 @@ mod tests {
         };
         assert_eq!(v6.dial().to_string(), "[::1]:7777");
         assert!(Record::read(&dir.path().join("none")).is_err());
+    }
+
+    #[test]
+    fn approve_dials_this_machine_only() {
+        let here = Record {
+            listen: "0.0.0.0:7777".parse().unwrap(),
+            endpoint: "https://peer.example.com:7777".into(),
+            certificate: None,
+        };
+        assert_eq!(here.dial_here().unwrap().to_string(), "127.0.0.1:7777");
+        let elsewhere = Record {
+            listen: "192.0.2.1:7777".parse().unwrap(),
+            ..here
+        };
+        assert!(elsewhere
+            .dial_here()
+            .unwrap_err()
+            .contains("not an address of this machine"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_in_the_data_directory_is_never_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&elsewhere, "not the peer's").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dir.path().join("admin-token")).unwrap();
+        assert!(read_plain(&dir.path().join("admin-token"), 1024).is_err());
+        std::fs::hard_link(&elsewhere, dir.path().join("door")).unwrap();
+        assert!(Record::read(dir.path()).is_err());
+        std::fs::remove_file(dir.path().join("door")).unwrap();
+        std::fs::write(dir.path().join("token"), "x".repeat(2048)).unwrap();
+        assert!(read_plain(&dir.path().join("token"), 1024).is_err());
+        std::fs::write(dir.path().join("token"), "the token\n").unwrap();
+        assert_eq!(read_plain(&dir.path().join("token"), 1024).unwrap(), "the token\n");
     }
 }

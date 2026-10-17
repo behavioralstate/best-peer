@@ -154,7 +154,8 @@ start, `tls/cert.pem` under its data folder, named at start for clients to pin, 
 host changes or fewer than thirty days of it remain, which the start-up line says. `BEST_PEER_DATA` (default
 `~/.best-peer`) holds the event log, the credentials as hashes, the admin token, that certificate, and the record of
 where the door is that `best-peer approve` reads, so it reaches the peer over the same TLS, pinned to that
-certificate and no other.
+certificate and no other. `approve` and `revoke` read the token and that record as plain files, never through a link,
+and dial an address of this machine only, so they may run with more rights than the peer's user.
 
 Every door hosts **workspaces**, the BEST tenants. The root manifest declares their template
 (`/.well-known/best/{tenantId}`), and a workspace's own door is at `/workspaces/<id>` under the root, with its own
