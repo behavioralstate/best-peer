@@ -11,11 +11,13 @@ use std::sync::Arc;
 
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderName, StatusCode, Uri};
+use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
 use best_peer_door::auth::{Credential, AUTH_HEADER};
 use best_peer_door::error::BestError;
+use best_peer_door::router::{access_log, Holder};
 use best_peer_door::Auth;
 
 use crate::transport::Transport;
@@ -50,6 +52,7 @@ pub fn router(upstream: Arc<dyn Upstream>, auth: Arc<Auth>) -> Router {
         .route("/deployments/:deployment", any(pass_through))
         .route("/deployments/:deployment/", any(pass_through))
         .route("/deployments/:deployment/*rest", any(pass_through))
+        .layer(middleware::from_fn(access_log))
         .with_state(Gateway { upstream, auth })
 }
 
@@ -118,6 +121,7 @@ async fn forward(gw: &Gateway, req: Request) -> Result<Response, BestError> {
         })?;
     let (mut parts, body) = res.into_parts();
     strip_hop_by_hop(&mut parts.headers);
+    parts.extensions.insert(Holder(who.holder()));
     Ok(Response::from_parts(parts, body))
 }
 

@@ -290,7 +290,12 @@ lists the scopes: `deploy` (pull-image, deploy-model, undeploy-model) and `jobs`
 scope and every holder's workloads, and what a key approved with nothing said is, so the owner's own box changes
 nothing. Reading is every key's: the hardware state, and its own workloads and events. `best-peer approve <code>
 --may deploy` grants scopes; `--memory 40G` sets the most device memory the key's workloads may hold together,
-counted across its deployments, jobs and commands admitted but not yet started. Every command document says which
+counted across its deployments, jobs and commands admitted but not yet started; `--expires 8h` ends the key after
+that long (`8h`, `30m`, `2d`, or seconds) whatever lifetime the agent asked for. `best-peer revoke <name>` takes a
+key back at once, by the connection name the agent signed in under or the holder id the events show, with the
+peer running and the same admin token; what the key left running is the owner's to end. Every request to the door
+is one line in the peer's log: where it came from, what it asked, what it got, and the holder, never the key; the
+sign-in endpoint admits a few registrations at a time from one address, as from one client. Every command document says which
 scope it needs. A command the key may not send is refused at ingest with `FORBIDDEN` and what it was approved for;
 a deploy or a job past the share with `SHARE_EXCEEDED`, what is held and the room left; a workload another key
 started, by name, whether the command, the endpoint or the events are asked for, and a refusal names only what the

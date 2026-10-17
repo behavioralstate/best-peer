@@ -1,14 +1,18 @@
 //! The HTTP routes the spec names (SPEC.md, HTTP Transport and the four capabilities), over a [`Door`]. The manifest
-//! and the two OAuth endpoints are public; everything else needs the credential in the `X-Api-Key` header. Every
-//! error the door answers, the framework's included, is in the BEST error format. A tenant's door has the protected
-//! routes alone ([`tenant_router`]): its manifest is the root's to serve, and sign-in is the root's.
+//! and the two OAuth endpoints are public, as are the two the person at the machine uses with the admin token
+//! (approve, revoke); everything else needs the credential in the `X-Api-Key` header. Every error the door answers,
+//! the framework's included, is in the BEST error format. Every request is one line in the log: where it came from,
+//! what it asked, what it got, and the holder, never the key. A tenant's door has the protected routes alone
+//! ([`tenant_router`]): its manifest is the root's to serve, and sign-in is the root's.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -41,7 +45,8 @@ pub fn router(door: Shared) -> Router {
         .route("/auth/device", post(device))
         .route("/auth/token", post(token))
         .route("/auth/verify", get(verify))
-        .route("/auth/approve", post(approve));
+        .route("/auth/approve", post(approve))
+        .route("/auth/revoke", post(revoke));
     shaped(public.merge(protected(&door)), door)
 }
 
@@ -72,7 +77,38 @@ fn shaped(routes: Router<Shared>, door: Shared) -> Router {
         .fallback(unknown_route)
         .layer(middleware::map_response(best_shaped))
         .layer(DefaultBodyLimit::max(MAX_BODY))
+        .layer(middleware::from_fn(access_log))
         .with_state(door)
+}
+
+/// Who a request was answered for, on the answer, for the log: the holder id, never the key.
+#[derive(Clone, Debug)]
+pub struct Holder(pub String);
+
+/// One line per request, at info, once it is answered: where it came from when the transport said, what it asked,
+/// what it got, how long it took, and the holder when a credential opened it. The query string, the headers and the
+/// body are not in it: a key travels in a header, and the line must never carry one.
+pub async fn access_log(from: Option<ConnectInfo<SocketAddr>>, req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let started = Instant::now();
+    let res = next.run(req).await;
+    let from = from.map(|c| c.0.to_string()).unwrap_or_else(|| "-".into());
+    let holder = res
+        .extensions()
+        .get::<Holder>()
+        .map(|h| h.0.clone())
+        .unwrap_or_else(|| "-".into());
+    tracing::info!(
+        %from,
+        %method,
+        %path,
+        status = res.status().as_u16(),
+        %holder,
+        ms = started.elapsed().as_millis() as u64,
+        "request"
+    );
+    res
 }
 
 async fn require_key(State(door): State<Shared>, mut req: Request, next: Next) -> Response {
@@ -85,8 +121,11 @@ async fn require_key(State(door): State<Shared>, mut req: Request, next: Next) -
     let Some(credential) = (!key.is_empty()).then(|| door.auth.authenticate(key)).flatten() else {
         return BestError::unauthorized().into_response();
     };
+    let holder = credential.holder();
     req.extensions_mut().insert(credential);
-    next.run(req).await
+    let mut res = next.run(req).await;
+    res.extensions_mut().insert(Holder(holder));
+    res
 }
 
 async fn unknown_route(req: Request) -> BestError {
@@ -187,9 +226,14 @@ fn form<T: serde::de::DeserializeOwned>(headers: &HeaderMap, body: &Bytes) -> Re
         .map_err(|e| OAuthError::invalid_request(format!("the form could not be read: {e}")))
 }
 
-async fn device(State(door): State<Shared>, headers: HeaderMap, body: Bytes) -> Result<Response, OAuthError> {
+async fn device(
+    State(door): State<Shared>,
+    from: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, OAuthError> {
     let req: DeviceRequest = form(&headers, &body)?;
-    let answer = door.auth.start_device(req)?;
+    let answer = door.auth.start_device_from(req, from.map(|c| c.0.ip()))?;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(answer)).into_response())
 }
 
@@ -211,6 +255,8 @@ struct ApproveForm {
     may: Option<String>,
     /// The most device memory the credential's workloads may hold together; absent for no share.
     memory_bytes: Option<u64>,
+    /// Seconds until the credential ends, whatever lifetime the agent asked for; absent for the agent's choice.
+    expires_in: Option<u64>,
 }
 
 async fn approve(State(door): State<Shared>, headers: HeaderMap, body: Bytes) -> Result<Response, OAuthError> {
@@ -224,8 +270,40 @@ async fn approve(State(door): State<Shared>, headers: HeaderMap, body: Bytes) ->
         }),
         memory_bytes: f.memory_bytes,
     };
-    let admitted = door.auth.approve(f.user_code.trim(), f.proof.trim(), grant).await?;
+    let admitted = door
+        .auth
+        .approve(
+            f.user_code.trim(),
+            f.proof.trim(),
+            grant,
+            f.expires_in.map(Duration::from_secs),
+        )
+        .await?;
     Ok(Json(json!({ "approved": true, "admitted": admitted })).into_response())
+}
+
+#[derive(serde::Deserialize)]
+struct RevokeForm {
+    /// The connection name or the holder id of the credential to take back.
+    name: String,
+    proof: String,
+}
+
+/// The person at the machine takes a credential back, with the same proof the approval takes: every live credential
+/// by that name is taken at once, and the answer says which.
+async fn revoke(State(door): State<Shared>, headers: HeaderMap, body: Bytes) -> Result<Response, OAuthError> {
+    let f: RevokeForm = form(&headers, &body)?;
+    let taken = door.auth.revoke(&f.name, f.proof.trim()).await?;
+    let revoked: Vec<Value> = taken
+        .iter()
+        .map(|c| {
+            json!({
+                "name": c.name, "holder": c.holder(), "client_id": c.client_id, "agent_label": c.agent_label,
+                "issued_at": c.issued_at, "revoked_at": c.revoked_at
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "revoked": revoked })).into_response())
 }
 
 // ----- commands ----------------------------------------------------------------------------------------------------
@@ -966,6 +1044,78 @@ mod tests {
         let (s, _, b) = call(&app, get("/events?limit=5000", Some(&key))).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert!(b["error"]["message"].as_str().unwrap().contains("200"));
+    }
+
+    #[tokio::test]
+    async fn the_person_takes_a_credential_back_with_the_proof_and_the_answer_names_the_holder_for_the_log() {
+        let d = door();
+        let app = router(d.clone());
+        let key = sign_in(&app, "test", "my-peer").await;
+        let res = app.clone().oneshot(get("/commands", Some(&key))).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let holder = d.auth.authenticate(&key).unwrap().holder();
+        assert_eq!(
+            res.extensions().get::<Holder>().map(|h| h.0.as_str()),
+            Some(holder.as_str()),
+            "the answer names the holder, for the log"
+        );
+        assert!(
+            !res.headers()
+                .iter()
+                .any(|(_, v)| v.as_bytes().windows(key.len()).any(|w| w == key.as_bytes())),
+            "and never the key"
+        );
+        let res = app.clone().oneshot(get("/.well-known/best", None)).await.unwrap();
+        assert!(res.extensions().get::<Holder>().is_none(), "nobody's");
+        // The wrong proof takes nothing; the right one takes it, and the door closes to it at once.
+        let (s, _, b) = call(&app, post_form("/auth/revoke", &[("name", "my-peer"), ("proof", "no")])).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+        let (s, _, b) = call(&app, post_form("/auth/revoke", &[("name", "my-peer"), ("proof", "ok")])).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["revoked"][0]["holder"], holder);
+        assert_eq!(b["revoked"][0]["name"], "my-peer");
+        assert!(b["revoked"][0]["revoked_at"].is_string());
+        assert!(!b.to_string().contains(&key));
+        let (s, _, b) = call(&app, get("/commands", Some(&key))).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        assert_eq!(b["error"]["code"], "UNAUTHORIZED");
+        let (s, _, b) = call(&app, post_form("/auth/revoke", &[("name", "my-peer"), ("proof", "ok")])).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(b["error_description"].as_str().unwrap().contains("none"), "{b}");
+        // An approval bounded in time: the token answer says so.
+        let (_, _, a) = call(
+            &app,
+            post_form("/auth/device", &[("client_id", "test"), ("connection", "bounded")]),
+        )
+        .await;
+        let (s, _, ok) = call(
+            &app,
+            post_form(
+                "/auth/approve",
+                &[
+                    ("user_code", a["user_code"].as_str().unwrap()),
+                    ("proof", "ok"),
+                    ("expires_in", "120"),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{ok}");
+        assert_eq!(ok["admitted"]["expires_in"], 120);
+        let (_, _, t) = call(
+            &app,
+            post_form(
+                "/auth/token",
+                &[
+                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                    ("device_code", a["device_code"].as_str().unwrap()),
+                    ("client_id", "test"),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(t["expires_in"], 120);
+        assert!(t["expires_at"].is_string());
     }
 
     #[tokio::test]
