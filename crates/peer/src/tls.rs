@@ -111,14 +111,21 @@ pub fn read_plain(path: &Path, limit: u64) -> std::io::Result<String> {
     if !named.file_type().is_file() {
         return Err(refuse("not a plain file"));
     }
-    let file = std::fs::File::open(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let opened = file.metadata()?;
+    if !opened.file_type().is_file() {
+        return Err(refuse("replaced while it was opened"));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let opened = file.metadata()?;
-        if (opened.dev(), opened.ino()) != (named.dev(), named.ino()) {
-            return Err(refuse("replaced while it was opened"));
-        }
         if opened.nlink() != 1 {
             return Err(refuse("a hard link to another file"));
         }
@@ -548,6 +555,9 @@ mod tests {
         std::fs::hard_link(&elsewhere, dir.path().join("door")).unwrap();
         assert!(Record::read(dir.path()).is_err());
         std::fs::remove_file(dir.path().join("door")).unwrap();
+        let fifo = std::ffi::CString::new(dir.path().join("fifo").into_os_string().into_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(read_plain(&dir.path().join("fifo"), 1024).is_err());
         std::fs::write(dir.path().join("token"), "x".repeat(2048)).unwrap();
         assert!(read_plain(&dir.path().join("token"), 1024).is_err());
         std::fs::write(dir.path().join("token"), "the token\n").unwrap();
