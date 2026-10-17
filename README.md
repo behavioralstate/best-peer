@@ -264,6 +264,11 @@ Every command of this peer follows one pattern, and nothing else is needed to dr
    the end, and follows from there with `GET /events/stream` and `Last-Event-ID`. There is no other channel for
    progress or outcome, and nothing to poll.
 
+The door bounds what one credential may ask of it: a command envelope weighs 16 KiB at most (every other body
+256 KiB), a credential sends 60 commands a minute and holds 4 event streams open at once, refused past that with
+`TOO_MANY_COMMANDS` and `TOO_MANY_STREAMS`; a stream ends within seconds of its key being taken back or running
+out, events or none. An accepted command is kept whole until it completes, then only as a line.
+
 ## Sign in
 
 An agent signs a person in the way every BEST service is signed in to: it reads the manifest, posts to

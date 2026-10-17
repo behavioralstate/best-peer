@@ -28,12 +28,15 @@ use crate::catalogue::{CommandDef, Emitter};
 use crate::envelope::Envelope;
 use crate::error::BestError;
 use crate::log::{Accept, Filter, MAX_PAGE};
-use crate::{manifest, Door};
+use crate::{manifest, Door, MAX_STREAMS_PER_HOLDER};
 
 type Shared = Arc<Door>;
 
 /// The most a request body may carry: a command is a few kilobytes, a form a few hundred bytes.
 const MAX_BODY: usize = 256 * 1024;
+/// What a command envelope may weigh: a command is a type, a schema and a small data object, and the door keeps
+/// every accepted one until it completes.
+const MAX_COMMAND_BODY: usize = 16 * 1024;
 
 pub fn router(door: Shared) -> Router {
     let public = Router::new()
@@ -53,7 +56,12 @@ pub fn tenant_router(door: Shared) -> Router {
 
 fn protected(door: &Shared) -> Router<Shared> {
     Router::new()
-        .route("/commands", get(command_catalogue).post(ingest))
+        .route(
+            "/commands",
+            get(command_catalogue)
+                .post(ingest)
+                .layer(DefaultBodyLimit::max(MAX_COMMAND_BODY)),
+        )
         .route("/commands/:schema/:version", get(command_document))
         .route("/events", get(list_events))
         .route("/events/stream", get(stream_events))
@@ -125,7 +133,12 @@ async fn best_shaped(res: Response) -> Response {
             "METHOD_NOT_ALLOWED",
             "this route does not take that method: the manifest's endpoints say which".into(),
         ),
-        StatusCode::PAYLOAD_TOO_LARGE => ("PAYLOAD_TOO_LARGE", format!("the body exceeds {MAX_BODY} bytes")),
+        StatusCode::PAYLOAD_TOO_LARGE => (
+            "PAYLOAD_TOO_LARGE",
+            format!(
+                "the body exceeds what this route takes: {MAX_COMMAND_BODY} bytes for a command, {MAX_BODY} otherwise"
+            ),
+        ),
         StatusCode::BAD_REQUEST => (
             "BAD_REQUEST",
             if text.is_empty() {
@@ -259,6 +272,7 @@ async fn ingest(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, BestError> {
+    door.pace(&sender.hash)?;
     let ct = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -531,8 +545,12 @@ async fn list_events(
     Ok(Json(body))
 }
 
+/// How often an open event stream looks at its credential again when no event comes.
+const CREDENTIAL_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Replays what came after `Last-Event-ID`, then follows live; the two never overlap. A client that falls behind
-/// the buffer is cut off, so it reconnects with its last id and misses nothing silently.
+/// the buffer is cut off, so it reconnects with its last id and misses nothing silently. A key taken back or run
+/// out ends the stream with it: the credential is looked at again on every event and every few seconds between.
 async fn stream_events(
     State(door): State<Shared>,
     Extension(sender): Extension<Credential>,
@@ -540,6 +558,7 @@ async fn stream_events(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, BestError> {
     let filter = filter_from(&q)?;
+    let slot = StreamSlot::take(&door.streams, &sender.hash)?;
     let last = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
@@ -557,20 +576,68 @@ async fn stream_events(
             .filter(move |s| f1.matches(s) && door1.visible_to(&who1, s)),
     );
     let door2 = door.clone();
-    let live = BroadcastStream::new(rx)
-        .take_while(|r| futures::future::ready(r.is_ok()))
+    let (auth, hash) = (door.auth.clone(), sender.hash.clone());
+    let recheck = stream::unfold(tokio::time::interval(CREDENTIAL_RECHECK), |mut every| async move {
+        every.tick().await;
+        Some((None, every))
+    });
+    let live = stream::select(BroadcastStream::new(rx).map(Some), recheck)
+        .take_while(move |r| {
+            futures::future::ready(!matches!(r, Some(Err(_))) && auth.credential_by_hash(&hash).is_some())
+        })
         .filter_map(move |r| {
             let keep = r
-                .ok()
+                .and_then(Result::ok)
                 .filter(|s| s.seq > seen_up_to && filter.matches(s) && door2.visible_to(&sender, s));
             async move { keep }
         });
-    let out = replayed.chain(live).map(|s| {
+    let out = replayed.chain(live).map(move |s| {
+        let _held = &slot;
         Ok(SseEvent::default()
             .id(s.envelope.id.clone())
             .data(serde_json::to_string(&s.envelope).unwrap_or_default()))
     });
     Ok(Sse::new(out).keep_alive(KeepAlive::default().text("keepalive")))
+}
+
+/// One of a credential's open event streams, counted while it lives and given back when the stream is dropped.
+struct StreamSlot {
+    streams: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    hash: String,
+}
+
+impl StreamSlot {
+    fn take(streams: &Arc<std::sync::Mutex<HashMap<String, usize>>>, hash: &str) -> Result<Self, BestError> {
+        let mut open = streams.lock().unwrap();
+        let count = open.entry(hash.to_string()).or_insert(0);
+        if *count >= MAX_STREAMS_PER_HOLDER {
+            return Err(BestError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "TOO_MANY_STREAMS",
+                format!(
+                    "this credential holds {MAX_STREAMS_PER_HOLDER} event streams open, the most it may: close one, or filter one stream instead of opening more"
+                ),
+            )
+            .with_details(json!({ "streams": MAX_STREAMS_PER_HOLDER })));
+        }
+        *count += 1;
+        Ok(Self {
+            streams: streams.clone(),
+            hash: hash.to_string(),
+        })
+    }
+}
+
+impl Drop for StreamSlot {
+    fn drop(&mut self) {
+        let mut open = self.streams.lock().unwrap();
+        if let Some(count) = open.get_mut(&self.hash) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                open.remove(&self.hash);
+            }
+        }
+    }
 }
 
 async fn event_document(
@@ -690,6 +757,11 @@ mod tests {
 
     /// A door over `log` with the credentials of a previous door, when it is that door restarted.
     fn door_over_with(log: Arc<EventLog>, auth: Option<Arc<Auth>>) -> Shared {
+        door_built(log, auth, crate::COMMANDS_PER_MINUTE)
+    }
+
+    /// The same, taking `per_minute` commands a minute from each credential.
+    fn door_built(log: Arc<EventLog>, auth: Option<Arc<Auth>>, per_minute: u32) -> Shared {
         let catalogue = Catalogue::new()
             .command(CommandDef {
                 schema: "pull-image".into(),
@@ -749,7 +821,7 @@ mod tests {
         let auth = auth.unwrap_or_else(|| {
             Arc::new(Auth::ephemeral(EP, Box::new(FakeApprover { proof: "ok".into() })).with_scopes(&["deploy"]))
         });
-        Arc::new(Door::new(EP, "io.best.agents", "A test peer.", catalogue, log, auth))
+        Arc::new(Door::new(EP, "io.best.agents", "A test peer.", catalogue, log, auth).taking_per_minute(per_minute))
     }
 
     async fn call(app: &Router, req: Request) -> (StatusCode, HeaderMap, Value) {
@@ -960,6 +1032,12 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(b["error"]["code"], "PAYLOAD_TOO_LARGE");
+        // A command is small: a padded envelope the general limit would take is too large for /commands.
+        let mut padded = command("pad-1", json!("ollama/ollama:0.6"));
+        padded["pad"] = json!("x".repeat(MAX_COMMAND_BODY));
+        let (s, _, b) = call(&app, post_json("/commands", &key, "application/json", padded)).await;
+        assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(b["error"]["message"].as_str().unwrap().contains("for a command"), "{b}");
         let (s, _, b) = call(&app, get("/events?limit=0", Some(&key))).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert_eq!(b["error"]["details"]["parameter"], "limit");
@@ -1474,6 +1552,156 @@ mod tests {
         assert_eq!(w["workflows"], json!([]));
         let (s, _, _) = call(&app, get("/workflows/nope", Some(&key))).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn one_credential_is_bounded_in_what_it_sends_and_holds_open() {
+        let auth = Arc::new(Auth::ephemeral(EP, Box::new(FakeApprover { proof: "ok".into() })).with_scopes(&["pull"]));
+        let d = door_built(Arc::new(EventLog::ephemeral()), Some(auth), 3);
+        let app = router(d.clone());
+        let key = sign_in(&app, "test", "my-peer").await;
+        // The other credential acts for itself alone: it reads under its own commands only.
+        let (s, _, a) = call(
+            &app,
+            post_form("/auth/device", &[("client_id", "other"), ("connection", "other-peer")]),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{a}");
+        let (s, _, _) = call(
+            &app,
+            post_form(
+                "/auth/approve",
+                &[
+                    ("user_code", a["user_code"].as_str().unwrap()),
+                    ("proof", "ok"),
+                    ("may", "pull"),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _, t) = call(
+            &app,
+            post_form(
+                "/auth/token",
+                &[
+                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                    ("device_code", a["device_code"].as_str().unwrap()),
+                    ("client_id", "other"),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{t}");
+        let other = t["access_token"].as_str().unwrap().to_string();
+        // Three commands a minute here: the fourth is refused with the pace, the other credential is not.
+        for id in ["p1", "p2", "p3"] {
+            let (s, _, b) = call(
+                &app,
+                post_json(
+                    "/commands",
+                    &key,
+                    "application/json",
+                    command(id, json!("ollama/ollama:0.6")),
+                ),
+            )
+            .await;
+            assert_eq!(s, StatusCode::CREATED, "{b}");
+        }
+        let (s, _, b) = call(
+            &app,
+            post_json(
+                "/commands",
+                &key,
+                "application/json",
+                command("p4", json!("ollama/ollama:0.6")),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{b}");
+        assert_eq!(b["error"]["code"], "TOO_MANY_COMMANDS");
+        assert_eq!(b["error"]["details"]["per_minute"], 3);
+        assert!(b["error"]["message"].as_str().unwrap().contains("/events/stream"));
+        let (s, _, _) = call(
+            &app,
+            post_json(
+                "/commands",
+                &other,
+                "application/json",
+                command("o2", json!("ollama/ollama:0.6")),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        // Four event streams open at once, no more; a closed one gives its place back.
+        let open = |key: String| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::get("/events/stream")
+                        .header(AUTH_HEADER, &key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let mut held = Vec::new();
+        for _ in 0..crate::MAX_STREAMS_PER_HOLDER {
+            let res = open(key.clone()).await;
+            assert_eq!(res.status(), StatusCode::OK);
+            held.push(res);
+        }
+        let refused = open(key.clone()).await;
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        let b: Value = serde_json::from_slice(&refused.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(b["error"]["code"], "TOO_MANY_STREAMS");
+        assert_eq!(
+            open(other.clone()).await.status(),
+            StatusCode::OK,
+            "another credential's streams are its own"
+        );
+        drop(held.pop());
+        assert_eq!(open(key.clone()).await.status(), StatusCode::OK);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_stream_ends_when_its_credential_runs_out() {
+        let d = door();
+        let app = router(d.clone());
+        let key = sign_in(&app, "test", "my-peer").await;
+        let res = app
+            .clone()
+            .oneshot(
+                Request::get("/events/stream")
+                    .header(AUTH_HEADER, &key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let mut body = res.into_body().into_data_stream();
+        // The stream runs a while with the key live and nothing to tell; then the key runs out, between events.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), body.next())
+                .await
+                .is_err(),
+            "a live key's quiet stream stays open"
+        );
+        d.auth.expire(&crate::auth::hash_key(&key));
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while let Some(frame) = body.next().await {
+                let frame = frame.unwrap();
+                assert!(
+                    String::from_utf8_lossy(&frame).contains("keepalive"),
+                    "no event reaches a key taken back"
+                );
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "the stream outlived its credential");
     }
 
     #[tokio::test]

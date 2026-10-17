@@ -38,6 +38,9 @@ pub use router::{payload_hash, resume, router, tenant_router};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use axum::http::StatusCode;
+use serde_json::json;
+
 /// The BEST spec version this surface is written against.
 pub const BEST_VERSION: &str = "0.9.17";
 
@@ -65,7 +68,17 @@ pub struct Door {
     pub tenants: Option<String>,
     /// What a credential may read of this log's events, when the door's own rule is not the whole answer.
     pub partition: Option<Partition>,
+    /// How many commands one credential may send a minute, and each credential's count in the current minute.
+    pub commands_per_minute: u32,
+    pub command_counts: std::sync::Mutex<HashMap<String, (std::time::Instant, u32)>>,
+    /// The event streams each credential holds open, against [`MAX_STREAMS_PER_HOLDER`].
+    pub streams: Arc<std::sync::Mutex<HashMap<String, usize>>>,
 }
+
+/// What one credential may send a minute, unless the door is told otherwise.
+pub const COMMANDS_PER_MINUTE: u32 = 60;
+/// How many event streams one credential may hold open at once.
+pub const MAX_STREAMS_PER_HOLDER: usize = 4;
 
 impl Door {
     pub fn new(
@@ -91,6 +104,9 @@ impl Door {
             completions,
             tenants: None,
             partition: None,
+            commands_per_minute: COMMANDS_PER_MINUTE,
+            command_counts: std::sync::Mutex::new(HashMap::new()),
+            streams: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -116,6 +132,37 @@ impl Door {
     pub fn with_tenants(mut self, template: &str) -> Self {
         self.tenants = Some(template.into());
         self
+    }
+
+    /// The same door, taking `n` commands a minute from each credential.
+    pub fn taking_per_minute(mut self, n: u32) -> Self {
+        self.commands_per_minute = n;
+        self
+    }
+
+    /// Counts a command from `sender` against its minute, and says when the minute is full.
+    pub fn pace(&self, sender: &str) -> Result<(), BestError> {
+        let now = std::time::Instant::now();
+        let mut counts = self.command_counts.lock().unwrap();
+        counts.retain(|_, (since, _)| now.duration_since(*since) < std::time::Duration::from_secs(60));
+        let (since, count) = counts.entry(sender.to_string()).or_insert((now, 0));
+        if now.duration_since(*since) >= std::time::Duration::from_secs(60) {
+            *since = now;
+            *count = 0;
+        }
+        if *count >= self.commands_per_minute {
+            return Err(BestError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "TOO_MANY_COMMANDS",
+                format!(
+                    "this credential sent {} commands this minute, the most it may: wait for the minute to pass; follow /events/stream instead of asking again",
+                    self.commands_per_minute
+                ),
+            )
+            .with_details(json!({ "per_minute": self.commands_per_minute })));
+        }
+        *count += 1;
+        Ok(())
     }
 
     /// The absolute `dataschema` URI of a command, query or event schema document on this door.

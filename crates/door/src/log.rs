@@ -272,6 +272,8 @@ impl EventLog {
             return;
         }
         a.finished = true;
+        // The command itself was kept for a restart to run it; finished, it is only a line on disk.
+        a.envelope = None;
         let line = AcceptedLine {
             sender: sender.into(),
             id: id.into(),
