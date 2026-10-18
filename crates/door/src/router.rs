@@ -1,18 +1,16 @@
 //! The HTTP routes the spec names (SPEC.md, HTTP Transport and the four capabilities), over a [`Door`]. The manifest
 //! and the two OAuth endpoints are public, as are the two the person at the machine uses with the admin token
 //! (approve, revoke); everything else needs the credential in the `X-Api-Key` header. Every error the door answers,
-//! the framework's included, is in the BEST error format. Every request is one line in the log: where it came from,
-//! what it asked, what it got, and the holder, never the key. A tenant's door has the protected routes alone
+//! the framework's included, is in the BEST error format. A tenant's door has the protected routes alone
 //! ([`tenant_router`]): its manifest is the root's to serve, and sign-in is the root's.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -31,7 +29,7 @@ use crate::auth::{Credential, DeviceRequest, Grant, OAuthError, TokenRequest, AU
 use crate::catalogue::{CommandDef, Emitter};
 use crate::envelope::Envelope;
 use crate::error::BestError;
-use crate::log::{Accept, Filter, MAX_PAGE};
+use crate::log::{Accept, Filter, Stored, MAX_PAGE};
 use crate::{manifest, Door};
 
 type Shared = Arc<Door>;
@@ -77,38 +75,7 @@ fn shaped(routes: Router<Shared>, door: Shared) -> Router {
         .fallback(unknown_route)
         .layer(middleware::map_response(best_shaped))
         .layer(DefaultBodyLimit::max(MAX_BODY))
-        .layer(middleware::from_fn(access_log))
         .with_state(door)
-}
-
-/// Who a request was answered for, on the answer, for the log: the holder id, never the key.
-#[derive(Clone, Debug)]
-pub struct Holder(pub String);
-
-/// One line per request, at info, once it is answered: where it came from when the transport said, what it asked,
-/// what it got, how long it took, and the holder when a credential opened it. The query string, the headers and the
-/// body are not in it: a key travels in a header, and the line must never carry one.
-pub async fn access_log(from: Option<ConnectInfo<SocketAddr>>, req: Request, next: Next) -> Response {
-    let method = req.method().clone();
-    let path = req.uri().path().to_string();
-    let started = Instant::now();
-    let res = next.run(req).await;
-    let from = from.map(|c| c.0.to_string()).unwrap_or_else(|| "-".into());
-    let holder = res
-        .extensions()
-        .get::<Holder>()
-        .map(|h| h.0.clone())
-        .unwrap_or_else(|| "-".into());
-    tracing::info!(
-        %from,
-        %method,
-        %path,
-        status = res.status().as_u16(),
-        %holder,
-        ms = started.elapsed().as_millis() as u64,
-        "request"
-    );
-    res
 }
 
 async fn require_key(State(door): State<Shared>, mut req: Request, next: Next) -> Response {
@@ -121,11 +88,8 @@ async fn require_key(State(door): State<Shared>, mut req: Request, next: Next) -
     let Some(credential) = (!key.is_empty()).then(|| door.auth.authenticate(key)).flatten() else {
         return BestError::unauthorized().into_response();
     };
-    let holder = credential.holder();
     req.extensions_mut().insert(credential);
-    let mut res = next.run(req).await;
-    res.extensions_mut().insert(Holder(holder));
-    res
+    next.run(req).await
 }
 
 async fn unknown_route(req: Request) -> BestError {
@@ -164,7 +128,12 @@ async fn best_shaped(res: Response) -> Response {
             "METHOD_NOT_ALLOWED",
             "this route does not take that method: the manifest's endpoints say which".into(),
         ),
-        StatusCode::PAYLOAD_TOO_LARGE => ("PAYLOAD_TOO_LARGE", format!("the body exceeds {MAX_BODY} bytes")),
+        StatusCode::PAYLOAD_TOO_LARGE => (
+            "PAYLOAD_TOO_LARGE",
+            format!(
+                "the body exceeds {MAX_BODY} bytes: send less in one command; for a prompt, fewer or shorter messages"
+            ),
+        ),
         StatusCode::BAD_REQUEST => (
             "BAD_REQUEST",
             if text.is_empty() {
@@ -226,14 +195,9 @@ fn form<T: serde::de::DeserializeOwned>(headers: &HeaderMap, body: &Bytes) -> Re
         .map_err(|e| OAuthError::invalid_request(format!("the form could not be read: {e}")))
 }
 
-async fn device(
-    State(door): State<Shared>,
-    from: Option<ConnectInfo<SocketAddr>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, OAuthError> {
+async fn device(State(door): State<Shared>, headers: HeaderMap, body: Bytes) -> Result<Response, OAuthError> {
     let req: DeviceRequest = form(&headers, &body)?;
-    let answer = door.auth.start_device_from(req, from.map(|c| c.0.ip()))?;
+    let answer = door.auth.start_device(req)?;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(answer)).into_response())
 }
 
@@ -609,8 +573,13 @@ async fn list_events(
     Ok(Json(body))
 }
 
+/// How often an open event stream looks at its credential again when no event comes.
+const CREDENTIAL_RECHECK: Duration = Duration::from_secs(5);
+
 /// Replays what came after `Last-Event-ID`, then follows live; the two never overlap. A client that falls behind
-/// the buffer is cut off, so it reconnects with its last id and misses nothing silently.
+/// the buffer is cut off, so it reconnects with its last id and misses nothing silently. A credential taken back or
+/// run out ends the stream with it, within seconds whether or not events flow: its end is looked at on every event
+/// and every few seconds between, and the credential itself whenever one was taken back since.
 async fn stream_events(
     State(door): State<Shared>,
     Extension(sender): Extension<Credential>,
@@ -635,19 +604,41 @@ async fn stream_events(
             .filter(move |s| f1.matches(s) && door1.visible_to(&who1, s)),
     );
     let door2 = door.clone();
-    let live = BroadcastStream::new(rx)
+    let ends = sender
+        .expires_at
+        .as_deref()
+        .and_then(|e| OffsetDateTime::parse(e, &Rfc3339).ok());
+    let (auth, hash) = (door.auth.clone(), sender.hash.clone());
+    let mut seen = auth.revocations();
+    let recheck = stream::unfold(tokio::time::interval(CREDENTIAL_RECHECK), |mut every| async move {
+        every.tick().await;
+        Some((Ok(None), every))
+    });
+    let live = stream::select(BroadcastStream::new(rx).map(|r| r.map(Some)), recheck)
         .take_while(|r| futures::future::ready(r.is_ok()))
         .filter_map(move |r| {
             let keep = r
                 .ok()
+                .flatten()
                 .filter(|s| s.seq > seen_up_to && filter.matches(s) && door2.visible_to(&sender, s));
-            async move { keep }
+            async move { Some(keep) }
         });
-    let out = replayed.chain(live).map(|s| {
-        Ok(SseEvent::default()
-            .id(s.envelope.id.clone())
-            .data(serde_json::to_string(&s.envelope).unwrap_or_default()))
-    });
+    let still_open = move |_: &Option<Stored>| {
+        let open = ends.is_none_or(|e| OffsetDateTime::now_utc() < e)
+            && (auth.revocations() == seen || auth.credential_by_hash(&hash).is_some());
+        seen = auth.revocations();
+        futures::future::ready(open)
+    };
+    let out = replayed
+        .map(Some)
+        .chain(live)
+        .take_while(still_open)
+        .filter_map(futures::future::ready)
+        .map(|s| {
+            Ok(SseEvent::default()
+                .id(s.envelope.id.clone())
+                .data(serde_json::to_string(&s.envelope).unwrap_or_default()))
+        });
     Ok(Sse::new(out).keep_alive(KeepAlive::default().text("keepalive")))
 }
 
@@ -869,6 +860,12 @@ mod tests {
 
     /// The same, approved for the scopes `may` names when given.
     async fn sign_in_with(app: &Router, client: &str, connection: &str, may: Option<&str>) -> String {
+        let extra: Vec<(&str, &str)> = may.map(|m| ("may", m)).into_iter().collect();
+        sign_in_approved(app, client, connection, &extra).await
+    }
+
+    /// The same, approved with the `extra` fields of the approval form.
+    async fn sign_in_approved(app: &Router, client: &str, connection: &str, extra: &[(&str, &str)]) -> String {
         let (s, _, a) = call(
             app,
             post_form("/auth/device", &[("client_id", client), ("connection", connection)]),
@@ -876,9 +873,7 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::OK, "{a}");
         let mut fields = vec![("user_code", a["user_code"].as_str().unwrap()), ("proof", "ok")];
-        if let Some(m) = may {
-            fields.push(("may", m));
-        }
+        fields.extend_from_slice(extra);
         let (s, _, ok) = call(app, post_form("/auth/approve", &fields)).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(ok["admitted"]["connection"], connection);
@@ -1047,26 +1042,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_person_takes_a_credential_back_with_the_proof_and_the_answer_names_the_holder_for_the_log() {
+    async fn the_person_takes_a_credential_back_with_the_proof() {
         let d = door();
         let app = router(d.clone());
         let key = sign_in(&app, "test", "my-peer").await;
         let res = app.clone().oneshot(get("/commands", Some(&key))).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let holder = d.auth.authenticate(&key).unwrap().holder();
-        assert_eq!(
-            res.extensions().get::<Holder>().map(|h| h.0.as_str()),
-            Some(holder.as_str()),
-            "the answer names the holder, for the log"
-        );
-        assert!(
-            !res.headers()
-                .iter()
-                .any(|(_, v)| v.as_bytes().windows(key.len()).any(|w| w == key.as_bytes())),
-            "and never the key"
-        );
-        let res = app.clone().oneshot(get("/.well-known/best", None)).await.unwrap();
-        assert!(res.extensions().get::<Holder>().is_none(), "nobody's");
         // The wrong proof takes nothing; the right one takes it, and the door closes to it at once.
         let (s, _, b) = call(&app, post_form("/auth/revoke", &[("name", "my-peer"), ("proof", "no")])).await;
         assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
@@ -1116,6 +1098,74 @@ mod tests {
         .await;
         assert_eq!(t["expires_in"], 120);
         assert!(t["expires_at"].is_string());
+    }
+
+    /// Opens an event stream under `key` and gives its body, frame by frame.
+    async fn open_stream(app: &Router, key: &str) -> axum::body::BodyDataStream {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::get("/events/stream")
+                    .header(AUTH_HEADER, key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        res.into_body().into_data_stream()
+    }
+
+    /// Whether a quiet stream ends within `within`, with nothing but keep-alives before it does.
+    async fn ends_within(body: &mut axum::body::BodyDataStream, within: Duration) -> bool {
+        tokio::time::timeout(within, async {
+            while let Some(frame) = body.next().await {
+                let frame = frame.unwrap();
+                assert!(
+                    String::from_utf8_lossy(&frame).contains("keepalive"),
+                    "no event reaches a credential taken back or run out"
+                );
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_stream_ends_within_seconds_of_its_credential_being_taken_back() {
+        let d = door();
+        let app = router(d.clone());
+        let key = sign_in(&app, "test", "my-peer").await;
+        let other = sign_in(&app, "test", "other").await;
+        let mut body = open_stream(&app, &key).await;
+        let mut others = open_stream(&app, &other).await;
+        assert!(
+            !ends_within(&mut body, Duration::from_secs(30)).await,
+            "a live key's quiet stream stays open"
+        );
+        let (s, _, b) = call(&app, post_form("/auth/revoke", &[("name", "my-peer"), ("proof", "ok")])).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert!(
+            ends_within(&mut body, CREDENTIAL_RECHECK * 2).await,
+            "the stream outlived its credential"
+        );
+        assert!(
+            !ends_within(&mut others, CREDENTIAL_RECHECK * 3).await,
+            "another credential's stream is its own"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_stream_ends_within_seconds_of_its_credential_running_out() {
+        let app = router(door());
+        let key = sign_in_approved(&app, "test", "brief", &[("expires_in", "1")]).await;
+        let mut body = open_stream(&app, &key).await;
+        assert!(!ends_within(&mut body, Duration::from_millis(500)).await);
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(
+            ends_within(&mut body, CREDENTIAL_RECHECK * 2).await,
+            "the stream outlived its credential"
+        );
     }
 
     #[tokio::test]

@@ -28,7 +28,7 @@ cd "$(git rev-parse --show-toplevel)"
 [ "$(git rev-parse --abbrev-ref HEAD)" = main ] || { echo "releases are cut from main"; exit 1; }
 [ -z "$(git status --porcelain)" ] || { echo "the tree is not clean"; exit 1; }
 git fetch -q --tags origin main
-[ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] || { echo "main is not level with origin/main: push (through the review gate) or pull first"; exit 1; }
+[ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] || { echo "main is not level with origin/main: pull first (nothing is pushed to main but this release; work lands by pull request)"; exit 1; }
 git rev-parse -q --verify "refs/tags/v$version" > /dev/null && { echo "v$version already exists"; exit 1; }
 [ -z "$(git ls-remote --tags origin "refs/tags/v$version")" ] || { echo "v$version already exists on origin"; exit 1; }
 current=$(grep -m1 -E '^version = "' Cargo.toml | sed -E 's/version = "(.*)"/\1/')

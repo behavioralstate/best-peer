@@ -4,11 +4,11 @@
 //! turns a pending registration into an admitted agent, and takes a credential back. The credential is a secret the
 //! door generates, kept hashed, shown once, until it expires or is revoked.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::net::IpAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -38,10 +38,10 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const SESSION_LIFETIME: Duration = Duration::from_secs(8 * 3600);
 /// Registrations that may be pending at once, in all; the device endpoint is public, so it has a ceiling.
 const MAX_PENDING: usize = 64;
+/// The longest a person may bound a credential to at the approval: a year and a day.
+pub const MAX_EXPIRES: Duration = Duration::from_secs(366 * 24 * 3600);
 /// Registrations one client may have pending at once.
 const MAX_PENDING_PER_CLIENT: usize = 5;
-/// Registrations one address may have pending at once: a client names itself, an address is what it has.
-const MAX_PENDING_PER_ADDRESS: usize = 5;
 const MAX_CLIENT_ID: usize = 100;
 const MAX_AGENT_LABEL: usize = 200;
 /// Letters and digits a person can read back without ambiguity.
@@ -179,8 +179,6 @@ pub struct Pending {
     pub connection: Option<String>,
     pub agent_label: Option<String>,
     pub lifetime: Lifetime,
-    /// Where the request came from, when the transport said.
-    from: Option<IpAddr>,
     created: Instant,
     last_poll: Option<Instant>,
     approved: bool,
@@ -248,8 +246,14 @@ pub trait Approver: Send + Sync {
     /// Admits the registration `user_code` names when `proof` is the authority's: an error says why not.
     async fn admit(&self, user_code: &str, proof: &str) -> Result<(), OAuthError>;
     /// Whether `proof` is the authority's, for what the authority alone does beyond admitting: taking a credential
-    /// back.
-    async fn attest(&self, proof: &str) -> Result<(), OAuthError>;
+    /// back. An approver that does not say takes nothing back this way; the agent's own revoke-agent still does.
+    async fn attest(&self, _proof: &str) -> Result<(), OAuthError> {
+        Err(OAuthError {
+            status: 403,
+            error: "access_denied",
+            description: "this door's approver does not take credentials back: the agent revokes its own with the revoke-agent command".into(),
+        })
+    }
 }
 
 /// Approval by whoever controls the machine: a token the peer wrote to its data directory, which only that person
@@ -366,6 +370,11 @@ pub struct Auth {
     approver: Box<dyn Approver>,
     credentials: Mutex<Vec<Credential>>,
     credentials_file: Mutex<Option<std::fs::File>>,
+    /// Credentials taken back whose new line did not reach the disk: closed now, open again after a restart until a
+    /// revoke writes them, so a revoke takes them again.
+    unwritten: Mutex<HashSet<String>>,
+    /// How many times a credential was taken back: what an open stream looks at before it looks for its own.
+    revocations: AtomicU64,
     pending: Mutex<HashMap<String, Pending>>,
     /// The scopes this door has, named by the service: what an approval may grant.
     scopes: Vec<String>,
@@ -379,6 +388,8 @@ impl Auth {
             approver,
             credentials: Mutex::new(Vec::new()),
             credentials_file: Mutex::new(None),
+            unwritten: Mutex::new(HashSet::new()),
+            revocations: AtomicU64::new(0),
             pending: Mutex::new(HashMap::new()),
             scopes: Vec::new(),
         }
@@ -464,52 +475,98 @@ impl Auth {
 
     /// Takes back every live credential `name` names, by its connection name or its holder id, on the authority's
     /// word: each is written again with `revoked_at` set, so a restart reads it back taken, and opens nothing from
-    /// now on. No live credential by that name is refused with the live names.
+    /// now on. No live credential by that name is refused with the live names; one the disk did not take is closed
+    /// now and said so (500), and a revoke again writes it.
     pub async fn revoke(&self, name: &str, proof: &str) -> Result<Vec<Credential>, OAuthError> {
         self.approver.attest(proof).await?;
         let name = name.trim();
-        let now = OffsetDateTime::now_utc();
-        let taken: Vec<Credential> = {
-            let mut credentials = self.credentials.lock().unwrap();
-            let mut taken = Vec::new();
-            for c in credentials
-                .iter_mut()
-                .filter(|c| is_live(c, now) && (c.name == name || holder_of_hash(&c.hash) == name))
-            {
-                c.revoked_at = Some(now_rfc3339());
-                taken.push(c.clone());
-            }
-            if taken.is_empty() {
-                let live: Vec<String> = credentials
-                    .iter()
-                    .filter(|c| is_live(c, now))
-                    .map(|c| format!("{} ({})", c.name, holder_of_hash(&c.hash)))
-                    .collect();
-                return Err(OAuthError::invalid_request(format!(
+        self.take_back(|c| c.name == name || holder_of_hash(&c.hash) == name)
+            .map_err(|why| match why {
+                TakeBack::NoneLive(live) => OAuthError::invalid_request(format!(
                     "no live credential is named {name}: the live ones are {}",
                     if live.is_empty() {
                         "none".to_string()
                     } else {
                         live.join(", ")
                     }
-                )));
+                )),
+                TakeBack::Unwritten(e) => OAuthError {
+                    status: 500,
+                    error: "server_error",
+                    description: format!(
+                        "{name} is taken back now, but the line that keeps it taken was not written ({e}): it would open again after a restart; free the disk and revoke {name} again"
+                    ),
+                },
+            })
+    }
+
+    /// Takes back the credential with this hash, on its own word (the agent's revoke-agent command).
+    pub fn revoke_own(&self, hash: &str) -> Result<Credential, String> {
+        match self.take_back(|c| c.hash == hash) {
+            Ok(mut taken) => Ok(taken.remove(0)),
+            Err(TakeBack::NoneLive(_)) => Err("this credential is not live".into()),
+            Err(TakeBack::Unwritten(e)) => Err(format!(
+                "taken back now, but the line that keeps it taken was not written ({e}): it would open again after a restart until its owner revokes it again"
+            )),
+        }
+    }
+
+    /// How many times a credential was taken back since the door started: an open stream looks for its own
+    /// credential again only when this moved.
+    pub fn revocations(&self) -> u64 {
+        self.revocations.load(Ordering::SeqCst)
+    }
+
+    /// Marks every live credential `select` picks taken back, in memory first, so it opens nothing at once, then on
+    /// disk, a line each; one whose line did not reach the disk stays pickable, so the next revoke writes it.
+    fn take_back(&self, select: impl Fn(&Credential) -> bool) -> Result<Vec<Credential>, TakeBack> {
+        let now = OffsetDateTime::now_utc();
+        let taken: Vec<Credential> = {
+            let mut credentials = self.credentials.lock().unwrap();
+            let unwritten = self.unwritten.lock().unwrap();
+            let mut taken = Vec::new();
+            for c in credentials
+                .iter_mut()
+                .filter(|c| select(c) && (is_live(c, now) || unwritten.contains(&c.hash)))
+            {
+                if c.revoked_at.is_none() {
+                    c.revoked_at = Some(now_rfc3339());
+                }
+                taken.push(c.clone());
+            }
+            if taken.is_empty() {
+                return Err(TakeBack::NoneLive(
+                    credentials
+                        .iter()
+                        .filter(|c| is_live(c, now))
+                        .map(|c| format!("{} ({})", c.name, holder_of_hash(&c.hash)))
+                        .collect(),
+                ));
             }
             taken
         };
+        self.revocations.fetch_add(1, Ordering::SeqCst);
+        let mut failed = None;
         for c in &taken {
-            self.write(c);
+            match self.write(c) {
+                Ok(()) => {
+                    self.unwritten.lock().unwrap().remove(&c.hash);
+                }
+                Err(e) => {
+                    tracing::error!(holder = %holder_of_hash(&c.hash), error = %e, "a credential taken back could not be written to disk: it is closed until the peer restarts");
+                    self.unwritten.lock().unwrap().insert(c.hash.clone());
+                    failed = Some(e.to_string());
+                }
+            }
         }
-        Ok(taken)
+        match failed {
+            None => Ok(taken),
+            Some(e) => Err(TakeBack::Unwritten(e)),
+        }
     }
 
     /// RFC 8628 §3.1–3.2 with BEST's parameters: a `connection` of another shape is refused with the shape.
     pub fn start_device(&self, req: DeviceRequest) -> Result<DeviceAnswer, OAuthError> {
-        self.start_device_from(req, None)
-    }
-
-    /// The same, from an address the transport named, which has its own ceiling on registrations pending at once:
-    /// a client names itself, an address is what it has.
-    pub fn start_device_from(&self, req: DeviceRequest, from: Option<IpAddr>) -> Result<DeviceAnswer, OAuthError> {
         let client_id = match req.client_id.as_deref().map(str::trim) {
             Some(c) if !c.is_empty() && c.len() <= MAX_CLIENT_ID => c.to_string(),
             Some(_) => {
@@ -551,15 +608,12 @@ impl Auth {
             .values()
             .filter(|p| !p.expired() && p.client_id == client_id)
             .count();
-        let here = from
-            .map(|a| pending.values().filter(|p| !p.expired() && p.from == Some(a)).count())
-            .unwrap_or(0);
-        if live >= MAX_PENDING || mine >= MAX_PENDING_PER_CLIENT || here >= MAX_PENDING_PER_ADDRESS {
+        if live >= MAX_PENDING || mine >= MAX_PENDING_PER_CLIENT {
             return Err(OAuthError {
                 status: 503,
                 error: "temporarily_unavailable",
                 description: format!(
-                    "too many registrations are waiting for approval ({mine} from {client_id}, {here} from your address); finish or let one expire ({} s) before asking again",
+                    "too many registrations are waiting for approval ({mine} from {client_id}); finish or let one expire ({} s) before asking again",
                     DEVICE_CODE_TTL.as_secs()
                 ),
             });
@@ -575,7 +629,6 @@ impl Auth {
                 connection: req.connection,
                 agent_label: req.agent_label,
                 lifetime,
-                from,
                 grant: Grant::default(),
                 expires: None,
                 created: Instant::now(),
@@ -644,10 +697,11 @@ impl Auth {
         grant: Grant,
         expires: Option<Duration>,
     ) -> Result<Admitted, OAuthError> {
-        if expires.is_some_and(|d| d.is_zero()) {
-            return Err(OAuthError::invalid_request(
-                "expires_in must be seconds above zero: how long the credential lasts, or leave it out",
-            ));
+        if expires.is_some_and(|d| d.is_zero() || d > MAX_EXPIRES) {
+            return Err(OAuthError::invalid_request(format!(
+                "expires_in must be seconds above zero and {} at most (366 days): how long the credential lasts, or leave it out",
+                MAX_EXPIRES.as_secs()
+            )));
         }
         if let Some(scopes) = &grant.scopes {
             if scopes.is_empty() {
@@ -667,16 +721,23 @@ impl Auth {
         }
         self.expire_pending();
         let code = normalise_user_code(user_code);
-        let exists = self
+        let lifetime = self
             .pending
             .lock()
             .unwrap()
             .values()
-            .any(|p| p.user_code == code && !p.approved && !p.expired());
-        if !exists {
+            .find(|p| p.user_code == code && !p.approved && !p.expired())
+            .map(|p| p.lifetime);
+        let Some(lifetime) = lifetime else {
             return Err(OAuthError::invalid_request(format!(
                 "no pending registration has the code {code}: it is unknown, already approved, or older than {} s",
                 DEVICE_CODE_TTL.as_secs()
+            )));
+        };
+        if lifetime == Lifetime::Session && expires.is_some_and(|d| d > SESSION_LIFETIME) {
+            return Err(OAuthError::invalid_request(format!(
+                "the agent asked for a session credential, which lasts {} s (8 hours) at most: approve it with expires_in of that or less, or leave it out",
+                SESSION_LIFETIME.as_secs()
             )));
         }
         self.approver.admit(&code, proof).await?;
@@ -814,20 +875,22 @@ impl Auth {
 
     /// Keeps a credential, in memory and, when there is a file, on disk.
     fn store(&self, c: &Credential) {
-        self.write(c);
+        if let Err(e) = self.write(c) {
+            tracing::error!(error = %e, "a credential could not be written to disk; it lasts until restart");
+        }
         self.credentials.lock().unwrap().push(c.clone());
     }
 
-    /// Writes a credential as it stands, when there is a file: one line, one write. A disk error is logged and the
-    /// credential still works, or stays taken, until the peer restarts; it never panics a request.
-    fn write(&self, c: &Credential) {
+    /// Writes a credential as it stands, when there is a file: one line, one write, on the disk before it returns.
+    fn write(&self, c: &Credential) -> std::io::Result<()> {
         if let Some(f) = self.credentials_file.lock().unwrap().as_mut() {
             let mut line = serde_json::to_string(c).expect("a credential serialises");
             line.push('\n');
-            if let Err(e) = f.write_all(line.as_bytes()).and_then(|_| f.flush()) {
-                tracing::error!(error = %e, "a credential could not be written to disk; it lasts until restart");
-            }
+            f.write_all(line.as_bytes())?;
+            f.flush()?;
+            f.sync_data()?;
         }
+        Ok(())
     }
 
     /// Forgets registrations that expired longer ago than the grace period keeps them for `expired_token`.
@@ -900,14 +963,21 @@ fn rfc3339_in(d: Duration) -> String {
     (OffsetDateTime::now_utc() + d).format(&Rfc3339).expect("rfc3339")
 }
 
-/// How long a credential lasts: what the person said at the approval, the session lifetime for a session credential,
-/// the sooner of the two when both apply, and for ever for a durable one nobody bounded.
+/// Why nothing, or not all, was taken back.
+enum TakeBack {
+    /// No live credential was picked; the live ones, by name and holder.
+    NoneLive(Vec<String>),
+    /// Taken in memory, not written: the disk's error.
+    Unwritten(String),
+}
+
+/// How long a credential lasts: what the person said at the approval, which the approval held to the session
+/// lifetime for a session credential, else that lifetime, and for ever for a durable one nobody bounded.
 fn lasts(lifetime: Lifetime, said: Option<Duration>) -> Option<Duration> {
     match (lifetime, said) {
+        (_, Some(d)) => Some(d),
         (Lifetime::Durable, None) => None,
         (Lifetime::Session, None) => Some(SESSION_LIFETIME),
-        (Lifetime::Durable, Some(d)) => Some(d),
-        (Lifetime::Session, Some(d)) => Some(d.min(SESSION_LIFETIME)),
     }
 }
 
@@ -1208,6 +1278,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_revocation_the_disk_did_not_take_is_said_closes_at_once_and_is_written_by_the_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = || {
+            Auth::open(
+                dir.path(),
+                "http://peer.test",
+                Box::new(FakeApprover { proof: "ok".into() }),
+            )
+            .unwrap()
+        };
+        let auth = open();
+        let a = start(&auth, Some("team"));
+        auth.approve(&a.user_code, "ok", Grant::default(), None).await.unwrap();
+        let key = poll(&auth, &a.device_code).unwrap()["access_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let before = auth.revocations();
+        // The disk refuses the line: the revoke says so, and the key is closed now all the same.
+        let file = dir.path().join("credentials.jsonl");
+        let writable = auth
+            .credentials_file
+            .lock()
+            .unwrap()
+            .replace(std::fs::File::open(&file).unwrap());
+        let err = auth.revoke("team", "ok").await.unwrap_err();
+        assert_eq!((err.status, err.error), (500, "server_error"));
+        assert!(err.description.contains("revoke team again"), "{}", err.description);
+        assert!(auth.authenticate(&key).is_none(), "closed at once");
+        assert!(auth.revocations() > before, "an open stream looks again");
+        // Read back from what the disk holds, it would open again: that is what the 500 said.
+        assert!(open().authenticate(&key).is_some());
+        // The disk takes lines again: the same revoke writes it, though it is no longer live.
+        *auth.credentials_file.lock().unwrap() = writable;
+        assert_eq!(auth.revoke("team", "ok").await.unwrap().len(), 1);
+        assert!(open().authenticate(&key).is_none(), "taken for good");
+        assert_eq!(auth.revoke("team", "ok").await.unwrap_err().error, "invalid_request");
+        // The agent's own revoke: by the hash alone.
+        let b = start(&auth, Some("own"));
+        auth.approve(&b.user_code, "ok", Grant::default(), None).await.unwrap();
+        let own = poll(&auth, &b.device_code).unwrap()["access_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let taken = auth.revoke_own(&hash_key(&own)).unwrap();
+        assert_eq!(taken.name, "own");
+        assert!(auth.authenticate(&own).is_none() && open().authenticate(&own).is_none());
+        assert!(auth.revoke_own(&hash_key(&own)).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_approver_that_does_not_take_credentials_back_refuses_a_revoke() {
+        struct AdmitsOnly;
+        #[async_trait]
+        impl Approver for AdmitsOnly {
+            fn instructions(&self, _user_code: &str) -> String {
+                String::new()
+            }
+            async fn admit(&self, _user_code: &str, _proof: &str) -> Result<(), OAuthError> {
+                Ok(())
+            }
+        }
+        let auth = Auth::ephemeral("http://peer.test", Box::new(AdmitsOnly));
+        let err = auth.revoke("anyone", "anything").await.unwrap_err();
+        assert_eq!((err.status, err.error), (403, "access_denied"));
+        assert!(err.description.contains("revoke-agent"), "{}", err.description);
+    }
+
+    #[tokio::test]
     async fn the_person_bounds_how_long_a_credential_lasts_whatever_the_agent_asked() {
         let auth = auth();
         // A durable credential bounded to a minute.
@@ -1222,7 +1361,8 @@ mod tests {
         let ends = OffsetDateTime::parse(answer["expires_at"].as_str().unwrap(), &Rfc3339).unwrap();
         assert!(ends > OffsetDateTime::now_utc() && ends < OffsetDateTime::now_utc() + Duration::from_secs(61));
         assert!(auth.authenticate(answer["access_token"].as_str().unwrap()).is_some());
-        // A session credential bounded to a day keeps its eight hours; bounded to an hour, it gets the hour.
+        // A session credential bounded past its eight hours is refused, nothing cut silently; bounded to an hour, it
+        // gets the hour.
         let s = auth
             .start_device(DeviceRequest {
                 client_id: Some("best-validate".into()),
@@ -1230,7 +1370,7 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        let admitted = auth
+        let err = auth
             .approve(
                 &s.user_code,
                 "ok",
@@ -1238,9 +1378,13 @@ mod tests {
                 Some(Duration::from_secs(24 * 3600)),
             )
             .await
-            .unwrap();
-        assert_eq!(admitted.expires_in, Some(8 * 3600));
-        assert_eq!(poll(&auth, &s.device_code).unwrap()["expires_in"], 8 * 3600);
+            .unwrap_err();
+        assert!(
+            err.description.contains("session") && err.description.contains("28800"),
+            "{}",
+            err.description
+        );
+        assert_eq!(poll(&auth, &s.device_code).unwrap_err().error, "authorization_pending");
         let s = auth
             .start_device(DeviceRequest {
                 client_id: Some("best-validate".into()),
@@ -1252,38 +1396,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(poll(&auth, &s.device_code).unwrap()["expires_in"], 3600);
-        // Zero is not a bound.
+        // Zero is not a bound, nor is more than a year and a day: refused before anything is admitted.
         let z = start(&auth, Some("zero"));
-        let err = auth
-            .approve(&z.user_code, "ok", Grant::default(), Some(Duration::ZERO))
-            .await
-            .unwrap_err();
-        assert!(err.description.contains("expires_in"), "{}", err.description);
-        assert_eq!(lasts(Lifetime::Durable, None), None);
-    }
-
-    #[test]
-    fn the_device_endpoint_has_a_ceiling_per_address_too() {
-        let auth = auth();
-        let from = |client: &str, ip: &str| {
-            auth.start_device_from(
-                DeviceRequest {
-                    client_id: Some(client.into()),
-                    ..Default::default()
-                },
-                Some(ip.parse().unwrap()),
-            )
-        };
-        // Five clients, one address: the sixth is refused however it names itself.
-        for i in 0..MAX_PENDING_PER_ADDRESS {
-            from(&format!("client-{i}"), "203.0.113.9").unwrap();
+        for bad in [Duration::ZERO, MAX_EXPIRES + Duration::from_secs(1), Duration::MAX] {
+            let err = auth
+                .approve(&z.user_code, "ok", Grant::default(), Some(bad))
+                .await
+                .unwrap_err();
+            assert!(
+                err.description.contains("expires_in") && err.description.contains("31622400"),
+                "{}",
+                err.description
+            );
         }
-        let err = from("client-new", "203.0.113.9").unwrap_err();
-        assert_eq!(err.error, "temporarily_unavailable");
-        assert!(err.description.contains("from your address"), "{}", err.description);
-        // Another address is another count; an address the transport did not name is counted by client alone.
-        from("client-new", "203.0.113.10").unwrap();
-        start(&auth, None);
+        let admitted = auth
+            .approve(&z.user_code, "ok", Grant::default(), Some(MAX_EXPIRES))
+            .await
+            .unwrap();
+        assert_eq!(admitted.expires_in, Some(MAX_EXPIRES.as_secs()));
+        assert_eq!(
+            poll(&auth, &z.device_code).unwrap()["expires_in"],
+            MAX_EXPIRES.as_secs()
+        );
+        assert_eq!(lasts(Lifetime::Durable, None), None);
     }
 
     #[test]
