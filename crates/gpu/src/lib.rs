@@ -169,7 +169,6 @@ impl Fake {
         self
     }
 
-    /// A plain CUDA card of `total_gb` with all of it free, the common test fixture.
     /// The host's own CPU with `total_gb` of system memory, offering the CPU alone, as the host adapter reports it.
     pub fn host_cpu(id: &str, total_gb: u64) -> Device {
         Device {
@@ -187,6 +186,7 @@ impl Fake {
         }
     }
 
+    /// A plain CUDA card of `total_gb` with all of it free, the common test fixture.
     pub fn cuda_card(id: &str, name: &str, total_gb: u64, cuda: &str) -> Device {
         let total = total_gb * 1024 * 1024 * 1024;
         Device {

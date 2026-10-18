@@ -189,8 +189,8 @@ impl Peer {
         let weak = Arc::downgrade(self);
         self.holdings.add(move |holder| {
             weak.upgrade()
-                .map(|p| p.state.lock().unwrap().holdings_of(holder))
-                .unwrap_or_default()
+                .map(|p| p.state.lock().unwrap().held_by(holder))
+                .unwrap_or(0)
         });
     }
 
@@ -353,14 +353,6 @@ impl Peer {
             .map_err(|e| BestError::internal(format!("the accelerator library failed: {e}")))
     }
 
-    /// The hardware as `who` may use it: every device for a credential approved for all, the accelerators alone
-    /// for one with a share, whose deployments run on an accelerator or not at all, since the host's own CPU and
-    /// memory are the operator's.
-    async fn hardware_for(&self, who: &Credential) -> Result<Host, BestError> {
-        let host = self.hardware().await?;
-        Ok(if shared(who) { accelerators(&host) } else { host })
-    }
-
     /// The base URL the peer itself reaches an engine at.
     fn engine_base(&self, port: u16) -> String {
         format!("http://{}:{port}", self.engine_host)
@@ -466,15 +458,13 @@ impl Peer {
     pub async fn admit_deploy(&self, cmd: Envelope, who: Credential, key: String) -> Result<(), BestError> {
         require(&who, "deploy")?;
         let data: DeployData = parse(&cmd.data)?;
-        let host = self.hardware_for(&who).await?;
+        let host = usable_by(self.hardware().await?, &who, data.device.as_deref())?;
         // One admission at a time across the door, and what the credential holds is read before the state is
         // locked, since the door's holdings read this state too.
         let _admitting = self.holdings.admitting();
         let held = self.holdings.held_by(&who.holder());
-        let running = self.holdings.deployments_of(&who.holder());
         let mut state = self.state.lock().unwrap();
         within_share(held, &who, data.memory_bytes)?;
-        within_deployments(running, &who, self.holdings.deployments_per_holder())?;
         let (device, compute) = place(
             &host,
             &state,
@@ -802,7 +792,7 @@ impl Peer {
             )
             .with_details(json!({ "field": "memory_bytes" })));
         }
-        if shared(&who) && data.memory_bytes.is_none() {
+        if has_share(&who) && data.memory_bytes.is_none() {
             return Err(BestError::bad_request(
                 "JOB_NEEDS_DEVICE",
                 "this credential runs jobs on the accelerators alone, where its share counts them: send memory_bytes, the device memory the job needs",
@@ -810,7 +800,7 @@ impl Peer {
             .with_details(json!({ "field": "memory_bytes" })));
         }
         let host = match data.memory_bytes {
-            Some(_) => Some(self.hardware_for(&who).await?),
+            Some(_) => Some(usable_by(self.hardware().await?, &who, data.device.as_deref())?),
             None => None,
         };
         let _admitting = self.holdings.admitting();
@@ -1102,7 +1092,7 @@ impl Peer {
 #[async_trait]
 impl Service for Peer {
     async fn hardware_state(&self, who: &Credential) -> Result<Value, BestError> {
-        Ok(crate::domain::host_state(&self.hardware_for(who).await?))
+        Ok(crate::domain::host_state(&shown_to(self.hardware().await?, who)))
     }
 
     fn workloads(&self, who: &Credential) -> Result<Value, BestError> {
@@ -1262,10 +1252,10 @@ pub(crate) fn within_share(held: u64, who: &Credential, needed: u64) -> Result<(
     .with_details(json!({ "share_bytes": share, "held_bytes": held, "needed_bytes": needed, "room_bytes": share.saturating_sub(held) })))
 }
 
-/// Whether `who` holds a share of this peer rather than all of it: approved for a share of memory, or for less than
-/// every scope. Such a credential runs on the accelerators alone and holds a bounded number of deployments.
-pub(crate) fn shared(who: &Credential) -> bool {
-    who.grant.memory_bytes.is_some() || !who.grant.is_all()
+/// Whether `who` was approved for a share of device memory. Such a credential runs on the accelerators alone, since
+/// its share counts their memory and the host's CPU and memory are the operator's.
+pub(crate) fn has_share(who: &Credential) -> bool {
+    who.grant.memory_bytes.is_some()
 }
 
 /// `host` without the devices that offer the CPU alone.
@@ -1282,19 +1272,41 @@ pub(crate) fn accelerators(host: &Host) -> Host {
     }
 }
 
-/// A credential with a share runs `ceiling` deployments at once across the door, `running` of them already, every
-/// workspace counted: one more is refused with what it runs.
-pub(crate) fn within_deployments(running: usize, who: &Credential, ceiling: usize) -> Result<(), BestError> {
-    if !shared(who) || running < ceiling {
-        return Ok(());
+/// The devices `who` is shown: every one, or the accelerators alone for a credential with a share.
+pub(crate) fn shown_to(host: Host, who: &Credential) -> Host {
+    if has_share(who) {
+        accelerators(&host)
+    } else {
+        host
     }
+}
+
+/// The devices a workload of `who` may be placed on. A credential with a share that names a device offering the CPU
+/// alone, or asks on a host with no accelerator, is refused with why and what it may do instead.
+pub(crate) fn usable_by(host: Host, who: &Credential, pinned: Option<&str>) -> Result<Host, BestError> {
+    if !has_share(who) {
+        return Ok(host);
+    }
+    let usable = accelerators(&host);
+    let ids: Vec<String> = usable.devices.iter().map(|d| d.id.0.clone()).collect();
+    let cpu = pinned.filter(|p| host.devices.iter().any(|d| d.id.0 == *p) && !ids.iter().any(|i| i == p));
+    if cpu.is_none() && !ids.is_empty() {
+        return Ok(usable);
+    }
+    let condition = match cpu {
+        Some(p) => format!("device {p} offers the CPU alone"),
+        None => "no device here is an accelerator".into(),
+    };
+    let fix = if ids.is_empty() {
+        "the owner can approve a key without a share for work on the CPU".into()
+    } else {
+        format!("name one of {}, or leave device out", list(ids.iter()))
+    };
     Err(BestError::bad_request(
-        "DEPLOYMENTS_EXCEEDED",
-        format!(
-            "this credential may run {ceiling} deployment(s) at once and runs {running} across this door, every workspace counted: undeploy one first (get-workloads on each door you use lists them), or ask for more"
-        ),
+        "ACCELERATORS_ONLY",
+        format!("{condition}, and this credential runs on the accelerators alone, since its share counts their memory: {fix}"),
     )
-    .with_details(json!({ "deployments": ceiling, "running": running })))
+    .with_details(json!({ "device": pinned, "devices": ids })))
 }
 
 /// A workload another credential holds is not this one's to end.

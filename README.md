@@ -89,7 +89,8 @@ At your machine:
 Their client's next poll receives a key under that name. No accounts, no passwords: whoever controls the machine
 decides who is in, as with SSH keys, and what they may do: approved with nothing more said, a key may do everything;
 `--may deploy,prompt --memory 40G` makes one that may deploy models and prompt them but run no job, and hold 40 GiB
-of device memory at most across its workloads, which it alone sees, prompts and ends.
+of device memory at most across its workloads, which it alone sees, prompts and ends. A key with a share runs on
+the accelerators alone, never on the host's CPU.
 
 **4. More than one machine.** Run a peer on each, and one more `best-peer` anywhere as the door your team enters
 by: a laptop will do, with `BEST_PEER_GPU=none` and the runtime it has (`BEST_PEER_RUNTIME=fake` when it has none:
@@ -297,15 +298,15 @@ nothing. Reading is every key's: the hardware state, and its own workloads and e
 --may deploy` grants scopes; `--memory 40G` sets the most device memory the key's workloads may hold together,
 counted across its deployments, jobs and commands admitted but not yet started. Every command document says which
 scope it needs. A command the key may not send is refused at ingest with `FORBIDDEN` and what it was approved for;
-a deploy or a job past the share with `SHARE_EXCEEDED`, what is held and the room left; a second deployment from
-a key that holds a share with `DEPLOYMENTS_EXCEEDED`, counted across the door like the share, every workspace's
-included (`BEST_PEER_DEPLOYMENTS_PER_HOLDER`, default 1, since what a deployment claims in `memory_bytes` is its own
-word); such a key sees and uses the accelerators alone, the host's CPU and memory being the operator's, and
-`get-hardware-state` shows it only those, and a job from it without `memory_bytes`, which would run on the host, is
-refused with `JOB_NEEDS_DEVICE`; a workload another key
+a deploy or a job past the share with `SHARE_EXCEEDED`, what is held and the room left; a workload another key
 started, by name, whether a command, a prompt or the events are asked for, and a refusal names only what the key may
 see. `get-workloads` shows a key its own, with `held_bytes` against `share_bytes`; `DeploymentStarted` and
-`JobStarted` name the `holder`, an opaque id of the credential, never the key. Another sign-in is another holder,
-as the spec has it: what a key that expired or was replaced left running is the owner's to end with a key approved
-for all. The spec has no per-command scope field yet, so the requirement is in the description text; that is an
-entry on the spec follow-ups.
+`JobStarted` name the `holder`, an opaque id of the credential, never the key. A key with a share sees and uses the
+accelerators alone, since its share counts their memory and the host's CPU and memory are the operator's:
+`get-hardware-state` shows it only those, a device that offers the CPU alone, or a host with no accelerator, is
+refused with `ACCELERATORS_ONLY` and what it may name instead, and a job without `memory_bytes`, which would run on
+the host, with `JOB_NEEDS_DEVICE`; a key with scopes and no share is not held to them. In a workspace the rule holds
+for the cloud's devices, and a member's owner who approved the cloud with a share holds every tenant of the cloud to
+that member's accelerators. Another sign-in is another holder, as the spec has it: what a key that expired or was
+replaced left running is the owner's to end with a key approved for all. The spec has no per-command scope field
+yet, so the requirement is in the description text; that is an entry on the spec follow-ups.
