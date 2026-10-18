@@ -23,8 +23,9 @@
 - A command the peer cannot honour in its current state is refused at ingest, before it is accepted, with the reason
   and the fix; a command that was accepted ends in a terminal event, never in silence.
 - The accelerator abstraction is vendor-neutral: a workload asks for a compute API and memory, never for a vendor.
-- The inference data path is the runtime's OpenAI-compatible endpoint, reached through the door with the door's
-  credential and passed through untouched; BEST carries the control path only and never a token.
+- BEST carries the whole of it: a prompt is a command and its answer an event, under the holder's correlation and
+  scope; the engine's API is the peer's internal matter behind the `Engine` abstraction, and nothing of it is on the
+  door. A door never carries a token of another service.
 - Instructions and this file state the current rule, not its history; the history is in git.
 - The README's "Try it on your machine" is the operator's path, kept true by the change that moves it: a variable, a
   check at start, a command, the sign-in, or what the terminal shows changes that section in the same commit, and a

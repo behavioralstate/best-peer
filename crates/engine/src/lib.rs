@@ -2,10 +2,11 @@
 //!
 //! A peer serves a model with an engine it did not write (Ollama, vLLM), running in a container the runtime started.
 //! What to run for each engine is a [`Recipe`], pure data; what the engine is asked over its own API (is it up, make
-//! this model present and tell the progress) is [`Engine`], the one piece that talks to it. The door's deploy is
-//! written once against both and tested against [`Fake`]; the HTTP adapter is a separate crate, proven on a host by
-//! hand, never unit-tested. Prompts never pass here: inference stays on the engine's OpenAI-compatible endpoint,
-//! which the door only names.
+//! this model present and tell the progress, answer a prompt) is [`Engine`], the one piece that talks to it. The
+//! door's deploy and its prompt are written once against both and tested against [`Fake`]; the HTTP adapter is a
+//! separate crate, proven on a host by hand, never unit-tested. The engine's API is the peer's internal matter: a
+//! prompt reaches it as a command on the door and its answer leaves as an event, and nothing of the engine is on
+//! the door.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -88,6 +89,35 @@ pub struct Recipe {
 /// returns, so the caller tells each step as a fact before the outcome.
 pub type Progress = Arc<dyn Fn(Option<u8>) + Send + Sync>;
 
+/// One turn of a conversation, as the engines take it: who said it and what.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Message {
+    pub role: String,
+    pub content: String,
+}
+
+/// What a prompt asks of the engine beyond the messages; absent means the engine's own default.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Options {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop: Vec<String>,
+}
+
+/// The engine's answer to a prompt, whole: the text, the model that answered, why it stopped where the engine
+/// says, and the token counts where the engine reports them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Answer {
+    pub content: String,
+    pub model: String,
+    pub finish: Option<String>,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error("the engine at {base} did not answer within {within:?}")]
@@ -109,6 +139,17 @@ pub trait Engine: Send + Sync {
     /// Frees the memory `model` holds in the engine at `base`, where the engine can do that without stopping; an
     /// engine that cannot answers Ok and its container's stop does it.
     async fn unload(&self, kind: Kind, base: &str, model: &str) -> Result<(), EngineError>;
+    /// Asks `model` in the engine at `base` to answer `messages` with `options`, whole, within `within`: the one
+    /// call that carries a conversation, so that nothing of the engine's API is on the door.
+    async fn complete(
+        &self,
+        kind: Kind,
+        base: &str,
+        model: &str,
+        messages: &[Message],
+        options: &Options,
+        within: Duration,
+    ) -> Result<Answer, EngineError>;
 }
 
 /// An in-memory [`Engine`] for tests: every base is up unless a test says it is down, every model exists unless a
@@ -120,7 +161,12 @@ pub struct Fake {
     unloaded: Mutex<BTreeMap<String, Vec<String>>>,
     /// What a load reports as it goes; a real engine reports every percent, often more.
     steps: Vec<Option<u8>>,
+    /// The prompts each base was asked, as they came.
+    prompted: Mutex<BTreeMap<String, Vec<Prompted>>>,
 }
+
+/// One prompt a fake engine was asked: the model and the messages.
+pub type Prompted = (String, Vec<Message>);
 
 impl Default for Fake {
     fn default() -> Self {
@@ -136,7 +182,13 @@ impl Fake {
             loaded: Mutex::new(BTreeMap::new()),
             unloaded: Mutex::new(BTreeMap::new()),
             steps: vec![Some(25), Some(100)],
+            prompted: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// The prompts the engine at `base` was asked, in order: the model and the messages of each.
+    pub fn prompted_at(&self, base: &str) -> Vec<Prompted> {
+        self.prompted.lock().unwrap().get(base).cloned().unwrap_or_default()
     }
 
     /// A fake whose load reports every percent from 0 to 100, as a real engine does.
@@ -202,6 +254,46 @@ impl Engine for Fake {
             .or_default()
             .push(model.into());
         Ok(())
+    }
+
+    /// Answers with the last message echoed, so a test can see what reached the engine; a base said to be down
+    /// fails as the engine would, a model said to be missing is not found. The counts are the words.
+    async fn complete(
+        &self,
+        _kind: Kind,
+        base: &str,
+        model: &str,
+        messages: &[Message],
+        options: &Options,
+        _within: Duration,
+    ) -> Result<Answer, EngineError> {
+        if self.down.lock().unwrap().iter().any(|d| d == base) {
+            return Err(EngineError::Engine(format!("the engine at {base} did not answer")));
+        }
+        if self.missing.lock().unwrap().iter().any(|m| m == model) {
+            return Err(EngineError::ModelNotFound(model.into()));
+        }
+        self.prompted
+            .lock()
+            .unwrap()
+            .entry(base.into())
+            .or_default()
+            .push((model.into(), messages.to_vec()));
+        let last = messages.last().map(|m| m.content.as_str()).unwrap_or("");
+        let words = |t: &str| t.split_whitespace().count() as u64;
+        let content = format!("fake answer to: {last}");
+        let finish = if options.max_tokens.is_some_and(|m| u64::from(m) < words(&content)) {
+            "length"
+        } else {
+            "stop"
+        };
+        Ok(Answer {
+            content,
+            model: model.into(),
+            finish: Some(finish.into()),
+            prompt_tokens: Some(messages.iter().map(|m| words(&m.content)).sum()),
+            completion_tokens: Some(words(last) + 3),
+        })
     }
 }
 

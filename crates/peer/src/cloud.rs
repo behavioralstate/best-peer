@@ -23,7 +23,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::domain::Service;
-use crate::endpoint::{Route, Upstream};
 use crate::holdings::Holdings;
 use crate::lifecycle::{
     any_compute, mine, new_id, not_yours, parse, place, ready_deployment, require, within_share, workloads_view,
@@ -49,6 +48,8 @@ const TERMINAL: &[&str] = &[
     "JobFinished",
     "JobFailed",
     "JobStopped",
+    "PromptAnswered",
+    "PromptFailed",
     "CommandFailed",
 ];
 
@@ -622,15 +623,6 @@ impl Cloud {
                             em.bind_workload(w);
                         }
                     }
-                    "DeploymentReady" => {
-                        if let (Some(dep), Some(engine)) = (
-                            data["deployment"].as_str(),
-                            serde_json::from_value::<Kind>(data["engine"].clone()).ok(),
-                        ) {
-                            data["endpoint"] =
-                                json!(format!("{}/deployments/{dep}{}", self.endpoint, engine.openai_path()));
-                        }
-                    }
                     _ => {}
                 }
                 self.tell(&em, &e.r#type, data);
@@ -1097,7 +1089,7 @@ impl Service for Cloud {
 
     fn workloads(&self, who: &Credential) -> Result<Value, BestError> {
         let held = self.holdings.held_by(&who.holder());
-        let mut v = workloads_view(&self.state.lock().unwrap(), who, &self.endpoint, Some(&self.name));
+        let mut v = workloads_view(&self.state.lock().unwrap(), who, Some(&self.name));
         v["held_bytes"] = json!(held);
         Ok(v)
     }
@@ -1280,11 +1272,7 @@ impl Service for Cloud {
         };
         if let Err(e) = outcome {
             if let Some(d) = self.state.lock().unwrap().deployments.get_mut(&id) {
-                d.phase = if d.endpoint.is_some() {
-                    Phase::Ready
-                } else {
-                    Phase::Starting
-                };
+                d.phase = if d.ready { Phase::Ready } else { Phase::Starting };
             }
             self.tell(
                 &em,
@@ -1456,22 +1444,36 @@ impl Service for Cloud {
             );
         }
     }
-}
 
-impl Upstream for Cloud {
-    fn upstream_of(&self, deployment: &str, who: &Credential) -> Result<Route, BestError> {
-        let state = self.state.lock().unwrap();
-        let d = ready_deployment(&state, deployment, who)?;
-        let member = d
-            .peer
-            .as_deref()
-            .and_then(|p| self.member(p))
-            .ok_or_else(|| BestError::internal(format!("deployment {deployment} names no member peer")))?;
-        Ok(Route {
-            base: format!("{}/deployments/{deployment}", member.endpoint),
-            key: member.key(),
-            transport: member.transport.clone(),
-        })
+    fn admit_prompt(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError> {
+        require(who, "prompt")?;
+        let id = cmd.data["deployment"].as_str().unwrap_or_default();
+        ready_deployment(&self.state.lock().unwrap(), id, who).map(|_| ())
+    }
+
+    /// A prompt goes to the member that holds the deployment, as the member's own prompt command; its answer comes
+    /// back on the member's stream and is relayed under the caller's correlation with the cloud and the peer named.
+    async fn prompt(self: Arc<Self>, cmd: Envelope, em: Emitter) {
+        let id = cmd.data["deployment"].as_str().unwrap_or_default().to_string();
+        let member = self
+            .state
+            .lock()
+            .unwrap()
+            .deployments
+            .get(&id)
+            .and_then(|d| d.peer.clone())
+            .and_then(|p| self.member(&p));
+        let outcome = match &member {
+            Some(m) => self.place_on(m, &em, "Prompt", "prompt", cmd.data.clone()).await,
+            None => Err(BestError::internal(format!("deployment {id} names no member peer"))),
+        };
+        if let Err(e) = outcome {
+            self.tell(
+                &em,
+                "PromptFailed",
+                json!({ "deployment": id, "reason": e.message, "fix": "read the peer's refusal in the reason, then prompt again", "peer": member.map(|m| m.name.clone()) }),
+            );
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Proves the NVIDIA adapter and the Docker device hand-over on a GPU host, by hand, the way SDLC.md asks for every
 # adapter: the peer is started with the driver's library, the hardware state is read, a model is deployed on a card
-# in a container, prompted at the endpoint, and undeployed. The transcript it prints is what goes on the slice's
+# in a container, prompted with the prompt command, and undeployed. The transcript it prints is what goes on the slice's
 # issue. Needs: a best-peer binary (a release archive, or a dry run's artifact), Docker with the NVIDIA container
 # toolkit, curl and python3. Nothing else is configured; the peer is approved from this same shell.
 #
@@ -27,7 +27,7 @@ for e in d["events"]: print(" ", e["time"][11:19], e["type"], json.dumps(e["data
     [ -n "$after" ] || break
   done
 }
-done_types='DeploymentReady DeploymentFailed CommandFailed OutOfMemory DeploymentEnded'
+done_types='DeploymentReady DeploymentFailed CommandFailed OutOfMemory DeploymentEnded PromptAnswered PromptFailed'
 wait_outcome() {  # correlation id -> the completing event's type, polling the log
   local t
   for _ in $(seq 1 600); do
@@ -74,15 +74,18 @@ events gpu-proof-deploy | grep -v -E ' (ImagePulling|WeightsLoading) ' ; say "  
 say "  outcome: $outcome"
 if [ "$outcome" = DeploymentReady ]; then
   ready=$(events gpu-proof-deploy | grep ' DeploymentReady ' | sed 's/^.*DeploymentReady //')
-  endpoint=$(echo "$ready" | j 'd["endpoint"]')
   dep=$(echo "$ready" | j 'd["deployment"]')
   say "get-hardware-state while it runs (the card's free memory should have dropped):"
   curl -sf -H "X-Api-Key: $key" "$base/queries/get-hardware-state" | python3 -c 'import json,sys; d=json.load(sys.stdin)
 for x in d["devices"]:
     if x["id"]==sys.argv[1]: m=x["memory"]; print("  ", x["id"], "free %.1f of %.1f GB, util" % (m["free_bytes"]/2**30, m["total_bytes"]/2**30), x["utilisation_pct"], "%")' "$card"
-  say "prompt at $endpoint (no door credential):"
-  answer=$(curl -s "$endpoint/chat/completions" -H "Content-Type: application/json" -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"Answer with one word: what is the capital of Italy?\"}],\"max_tokens\":20}")
-  say "  $(echo "$answer" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(repr(d["choices"][0]["message"]["content"].strip()), "in", d["usage"]["completion_tokens"], "tokens")' 2>/dev/null || echo "$answer")"
+  say "prompt $dep with the prompt command (the one way to the model):"
+  p=$(python3 -c 'import json,sys,datetime; print(json.dumps({"specversion":"1.0","id":"gpu-proof-prompt","source":"https://proof.local/agent","type":"Prompt","datacontenttype":"application/json","dataschema":sys.argv[1]+"/commands/prompt/1.0","time":datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),"data":{"deployment":sys.argv[2],"messages":[{"role":"user","content":"Answer with one word: what is the capital of Italy?"}],"max_tokens":20}}))' "$base" "$dep")
+  accepted=$(curl -s -w '\n%{http_code}' -H "X-Api-Key: $key" -H "Content-Type: application/cloudevents+json" -d "$p" "$base/commands")
+  say "  $(echo "$accepted" | tail -1) $(echo "$accepted" | head -1)"
+  say "  outcome: $(wait_outcome gpu-proof-prompt)"
+  answered=$(events gpu-proof-prompt | grep ' PromptAnswered ' | sed 's/^.*PromptAnswered //')
+  [ -n "$answered" ] && say "  $(echo "$answered" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(repr(d["content"].strip()), "in", d["completion_tokens"], "tokens, finish", d["finish"])' 2>/dev/null || echo "$answered")"
   say "container's view of the card: $(docker exec "$(docker ps -q --filter label=best-peer | head -1)" nvidia-smi --query-gpu=name,memory.used --format=csv,noheader 2>&1 | head -1)"
   say "undeploy:"
   u=$(python3 -c 'import json,sys,datetime; print(json.dumps({"specversion":"1.0","id":"gpu-proof-undeploy","source":"https://proof.local/agent","type":"UndeployModel","datacontenttype":"application/json","dataschema":sys.argv[1]+"/commands/undeploy-model/1.0","time":datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),"data":{"deployment":sys.argv[2]}}))' "$base" "$dep")
