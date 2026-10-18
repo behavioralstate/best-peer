@@ -18,7 +18,7 @@ use best_peer_door::envelope::now_rfc3339;
 use best_peer_door::{BestError, Emitter, Envelope, EventLog};
 use best_peer_engine::Kind;
 use best_peer_gpu::{Device, DeviceId, Host};
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -28,7 +28,7 @@ use crate::holdings::Holdings;
 use crate::lifecycle::{
     any_compute, mine, new_id, not_yours, parse, place, ready_deployment, require, within_share, workloads_view,
 };
-use crate::member::{Member, Refusal};
+use crate::member::{Heard, Member, Refusal};
 use crate::state::{JobPhase, Phase, Reservation, State};
 use crate::transport::Transport;
 
@@ -51,6 +51,33 @@ const TERMINAL: &[&str] = &[
     "JobStopped",
     "CommandFailed",
 ];
+
+/// Why a member's stream is no longer read: the member closed it, or nothing at all came on it for the silence
+/// allowed.
+#[derive(Debug, PartialEq, Eq)]
+enum Stopped {
+    Ended,
+    Silent,
+}
+
+/// Reads a member's stream until it ends or falls silent, handing every event to `relay`. A keep-alive, or any bytes
+/// of an event still on its way, is the member saying it is there: a quiet member whose socket is alive is read on,
+/// however long nothing happens on it; only a socket with nothing on it for `silence` is dead.
+async fn read_until_stopped(
+    stream: impl Stream<Item = Heard>,
+    silence: Duration,
+    mut relay: impl FnMut(String, Envelope),
+) -> Stopped {
+    let mut stream = std::pin::pin!(stream);
+    loop {
+        match tokio::time::timeout(silence, stream.next()).await {
+            Ok(Some(Heard::Event(id, e))) => relay(id, *e),
+            Ok(Some(Heard::Alive)) => {}
+            Ok(None) => return Stopped::Ended,
+            Err(_) => return Stopped::Silent,
+        }
+    }
+}
 
 /// A member's credential and the cloud's place on its stream, kept across restarts in the cloud's `members.json`.
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -695,18 +722,12 @@ impl Cloud {
                 let last = me.cursors.lock().unwrap().get(&member.name).cloned();
                 match member.stream(last.as_deref()).await {
                     Ok(stream) => {
-                        let mut stream = std::pin::pin!(stream);
-                        loop {
-                            match tokio::time::timeout(STREAM_SILENCE, stream.next()).await {
-                                Ok(Some((id, e))) => me.relay(&member, &id, &e),
-                                Ok(None) => {
-                                    tracing::info!(cloud = %me.name, peer = %member.name, "the member's stream ended; reconnecting");
-                                    break;
-                                }
-                                Err(_) => {
-                                    tracing::info!(cloud = %me.name, peer = %member.name, "the member's stream went silent; reconnecting");
-                                    break;
-                                }
+                        match read_until_stopped(stream, STREAM_SILENCE, |id, e| me.relay(&member, &id, &e)).await {
+                            Stopped::Ended => {
+                                tracing::info!(cloud = %me.name, peer = %member.name, "the member's stream ended; reconnecting")
+                            }
+                            Stopped::Silent => {
+                                tracing::info!(cloud = %me.name, peer = %member.name, "the member's stream went silent; reconnecting")
                             }
                         }
                     }
@@ -1501,6 +1522,64 @@ mod tests {
             member_correlation(":anything", &json!({ "deployment": "dep-1" }), Some("0123456789abcdef")),
             "cloud-0123456789abcdef-dep-1",
             "a command of the cloud's own carries the cloud's identity on the member"
+        );
+    }
+
+    /// A member's stream as the socket delivers it: `Alive` every `every`, `times` times, then the member closes it.
+    fn keep_alives(every: Duration, times: usize) -> impl Stream<Item = Heard> {
+        futures::stream::unfold(0usize, move |n| async move {
+            if n == times {
+                return None;
+            }
+            tokio::time::sleep(every).await;
+            Some((Heard::Alive, n + 1))
+        })
+    }
+
+    #[tokio::test]
+    async fn a_quiet_member_whose_socket_is_alive_is_read_on_and_not_taken_for_silent() {
+        // Keep-alives alone, each well inside the silence allowed, for ten times that silence: the stream is read to
+        // its end and no event is relayed. Before the fix every keep-alive was swallowed by the parser, and a member
+        // with nothing to tell for a minute was reconnected every minute.
+        let silence = Duration::from_millis(60);
+        let mut relayed = 0;
+        let stopped =
+            read_until_stopped(keep_alives(Duration::from_millis(20), 30), silence, |_, _| relayed += 1).await;
+        assert_eq!(stopped, Stopped::Ended);
+        assert_eq!(relayed, 0);
+    }
+
+    #[tokio::test]
+    async fn a_socket_with_nothing_on_it_for_the_silence_allowed_is_silent() {
+        let started = tokio::time::Instant::now();
+        let stopped = read_until_stopped(
+            futures::stream::pending::<Heard>(),
+            Duration::from_millis(60),
+            |_, _| {},
+        )
+        .await;
+        assert_eq!(stopped, Stopped::Silent);
+        assert!(started.elapsed() >= Duration::from_millis(60));
+    }
+
+    #[tokio::test]
+    async fn events_between_keep_alives_are_relayed_in_order() {
+        let e = |t: &str| Envelope::event("s", t, json!({}), None, None);
+        let items = vec![
+            Heard::Alive,
+            Heard::Event("1".into(), Box::new(e("A"))),
+            Heard::Alive,
+            Heard::Event("2".into(), Box::new(e("B"))),
+        ];
+        let mut got = Vec::new();
+        let stopped = read_until_stopped(futures::stream::iter(items), Duration::from_secs(1), |id, e| {
+            got.push((id, e.r#type))
+        })
+        .await;
+        assert_eq!(stopped, Stopped::Ended);
+        assert_eq!(
+            got,
+            vec![("1".to_string(), "A".to_string()), ("2".to_string(), "B".to_string())]
         );
     }
 }
