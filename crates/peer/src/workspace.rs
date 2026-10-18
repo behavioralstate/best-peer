@@ -34,7 +34,7 @@ use crate::domain::{
 };
 use crate::holdings::Holdings;
 use crate::lifecycle::{list, new_id, require};
-use crate::transport::Transport;
+use crate::transport::{Cleartext, Transport};
 
 /// Where the workspaces' doors are under the root: `/workspaces/<id>`.
 pub const PREFIX: &str = "/workspaces/";
@@ -53,6 +53,8 @@ pub struct Context {
     pub transport: Arc<dyn Transport>,
     /// What a credential holds across the door, for its share.
     pub holdings: Arc<Holdings>,
+    /// Where a cloud may reach a member in cleartext: on loopback alone, unless the operator said a VPN carries it.
+    pub cleartext: Cleartext,
 }
 
 impl Context {
@@ -902,6 +904,16 @@ impl Clouds for Workspace {
                     format!("peer {} is listed twice: give each member its own name", m.peer),
                 )
                 .with_details(json!({ "peer": m.peer })));
+            }
+            if !self.ctx.cleartext.allows(&endpoint) {
+                return Err(BestError::bad_request(
+                    "CLEARTEXT_MEMBER",
+                    format!(
+                        "endpoint {endpoint} is cleartext off loopback: the cloud's credential would travel unencrypted to peer {}; name it by its https:// endpoint, as its manifest advertises it, or have this door's operator set BEST_PEER_CLEARTEXT=vpn when a VPN carries it",
+                        m.peer
+                    ),
+                )
+                .with_details(json!({ "field": "members", "peer": m.peer, "endpoint": endpoint })));
             }
             if !seen_endpoints.insert(endpoint.clone()) {
                 return Err(BestError::bad_request(
