@@ -37,6 +37,8 @@ pub trait Service: Send + Sync + 'static {
     async fn run_job(self: Arc<Self>, cmd: Envelope, em: Emitter);
     fn admit_stop_job(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError>;
     async fn stop_job(self: Arc<Self>, cmd: Envelope, em: Emitter);
+    fn admit_prompt(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError>;
+    async fn prompt(self: Arc<Self>, cmd: Envelope, em: Emitter);
 }
 
 /// What a workspace adds to the lifecycle surface: its clouds, configured and archived.
@@ -108,7 +110,8 @@ fn lifecycle(c: Catalogue, svc: Arc<dyn Service>, at: Where) -> Catalogue {
         .command(deploy_model(svc.clone(), at))
         .command(undeploy_model(svc.clone()))
         .command(run_job(svc.clone(), at))
-        .command(stop_job(svc))
+        .command(stop_job(svc.clone()))
+        .command(prompt(svc, at))
 }
 
 /// What completes each command: the events after which its outcome is known, so a consumer stops waiting for the
@@ -125,6 +128,7 @@ pub fn completions() -> HashMap<String, HashSet<String>> {
         ("UndeployModel".to_string(), set(&["Undeployed"])),
         ("RunJob".to_string(), set(&["JobStarted", "JobFailed"])),
         ("StopJob".to_string(), set(&["JobStopped"])),
+        ("Prompt".to_string(), set(&["PromptAnswered", "PromptFailed"])),
         ("CreateWorkspace".to_string(), set(&["WorkspaceCreatedV1"])),
         ("InviteMember".to_string(), set(&["MemberInvitedV1"])),
         ("AcceptInvitation".to_string(), set(&["MemberJoinedV1"])),
@@ -192,11 +196,11 @@ pub const WORKSPACE_EVENTS: &[&str] = &[
     "PeerLost",
 ];
 
-/// What a credential may be approved for: `deploy` models (pull, deploy, undeploy), run `jobs` (run, stop); `all` is
-/// every scope and every holder's workloads, what a credential approved with nothing said is. Reading the hardware
-/// and its own workloads and events is every credential's, as is creating a workspace and acting in the ones it
-/// belongs to.
-pub const SCOPES: &[&str] = &["deploy", "jobs"];
+/// What a credential may be approved for: `deploy` models (pull, deploy, undeploy), run `jobs` (run, stop), `prompt`
+/// a ready deployment; `all` is every scope and every holder's workloads, what a credential approved with nothing
+/// said is. Reading the hardware and its own workloads and events is every credential's, as is creating a workspace
+/// and acting in the ones it belongs to.
+pub const SCOPES: &[&str] = &["deploy", "jobs", "prompt"];
 
 /// `^[a-z0-9][a-z0-9-]{0,63}$`: the shape of a cloud's name and a peer's name in a cloud, so that each composes
 /// into a device id (`cloud/peer/device`) and into the connection name a cloud signs in to its members under.
@@ -261,13 +265,12 @@ fn hardware_query(svc: Arc<dyn Service>, at: Where) -> QueryDef {
 
 fn workloads_query(peer: Arc<dyn Service>, at: Where) -> QueryDef {
     let description = match at {
-        Where::Root => "What this peer runs for you now: each deployment with its model, engine, device, the memory promised to it, its inference endpoint once ready and its phase (starting, ready, ending); each job with its image, device and phase (running, stopping); and held_bytes, the device memory your workloads hold together on this door, against share_bytes, the most your credential may hold (null when no share was set). A credential approved for all sees every holder's workloads, with the holder. The ids here are what undeploy-model and stop-job name.",
-        Where::Workspace => "What this workspace runs for you now, across its clouds: each deployment with its cloud, the peer it is on, its model, engine, device (cloud/peer/device), the memory promised to it, its inference endpoint on this workspace's door once ready and its phase (starting, ready, ending); each job with its cloud, peer, image, device and phase (running, stopping); and held_bytes, the device memory your workloads hold together on this door, every workspace counted, against share_bytes, the most your credential may hold (null when no share was set). A credential approved for all sees every holder's workloads, with the holder. The ids here are what undeploy-model and stop-job name.",
+        Where::Root => "What this peer runs for you now: each deployment with its model, engine, device, the memory promised to it, its phase (starting, ready, ending); each job with its image, device and phase (running, stopping); and held_bytes, the device memory your workloads hold together on this door, against share_bytes, the most your credential may hold (null when no share was set). A credential approved for all sees every holder's workloads, with the holder. The ids here are what undeploy-model and stop-job name.",
+        Where::Workspace => "What this workspace runs for you now, across its clouds: each deployment with its cloud, the peer it is on, its model, engine, device (cloud/peer/device), the memory promised to it, its phase (starting, ready, ending); each job with its cloud, peer, image, device and phase (running, stopping); and held_bytes, the device memory your workloads hold together on this door, every workspace counted, against share_bytes, the most your credential may hold (null when no share was set). A credential approved for all sees every holder's workloads, with the holder. The ids here are what undeploy-model and stop-job name.",
     };
     let mut deployment = json!({
         "deployment": { "type": "string" }, "model": { "type": "string" }, "engine": { "type": "string", "enum": ["ollama", "vllm"] },
         "device": { "type": "string" }, "memory_bytes": { "type": "integer" }, "holder": { "type": "string", "description": "The credential that deployed it, an opaque id" },
-        "endpoint": { "type": ["string", "null"], "description": "The OpenAI-compatible base URL on this door, once the deployment is ready; this door's credential opens it, as X-Api-Key or Authorization: Bearer" },
         "phase": { "type": "string", "enum": ["starting", "ready", "ending"] }
     });
     let mut job = json!({
@@ -311,6 +314,53 @@ fn cloud_property(what: &str) -> Value {
     json!({ "type": "string", "description": format!("The cloud of this workspace {what}; get-clouds lists them") })
 }
 
+fn prompt(peer: Arc<dyn Service>, at: Where) -> CommandDef {
+    let admit = peer.clone();
+    let description = match at {
+        Where::Root => "Asks a ready deployment on this peer to answer a conversation, whole. The messages are the conversation so far, each with its role (system, user, assistant) and content; max_tokens, temperature and stop are the engine's knobs, and are left to the engine when not given. Refused at once, with the reason and what to do, when the deployment is not there, not ready yet, ending, or another credential's. Otherwise PromptAnswered follows on the stream with this command's correlation id, carrying the answer and the token counts the engine reports, or PromptFailed with the reason and the fix; either completes the command. Nothing of the engine is reachable any other way: this command is the one data path. Needs the prompt scope.",
+        Where::Workspace => "Asks a ready deployment in a cloud of this workspace to answer a conversation, whole; the deployment names its cloud and peer. The messages are the conversation so far, each with its role (system, user, assistant) and content; max_tokens, temperature and stop are the engine's knobs, and are left to the engine when not given. Refused at once, with the reason and what to do, when the deployment is not this workspace's, not ready yet, ending, or another credential's. Otherwise PromptAnswered follows on this workspace's stream with this command's correlation id, the cloud and the peer named, carrying the answer and the token counts the engine reports, or PromptFailed with the reason and the fix; either completes the command. Needs the prompt scope.",
+    };
+    CommandDef {
+        schema: "prompt".into(),
+        version: "1.0".into(),
+        command_type: "Prompt".into(),
+        description: description.into(),
+        data_schema: json!({
+            "type": "object",
+            "required": ["deployment", "messages"],
+            "properties": {
+                "deployment": { "type": "string", "minLength": 1, "description": "The deployment to ask, as DeploymentReady and get-workloads name it; it must be ready" },
+                "messages": {
+                    "type": "array", "minItems": 1,
+                    "description": "The conversation so far, oldest first; the last is what the model answers",
+                    "items": {
+                        "type": "object", "required": ["role", "content"], "additionalProperties": false,
+                        "properties": {
+                            "role": { "type": "string", "enum": ["system", "user", "assistant"] },
+                            "content": { "type": "string" }
+                        }
+                    }
+                },
+                "max_tokens": { "type": "integer", "minimum": 1, "maximum": 1048576, "description": "The most tokens the answer may have; the engine's default when not given" },
+                "temperature": { "type": "number", "minimum": 0, "maximum": 2, "description": "The sampling temperature; the engine's default when not given" },
+                "stop": { "type": "array", "items": { "type": "string", "minLength": 1 }, "maxItems": 4, "description": "Strings at which the answer stops" }
+            },
+            "additionalProperties": false
+        }),
+        produces: vec!["PromptAnswered".into(), "PromptFailed".into()],
+        completes: completes("Prompt"),
+        impact: None,
+        admit: Some(Arc::new(move |cmd, who, _key| {
+            let peer = admit.clone();
+            Box::pin(async move { peer.admit_prompt(cmd, &who) })
+        })),
+        handler: Arc::new(move |cmd, emitter| {
+            let peer = peer.clone();
+            Box::pin(async move { peer.prompt(cmd, emitter).await })
+        }),
+    }
+}
+
 fn pull_image(peer: Arc<dyn Service>, at: Where) -> CommandDef {
     let admit = peer.clone();
     let (description, mut properties, required) = match at {
@@ -350,13 +400,13 @@ fn deploy_model(peer: Arc<dyn Service>, at: Where) -> CommandDef {
     let admit = peer.clone();
     let (description, mut properties) = match at {
         Where::Root => (
-            "Serves a model on this peer with the engine named, on a device that offers an API the engine runs on and has the memory asked for free. Refused at once, with the reason and what to do, when no device fits. Otherwise the facts follow on the stream with this command's correlation id: ImagePulling and ImagePulled, DeploymentStarted, WeightsLoading, then DeploymentReady with the OpenAI-compatible endpoint to send prompts to, or DeploymentFailed, which complete it. Later, OutOfMemory or DeploymentEnded if the engine ends it or stops on its own, under the same correlation id. Needs the deploy scope, and room in the credential's share when one was set.",
+            "Serves a model on this peer with the engine named, on a device that offers an API the engine runs on and has the memory asked for free. Refused at once, with the reason and what to do, when no device fits. Otherwise the facts follow on the stream with this command's correlation id: ImagePulling and ImagePulled, DeploymentStarted, WeightsLoading, then DeploymentReady, after which prompt commands naming the deployment are answered, or DeploymentFailed, which complete it. Later, OutOfMemory or DeploymentEnded if the engine ends it or stops on its own, under the same correlation id. Needs the deploy scope, and room in the credential's share when one was set.",
             json!({
                 "device": { "type": "string", "description": "A device id from get-hardware-state, to pin the placement; otherwise the fitting device with the most room" }
             }),
         ),
         Where::Workspace => (
-            "Serves a model in a cloud of this workspace with the engine named, on the member peer whose device offers an API the engine runs on and has the memory asked for free; name the cloud, or a device (cloud/peer/device) to pin the placement, which names the cloud too. Refused at once, with the reason and what to do, when the cloud is not this workspace's, is archived, or no device in it fits. Otherwise the facts follow on this workspace's stream with this command's correlation id, each with the cloud and the peer named: ImagePulling and ImagePulled, DeploymentStarted with the device as cloud/peer/device, WeightsLoading, then DeploymentReady with the OpenAI-compatible endpoint on this workspace's door to send prompts to, or DeploymentFailed, which complete it. Later, OutOfMemory or DeploymentEnded if the engine ends it, the peer stops on its own, or the peer is lost, under the same correlation id. Needs the deploy scope, and room in the credential's share when one was set.",
+            "Serves a model in a cloud of this workspace with the engine named, on the member peer whose device offers an API the engine runs on and has the memory asked for free; name the cloud, or a device (cloud/peer/device) to pin the placement, which names the cloud too. Refused at once, with the reason and what to do, when the cloud is not this workspace's, is archived, or no device in it fits. Otherwise the facts follow on this workspace's stream with this command's correlation id, each with the cloud and the peer named: ImagePulling and ImagePulled, DeploymentStarted with the device as cloud/peer/device, WeightsLoading, then DeploymentReady, after which prompt commands naming the deployment are answered on this workspace's door, or DeploymentFailed, which complete it. Later, OutOfMemory or DeploymentEnded if the engine ends it, the peer stops on its own, or the peer is lost, under the same correlation id. Needs the deploy scope, and room in the credential's share when one was set.",
             json!({
                 "cloud": cloud_property("to place in; may be left out when device names it"),
                 "device": { "type": "string", "description": "A device id from this workspace's get-hardware-state, cloud/peer/device, to pin the placement; otherwise the fitting device of the cloud with the most room" }
@@ -814,9 +864,23 @@ pub fn event_defs() -> Vec<EventDef> {
         event(
             "deployment-ready",
             "DeploymentReady",
-            "The model answers at the endpoint: an OpenAI-compatible base URL on this door, under the deployment, to send prompts to with the engine's own API and this door's credential, as X-Api-Key or Authorization: Bearer. The door passes the request and the answer through as they are, streaming included, and records nothing. The model name goes in the request.",
-            &["deployment", "model", "engine", "endpoint"],
-            placed(json!({ "deployment": s("The deployment"), "model": s("The model name to put in the request"), "engine": s("ollama or vllm"), "endpoint": s("The OpenAI-compatible base URL on this door, such as http://host:7777/deployments/dep-1/v1; this door\'s credential opens it") })),
+            "The model is loaded and answers: send prompt commands naming this deployment, and each is answered with PromptAnswered under its own correlation id. Nothing of the engine is on the door; the command is the one way to the model.",
+            &["deployment", "model", "engine"],
+            placed(json!({ "deployment": s("The deployment to name in prompt"), "model": s("The model"), "engine": s("ollama or vllm") })),
+        ),
+        event(
+            "prompt-answered",
+            "PromptAnswered",
+            "The model's answer to a prompt, whole, under the prompt's correlation id; the counts are what the engine reported, null where it did not.",
+            &["deployment", "model", "content"],
+            placed(json!({ "deployment": s("The deployment that answered"), "model": s("The model that answered, as the engine names it"), "content": s("The answer"), "finish": { "type": ["string", "null"], "description": "Why the answer stopped, as the engine says: stop, length, or its own word" }, "prompt_tokens": { "type": ["integer", "null"] }, "completion_tokens": { "type": ["integer", "null"] } })),
+        ),
+        event(
+            "prompt-failed",
+            "PromptFailed",
+            "The prompt was accepted and not answered: the deployment ended meanwhile, or the engine failed or did not answer in time. The reason says what happened and the fix what to do.",
+            &["deployment", "reason", "fix"],
+            placed(json!({ "deployment": s("The deployment asked"), "reason": s("What happened"), "fix": s("What to do") })),
         ),
         event(
             "deployment-failed",
