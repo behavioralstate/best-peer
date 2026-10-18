@@ -5,10 +5,11 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -192,9 +193,14 @@ fn form<T: serde::de::DeserializeOwned>(headers: &HeaderMap, body: &Bytes) -> Re
         .map_err(|e| OAuthError::invalid_request(format!("the form could not be read: {e}")))
 }
 
-async fn device(State(door): State<Shared>, headers: HeaderMap, body: Bytes) -> Result<Response, OAuthError> {
+async fn device(
+    State(door): State<Shared>,
+    from: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, OAuthError> {
     let req: DeviceRequest = form(&headers, &body)?;
-    let answer = door.auth.start_device(req)?;
+    let answer = door.auth.start_device_from(req, from.map(|c| c.0.ip()))?;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(answer)).into_response())
 }
 
@@ -971,6 +977,35 @@ mod tests {
         let (s, _, b) = call(&app, get("/events?limit=5000", Some(&key))).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert!(b["error"]["message"].as_str().unwrap().contains("200"));
+    }
+
+    #[tokio::test]
+    async fn sign_in_counts_registrations_by_the_address_the_connection_came_from() {
+        let at = |ip: &str| {
+            router(door()).layer(axum::extract::connect_info::MockConnectInfo(SocketAddr::new(
+                ip.parse().unwrap(),
+                40000,
+            )))
+        };
+        let app = at("203.0.113.9");
+        for i in 0..16 {
+            let client = format!("client-{i}");
+            let (s, _, b) = call(&app, post_form("/auth/device", &[("client_id", client.as_str())])).await;
+            assert_eq!(s, StatusCode::OK, "{b}");
+        }
+        let (s, h, b) = call(&app, post_form("/auth/device", &[("client_id", "client-new")])).await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{b}");
+        assert_eq!(h[header::CACHE_CONTROL], "no-store");
+        assert!(
+            b["error_description"].as_str().unwrap().contains("from your address"),
+            "{b}"
+        );
+        let local = at("127.0.0.1");
+        for i in 0..20 {
+            let client = format!("client-{i}");
+            let (s, _, b) = call(&local, post_form("/auth/device", &[("client_id", client.as_str())])).await;
+            assert_eq!(s, StatusCode::OK, "loopback is not counted: {b}");
+        }
     }
 
     #[tokio::test]

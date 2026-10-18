@@ -374,7 +374,8 @@ async fn serve_on(
     tls: Option<Arc<rustls::ServerConfig>>,
     handle: axum_server::Handle<SocketAddr>,
 ) -> std::io::Result<()> {
-    let service = app.into_make_service();
+    // Each connection's address goes with its requests: sign-in counts registrations by it.
+    let service = app.into_make_service_with_connect_info::<SocketAddr>();
     match tls {
         Some(config) => {
             let config = axum_server::tls_rustls::RustlsConfig::from_config(config);
