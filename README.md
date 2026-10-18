@@ -2,8 +2,8 @@
 
 A peer is one binary on a machine with a GPU that puts that machine behind a
 [Behavioral State Protocol](https://behavioralstate.io) door. An agent that knows only the door's manifest can read the
-hardware state, deploy a model, follow its lifecycle on the event stream, run a prompt against the endpoint the event
-named, run a job and undeploy. Nothing is written for the agent beyond the manifest. The same door hosts workspaces, the
+hardware state, deploy a model, follow its lifecycle on the event stream, prompt it with a command and read the
+answer as an event, run a job and undeploy. Nothing is written for the agent beyond the manifest. The same door hosts workspaces, the
 protocol's tenants: an organization or team creates one, invites the identities who may use it, and configures
 clouds in it, named pools of peers whose owners admit the cloud at their console; a workload is placed in a cloud of
 a workspace and every fact about it names the cloud, the peer and the device. Peers find, name and vouch for each
@@ -11,9 +11,9 @@ other through BEST doors too, so the same word carries to the end game: a networ
 
 best-peer is an implementation of BEST written in Rust from the spec text alone, sharing no code with any other, so
 the spec is proven portable and its gaps surface. It wraps an existing runtime (containers with the NVIDIA container
-toolkit running Ollama or vLLM) and builds no engine of its own. Prompts go to the runtime's OpenAI-compatible
-endpoint through the door, with the door's credential, and the door passes them through untouched; BEST carries the
-control path only.
+toolkit running Ollama or vLLM) and builds no engine of its own. A prompt is a BEST command and its answer a BEST
+event; the peer reaches the engine's own API behind an abstraction it owns, and nothing of the engine is on the door:
+BEST carries the whole of it.
 
 The plan is the epic [behavioralstate/spec#27](https://github.com/behavioralstate/spec/issues/27) and its slices, on the
 [Behavioralstate board](https://github.com/orgs/Amarcode-Studios/projects/4). The board is the plan: no plan file lives
@@ -36,7 +36,7 @@ the CPU is the one device. Then one of two ways to run models, each with what it
 | Way | What the machine needs | Settings |
 |---|---|---|
 | **Docker** (the default) | Docker Engine running and reachable by your user (`docker ps` without `sudo`, or run the peer with it), and the NVIDIA container toolkit registered with it, so that `docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi` lists the card. Room under Docker's storage for the engine image and the model weights, a few GB. | None: the peer pulls the engine image, starts the container, publishes its port. |
-| **Native** | Ollama installed and running as a service on its own port. The peer pulls the model through it and claims its port; nothing is started or stopped. No jobs: `run-job` is refused at ingest, with the fix. | `BEST_PEER_RUNTIME=native`. Ollama keeps its own bind, loopback as installed: prompts reach it through the door. |
+| **Native** | Ollama installed and running as a service on its own port. The peer pulls the model through it and claims its port; nothing is started or stopped. No jobs: `run-job` is refused at ingest, with the fix. | `BEST_PEER_RUNTIME=native`. Ollama keeps its own bind, loopback as installed: a prompt reaches it as a command through the door. |
 
 `BEST_PEER_RUNTIME=fake` is a third way for a machine with neither: the surface answers, nothing runs. Every other
 variable has a default that fits these two ways; [Run](#run) lists them for a setup that differs.
@@ -74,8 +74,9 @@ curl). A certificate of your own, from your CA or a public one for a name you ho
 `BEST_PEER_TLS_CERT=<chain.pem> BEST_PEER_TLS_KEY=<key.pem>`; the peer checks nothing about it beyond that it
 loads. An `http://` endpoint still works, with a warning at start: the credential then travels in the clear, so keep
 that to a VPN. There is no relay in the peer, so across the internet the address is one you make reachable (a static
-IP with a port forward, a Tailscale IP), and the firewall lets in 7777 and nothing else: prompts go through the door
-too, on that port, with the door's credential. The engines' own ports stay on loopback whatever the door listens on.
+IP with a port forward, a Tailscale IP), and the firewall lets in 7777 and nothing else: a prompt is a command on
+the door like any other, on that port, with the door's credential. The engines' own ports stay on loopback whatever
+the door listens on, and nothing of them is on the door.
 
 **3. Admit the agent.** The person connecting says to their client "sign me in `<name>`, start from
 `https://<address>:7777/.well-known/best`"; their client shows them a code like `8BB9-CB44`, and they send it to you.
@@ -87,8 +88,8 @@ At your machine:
 
 Their client's next poll receives a key under that name. No accounts, no passwords: whoever controls the machine
 decides who is in, as with SSH keys, and what they may do: approved with nothing more said, a key may do everything;
-`--may deploy --memory 40G` makes one that may deploy models but run no job, and hold 40 GiB of device memory at
-most across its workloads, which it alone sees, prompts and ends.
+`--may deploy,prompt --memory 40G` makes one that may deploy models and prompt them but run no job, and hold 40 GiB
+of device memory at most across its workloads, which it alone sees, prompts and ends.
 
 **4. More than one machine.** Run a peer on each, and one more `best-peer` anywhere as the door your team enters
 by: a laptop will do, with `BEST_PEER_GPU=none` and the runtime it has (`BEST_PEER_RUNTIME=fake` when it has none:
@@ -100,8 +101,8 @@ the workspace's endpoint from `get-workspaces`, and sends `configure-cloud` ther
 machine as any agent would and logs the code for its owner: `to admit cloud lab of workspace ws-… on a, run on that
 machine: best-peer approve <code>`. Once admitted, the machine is `up` in the workspace's `get-clouds` and its
 devices are in its `get-hardware-state` as `lab/a/gpu-0`; a deploy in the workspace names the cloud and goes to
-the peer with the room, every fact comes back on the workspace's stream with the cloud and the peer named, and
-prompts to the workspace's endpoints pass through to the peer's. A machine that stops answering is `PeerLost` on
+the peer with the room, every fact comes back on the workspace's stream with the cloud and the peer named, and a
+prompt in the workspace is placed on the peer that holds the deployment and answered on the same stream. A machine that stops answering is `PeerLost` on
 that stream, with every workload it held told as ended, and `PeerJoined` when it answers again. The same machine
 may serve a cloud of another workspace too; one cloud per workspace. Who else may use the pool is the owner's to
 say: `invite-member` with the identity their `get-workspaces` shows them, and they `accept-invitation`. A door
@@ -110,9 +111,11 @@ door, not the process.
 
 **5. What the agent does from there.** Reads the hardware state (a card shows its memory, temperature, power,
 utilisation and the CUDA version; the host CPU is listed after it), deploys a model on it, follows the events to
-`DeploymentReady`, prompts the endpoint that event names, runs a job, undeploys. The whole run, as recorded the first
-time it passed, is [acceptance/lifecycle-from-the-manifest.md](acceptance/lifecycle-from-the-manifest.md). Send back
-the terminal output of the peer, whatever happened: the release notes say what is proven and what is not yet.
+`DeploymentReady`, sends it a `prompt` and reads `PromptAnswered`, runs a job, undeploys. The run as recorded the
+first time it passed is [acceptance/lifecycle-from-the-manifest.md](acceptance/lifecycle-from-the-manifest.md); it
+prompted an inference endpoint the door no longer has, and the run with the prompt as a command is recorded again on
+a GPU host under behavioralstate/spec#54. Send back the terminal output of the peer, whatever happened: the release
+notes say what is proven and what is not yet.
 
 ## Layout
 
@@ -121,7 +124,7 @@ the terminal output of the peer, whatever happened: the release notes say what i
 | `crates/door` | The BEST surface, from the spec text: the manifest, the catalogues and schema documents, command ingest with refusals that say what to send and an idempotent `id`, the event log on disk with its paged history and its live stream, queries, workflows, and sign-in by the device flow with the guidance verbatim; a door that hosts tenants declares their manifests' template and serves each tenant's capabilities as a door of its own. Who approves is an `Approver` the peer chooses. |
 | `crates/gpu` | The accelerator abstraction: a vendor-neutral snapshot of the host's devices (`Gpu`), each naming the compute APIs it offers (CUDA, ROCm, oneAPI, Metal, Vulkan, CPU) so a workload asks for an API and memory, never for a vendor. Ships the `Fake` tests run against. |
 | `crates/runtime` | The container runtime abstraction (`Runtime`): pull with progress, start with devices handed over by id and the ports published, stop, observe, and what the engine does on its own told as events. Ships the `Fake`. |
-| `crates/engine` | The inference engine abstraction (`Engine`): which engines serve a model (Ollama, vLLM), what to run for each, and how a served model is made ready, with progress. Ships the `Fake`. |
+| `crates/engine` | The inference engine abstraction (`Engine`): which engines serve a model (Ollama, vLLM), what to run for each, how a served model is made ready, with progress, and how it is asked to answer a conversation. Ships the `Fake`. |
 | `crates/peer` | The `best-peer` binary: the door over the three abstractions, with the peer's own commands, queries and events, its state folded from the events it told; the workspaces it hosts, each a tenant door with its clouds of peers, folded from their own logs; and `best-peer approve`, the operator's side of sign-in. |
 | `crates/host` | The host itself as a device: a `Gpu` adapter reporting the CPU and system memory, so a peer with no accelerator serves the whole lifecycle. |
 | `crates/nvml` | The `Gpu` adapter for NVIDIA cards through NVML: memory, temperature, power, utilisation and the CUDA version, read live; the peer refuses to start without the driver unless told the host has none. |
@@ -174,9 +177,9 @@ the credentials and its place on each member's stream live in `workspaces/<id>/c
 the data folder. The workspace's `get-hardware-state` lists every cloud's devices as `cloud/peer/device` with the
 peers and their state; `deploy-model`, `run-job` and `pull-image` take the `cloud` (a `device` names it too) and
 are placed by the peer's own rule across its members and sent there as the cloud's command; what a member tells
-comes back on the workspace's stream under the caller's correlation id with `cloud` and `peer` named; the endpoint
-`DeploymentReady` names is on the workspace's door and passes through to the member's with the cloud's own
-credential for it. `BEST_PEER_TRUST` lists PEM files to trust beyond the public roots, for members serving their own
+comes back on the workspace's stream under the caller's correlation id with `cloud` and `peer` named; a prompt is
+placed on the member that holds the deployment, as the cloud's own command there, and its answer relayed the same
+way. `BEST_PEER_TRUST` lists PEM files to trust beyond the public roots, for members serving their own
 certificates. Every thirty seconds each cloud squares its state with its members: one that does not answer within
 fifteen seconds is told as `PeerLost`, with its workloads told as ended and its commands in flight failed;
 `PeerJoined` when it answers again, and what it still runs of the cloud's by then is ended there, so the two agree;
@@ -194,12 +197,12 @@ outside any container (an installed Ollama; no jobs), `fake` serves the whole su
 (what CI runs).
 `BEST_PEER_OLLAMA_IMAGE` and `BEST_PEER_VLLM_IMAGE` pin or mirror the engines' images; `BEST_PEER_READY_SECONDS`
 (default 900) is how long an engine may take to answer after its container started, `BEST_PEER_LOAD_SECONDS`
-(default 3600) how long a model may take to load. `BEST_PEER_ENGINE_HOST` (default `127.0.0.1`) is where the peer
+(default 3600) how long a model may take to load, and a prompt is given ten minutes to be answered. `BEST_PEER_ENGINE_HOST` (default `127.0.0.1`) is where the peer
 itself reaches the engines' ports, which are bound there and nowhere else whatever the door listens on: on loopback
 when the container engine is on this host, on that host's interfaces when it is elsewhere, so a container engine
-on another host sits on a network you trust. The endpoint a `DeploymentReady` event names is on the door, under
-the deployment. A deployment made by a peer older than 0.0.4 is served through the door too, but its engine's port
-stays published as that peer bound it until it is undeployed and deployed again.
+on another host sits on a network you trust. The peer alone reaches them: a prompt is a command on the door, and
+the peer carries it to the engine. Prompts are answered sixteen at a time per peer; the rest wait their turn,
+accepted, in order.
 
 ## Deploy
 
@@ -210,34 +213,36 @@ engine runs on with that much room after what is already promised, or refuses at
 On a workspace's door the same commands take the `cloud` to place in (or a `device` as `cloud/peer/device`, which
 names it), the devices are every cloud's peers', and every row and event carries `cloud` and `peer`.
 The facts follow on the event stream under the command's correlation id, in order: `ImagePulling`, `ImagePulled`,
-`DeploymentStarted`, `WeightsLoading`, then `DeploymentReady` with the OpenAI-compatible endpoint prompts go to, or
-`DeploymentFailed`. What the engine does on its own later (`OutOfMemory`, `DeploymentEnded`) is told under the same
-correlation id. `run-job` runs an image once and tells `JobStarted` and `JobFinished` with the exit code;
-`undeploy-model` and `stop-job` end them.
+`DeploymentStarted`, `WeightsLoading`, then `DeploymentReady`, or `DeploymentFailed`. What the engine does on its own
+later (`OutOfMemory`, `DeploymentEnded`) is told under the same correlation id. `prompt` names a ready deployment and
+the conversation so far, and `PromptAnswered` follows under its own correlation id with the answer whole, or
+`PromptFailed` with the reason and the fix. `run-job` runs an image once and tells `JobStarted` and `JobFinished`
+with the exit code; `undeploy-model` and `stop-job` end them.
 
 The peer's state is the fold of the events it told. After a restart it is rebuilt from the log and squared with what
 the engine still runs; a workload that ended while the peer was down is told so then.
 
 ## The data path
 
-BEST carries the control path: the commands, the facts they produce and the state those facts fold to. The
-conversation with the model is not on it. `DeploymentReady` names the endpoint, an OpenAI-compatible base URL on
-the door under the deployment (`<door>/deployments/<deployment>/v1`), and the model name to put in the request. A
-client prompts there with the engine's own API and the door's credential, sent as the door's `X-Api-Key` header or
-as the `Authorization: Bearer` the OpenAI-compatible clients send; the door checks it, passes the request to the
-engine as it is and the answer back as it comes, streaming included, and records nothing. Tokens are not turned into
-events: a token is not a fact about the machine, and the door's events say what the machine runs, never what the
-model answered. The pass-through is there so that the one credential means what a person expects: who may deploy on
-the machine is who may prompt it.
+BEST carries the whole of it. A deployment is prompted with a command, `prompt`, naming the deployment and the
+conversation so far (messages with their role and content, and the engine's knobs: `max_tokens`, `temperature`,
+`stop`), and the model's answer is a fact, `PromptAnswered`, under the prompt's correlation id, with the answer whole,
+the model that answered and the token counts the engine reported; `PromptFailed` says why there is no answer and what
+to do. The peer reaches the engine's own API behind the `Engine` abstraction, on the loopback port the runtime
+published, and nothing of the engine is on the door: there is no inference endpoint, no path under a deployment, no
+header the engine would read. A prompt needs the `prompt` scope and a deployment that is ready and the caller's,
+refused at ingest otherwise with what to do. The answer is one fact, not one per token: a token is not a fact about
+the machine, and streaming partial output is not here (behavioralstate/spec#54 says what is and what waits). What the
+engine is asked and what it answers are in the door's log like every other fact, read by the holder under its own
+correlations and by nobody else (behavioralstate/spec#53).
 
 Where the boundary lies: the engines' own ports are bound to loopback whatever the door listens on (in `native` mode
-the installed engine keeps its own bind), so the door is the one way in. Without the credential the endpoint
-answers the door's `401`; a deployment that is not ready, or whose `undeploy-model` was accepted (its phase is
-`ending` in `get-workloads` from then, and `Undeployed` follows), or that nobody made, answers `404` with what to
-do; an engine that does not answer is `502` with what to do. The door promises that the endpoint serves the model
-from `DeploymentReady` until the deployment ends: the undeploy, or `DeploymentEnded` or `OutOfMemory` telling what
-the engine did on its own, within 30 s of it where the engine told nothing itself. What is said at the endpoint
-and how fast is the engine's.
+the installed engine keeps its own bind), and the peer is the one thing that reaches them. A prompt on a deployment
+that is not ready, or whose `undeploy-model` was accepted (its phase is `ending` in `get-workloads` from then, and
+`Undeployed` follows), or that nobody made, is refused at ingest with what to do; an engine that does not answer
+within ten minutes is `PromptFailed` with the fix. The door promises that a ready deployment answers prompts from
+`DeploymentReady` until the deployment ends: the undeploy, or `DeploymentEnded` or `OutOfMemory` telling what the
+engine did on its own, within 30 s of it where the engine told nothing itself. What the model says is the model's.
 
 ## Commands over time
 
@@ -286,15 +291,15 @@ owner names to invite it; the token answer's `endpoint` is the root, where that 
 joined any workspace still uses the machine's own surface at the root.
 
 **What a credential may do** is set at the approval and travels with the key. The manifest's authentication block
-lists the scopes: `deploy` (pull-image, deploy-model, undeploy-model) and `jobs` (run-job, stop-job); `all` is every
-scope and every holder's workloads, and what a key approved with nothing said is, so the owner's own box changes
+lists the scopes: `deploy` (pull-image, deploy-model, undeploy-model), `jobs` (run-job, stop-job) and `prompt`
+(prompt); `all` is every scope and every holder's workloads, and what a key approved with nothing said is, so the owner's own box changes
 nothing. Reading is every key's: the hardware state, and its own workloads and events. `best-peer approve <code>
 --may deploy` grants scopes; `--memory 40G` sets the most device memory the key's workloads may hold together,
 counted across its deployments, jobs and commands admitted but not yet started. Every command document says which
 scope it needs. A command the key may not send is refused at ingest with `FORBIDDEN` and what it was approved for;
 a deploy or a job past the share with `SHARE_EXCEEDED`, what is held and the room left; a workload another key
-started, by name, whether the command, the endpoint or the events are asked for, and a refusal names only what the
-key may see. `get-workloads` shows a key its own, with `held_bytes` against `share_bytes`; `DeploymentStarted` and
+started, by name, whether a command, a prompt or the events are asked for, and a refusal names only what the key may
+see. `get-workloads` shows a key its own, with `held_bytes` against `share_bytes`; `DeploymentStarted` and
 `JobStarted` name the `holder`, an opaque id of the credential, never the key. Another sign-in is another holder,
 as the spec has it: what a key that expired or was replaced left running is the owner's to end with a key approved
 for all. The spec has no per-command scope field yet, so the requirement is in the description text; that is an

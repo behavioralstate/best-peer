@@ -13,7 +13,7 @@ use serde_json::Value;
 pub enum Phase {
     /// The container runs; the engine is not yet serving the model.
     Starting,
-    /// The endpoint answers.
+    /// The model answers: the deployment takes prompts.
     Ready,
     /// An undeploy or a failure is ending it; its exit is expected and is not an ending of its own.
     Ending,
@@ -29,7 +29,7 @@ pub struct Deployment {
     pub container: ContainerId,
     /// The host port the engine is reached at.
     pub port: u16,
-    pub endpoint: Option<String>,
+    pub ready: bool,
     /// The credential that deployed it, as `holder` in DeploymentStarted; empty for one told before holders existed.
     pub holder: String,
     /// The correlation id of the command that deployed it: what every later fact about it carries.
@@ -190,7 +190,7 @@ impl State {
                         memory_bytes: data["memory_bytes"].as_u64().unwrap_or(0),
                         container: ContainerId(text("container")),
                         port: data["port"].as_u64().unwrap_or(0) as u16,
-                        endpoint: None,
+                        ready: false,
                         holder: text("holder"),
                         correlation,
                         phase: Phase::Starting,
@@ -200,7 +200,7 @@ impl State {
             }
             "DeploymentReady" => {
                 if let Some(d) = self.deployments.get_mut(&text("deployment")) {
-                    d.endpoint = data["endpoint"].as_str().map(str::to_string);
+                    d.ready = true;
                     d.phase = Phase::Ready;
                 }
             }
@@ -276,10 +276,10 @@ mod tests {
         s.apply(&ev(
             "DeploymentReady",
             "c1",
-            json!({ "deployment": "dep-1", "endpoint": "http://h:41434/v1" }),
+            json!({ "deployment": "dep-1", "model": "m", "engine": "ollama" }),
         ));
         assert_eq!(s.deployments["dep-1"].phase, Phase::Ready);
-        assert_eq!(s.deployments["dep-1"].endpoint.as_deref(), Some("http://h:41434/v1"));
+        assert!(s.deployments["dep-1"].ready);
         assert!(matches!(s.by_container(&ContainerId("k-1".into())), Some(Owner::Deployment(d)) if d.id == "dep-1"));
         s.apply(&ev(
             "JobStarted",

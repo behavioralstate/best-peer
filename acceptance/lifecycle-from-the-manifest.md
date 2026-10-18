@@ -1,5 +1,8 @@
 # An agent runs the whole lifecycle from the manifest alone
 
+> This record predates the `prompt` command: the run prompted an inference endpoint the door no longer has
+> (behavioralstate/spec#54). The run with the prompt as a command is recorded again on a GPU host under that slice.
+
 The release gate of best-peer ([behavioralstate/spec#34](https://github.com/behavioralstate/spec/issues/34)): an LLM
 client connected through the published connector signs in to the door, reads the manifest, checks the hardware,
 deploys a model, follows the events, prompts the endpoint, runs a job and undeploys, with nothing written for it

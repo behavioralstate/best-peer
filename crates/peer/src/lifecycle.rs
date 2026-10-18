@@ -13,18 +13,16 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use best_peer_door::auth::{holder_of_hash, Credential};
 use best_peer_door::{BestError, Emitter, Envelope, EventLog};
-use best_peer_engine::{Engine, EngineError, Kind};
+use best_peer_engine::{Engine, EngineError, Kind, Message, Options};
 use best_peer_gpu::{Compute, DeviceId, Gpu, Host};
 use best_peer_runtime::{ContainerId, Event as RuntimeEvent, Runtime, RuntimeError, Spec};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Semaphore};
 
 use crate::domain::Service;
-use crate::endpoint::{Route, Upstream};
 use crate::holdings::Holdings;
 use crate::state::{JobPhase, Owner, Phase, Reservation, State};
-use crate::transport::Transport;
 
 /// The operator's overrides for the engines' images (a pinned tag, a mirror); none means the engine's default.
 #[derive(Clone, Debug, Default)]
@@ -42,12 +40,14 @@ impl Images {
     }
 }
 
-/// How long the peer waits on an engine: to answer after its container started, to load a model, to unload one.
+/// How long the peer waits on an engine: to answer after its container started, to load a model, to unload one,
+/// to answer a prompt.
 #[derive(Clone, Copy, Debug)]
 pub struct Patience {
     pub ready: Duration,
     pub load: Duration,
     pub unload: Duration,
+    pub prompt: Duration,
 }
 
 impl Default for Patience {
@@ -56,12 +56,17 @@ impl Default for Patience {
             ready: Duration::from_secs(900),
             load: Duration::from_secs(3600),
             unload: Duration::from_secs(30),
+            prompt: Duration::from_secs(600),
         }
     }
 }
 
 /// How often the state is squared with what the engine runs, for the exits the event feed may have missed.
 const RECONCILE_EVERY: Duration = Duration::from_secs(30);
+
+/// How many prompts a peer has in flight at once: each holds a blocking thread while the engine answers, and the
+/// engines answer a few at a time anyway; the rest wait their turn, accepted, in order.
+const PROMPTS_AT_ONCE: usize = 16;
 
 /// The most runtime events kept for containers the state does not know yet: a job can exit before its start is
 /// told, and its exit is replayed once it is.
@@ -75,8 +80,6 @@ pub struct Peer {
     service: String,
     dataschemas: Arc<HashMap<String, String>>,
     completions: Arc<HashMap<String, std::collections::HashSet<String>>>,
-    /// The door's own base URL: what `DeploymentReady` names an endpoint under.
-    endpoint: String,
     /// The host the peer itself reaches the engines at: where the containers' ports are bound, on this machine.
     engine_host: String,
     images: Images,
@@ -86,8 +89,8 @@ pub struct Peer {
     unowned: Mutex<HashMap<ContainerId, RuntimeEvent>>,
     /// The tasks that follow the engine, so a peer that stops stops hearing.
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
-    /// How prompts reach the engines: plain HTTP on this host.
-    transport: Arc<dyn Transport>,
+    /// The turns to prompt the engines, `PROMPTS_AT_ONCE` of them.
+    prompts: Semaphore,
     /// What a credential holds across the door, for its share: this peer's own promises and every workspace's.
     holdings: Arc<Holdings>,
 }
@@ -99,6 +102,18 @@ struct DeployData {
     memory_bytes: u64,
     #[serde(default)]
     device: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PromptData {
+    deployment: String,
+    messages: Vec<Message>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    temperature: Option<f64>,
+    #[serde(default)]
+    stop: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -152,14 +167,13 @@ impl Peer {
             service: service.into(),
             dataschemas: Arc::new(crate::domain::event_dataschemas(endpoint)),
             completions: Arc::new(crate::domain::completions()),
-            endpoint: endpoint.trim_end_matches('/').to_string(),
             engine_host: engine_host.into(),
             images,
             patience,
             state: Mutex::new(State::default()),
             unowned: Mutex::new(HashMap::new()),
             tasks: Mutex::new(Vec::new()),
-            transport: Arc::new(crate::transport::Http::plain()),
+            prompts: Semaphore::new(PROMPTS_AT_ONCE),
             holdings: Arc::new(Holdings::default()),
         }
     }
@@ -344,18 +358,76 @@ impl Peer {
         format!("http://{}:{port}", self.engine_host)
     }
 
-    /// The endpoint a deployment has on this door: under the deployment, at the engine's OpenAI-compatible path.
-    fn door_endpoint(&self, deployment: &str, engine: Kind) -> String {
-        format!("{}/deployments/{deployment}{}", self.endpoint, engine.openai_path())
+    // ----- prompt ---------------------------------------------------------------------------------------------------
+
+    /// A prompt needs the prompt scope and a deployment that is ready and the caller's.
+    pub fn admit_prompt(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError> {
+        require(who, "prompt")?;
+        let id = cmd.data["deployment"].as_str().unwrap_or_default();
+        ready_deployment(&self.state.lock().unwrap(), id, who).map(|_| ())
     }
 
-    /// Where the door passes a prompt for a deployment: its engine's base on this host, while the deployment is
-    /// ready. Before that, after an undeploy was accepted, or for a deployment nobody made, the refusal says what to
-    /// do.
-    pub fn engine_upstream(&self, deployment: &str, who: &Credential) -> Result<String, BestError> {
-        let state = self.state.lock().unwrap();
-        let d = ready_deployment(&state, deployment, who)?;
-        Ok(self.engine_base(d.port))
+    /// Asks the deployment's engine for the answer and tells it whole, under the command's correlation id; what the
+    /// engine could not do is `PromptFailed` with the reason and the fix. The engine's API is reached here and
+    /// nowhere else.
+    pub async fn prompt(&self, cmd: Envelope, em: Emitter) {
+        let data = match parse::<PromptData>(&cmd.data) {
+            Ok(d) => d,
+            Err(e) => {
+                // Accepted by the schema and still not readable here: the outcome is told, never silence.
+                self.tell(
+                    &em,
+                    "PromptFailed",
+                    json!({ "deployment": cmd.data["deployment"], "reason": format!("the prompt could not be read: {}", e.message), "fix": "send it as the schema at the catalogue's dataschema for prompt describes" }),
+                );
+                return;
+            }
+        };
+        let Some(d) = self.state.lock().unwrap().deployments.get(&data.deployment).cloned() else {
+            self.tell(
+                &em,
+                "PromptFailed",
+                json!({ "deployment": data.deployment, "reason": "the deployment ended between the prompt's admission and now", "fix": "deploy the model again, then prompt it" }),
+            );
+            return;
+        };
+        let options = Options {
+            max_tokens: data.max_tokens,
+            temperature: data.temperature,
+            stop: data.stop,
+        };
+        let within = self.patience.prompt;
+        // A turn: the engine is asked a few prompts at a time, the rest wait, accepted.
+        let _turn = self.prompts.acquire().await;
+        let asked = tokio::time::timeout(
+            within,
+            self.engine.complete(
+                d.engine,
+                &self.engine_base(d.port),
+                &d.model,
+                &data.messages,
+                &options,
+                within,
+            ),
+        )
+        .await;
+        match asked {
+            Ok(Ok(a)) => self.tell(
+                &em,
+                "PromptAnswered",
+                json!({ "deployment": d.id, "model": a.model, "content": a.content, "finish": a.finish, "prompt_tokens": a.prompt_tokens, "completion_tokens": a.completion_tokens }),
+            ),
+            Ok(Err(e)) => self.tell(
+                &em,
+                "PromptFailed",
+                json!({ "deployment": d.id, "reason": e.to_string(), "fix": fix_for_engine(&e) }),
+            ),
+            Err(_) => self.tell(
+                &em,
+                "PromptFailed",
+                json!({ "deployment": d.id, "reason": format!("the engine did not answer within {within:?}"), "fix": "send a shorter conversation or a smaller max_tokens; if the engine is stuck, DeploymentEnded follows when it stops" }),
+            ),
+        };
     }
 
     // ----- pull-image -----------------------------------------------------------------------------------------------
@@ -546,7 +618,7 @@ impl Peer {
                 self.tell(
                     &em,
                     "DeploymentReady",
-                    json!({ "deployment": id, "model": data.model, "engine": data.engine, "endpoint": self.door_endpoint(&id, data.engine) }),
+                    json!({ "deployment": id, "model": data.model, "engine": data.engine }),
                 );
             }
             Ok(()) => {}
@@ -661,7 +733,7 @@ impl Peer {
             return;
         };
         // The engine frees the model's memory where it can; an engine that cannot is ended with its container.
-        if d.endpoint.is_some() {
+        if d.ready {
             match tokio::time::timeout(
                 self.patience.unload,
                 self.engine.unload(d.engine, &self.engine_base(d.port), &d.model),
@@ -679,7 +751,7 @@ impl Peer {
         }
         match self.runtime.stop(&d.container).await {
             Ok(()) | Err(RuntimeError::NoSuchContainer(_)) => {
-                if d.endpoint.is_none() {
+                if !d.ready {
                     // Undeployed before it was ready: the deploy's outcome is that it did not get there.
                     self.tell(
                         &self.emitter(&d.correlation),
@@ -691,11 +763,7 @@ impl Peer {
             }
             Err(e) => {
                 if let Some(d) = self.state.lock().unwrap().deployments.get_mut(&id) {
-                    d.phase = if d.endpoint.is_some() {
-                        Phase::Ready
-                    } else {
-                        Phase::Starting
-                    };
+                    d.phase = if d.ready { Phase::Ready } else { Phase::Starting };
                 }
                 self.tell(
                     &em,
@@ -931,7 +999,7 @@ impl Peer {
             }
             (RuntimeEvent::Failed { reason, .. }, Owner::Deployment(dep)) => {
                 if self.claim_deployment(&dep.id) {
-                    if dep.endpoint.is_some() {
+                    if dep.ready {
                         // The deploy's outcome stands; what it made has ended, and that is the deployment's own fact.
                         self.tell(
                             &em,
@@ -1008,7 +1076,7 @@ impl Peer {
     /// `get-workloads`: what is deployed and what runs, now.
     pub fn workloads(&self, who: &Credential) -> Result<Value, BestError> {
         let held = self.holdings.held_by(&who.holder());
-        let mut v = workloads_view(&self.state.lock().unwrap(), who, &self.endpoint, None);
+        let mut v = workloads_view(&self.state.lock().unwrap(), who, None);
         v["held_bytes"] = json!(held);
         Ok(v)
     }
@@ -1063,52 +1131,53 @@ impl Service for Peer {
     async fn stop_job(self: Arc<Self>, cmd: Envelope, em: Emitter) {
         Peer::stop_job(&self, cmd, em).await
     }
-}
 
-impl Upstream for Peer {
-    fn upstream_of(&self, deployment: &str, who: &Credential) -> Result<Route, BestError> {
-        Ok(Route {
-            base: self.engine_upstream(deployment, who)?,
-            key: None,
-            transport: self.transport.clone(),
-        })
+    fn admit_prompt(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError> {
+        Peer::admit_prompt(self, cmd, who)
+    }
+
+    async fn prompt(self: Arc<Self>, cmd: Envelope, em: Emitter) {
+        Peer::prompt(&self, cmd, em).await
     }
 }
 
-/// The deployment `id` while it is ready and the caller's to prompt; otherwise the refusal that says what to do.
+/// The deployment `id` while it is ready and the caller's to prompt; otherwise the refusal at ingest that says what
+/// to do.
 pub(crate) fn ready_deployment<'a>(
     state: &'a State,
     id: &str,
     who: &Credential,
 ) -> Result<&'a crate::state::Deployment, BestError> {
     let Some(d) = state.deployments.get(id) else {
-        return Err(BestError::not_found(
+        return Err(BestError::bad_request(
             "NO_SUCH_DEPLOYMENT",
             format!("no deployment {id}: get-workloads lists what this peer runs for you, and deploy-model starts one"),
-        ));
+        )
+        .with_details(json!({ "deployment": id })));
     };
     if !who.grant.is_all() && d.holder != who.holder() {
         return Err(not_yours("deployment", id));
     }
     match d.phase {
         Phase::Ready => Ok(d),
-        Phase::Starting => Err(BestError::not_found(
+        Phase::Starting => Err(BestError::bad_request(
             "DEPLOYMENT_NOT_READY",
             format!("deployment {id} is not ready yet: follow its events to DeploymentReady, then prompt it"),
-        )),
-        Phase::Ending => Err(BestError::not_found(
+        )
+        .with_details(json!({ "deployment": id }))),
+        Phase::Ending => Err(BestError::bad_request(
             "DEPLOYMENT_ENDING",
             format!(
                 "deployment {id} is ending: an undeploy was accepted; deploy the model again if it is still wanted"
             ),
-        )),
+        )
+        .with_details(json!({ "deployment": id }))),
     }
 }
 
-/// `get-workloads`' body: what `state` holds for `who`, each ready deployment's endpoint on the door at `endpoint`,
-/// each row with the `cloud` when the state is a cloud's. `held_bytes` is this state's alone; a door with more
-/// than one surface puts the whole door's in.
-pub(crate) fn workloads_view(s: &State, who: &Credential, endpoint: &str, cloud: Option<&str>) -> Value {
+/// `get-workloads`' body: what `state` holds for `who`, each row with the `cloud` when the state is a cloud's.
+/// `held_bytes` is this state's alone; a door with more than one surface puts the whole door's in.
+pub(crate) fn workloads_view(s: &State, who: &Credential, cloud: Option<&str>) -> Value {
     let mine = |holder: &str| who.grant.is_all() || holder == who.holder();
     let with_cloud = |mut row: Value| {
         if let Some(c) = cloud {
@@ -1124,8 +1193,6 @@ pub(crate) fn workloads_view(s: &State, who: &Credential, endpoint: &str, cloud:
             with_cloud(json!({
                 "deployment": d.id, "model": d.model, "engine": d.engine, "device": d.device.0,
                 "memory_bytes": d.memory_bytes, "holder": d.holder, "peer": d.peer,
-                // Computed, not read back from the log: a deployment made by an earlier peer is on the door too.
-                "endpoint": d.endpoint.as_ref().map(|_| format!("{endpoint}/deployments/{}{}", d.id, d.engine.openai_path())),
                 "phase": match d.phase { Phase::Starting => "starting", Phase::Ready => "ready", Phase::Ending => "ending" }
             }))
         })
