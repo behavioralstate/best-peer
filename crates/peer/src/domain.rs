@@ -365,12 +365,12 @@ fn pull_image(peer: Arc<dyn Service>, at: Where) -> CommandDef {
     let admit = peer.clone();
     let (description, mut properties, required) = match at {
         Where::Root => (
-            "Makes a container image present on this peer, so a later deploy or job can start at once. The outcome is an ImagePulled or ImagePullFailed event with this command's correlation id. Needs the deploy scope.",
+            "Pulls a container image from its registry onto this peer, whether or not the peer holds it already, so a later deploy or job can start at once: how a held image is refreshed, since a deploy or a job runs an image the peer holds as it is and pulls only one it lacks. The outcome is an ImagePulled or ImagePullFailed event with this command's correlation id. Needs the deploy scope.",
             json!({}),
             vec!["image"],
         ),
         Where::Workspace => (
-            "Makes a container image present on every peer of the cloud named, so a later deploy or job there can start at once. Progress is told per peer as ImagePulling with the peer named; the outcome is one ImagePulled once every peer has it, or ImagePullFailed naming the peers that failed, with this command's correlation id. Refused at once when the cloud is not this workspace's or is archived. Needs the deploy scope.",
+            "Pulls a container image from its registry onto every peer of the cloud named, whether or not a peer holds it already, so a later deploy or job there can start at once: how a held image is refreshed, since a deploy or a job runs an image a peer holds as it is. Progress is told per peer as ImagePulling with the peer named; the outcome is one ImagePulled once every peer has it, or ImagePullFailed naming the peers that failed, with this command's correlation id. Refused at once when the cloud is not this workspace's or is archived. Needs the deploy scope.",
             json!({ "cloud": cloud_property("to pull on") }),
             vec!["image", "cloud"],
         ),
@@ -400,13 +400,13 @@ fn deploy_model(peer: Arc<dyn Service>, at: Where) -> CommandDef {
     let admit = peer.clone();
     let (description, mut properties) = match at {
         Where::Root => (
-            "Serves a model on this peer with the engine named, on a device that offers an API the engine runs on and has the memory asked for free. Refused at once, with the reason and what to do, when no device fits. Otherwise the facts follow on the stream with this command's correlation id: ImagePulling and ImagePulled, DeploymentStarted, WeightsLoading, then DeploymentReady, after which prompt commands naming the deployment are answered, or DeploymentFailed, which complete it. Later, OutOfMemory or DeploymentEnded if the engine ends it or stops on its own, under the same correlation id. Needs the deploy scope, and room in the credential's share when one was set.",
+            "Serves a model on this peer with the engine named, on a device that offers an API the engine runs on and has the memory asked for free. Refused at once, with the reason and what to do, when no device fits. Otherwise the facts follow on the stream with this command's correlation id: ImagePulling and ImagePulled (an image the peer already holds is used as it is, not pulled again), DeploymentStarted, WeightsLoading, then DeploymentReady, after which prompt commands naming the deployment are answered, or DeploymentFailed, which complete it. Later, OutOfMemory or DeploymentEnded if the engine ends it or stops on its own, under the same correlation id. Needs the deploy scope, and room in the credential's share when one was set.",
             json!({
                 "device": { "type": "string", "description": "A device id from get-hardware-state, to pin the placement; otherwise the fitting device with the most room" }
             }),
         ),
         Where::Workspace => (
-            "Serves a model in a cloud of this workspace with the engine named, on the member peer whose device offers an API the engine runs on and has the memory asked for free; name the cloud, or a device (cloud/peer/device) to pin the placement, which names the cloud too. Refused at once, with the reason and what to do, when the cloud is not this workspace's, is archived, or no device in it fits. Otherwise the facts follow on this workspace's stream with this command's correlation id, each with the cloud and the peer named: ImagePulling and ImagePulled, DeploymentStarted with the device as cloud/peer/device, WeightsLoading, then DeploymentReady, after which prompt commands naming the deployment are answered on this workspace's door, or DeploymentFailed, which complete it. Later, OutOfMemory or DeploymentEnded if the engine ends it, the peer stops on its own, or the peer is lost, under the same correlation id. Needs the deploy scope, and room in the credential's share when one was set.",
+            "Serves a model in a cloud of this workspace with the engine named, on the member peer whose device offers an API the engine runs on and has the memory asked for free; name the cloud, or a device (cloud/peer/device) to pin the placement, which names the cloud too. Refused at once, with the reason and what to do, when the cloud is not this workspace's, is archived, or no device in it fits. Otherwise the facts follow on this workspace's stream with this command's correlation id, each with the cloud and the peer named: ImagePulling and ImagePulled (an image the peer already holds is used as it is, not pulled again), DeploymentStarted with the device as cloud/peer/device, WeightsLoading, then DeploymentReady, after which prompt commands naming the deployment are answered on this workspace's door, or DeploymentFailed, which complete it. Later, OutOfMemory or DeploymentEnded if the engine ends it, the peer stops on its own, or the peer is lost, under the same correlation id. Needs the deploy scope, and room in the credential's share when one was set.",
             json!({
                 "cloud": cloud_property("to place in; may be left out when device names it"),
                 "device": { "type": "string", "description": "A device id from this workspace's get-hardware-state, cloud/peer/device, to pin the placement; otherwise the fitting device of the cloud with the most room" }
@@ -483,13 +483,13 @@ fn run_job(peer: Arc<dyn Service>, at: Where) -> CommandDef {
     let admit = peer.clone();
     let (description, mut properties) = match at {
         Where::Root => (
-            "Runs an image once, with the arguments given, and tells its end. With memory_bytes the job is placed on a device with that much room and handed that device; without, it runs with no device. The facts follow with this command's correlation id: ImagePulling and ImagePulled, then JobStarted or JobFailed, which complete the command; the job's own end follows as JobFinished with the exit code, or JobFailed. Needs the jobs scope, and room in the credential's share when one was set and memory_bytes is given.",
+            "Runs an image once, with the arguments given, and tells its end. With memory_bytes the job is placed on a device with that much room and handed that device; without, it runs with no device. The facts follow with this command's correlation id: ImagePulling and ImagePulled (an image the peer already holds is used as it is, not pulled again), then JobStarted or JobFailed, which complete the command; the job's own end follows as JobFinished with the exit code, or JobFailed. Needs the jobs scope, and room in the credential's share when one was set and memory_bytes is given.",
             json!({
                 "device": { "type": "string", "description": "A device id from get-hardware-state, to pin the placement; refused without memory_bytes" }
             }),
         ),
         Where::Workspace => (
-            "Runs an image once in a cloud of this workspace, with the arguments given, and tells its end. With memory_bytes the job is placed on a member peer's device with that much room and handed that device; without, it runs on the first peer of the cloud that answers, with no device. Name the cloud, or a device (cloud/peer/device) to pin the placement, which names the cloud too. Refused at once when the cloud is not this workspace's or is archived. The facts follow on this workspace's stream with this command's correlation id, each with the cloud and the peer named: ImagePulling and ImagePulled, then JobStarted or JobFailed, which complete the command; the job's own end follows as JobFinished with the exit code, or JobFailed. Needs the jobs scope, and room in the credential's share when one was set and memory_bytes is given.",
+            "Runs an image once in a cloud of this workspace, with the arguments given, and tells its end. With memory_bytes the job is placed on a member peer's device with that much room and handed that device; without, it runs on the first peer of the cloud that answers, with no device. Name the cloud, or a device (cloud/peer/device) to pin the placement, which names the cloud too. Refused at once when the cloud is not this workspace's or is archived. The facts follow on this workspace's stream with this command's correlation id, each with the cloud and the peer named: ImagePulling and ImagePulled (an image the peer already holds is used as it is, not pulled again), then JobStarted or JobFailed, which complete the command; the job's own end follows as JobFinished with the exit code, or JobFailed. Needs the jobs scope, and room in the credential's share when one was set and memory_bytes is given.",
             json!({
                 "cloud": cloud_property("to run in; may be left out when device names it"),
                 "device": { "type": "string", "description": "A device id from this workspace's get-hardware-state, cloud/peer/device, to pin the placement; refused without memory_bytes" }
@@ -838,7 +838,7 @@ pub fn event_defs() -> Vec<EventDef> {
             "ImagePulled",
             "The image is present on the peer; on a workspace's door, on every peer of the cloud.",
             &["image"],
-            placed(json!({ "image": s("The image now present") })),
+            placed(json!({ "image": s("The image now present"), "held": { "type": "boolean", "description": "True when the peer already held it and nothing was downloaded, as a deploy or a job finds it; false when it was pulled from the registry, as pull-image always does. Absent on a workspace's door, which tells the cloud as a whole" } })),
         ),
         event(
             "image-pull-failed",

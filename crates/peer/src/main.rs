@@ -1349,8 +1349,9 @@ mod tests {
         let (s, b) = site.deploy(&ws2, "d2", None, 4, Some("ops-pool/a/gpu-0")).await;
         assert_eq!(s, StatusCode::CREATED, "{b}");
         let events = site.events(&ws2, "d2", "DeploymentReady").await;
-        assert_eq!(events[3]["data"]["cloud"], "ops-pool");
-        assert_eq!(events[3]["data"]["device"], "ops-pool/a/gpu-0");
+        let started = events.iter().find(|e| e["type"] == "DeploymentStarted").unwrap();
+        assert_eq!(started["data"]["cloud"], "ops-pool");
+        assert_eq!(started["data"]["device"], "ops-pool/a/gpu-0");
         assert_eq!(
             site.query(&ws1, "get-workloads").await["deployments"]
                 .as_array()
@@ -2275,7 +2276,11 @@ mod tests {
         let (s, b) = site.deploy(&ws, "d3", Some("lab"), 1, None).await;
         assert_eq!(s, StatusCode::CREATED, "{b}");
         assert_eq!(
-            site.events(&ws, "d3", "DeploymentReady").await[3]["data"]["device"],
+            site.events(&ws, "d3", "DeploymentReady")
+                .await
+                .iter()
+                .find(|e| e["type"] == "DeploymentStarted")
+                .unwrap()["data"]["device"],
             "lab/b/gpu-0"
         );
     }
@@ -3426,6 +3431,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_deploy_or_a_job_runs_what_the_peer_holds_without_a_registry_and_pull_image_always_pulls() {
+        let held = best_peer_runtime::ImageRef("held/trainer:1".into());
+        let runtime = Arc::new(best_peer_runtime::Fake::new(
+            vec!["gpu-0".into()],
+            vec![held.clone(), best_peer_runtime::ImageRef("ollama/ollama".into())],
+        ));
+        let bed = bed(card(), Arc::new(EventLog::ephemeral()), runtime.clone()).await;
+        // Held and in no registry, as on a host with no way out: the job runs, and nothing went to a registry.
+        let (s, b) = bed
+            .send(
+                "h1",
+                "RunJob",
+                "run-job",
+                json!({ "image": held.0, "memory_bytes": GB }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let events = bed.events_of("h1", "JobStarted").await;
+        assert_eq!(types(&events), vec!["ImagePulling", "ImagePulled", "JobStarted"]);
+        assert_eq!(events[0].data["progress_pct"], 100);
+        assert_eq!(events[1].data["held"], true);
+        assert!(!runtime.pulled().contains(&held), "a held image is not pulled");
+        // The engine's image, held, is not pulled for a deploy either.
+        bed.deployed("h2", "llama3.2:3b", 4).await;
+        assert_eq!(bed.log_of("h2")[1].data["held"], true);
+        assert!(!runtime.pulled().iter().any(|i| i.0 == "ollama/ollama"));
+        // Neither held nor in a registry: the job fails with the fix, after one pull.
+        let (s, _) = bed
+            .send("h3", "RunJob", "run-job", json!({ "image": "nobody/nothing:1" }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED);
+        let failed = bed.events_of("h3", "JobFailed").await;
+        assert!(failed.last().unwrap().data["fix"]
+            .as_str()
+            .unwrap()
+            .contains("check the name"));
+        assert_eq!(runtime.pulled().iter().filter(|i| i.0 == "nobody/nothing:1").count(), 1);
+        // pull-image always goes to the registry, held or not: the way a held image is refreshed.
+        let (s, _) = bed
+            .send("h4", "PullImage", "pull-image", json!({ "image": held.0 }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED);
+        bed.events_of("h4", "ImagePullFailed").await;
+        assert!(runtime.pulled().contains(&held), "pull-image asked the registry");
+        let (s, _) = bed
+            .send("h5", "PullImage", "pull-image", json!({ "image": "busybox" }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED);
+        assert_eq!(
+            bed.events_of("h5", "ImagePulled").await.last().unwrap().data["held"],
+            false
+        );
+        let (s, _) = bed
+            .send("h6", "PullImage", "pull-image", json!({ "image": "busybox" }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED);
+        bed.events_of("h6", "ImagePulled").await;
+        assert_eq!(runtime.pulled().iter().filter(|i| i.0 == "busybox").count(), 2);
+    }
+
+    #[tokio::test]
     async fn a_job_runs_once_and_its_end_is_told_and_a_stop_ends_it_early() {
         let bed = fresh().await;
         let (s, b) = bed
@@ -3481,8 +3547,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(
             types(&bed.log_of("j2")),
-            vec!["ImagePulling", "ImagePulling", "ImagePulled", "JobStarted"],
-            "no JobFinished for a stop"
+            vec!["ImagePulling", "ImagePulled", "JobStarted"],
+            "no JobFinished for a stop; busybox is held since j1, so it is not pulled again"
         );
         // A device without the memory to place it by is refused, not ignored.
         let (s, b) = bed

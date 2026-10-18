@@ -441,7 +441,7 @@ impl Peer {
         let image = best_peer_runtime::ImageRef(cmd.data["image"].as_str().unwrap_or_default().to_string());
         match self.pull(&em, &image).await {
             Ok(()) => {
-                self.tell(&em, "ImagePulled", json!({ "image": image.0 }));
+                self.tell(&em, "ImagePulled", json!({ "image": image.0, "held": false }));
             }
             Err(e) => {
                 self.tell(
@@ -511,19 +511,22 @@ impl Peer {
             .engine
             .recipe(&data.model, &compute, self.images.for_engine(data.engine));
         let image = recipe.image.clone();
-        if let Err(e) = self.pull(&em, &image).await {
-            self.fail_deployment(
-                &em,
-                &id,
-                &data.model,
-                &e.to_string(),
-                fix_for_runtime(&e),
-                Stage::BeforeStart(None),
-            )
-            .await;
-            return;
-        }
-        self.tell(&em, "ImagePulled", json!({ "image": image.0 }));
+        let held = match self.ensure(&em, &image).await {
+            Ok(held) => held,
+            Err(e) => {
+                self.fail_deployment(
+                    &em,
+                    &id,
+                    &data.model,
+                    &e.to_string(),
+                    fix_for_runtime(&e),
+                    Stage::BeforeStart(None),
+                )
+                .await;
+                return;
+            }
+        };
+        self.tell(&em, "ImagePulled", json!({ "image": image.0, "held": held }));
         let spec = Spec {
             image,
             args: recipe.args,
@@ -636,7 +639,18 @@ impl Peer {
         }
     }
 
-    /// Pulls an image, telling its progress; a pull that completed is 100, whether or not the engine said so.
+    /// Makes an image present for a deploy or a job: one the engine holds is not pulled, so a host with no way to a
+    /// registry runs what it holds, and is told at 100 at once; another is pulled. Says whether it was held.
+    async fn ensure(self: &Arc<Self>, em: &Emitter, image: &best_peer_runtime::ImageRef) -> Result<bool, RuntimeError> {
+        if self.runtime.holds(image).await? {
+            self.pulling(em, image)(Some(100));
+            return Ok(true);
+        }
+        self.pull(em, image).await.map(|()| false)
+    }
+
+    /// Pulls an image from the registry, held or not, telling its progress; a pull that completed is 100, whether or
+    /// not the engine said so. What pull-image does, so that is how a held image is refreshed.
     async fn pull(self: &Arc<Self>, em: &Emitter, image: &best_peer_runtime::ImageRef) -> Result<(), RuntimeError> {
         let progress = self.pulling(em, image);
         self.runtime.pull(image, progress.clone()).await?;
@@ -846,11 +860,14 @@ impl Peer {
                 json!({ "job": id, "image": data.image, "reason": reason, "fix": fix }),
             );
         };
-        if let Err(e) = self.pull(&em, &image).await {
-            fail(e.to_string(), fix_for_runtime(&e));
-            return;
-        }
-        self.tell(&em, "ImagePulled", json!({ "image": image.0 }));
+        let held = match self.ensure(&em, &image).await {
+            Ok(held) => held,
+            Err(e) => {
+                fail(e.to_string(), fix_for_runtime(&e));
+                return;
+            }
+        };
+        self.tell(&em, "ImagePulled", json!({ "image": image.0, "held": held }));
         let devices = match (&reservation.device, &reservation.compute) {
             (Some(d), Some(c)) if *c != Compute::Cpu => vec![d.clone()],
             _ => vec![],

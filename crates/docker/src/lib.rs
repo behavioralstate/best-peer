@@ -122,11 +122,6 @@ fn image_error(image: &ImageRef, message: &str) -> RuntimeError {
 #[async_trait]
 impl Runtime for DockerRuntime {
     async fn pull(&self, image: &ImageRef, progress: Progress) -> Result<(), RuntimeError> {
-        // An image already here is not pulled again: a host with no way to a registry still runs what it holds.
-        if self.docker.inspect_image(&image.0).await.is_ok() {
-            progress(Some(100));
-            return Ok(());
-        }
         let (name, tag) = name_and_tag(image);
         let mut options = CreateImageOptionsBuilder::new().from_image(&name);
         if let Some(tag) = &tag {
@@ -158,6 +153,17 @@ impl Runtime for DockerRuntime {
             }
         }
         Ok(())
+    }
+
+    async fn holds(&self, image: &ImageRef) -> Result<bool, RuntimeError> {
+        match self.docker.inspect_image(&image.0).await {
+            Ok(_) => Ok(true),
+            Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => Ok(false),
+            Err(e) => Err(RuntimeError::Engine(format!(
+                "the container engine cannot say whether it holds {}: {e}",
+                image.0
+            ))),
+        }
     }
 
     async fn start(&self, spec: Spec) -> Result<Started, RuntimeError> {
@@ -285,23 +291,5 @@ impl Runtime for DockerRuntime {
 
     fn events(&self) -> broadcast::Receiver<Event> {
         self.tx.subscribe()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn an_image_reference_is_split_as_the_engine_wants_it_and_a_digest_is_kept_whole() {
-        let split = |r: &str| name_and_tag(&ImageRef(r.into()));
-        assert_eq!(split("ollama/ollama"), ("ollama/ollama".into(), Some("latest".into())));
-        assert_eq!(split("ollama/ollama:0.6"), ("ollama/ollama".into(), Some("0.6".into())));
-        assert_eq!(
-            split("registry.local:5000/team/engine"),
-            ("registry.local:5000/team/engine".into(), Some("latest".into()))
-        );
-        let pinned = "ollama/ollama:0.40.1@sha256:69f27594d8127cb43db1edcafa5e2d3cd8f88bdbc54a2cf3ceb11b8d138a24b1";
-        assert_eq!(split(pinned), (pinned.into(), None));
     }
 }

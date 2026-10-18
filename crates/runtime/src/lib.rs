@@ -80,8 +80,13 @@ pub enum RuntimeError {
 /// What the door needs from a container engine.
 #[async_trait]
 pub trait Runtime: Send + Sync {
-    /// Makes the image present, telling `progress` as it goes.
+    /// Makes the image present, telling `progress` as it goes: from the registry, whether or not it is held.
     async fn pull(&self, image: &ImageRef, progress: Progress) -> Result<(), RuntimeError>;
+    /// Whether the engine holds the image now, so starting it needs no registry. An error is the engine's, never
+    /// "not held". An engine that cannot tell says no, and every image is pulled.
+    async fn holds(&self, _image: &ImageRef) -> Result<bool, RuntimeError> {
+        Ok(false)
+    }
     /// Creates and starts a container, answering its id and the published ports; emits `Started` too.
     async fn start(&self, spec: Spec) -> Result<Started, RuntimeError>;
     /// Stops and removes a container; emits `Exited`.
@@ -114,6 +119,8 @@ pub struct Fake {
     /// What a pull reports as it goes; a real engine reports every percent, often more.
     steps: Vec<Option<u8>>,
     containers: Mutex<BTreeMap<ContainerId, Spec>>,
+    /// Every image a pull was asked for, in order: what went to the registry.
+    pulled: Mutex<Vec<ImageRef>>,
     devices: Vec<DeviceId>,
     next: Mutex<u32>,
     tx: broadcast::Sender<Event>,
@@ -131,10 +138,16 @@ impl Fake {
             published: BTreeMap::new(),
             steps: vec![Some(50)],
             containers: Mutex::new(BTreeMap::new()),
+            pulled: Mutex::new(Vec::new()),
             devices,
             next: Mutex::new(0),
             tx,
         }
+    }
+
+    /// Every image a pull was asked for, in order: what went to the registry.
+    pub fn pulled(&self) -> Vec<ImageRef> {
+        self.pulled.lock().unwrap().clone()
     }
 
     /// Declares an image the registry serves, so a `pull` of it succeeds; it is not local until pulled.
@@ -200,6 +213,7 @@ impl Fake {
 #[async_trait]
 impl Runtime for Fake {
     async fn pull(&self, image: &ImageRef, progress: Progress) -> Result<(), RuntimeError> {
+        self.pulled.lock().unwrap().push(image.clone());
         if !self.open_registry && !self.registry.lock().unwrap().contains(image) {
             return Err(RuntimeError::ImageNotFound(image.0.clone()));
         }
@@ -211,6 +225,10 @@ impl Runtime for Fake {
             local.push(image.clone());
         }
         Ok(())
+    }
+
+    async fn holds(&self, image: &ImageRef) -> Result<bool, RuntimeError> {
+        Ok(self.local.lock().unwrap().contains(image))
     }
 
     async fn start(&self, spec: Spec) -> Result<Started, RuntimeError> {
