@@ -14,8 +14,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use best_peer_door::auth::Credential;
-use best_peer_door::{BestError, Catalogue, CommandDef, Emitter, Envelope, EventDef, QueryDef};
+use best_peer_door::auth::{holder_of_hash, Credential};
+use best_peer_door::{Auth, BestError, Catalogue, CommandDef, Emitter, Envelope, EventDef, QueryDef};
 use best_peer_gpu::Host;
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
@@ -73,14 +73,19 @@ enum Where {
 }
 
 /// The root door's catalogue: the machine's own hardware and lifecycle, and the workspaces it hosts.
-pub fn catalogue(svc: Arc<dyn Service>, membership: Arc<dyn Membership>) -> Catalogue {
+pub fn catalogue(svc: Arc<dyn Service>, membership: Arc<dyn Membership>, auth: Arc<Auth>) -> Catalogue {
     let mut c = lifecycle(Catalogue::new(), svc, Where::Root)
         .query(workspaces_query(membership.clone()))
         .command(create_workspace(membership.clone()))
         .command(invite_member(membership.clone()))
         .command(accept_invitation(membership.clone()))
-        .command(leave_workspace(membership));
-    for e in event_defs().into_iter().chain(membership_event_defs()) {
+        .command(leave_workspace(membership))
+        .command(revoke_agent(auth));
+    for e in event_defs()
+        .into_iter()
+        .chain(membership_event_defs())
+        .chain(credential_event_defs())
+    {
         c = c.event(e);
     }
     c
@@ -135,6 +140,7 @@ pub fn completions() -> HashMap<String, HashSet<String>> {
         ("LeaveWorkspace".to_string(), set(&["MemberLeftV1"])),
         ("ConfigureCloud".to_string(), set(&["CloudConfiguredV1"])),
         ("ArchiveCloud".to_string(), set(&["CloudArchivedV1"])),
+        ("RevokeAgent".to_string(), set(&["AgentRevokedV1"])),
     ])
 }
 
@@ -148,10 +154,15 @@ fn completes(command_type: &str) -> Vec<String> {
     v
 }
 
-/// Event type to absolute dataschema URI for the root's emitters: the lifecycle and the membership facts.
+/// Event type to absolute dataschema URI for the root's emitters: the lifecycle, the membership facts and the
+/// credentials'.
 pub fn event_dataschemas(endpoint: &str) -> HashMap<String, String> {
     let mut c = Catalogue::new();
-    for e in event_defs().into_iter().chain(membership_event_defs()) {
+    for e in event_defs()
+        .into_iter()
+        .chain(membership_event_defs())
+        .chain(credential_event_defs())
+    {
         c = c.event(e);
     }
     c.event_dataschemas(endpoint)
@@ -734,6 +745,54 @@ fn leave_workspace(m: Arc<dyn Membership>) -> CommandDef {
             Box::pin(async move { m.leave(cmd, emitter).await })
         }),
     }
+}
+
+/// Revoke agent (SPEC.md, Agent Registration): the agent takes back the credential it sends this under. Any
+/// credential may; the door is the root's, and a workspace's door closes with it, since they share the credentials.
+fn revoke_agent(auth: Arc<Auth>) -> CommandDef {
+    CommandDef {
+        schema: "revoke-agent".into(),
+        version: "1.0".into(),
+        command_type: "RevokeAgent".into(),
+        description: "Takes back the credential this command is sent under, at once and for good: from then on every request carrying it is refused with 401, on this door and every workspace door here, and an event stream open under it ends within seconds. What it left running stays, for the owner to end. The outcome is an AgentRevokedV1 event with this command's correlation id, which the credential itself can no longer read; the way back is to sign in again, from the manifest. Any credential may revoke itself, and only itself.".into(),
+        data_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        produces: vec!["AgentRevokedV1".into(), "CommandFailed".into()],
+        completes: completes("RevokeAgent"),
+        impact: None,
+        admit: None,
+        handler: Arc::new(move |cmd, em: Emitter| {
+            let auth = auth.clone();
+            Box::pin(async move {
+                let hash = em
+                    .command_key()
+                    .split_once(':')
+                    .map(|(sender, _)| sender.to_string())
+                    .unwrap_or_default();
+                match auth.revoke_own(&hash) {
+                    Ok(c) => em.emit(
+                        "AgentRevokedV1",
+                        json!({ "holder": holder_of_hash(&c.hash), "name": c.name, "revoked_at": c.revoked_at }),
+                    ),
+                    Err(why) => em.emit(
+                        "CommandFailed",
+                        json!({ "type": cmd.r#type, "reason": format!("{why}; ask whoever runs this peer to run best-peer revoke {}", holder_of_hash(&hash)) }),
+                    ),
+                };
+            })
+        }),
+    }
+}
+
+/// What the door tells about its credentials.
+pub fn credential_event_defs() -> Vec<EventDef> {
+    let s = |d: &str| json!({ "type": "string", "description": d });
+    vec![event(
+        "agent-revoked",
+        "AgentRevokedV1",
+        "A credential was taken back by the agent that held it: it opens nothing from now on.",
+        &["holder", "name", "revoked_at"],
+        json!({ "holder": s("The opaque id of the credential taken back, as its workloads' events name it"), "name": s("The connection name it signed in under"), "revoked_at": s("When, RFC 3339") }),
+    )]
 }
 
 // ----- the clouds, in a workspace ------------------------------------------------------------------------------------

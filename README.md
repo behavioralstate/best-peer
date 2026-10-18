@@ -125,7 +125,7 @@ notes say what is proven and what is not yet.
 | `crates/gpu` | The accelerator abstraction: a vendor-neutral snapshot of the host's devices (`Gpu`), each naming the compute APIs it offers (CUDA, ROCm, oneAPI, Metal, Vulkan, CPU) so a workload asks for an API and memory, never for a vendor. Ships the `Fake` tests run against. |
 | `crates/runtime` | The container runtime abstraction (`Runtime`): pull with progress, start with devices handed over by id and the ports published, stop, observe, and what the engine does on its own told as events. Ships the `Fake`. |
 | `crates/engine` | The inference engine abstraction (`Engine`): which engines serve a model (Ollama, vLLM), what to run for each, how a served model is made ready, with progress, and how it is asked to answer a conversation. Ships the `Fake`. |
-| `crates/peer` | The `best-peer` binary: the door over the three abstractions, with the peer's own commands, queries and events, its state folded from the events it told; the workspaces it hosts, each a tenant door with its clouds of peers, folded from their own logs; and `best-peer approve`, the operator's side of sign-in. |
+| `crates/peer` | The `best-peer` binary: the door over the three abstractions, with the peer's own commands, queries and events, its state folded from the events it told; the workspaces it hosts, each a tenant door with its clouds of peers, folded from their own logs; and `best-peer approve` and `best-peer revoke`, the operator's side of sign-in. |
 | `crates/host` | The host itself as a device: a `Gpu` adapter reporting the CPU and system memory, so a peer with no accelerator serves the whole lifecycle. |
 | `crates/nvml` | The `Gpu` adapter for NVIDIA cards through NVML: memory, temperature, power, utilisation and the CUDA version, read live; the peer refuses to start without the driver unless told the host has none. |
 | `crates/docker` | The `Runtime` adapter over the Docker Engine API: NVIDIA devices handed over through the container toolkit by their NVML UUID. |
@@ -296,11 +296,13 @@ lists the scopes: `deploy` (pull-image, deploy-model, undeploy-model), `jobs` (r
 nothing. Reading is every key's: the hardware state, and its own workloads and events. `best-peer approve <code>
 --may deploy` grants scopes; `--memory 40G` sets the most device memory the key's workloads may hold together,
 counted across its deployments, jobs and commands admitted but not yet started; `--expires 8h` ends the key after
-that long (`8h`, `30m`, `2d`, or seconds) whatever lifetime the agent asked for. `best-peer revoke <name>` takes a
-key back at once, by the connection name the agent signed in under or the holder id the events show, with the
-peer running and the same admin token; what the key left running is the owner's to end. Every request to the door
-is one line in the peer's log: where it came from, what it asked, what it got, and the holder, never the key; the
-sign-in endpoint admits a few registrations at a time from one address, as from one client. Every command document says which
+that long (`8h`, `30m`, `2d`, or seconds; 366 days at most, and 8 hours at most for a session credential, which an
+agent asks for when it cannot keep a secret: more is refused, never cut). `best-peer revoke <name>` takes a key back
+at once, by the connection name the agent signed in under or the holder id the events show, with the peer running
+and the same admin token; an agent takes back its own with the `revoke-agent` command, sent under it. Either way the
+key opens nothing from then on, on this door and every workspace door here, an event stream open under it ends
+within seconds, as one does when a key runs out, and what the key left running is the owner's to end. A revoke the
+disk did not keep says so: the key is closed until the peer restarts, and running the revoke again writes it. Every command document says which
 scope it needs. A command the key may not send is refused at ingest with `FORBIDDEN` and what it was approved for;
 a deploy or a job past the share with `SHARE_EXCEEDED`, what is held and the room left; a workload another key
 started, by name, whether a command, a prompt or the events are asked for, and a refusal names only what the key may

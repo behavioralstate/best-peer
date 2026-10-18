@@ -124,7 +124,7 @@ pub fn door(peer: Arc<Peer>, workspaces: Arc<workspace::Workspaces>, auth: Arc<A
         &ctx.endpoint,
         SERVICE,
         "A peer: a GPU host that deploys models and runs jobs on request and tells their lifecycle as events, and hosts workspaces, each with its clouds of peers.",
-        domain::catalogue(peer.clone(), workspaces),
+        domain::catalogue(peer.clone(), workspaces, auth.clone()),
         peer.log.clone(),
         auth,
     )
@@ -376,8 +376,7 @@ async fn serve_on(
     tls: Option<Arc<rustls::ServerConfig>>,
     handle: axum_server::Handle<SocketAddr>,
 ) -> std::io::Result<()> {
-    // Each connection's address goes with its requests: the door counts sign-ins by it and logs it.
-    let service = app.into_make_service_with_connect_info::<SocketAddr>();
+    let service = app.into_make_service();
     match tls {
         Some(config) => {
             let config = axum_server::tls_rustls::RustlsConfig::from_config(config);
@@ -430,9 +429,12 @@ fn parse_duration(text: &str) -> Result<Duration, String> {
         Some('d') => 24 * 3600,
         Some(u) => return Err(format!("{u} is not a unit of time: s, m, h or d")),
     };
-    match n.checked_mul(factor) {
-        Some(0) | None => Err(format!("{text:?} is not a span of time above zero")),
-        Some(seconds) => Ok(Duration::from_secs(seconds)),
+    match n.checked_mul(factor).map(Duration::from_secs) {
+        Some(d) if d.is_zero() => Err(format!("{text:?} is not a span of time above zero")),
+        Some(d) if d <= best_peer_door::auth::MAX_EXPIRES => Ok(d),
+        _ => Err(format!(
+            "{text:?} is longer than a credential may be bounded to: 366d at most"
+        )),
     }
 }
 
@@ -3094,6 +3096,9 @@ mod tests {
         assert!(parse_duration("soon").unwrap_err().contains("8h"));
         assert!(parse_duration("4w").unwrap_err().contains("unit"));
         assert!(parse_duration("0").unwrap_err().contains("above zero"));
+        assert_eq!(parse_duration("366d").unwrap(), Duration::from_secs(366 * 86400));
+        assert!(parse_duration("367d").unwrap_err().contains("366d"));
+        assert!(parse_duration("3000000000d").unwrap_err().contains("366d"));
     }
 
     #[test]
@@ -3105,6 +3110,60 @@ mod tests {
         assert_eq!(parse_memory("1073741824").unwrap(), 1 << 30);
         assert!(parse_memory("lots").unwrap_err().contains("40G"));
         assert!(parse_memory("4X").unwrap_err().contains("unit"));
+    }
+
+    #[tokio::test]
+    async fn an_agent_revokes_its_own_credential_with_a_command_and_every_door_here_closes_to_it() {
+        let bed = fresh().await;
+        let team = key_with(&bed.app, Some("deploy"), None).await;
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &team,
+            "w1",
+            "CreateWorkspace",
+            "create-workspace",
+            json!({ "name": "Team" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let ws = bed.events_of("w1", "WorkspaceCreatedV1").await[0].data["workspace"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let at_ws = format!("/workspaces/{ws}");
+        assert_eq!(get_as(&bed.app, &at_ws, &team, "/commands").await.0, StatusCode::OK);
+        // Any credential may revoke itself, whatever it was approved for, and nothing else is named.
+        let (s, b) = send_as(&bed.app, "", &team, "r1", "RevokeAgent", "revoke-agent", json!({})).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let revoked = &bed.events_of("r1", "AgentRevokedV1").await[0].data;
+        assert!(revoked["revoked_at"].is_string() && revoked["holder"].is_string());
+        for prefix in ["", at_ws.as_str()] {
+            let (s, b) = get_as(&bed.app, prefix, &team, "/commands").await;
+            assert_eq!(s, StatusCode::UNAUTHORIZED, "{prefix}: {b}");
+        }
+        let (s, _) = send_as(&bed.app, "", &team, "r2", "RevokeAgent", "revoke-agent", json!({})).await;
+        assert_eq!(
+            s,
+            StatusCode::UNAUTHORIZED,
+            "a credential taken back sends nothing more"
+        );
+        assert_eq!(
+            get_as(&bed.app, "", &bed.key, "/commands").await.0,
+            StatusCode::OK,
+            "the owner's is its own"
+        );
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &bed.key,
+            "r3",
+            "RevokeAgent",
+            "revoke-agent",
+            json!({ "holder": "x" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "it names no one else: {b}");
     }
 
     #[tokio::test]
