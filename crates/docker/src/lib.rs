@@ -203,7 +203,6 @@ impl Runtime for DockerRuntime {
                 network_mode: match &confinement.network {
                     Network::None => Some("none".into()),
                     Network::Default => None,
-                    Network::Named(name) => Some(name.clone()),
                 },
                 // An init as PID 1 reaps and forwards signals, so a stop reaches an image that did not expect to be it.
                 init: Some(true),

@@ -27,7 +27,7 @@ use std::time::Duration;
 use best_peer_door::{Auth, Door, EventLog, LocalApprover};
 use best_peer_engine::Engine;
 use best_peer_gpu::Gpu;
-use best_peer_runtime::{Confinement, Network, Runtime};
+use best_peer_runtime::{Confinement, Runtime};
 use lifecycle::{Confine, Images, Patience, Peer};
 use tls::Tls;
 
@@ -65,13 +65,14 @@ pub fn config(
     Ok((listen, endpoint, tls))
 }
 
-/// How the containers are confined, from `BEST_PEER_JOB_NETWORK` (`none`, the default; `default` for the container
-/// engine's own network; or the name of a network the operator made), `BEST_PEER_JOB_MEMORY` (default `4G`) and
-/// `BEST_PEER_JOB_PIDS` (default 512) for a job, `BEST_PEER_ENGINE_MEMORY` (default none) and
-/// `BEST_PEER_ENGINE_PIDS` (default 4096) for an engine; `none` for a ceiling is no ceiling. What is not named stays
-/// closed: capabilities, privileges and a job's filesystem are never opened by a variable.
+/// The least host memory a container starts with: the container engine refuses less.
+const MIN_CONTAINER_MEMORY: u64 = 6 << 20;
+
+/// How the containers are confined, from `BEST_PEER_JOB_MEMORY` (default `4G`) and `BEST_PEER_JOB_PIDS` (default
+/// 4096) for a job, `BEST_PEER_ENGINE_MEMORY` (default none) and `BEST_PEER_ENGINE_PIDS` (default 4096) for an
+/// engine; `none` for a ceiling is no ceiling. These are ceilings and nothing else: a job never has a network, and
+/// capabilities, privileges and a job's filesystem are never opened by a variable.
 pub fn confine(
-    job_network: Option<&str>,
     job_memory: Option<&str>,
     job_pids: Option<&str>,
     engine_memory: Option<&str>,
@@ -81,9 +82,15 @@ pub fn confine(
         match text.map(str::trim) {
             None => Ok(default),
             Some("none") => Ok(None),
-            Some(t) => parse_memory(t)
-                .map(Some)
-                .map_err(|why| format!("{name}: {why}, or none")),
+            Some(t) => match parse_memory(t) {
+                Ok(m) if m < MIN_CONTAINER_MEMORY => Err(format!(
+                    "{name}: {t:?} is less than the 6M a container starts with: write 4G, 512M or a number of bytes \
+                     from 6M up, or none for no ceiling"
+                )),
+                Ok(m) if m > i64::MAX as u64 => Err(format!("{name}: {t:?} is more memory than exists, or none")),
+                Ok(m) => Ok(Some(m)),
+                Err(why) => Err(format!("{name}: {why}, or none")),
+            },
         }
     };
     let pids = |name: &str, text: Option<&str>, default: u64| -> Result<Option<u64>, String> {
@@ -93,24 +100,14 @@ pub fn confine(
             Some(t) => match t.parse::<u64>() {
                 Ok(n) if n > 0 => Ok(Some(n)),
                 _ => Err(format!(
-                    "{name} must be a number of processes above zero, or none, not {t:?}"
+                    "{name} must be a number of tasks above zero (every thread counts as one), or none, not {t:?}"
                 )),
             },
         }
     };
     let mut job = Confinement::default();
-    job.network = match job_network.map(str::trim) {
-        None | Some("none") => Network::None,
-        Some("default") => Network::Default,
-        Some(name) if !name.is_empty() => Network::Named(name.into()),
-        Some(_) => {
-            return Err(
-                "BEST_PEER_JOB_NETWORK must be none, default or the name of a network the container engine has".into(),
-            )
-        }
-    };
     job.memory_bytes = memory("BEST_PEER_JOB_MEMORY", job_memory, job.memory_bytes)?;
-    job.pids = pids("BEST_PEER_JOB_PIDS", job_pids, 512)?;
+    job.pids = pids("BEST_PEER_JOB_PIDS", job_pids, 4096)?;
     let mut engine = Confinement::serving();
     engine.memory_bytes = memory("BEST_PEER_ENGINE_MEMORY", engine_memory, None)?;
     engine.pids = pids("BEST_PEER_ENGINE_PIDS", engine_pids, 4096)?;
@@ -393,7 +390,6 @@ async fn peer_app(endpoint: &str, dir: &std::path::Path, log: Arc<EventLog>, aut
     };
     let holdings = Arc::new(holdings::Holdings::default());
     let confine = confine(
-        std::env::var("BEST_PEER_JOB_NETWORK").ok().as_deref(),
         std::env::var("BEST_PEER_JOB_MEMORY").ok().as_deref(),
         std::env::var("BEST_PEER_JOB_PIDS").ok().as_deref(),
         std::env::var("BEST_PEER_ENGINE_MEMORY").ok().as_deref(),
@@ -581,7 +577,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{header, Request, StatusCode};
     use best_peer_door::{Envelope, FakeApprover, Filter};
-    use best_peer_runtime::ContainerId;
+    use best_peer_runtime::{ContainerId, Network};
     use futures::StreamExt;
     use http_body_util::BodyExt;
 
@@ -3095,37 +3091,46 @@ mod tests {
     }
 
     #[test]
-    fn the_confinement_is_closed_unless_the_operator_opens_something_by_name() {
-        let c = confine(None, None, None, None, None).unwrap();
+    fn the_confinement_is_closed_and_the_operator_sets_only_its_ceilings() {
+        let c = confine(None, None, None, None).unwrap();
         assert_eq!(c.job, Confinement::default());
         assert_eq!(c.engine, Confinement::serving());
         assert_eq!(c.job.network, Network::None);
         assert_eq!(c.job.memory_bytes, Some(4 << 30));
-        assert_eq!(c.job.pids, Some(512));
+        assert_eq!(c.job.pids, Some(4096), "a training job's threads fit under the default");
         assert_eq!(c.engine.memory_bytes, None);
         assert_eq!(c.engine.pids, Some(4096));
-        let c = confine(Some("default"), Some("8G"), Some("none"), Some("16G"), Some("100")).unwrap();
-        assert_eq!(c.job.network, Network::Default);
+        let c = confine(Some("8G"), Some("none"), Some("16G"), Some("100")).unwrap();
         assert_eq!(c.job.memory_bytes, Some(8 << 30));
         assert_eq!(c.job.pids, None);
         assert_eq!(c.engine.memory_bytes, Some(16 << 30));
         assert_eq!(c.engine.pids, Some(100));
         assert!(
-            c.job.drop_capabilities && c.job.no_new_privileges && c.job.read_only_root,
-            "what was not named stays closed"
+            c.job.drop_capabilities
+                && c.job.no_new_privileges
+                && c.job.read_only_root
+                && c.job.network == Network::None,
+            "what is not a ceiling stays closed"
         );
-        let c = confine(Some("best-peer"), Some("none"), None, None, None).unwrap();
-        assert_eq!(c.job.network, Network::Named("best-peer".into()));
-        assert_eq!(c.job.memory_bytes, None);
+        let c = confine(Some("none"), None, None, None).unwrap();
+        assert_eq!(c.job.memory_bytes, None, "none is the one way to no ceiling");
+        assert_eq!(
+            confine(Some("6M"), None, None, None).unwrap().job.memory_bytes,
+            Some(6 << 20)
+        );
         for (why, args) in [
-            ("BEST_PEER_JOB_NETWORK", (Some(" "), None, None, None, None)),
-            ("BEST_PEER_JOB_MEMORY", (None, Some("lots"), None, None, None)),
-            ("BEST_PEER_JOB_PIDS", (None, None, Some("0"), None, None)),
-            ("BEST_PEER_ENGINE_MEMORY", (None, None, None, Some("4X"), None)),
-            ("BEST_PEER_ENGINE_PIDS", (None, None, None, None, Some("many"))),
+            ("BEST_PEER_JOB_MEMORY", (Some("lots"), None, None, None)),
+            ("BEST_PEER_JOB_MEMORY", (Some("0"), None, None, None)),
+            ("BEST_PEER_JOB_MEMORY", (Some("5M"), None, None, None)),
+            ("BEST_PEER_JOB_MEMORY", (Some("9000000T"), None, None, None)),
+            ("BEST_PEER_JOB_PIDS", (None, Some("0"), None, None)),
+            ("BEST_PEER_ENGINE_MEMORY", (None, None, Some("4X"), None)),
+            ("BEST_PEER_ENGINE_MEMORY", (None, None, Some("0"), None)),
+            ("BEST_PEER_ENGINE_PIDS", (None, None, None, Some("many"))),
         ] {
-            let err = confine(args.0, args.1, args.2, args.3, args.4).unwrap_err();
+            let err = confine(args.0, args.1, args.2, args.3).unwrap_err();
             assert!(err.contains(why), "{err}");
+            assert!(err.contains("none"), "the refusal names the way to no ceiling: {err}");
         }
     }
 
@@ -3557,7 +3562,7 @@ mod tests {
         let container = ContainerId(started["container"].as_str().unwrap().into());
         let spec = bed.runtime.spec_of(&container).unwrap();
         assert_eq!(spec.args, vec!["echo", "hi"]);
-        // A job runs code the peer did not write: a closed box unless the operator opened something by name.
+        // A job runs code the peer did not write: a closed box, whatever the operator set.
         assert_eq!(spec.confinement, Confinement::default());
         assert_eq!(spec.confinement.network, Network::None);
         assert!(
@@ -3568,6 +3573,25 @@ mod tests {
                 && spec.confinement.memory_bytes.is_some()
         );
         assert_eq!(bed.query("get-workloads").await["jobs"][0]["phase"], "running");
+        // The host memory it holds runs out: the fix is the host's ceiling, not the device memory it asked for.
+        let (s, _) = bed
+            .send(
+                "j5",
+                "RunJob",
+                "run-job",
+                json!({ "image": "busybox", "memory_bytes": GB }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED);
+        let events = bed.events_of("j5", "JobStarted").await;
+        let oom = ContainerId(events.last().unwrap().data["container"].as_str().unwrap().into());
+        bed.runtime.out_of_memory(&oom).unwrap();
+        let events = bed.events_of("j5", "JobFailed").await;
+        let failed = &events.last().unwrap().data;
+        assert_eq!(failed["host_memory_bytes"], 4u64 << 30);
+        assert!(failed["reason"].as_str().unwrap().contains("host memory"), "{failed}");
+        assert!(failed["fix"].as_str().unwrap().contains("ceiling"), "{failed}");
+        assert!(!failed["fix"].as_str().unwrap().contains("memory_bytes"), "{failed}");
         // The engine ends it: the exit is told, and the memory is free.
         bed.runtime.stop(&container).await.unwrap();
         let events = bed.events_of("j1", "JobFinished").await;

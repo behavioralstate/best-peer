@@ -205,13 +205,15 @@ the peer carries it to the engine. Prompts are answered sixteen at a time per pe
 accepted, in order.
 
 A container runs confined, since a peer runs code it did not write: no capabilities, no new privileges, a ceiling on
-processes, and for a job a read-only filesystem with a private `/tmp`, no network and a ceiling on host memory.
-`BEST_PEER_JOB_NETWORK` (default `none`) is what a job may reach: `default` for the container engine's own network,
-or the name of a network you made; `BEST_PEER_JOB_MEMORY` (default `4G`) and `BEST_PEER_JOB_PIDS` (default 512) are a
-job's ceilings, `BEST_PEER_ENGINE_MEMORY` (default none) and `BEST_PEER_ENGINE_PIDS` (default 4096) an engine's;
-`none` for a ceiling is no ceiling. The engines keep their network, which they need to pull models, and a writable
-filesystem, which they keep the models on. Capabilities, privileges and a job's filesystem are never opened by a
-variable.
+tasks (every thread counts as one), and a small init as its first process, which reaps what the image leaves behind
+and passes a stop on to it. A job also gets a read-only filesystem with a private `/tmp` of 1 GiB, which counts in its
+memory, no network, ever, and a ceiling on host memory with swap counted in. `BEST_PEER_JOB_MEMORY` (default `4G`)
+and `BEST_PEER_JOB_PIDS` (default 4096) are a job's ceilings, `BEST_PEER_ENGINE_MEMORY` (default none) and
+`BEST_PEER_ENGINE_PIDS` (default 4096) an engine's; `none` is no ceiling, and a memory ceiling under the 6M a
+container starts with is refused at start. Host memory is not device memory: a job that reaches its ceiling ends in
+`JobFailed` naming it, whatever `memory_bytes` it asked for. The engines keep their network, which they need to pull
+models, and a writable filesystem, which they keep the models on. Capabilities, privileges, a job's network and a
+job's filesystem are never opened by a variable.
 
 ## Deploy
 

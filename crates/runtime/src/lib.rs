@@ -45,11 +45,11 @@ pub struct Confinement {
     pub drop_capabilities: bool,
     /// No setuid binary or file capability gains a privilege the container did not start with.
     pub no_new_privileges: bool,
-    /// The image's filesystem is read-only, with a private `/tmp`.
+    /// The image's filesystem is read-only, with a private `/tmp` of at most 1 GiB, counted in its memory.
     pub read_only_root: bool,
-    /// The most processes the container may hold; none for the engine's own default.
+    /// The most tasks the container may hold, every thread counted as one; none for the engine's own default.
     pub pids: Option<u64>,
-    /// The most host memory the container may hold, swap counted in; none for no ceiling.
+    /// The most host memory the container may hold, swap counted in; none for no ceiling. Not device memory.
     pub memory_bytes: Option<u64>,
     pub network: Network,
 }
@@ -69,28 +69,28 @@ impl Confinement {
     }
 }
 
-/// The closed box a job gets: no network, no capabilities, no new privileges, a read-only root, 512 processes
-/// and 4 GiB of host memory at most.
+/// The closed box a job gets: no network, no capabilities, no new privileges, a read-only root, 4096 tasks and
+/// 4 GiB of host memory at most.
 impl Default for Confinement {
     fn default() -> Self {
         Self {
             drop_capabilities: true,
             no_new_privileges: true,
             read_only_root: true,
-            pids: Some(512),
+            pids: Some(4096),
             memory_bytes: Some(4 << 30),
             network: Network::None,
         }
     }
 }
 
-/// Where a container's network goes: nowhere, the engine's own default, or a network the operator made and named.
+/// Where a container's network goes: nowhere, what a job gets, or the container engine's own default, what an
+/// engine gets to pull its models.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Network {
     None,
     Default,
-    Named(String),
 }
 
 /// A published port: the container's and the host's.

@@ -41,10 +41,10 @@ impl Images {
 }
 
 /// How the containers are confined, as the operator set it. A job runs code the peer did not write, so it gets no
-/// network, no capabilities, a read-only filesystem and ceilings on memory and processes unless the operator
-/// loosened one of those (`BEST_PEER_JOB_NETWORK`, `BEST_PEER_JOB_MEMORY`, `BEST_PEER_JOB_PIDS`); an engine keeps
-/// its network and a writable filesystem, which it needs for the models, under the same capability and privilege
-/// rules and its own ceilings (`BEST_PEER_ENGINE_MEMORY`, `BEST_PEER_ENGINE_PIDS`).
+/// network, no capabilities and a read-only filesystem, always, under ceilings on host memory and tasks the
+/// operator sets (`BEST_PEER_JOB_MEMORY`, `BEST_PEER_JOB_PIDS`); an engine keeps its network and a writable
+/// filesystem, which it needs for the models, under the same capability and privilege rules and its own ceilings
+/// (`BEST_PEER_ENGINE_MEMORY`, `BEST_PEER_ENGINE_PIDS`).
 #[derive(Clone, Debug)]
 pub struct Confine {
     pub job: Confinement,
@@ -1005,20 +1005,35 @@ impl Peer {
                     if let Err(e) = self.runtime.stop(&dep.container).await {
                         tracing::warn!(container = %dep.container.0, error = %e, "the out-of-memory container could not be stopped");
                     }
+                    let fix = match self.confine.engine.memory_bytes {
+                        Some(ceiling) => format!("deploy a smaller model, or ask for more memory_bytes so it is placed where it fits; an engine may also hold {ceiling} bytes of host memory at most, which whoever runs the peer sets"),
+                        None => "deploy a smaller model, or ask for more memory_bytes so it is placed where it fits".to_string(),
+                    };
                     self.tell(
                         &em,
                         "OutOfMemory",
-                        json!({ "deployment": dep.id, "model": dep.model, "device": dep.device.0, "memory_bytes": dep.memory_bytes, "fix": "deploy a smaller model, or ask for more memory_bytes so it is placed where it fits" }),
+                        json!({ "deployment": dep.id, "model": dep.model, "device": dep.device.0, "memory_bytes": dep.memory_bytes, "fix": fix }),
                     );
                 }
             }
             (RuntimeEvent::OutOfMemory { id }, Owner::Job(job)) => {
                 if self.job_running(&job) {
                     let _ = self.runtime.stop(&id).await;
+                    // The container's own memory ran out, the host's and not the device's: memory_bytes does not move it.
+                    let (reason, fix) = match self.confine.job.memory_bytes {
+                        Some(ceiling) => (
+                            format!("out of host memory: a job holds {ceiling} bytes of host memory at most on this peer, device memory apart"),
+                            "hold less in host memory (fewer loader workers, smaller batches, weights streamed to the device), or ask whoever runs the peer to raise the ceiling".to_string(),
+                        ),
+                        None => (
+                            "out of host memory: the host had no more to give".to_string(),
+                            "hold less in host memory (fewer loader workers, smaller batches, weights streamed to the device)".to_string(),
+                        ),
+                    };
                     self.tell(
                         &em,
                         "JobFailed",
-                        json!({ "job": job, "reason": "out of memory", "fix": "run it with more memory_bytes so it is placed where it fits" }),
+                        json!({ "job": job, "reason": reason, "host_memory_bytes": self.confine.job.memory_bytes, "fix": fix }),
                     );
                 }
             }
