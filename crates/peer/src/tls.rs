@@ -57,7 +57,7 @@ impl Tls {
 }
 
 /// What the peer serves and where, for `best-peer approve`.
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Record {
     pub listen: SocketAddr,
     pub endpoint: String,
@@ -68,13 +68,15 @@ pub struct Record {
 
 impl Record {
     const FILE: &'static str = "door";
+    /// More than any record the peer writes: an address, an endpoint and a certificate.
+    pub const MAX_BYTES: u64 = 1 << 20;
 
     pub fn write(&self, dir: &Path) -> std::io::Result<()> {
         std::fs::write(dir.join(Self::FILE), serde_json::to_vec_pretty(self)?)
     }
 
     pub fn read(dir: &Path) -> std::io::Result<Self> {
-        let text = read_plain(&dir.join(Self::FILE), 1 << 20)?;
+        let text = read_plain(&dir.join(Self::FILE), Self::MAX_BYTES, "the record of the running peer")?;
         serde_json::from_str(&text).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
@@ -90,27 +92,157 @@ impl Record {
     }
 
     /// Where `approve` connects, when that is an address of this machine: the token never leaves it, whoever wrote
-    /// the record.
+    /// the record. Loopback always is; another address is when one of this machine's interfaces holds it now.
     pub fn dial_here(&self) -> Result<SocketAddr, String> {
         let addr = self.dial();
-        match std::net::UdpSocket::bind(SocketAddr::new(addr.ip(), 0)) {
-            Ok(_) => Ok(addr),
-            Err(_) => Err(format!(
-                "the record of the running peer names {addr}, which is not an address of this machine: the admin token goes nowhere else"
-            )),
+        if addr.ip().to_canonical().is_loopback() || holds(addr.ip()) {
+            Ok(addr)
+        } else {
+            Err(format!(
+                "the record of the running peer names {addr}, which no interface of this machine holds: the admin token goes nowhere else; is the peer running here with the same BEST_PEER_DATA?"
+            ))
         }
     }
 }
 
+/// Whether one of this machine's interfaces holds `ip` now, as the kernel lists them: never a guess from whether the
+/// address can be bound, which a host that binds addresses it does not hold (`ip_nonlocal_bind`) allows for any.
+#[cfg(unix)]
+fn holds(ip: std::net::IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return false;
+    }
+    let mut found = false;
+    let mut at = list;
+    while !at.is_null() {
+        let entry = unsafe { &*at };
+        if !entry.ifa_addr.is_null() {
+            let family = i32::from(unsafe { (*entry.ifa_addr).sa_family });
+            let here: Option<std::net::IpAddr> = if family == libc::AF_INET {
+                let v4 = unsafe { &*(entry.ifa_addr as *const libc::sockaddr_in) };
+                Some(std::net::Ipv4Addr::from(u32::from_be(v4.sin_addr.s_addr)).into())
+            } else if family == libc::AF_INET6 {
+                let v6 = unsafe { &*(entry.ifa_addr as *const libc::sockaddr_in6) };
+                Some(std::net::Ipv6Addr::from(v6.sin6_addr.s6_addr).into())
+            } else {
+                None
+            };
+            if here.is_some_and(|h| h.to_canonical() == ip) {
+                found = true;
+                break;
+            }
+        }
+        at = entry.ifa_next;
+    }
+    unsafe { libc::freeifaddrs(list) };
+    found
+}
+
+/// On Windows an address is bound only by the machine that holds it, so binding is the test.
+#[cfg(not(unix))]
+fn holds(ip: std::net::IpAddr) -> bool {
+    std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
+}
+
+/// Whether the data directory is reached without a link someone other than the administrator could have made: every
+/// part of its path is looked at, the last included whatever separator ends it. On Unix a link that root owns, in a
+/// directory only root may change, is the system's own (`/home` leading elsewhere) and is followed; any other is
+/// refused, naming where it leads now. Windows has no such owner to read, so any link or junction is refused.
+pub fn data_dir_trusted(dir: &Path) -> Result<(), String> {
+    let dir = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("cannot tell where {} is: {e}", dir.display()))?
+            .join(dir)
+    };
+    let mut at = PathBuf::new();
+    for part in dir.components() {
+        at.push(part);
+        let Ok(meta) = std::fs::symlink_metadata(&at) else {
+            continue;
+        };
+        if !meta.file_type().is_symlink() || system_link(&at, &meta) {
+            continue;
+        }
+        let leads = std::fs::canonicalize(&dir)
+            .map(|c| c.display().to_string())
+            .unwrap_or_else(|_| "nowhere it can read".into());
+        return Err(format!(
+            "the data directory {} is reached through a link at {}, which the administrator did not make; approve and revoke read it where it is, never through a link: set BEST_PEER_DATA to the directory itself (it leads to {leads} now), if that is where the peer keeps its data",
+            dir.display(),
+            at.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn system_link(link: &Path, meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let parent_is_roots = link
+        .parent()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .is_some_and(|p| p.uid() == 0 && p.mode() & 0o022 == 0);
+    meta.uid() == 0 && parent_is_roots
+}
+
+#[cfg(not(unix))]
+fn system_link(_link: &Path, _meta: &std::fs::Metadata) -> bool {
+    false
+}
+
 /// A file's text when it is the file itself, at most `limit` bytes: never a link to another, by name or by a second
-/// hard link, so a command run with more rights than the data directory's owner reads nothing that owner did not write.
-pub fn read_plain(path: &Path, limit: u64) -> std::io::Result<String> {
+/// hard link, never a pipe or a device, so a command run with more rights than the data directory's owner reads
+/// nothing that owner did not write. A file that is not there is `NotFound`; any other refusal names the file, what
+/// it is, and the fix.
+pub fn read_plain(path: &Path, limit: u64, what: &str) -> std::io::Result<String> {
     use std::io::Read;
-    let refuse = |why: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{}: {why}", path.display()));
+    let refuse = |why: String| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is {why}, which {what} never is: it is read only as the file the peer wrote; remove it and start the peer again, which writes it anew", path.display()),
+        )
+    };
     let named = std::fs::symlink_metadata(path)?;
     if !named.file_type().is_file() {
-        return Err(refuse("not a plain file"));
+        return Err(refuse(kind_of(&named).into()));
     }
+    let file = open_no_follow(path)?;
+    let opened = file.metadata()?;
+    if !opened.file_type().is_file() {
+        return Err(refuse(format!(
+            "{}, put in its place while it was opened",
+            kind_of(&opened)
+        )));
+    }
+    if links(&opened) > 1 {
+        return Err(refuse("a hard link to a file named elsewhere too".into()));
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(refuse(format!("larger than {limit} bytes")));
+    }
+    String::from_utf8(bytes).map_err(|_| refuse("not text".into()))
+}
+
+fn kind_of(meta: &std::fs::Metadata) -> &'static str {
+    let t = meta.file_type();
+    if t.is_symlink() {
+        "a link"
+    } else if t.is_dir() {
+        "a directory"
+    } else {
+        "not a plain file (a pipe, a socket or a device)"
+    }
+}
+
+/// Opens `path` for reading without following a link in its last part and without waiting on a pipe, whatever was
+/// put there since it was looked at.
+pub fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -118,24 +250,37 @@ pub fn read_plain(path: &Path, limit: u64) -> std::io::Result<String> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    let file = options.open(path)?;
-    let opened = file.metadata()?;
-    if !opened.file_type().is_file() {
-        return Err(refuse("replaced while it was opened"));
-    }
-    #[cfg(unix)]
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::MetadataExt;
-        if opened.nlink() != 1 {
-            return Err(refuse("a hard link to another file"));
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{} is a link or a junction", path.display()),
+            ));
         }
     }
-    let mut text = String::new();
-    file.take(limit + 1).read_to_string(&mut text)?;
-    if text.len() as u64 > limit {
-        return Err(refuse("larger than it can be"));
-    }
-    Ok(text)
+    Ok(file)
+}
+
+/// How many names the opened file has; Windows' stable library does not say, so there it is taken as one.
+#[cfg(unix)]
+fn links(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.nlink()
+}
+
+#[cfg(not(unix))]
+fn links(_meta: &std::fs::Metadata) -> u64 {
+    1
 }
 
 /// The names the peer's own certificate carries: this machine's loopback by its three names, the host the endpoint
@@ -534,33 +679,149 @@ mod tests {
             certificate: None,
         };
         assert_eq!(here.dial_here().unwrap().to_string(), "127.0.0.1:7777");
-        let elsewhere = Record {
-            listen: "192.0.2.1:7777".parse().unwrap(),
-            ..here
+        let v6 = Record {
+            listen: "[::1]:7777".parse().unwrap(),
+            ..here.clone()
         };
-        assert!(elsewhere
-            .dial_here()
-            .unwrap_err()
-            .contains("not an address of this machine"));
+        assert_eq!(v6.dial_here().unwrap().to_string(), "[::1]:7777");
+        for remote in ["192.0.2.1:7777", "[2001:db8::1]:7777"] {
+            let elsewhere = Record {
+                listen: remote.parse().unwrap(),
+                ..here.clone()
+            };
+            assert!(
+                elsewhere
+                    .dial_here()
+                    .unwrap_err()
+                    .contains("no interface of this machine holds"),
+                "{remote}"
+            );
+        }
     }
 
     #[cfg(unix)]
     #[test]
-    fn a_link_in_the_data_directory_is_never_followed() {
+    fn this_machines_addresses_are_read_from_its_interfaces_not_guessed_by_binding() {
+        assert!(holds("127.0.0.1".parse().unwrap()));
+        assert!(holds("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(!holds("192.0.2.1".parse().unwrap()));
+        assert!(!holds("2001:db8::1".parse().unwrap()));
+    }
+
+    fn record_json() -> String {
+        serde_json::to_string(&Record {
+            listen: "127.0.0.1:7777".parse().unwrap(),
+            endpoint: "https://127.0.0.1:7777".into(),
+            certificate: None,
+        })
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_last_part_of_the_path_is_never_followed_even_when_it_changed_after_it_was_looked_at() {
         let dir = tempfile::tempdir().unwrap();
-        let elsewhere = dir.path().join("elsewhere");
-        std::fs::write(&elsewhere, "not the peer's").unwrap();
-        std::os::unix::fs::symlink(&elsewhere, dir.path().join("admin-token")).unwrap();
-        assert!(read_plain(&dir.path().join("admin-token"), 1024).is_err());
-        std::fs::hard_link(&elsewhere, dir.path().join("door")).unwrap();
-        assert!(Record::read(dir.path()).is_err());
+        std::fs::write(dir.path().join("elsewhere"), record_json()).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("elsewhere"), dir.path().join("door")).unwrap();
+        assert!(
+            open_no_follow(&dir.path().join("door")).is_err(),
+            "opened through a link to a readable file"
+        );
+        let err = Record::read(dir.path()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("is a link") && err.to_string().contains("start the peer again"),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_is_never_waited_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("admin-token");
+        let c = std::ffi::CString::new(fifo.clone().into_os_string().into_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let opening = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(open_no_follow(&opening).map(|_| ()));
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok(),
+            "the open waited for a writer"
+        );
+        let err = read_plain(&fifo, 4096, "an admin token").unwrap_err();
+        assert!(err.to_string().contains("not a plain file"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_second_name_for_the_file_is_refused_whatever_it_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("elsewhere"), record_json()).unwrap();
+        std::fs::hard_link(dir.path().join("elsewhere"), dir.path().join("door")).unwrap();
+        let err = Record::read(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("hard link"), "{err}");
+        std::fs::remove_file(dir.path().join("elsewhere")).unwrap();
+        assert!(Record::read(dir.path()).is_ok(), "one name, a record");
+    }
+
+    #[test]
+    fn what_is_read_is_bounded_text_and_a_missing_file_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("admin-token");
+        assert_eq!(
+            read_plain(&token, 4096, "an admin token").unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        std::fs::write(&token, "x".repeat(4097)).unwrap();
+        let err = read_plain(&token, 4096, "an admin token").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("larger than 4096 bytes, which an admin token never is"),
+            "{err}"
+        );
+        std::fs::write(&token, [b'x', 0xff, 0xfe]).unwrap();
+        assert!(read_plain(&token, 4096, "an admin token")
+            .unwrap_err()
+            .to_string()
+            .contains("not text"));
+        std::fs::write(&token, "the token\n").unwrap();
+        assert_eq!(read_plain(&token, 4096, "an admin token").unwrap(), "the token\n");
+        std::fs::write(dir.path().join("door"), " ".repeat(Record::MAX_BYTES as usize + 1)).unwrap();
+        assert!(Record::read(dir.path())
+            .unwrap_err()
+            .to_string()
+            .contains("larger than 1048576 bytes"));
         std::fs::remove_file(dir.path().join("door")).unwrap();
-        let fifo = std::ffi::CString::new(dir.path().join("fifo").into_os_string().into_encoded_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-        assert!(read_plain(&dir.path().join("fifo"), 1024).is_err());
-        std::fs::write(dir.path().join("token"), "x".repeat(2048)).unwrap();
-        assert!(read_plain(&dir.path().join("token"), 1024).is_err());
-        std::fs::write(dir.path().join("token"), "the token\n").unwrap();
-        assert_eq!(read_plain(&dir.path().join("token"), 1024).unwrap(), "the token\n");
+        std::fs::create_dir(dir.path().join("door")).unwrap();
+        assert!(Record::read(dir.path())
+            .unwrap_err()
+            .to_string()
+            .contains("a directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_data_directory_reached_through_a_link_anyone_but_root_made_is_refused_wherever_the_link_is() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        std::fs::create_dir_all(real.join("data")).unwrap();
+        assert!(data_dir_trusted(&real.join("data")).is_ok());
+        std::os::unix::fs::symlink(real.join("data"), root.path().join("data")).unwrap();
+        std::os::unix::fs::symlink(&real, root.path().join("parent")).unwrap();
+        for through in [
+            root.path().join("data"),
+            PathBuf::from(format!("{}/", root.path().join("data").display())),
+            root.path().join("parent").join("data"),
+        ] {
+            let why = data_dir_trusted(&through).unwrap_err();
+            assert!(
+                why.contains("through a link") && why.contains("BEST_PEER_DATA") && why.contains("real/data"),
+                "{}: {why}",
+                through.display()
+            );
+        }
     }
 }

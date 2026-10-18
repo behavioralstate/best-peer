@@ -78,6 +78,9 @@ fn data_dir() -> PathBuf {
     }
 }
 
+/// More than any admin token the peer writes, which is 43 characters.
+const ADMIN_TOKEN_MAX: u64 = 4096;
+
 /// The service key in the manifest, and the `source` of every event.
 const SERVICE: &str = "io.best.agents";
 
@@ -445,26 +448,21 @@ fn parse_duration(text: &str) -> Result<Duration, String> {
 /// sends nothing that user could not read, and nowhere else.
 fn as_the_authority(path: &str, mut form: Vec<(&str, String)>) -> (u16, serde_json::Value) {
     let dir = data_dir();
-    if std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink()) {
-        fail(&format!(
-            "{} is a link: the data directory is read where it is, never through a link",
-            dir.display()
-        ));
-    }
-    let token = tls::read_plain(&dir.join("admin-token"), 4096)
-        .map(|t| t.trim().to_string())
-        .unwrap_or_else(|e| {
-            fail(&format!(
-                "no admin token in {}: is the peer running on this machine with the same BEST_PEER_DATA? ({e})",
+    tls::data_dir_trusted(&dir).unwrap_or_else(|why| fail(&why));
+    let missing = |what: &str, e: std::io::Error| -> String {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            format!(
+                "no {what} in {}: is the peer running on this machine with the same BEST_PEER_DATA?",
                 dir.display()
-            ))
-        });
-    let record = tls::Record::read(&dir).unwrap_or_else(|e| {
-        fail(&format!(
-            "no record of a running peer in {}: is the peer running on this machine with the same BEST_PEER_DATA? ({e})",
-            dir.display()
-        ))
-    });
+            )
+        } else {
+            e.to_string()
+        }
+    };
+    let token = tls::read_plain(&dir.join("admin-token"), ADMIN_TOKEN_MAX, "an admin token")
+        .map(|t| t.trim().to_string())
+        .unwrap_or_else(|e| fail(&missing("admin token", e)));
+    let record = tls::Record::read(&dir).unwrap_or_else(|e| fail(&missing("record of a running peer", e)));
     let addr = record.dial_here().unwrap_or_else(|why| fail(&why));
     form.push(("proof", token));
     let body = serde_urlencoded::to_string(&form).unwrap_or_else(|e| fail(&format!("cannot encode the request: {e}")));

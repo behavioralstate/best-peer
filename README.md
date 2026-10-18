@@ -157,8 +157,13 @@ start, `tls/cert.pem` under its data folder, named at start for clients to pin, 
 host changes or fewer than thirty days of it remain, which the start-up line says. `BEST_PEER_DATA` (default
 `~/.best-peer`) holds the event log, the credentials as hashes, the admin token, that certificate, and the record of
 where the door is that `best-peer approve` reads, so it reaches the peer over the same TLS, pinned to that
-certificate and no other. `approve` and `revoke` read the token and that record as plain files, never through a link,
-and dial an address of this machine only, so they may run with more rights than the peer's user.
+certificate and no other. `approve` and `revoke` may run with more rights than the peer's
+user, so they read only what that user wrote and send the token nowhere else. They refuse a data directory reached
+through a link anyone but the administrator made (on Unix a link root owns, in a directory only root may change, is
+followed; on Windows no link or junction is), and say which directory to set instead. They read the token (4 KiB at
+most) and the record (1 MiB at most) as the files themselves: not through a link in the last part of the path, not
+a pipe or a device, and on Unix not a file with a second hard link, which Windows' stable library cannot tell. They
+dial loopback, or an address one of this machine's interfaces holds now (on Windows, one it can bind).
 
 Every door hosts **workspaces**, the BEST tenants. The root manifest declares their template
 (`/.well-known/best/{tenantId}`), and a workspace's own door is at `/workspaces/<id>` under the root, with its own
