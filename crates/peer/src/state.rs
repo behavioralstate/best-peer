@@ -90,6 +90,22 @@ pub struct State {
 }
 
 impl State {
+    /// What `holder` holds here, for the door's holdings: device memory, and the deployments and jobs running or
+    /// admitted.
+    pub fn holdings_of(&self, holder: &str) -> crate::holdings::Held {
+        let admitted = |kind: &str| {
+            self.reserved
+                .values()
+                .filter(|r| r.holder == holder && r.id.starts_with(kind))
+                .count()
+        };
+        crate::holdings::Held {
+            memory_bytes: self.held_by(holder),
+            deployments: self.deployments.values().filter(|d| d.holder == holder).count() + admitted("dep-"),
+            jobs: self.jobs.values().filter(|j| j.holder == holder).count() + admitted("job-"),
+        }
+    }
+
     /// The device memory promised to one holder's workloads, admitted ones included: what a share is measured
     /// against.
     pub fn held_by(&self, holder: &str) -> u64 {

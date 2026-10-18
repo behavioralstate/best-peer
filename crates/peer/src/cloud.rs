@@ -26,7 +26,7 @@ use crate::domain::Service;
 use crate::holdings::Holdings;
 use crate::lifecycle::{
     any_compute, has_share, mine, new_id, not_yours, parse, place, ready_deployment, require, shown_to, usable_by,
-    within_share, workloads_view,
+    within_count, within_share, workloads_view,
 };
 use crate::member::{Heard, Member, Refusal};
 use crate::state::{JobPhase, Phase, Reservation, State};
@@ -251,8 +251,8 @@ impl Cloud {
         let weak = Arc::downgrade(&cloud);
         holdings.add(move |holder| {
             weak.upgrade()
-                .map(|c| c.state.lock().unwrap().held_by(holder))
-                .unwrap_or(0)
+                .map(|c| c.state.lock().unwrap().holdings_of(holder))
+                .unwrap_or_default()
         });
         cloud
     }
@@ -1169,9 +1169,15 @@ impl Service for Cloud {
         // One admission at a time across the door, and what the credential holds is read before the state is
         // locked, since the door's holdings read this state too.
         let _admitting = self.holdings.admitting();
-        let held = self.holdings.held_by(&who.holder());
+        let held = self.holdings.of(&who.holder());
         let mut state = self.state.lock().unwrap();
-        within_share(held, &who, data.memory_bytes)?;
+        within_share(held.memory_bytes, &who, data.memory_bytes)?;
+        within_count(
+            &who,
+            "deployment",
+            held.deployments,
+            self.holdings.ceilings().deployments,
+        )?;
         let (device, compute) = place(
             &host,
             &state,
@@ -1332,9 +1338,10 @@ impl Service for Cloud {
             None => host,
         };
         let _admitting = self.holdings.admitting();
-        let held = self.holdings.held_by(&who.holder());
+        let held = self.holdings.of(&who.holder());
         let mut state = self.state.lock().unwrap();
-        within_share(held, &who, data.memory_bytes.unwrap_or(0))?;
+        within_share(held.memory_bytes, &who, data.memory_bytes.unwrap_or(0))?;
+        within_count(&who, "job", held.jobs, self.holdings.ceilings().jobs)?;
         let placement = match data.memory_bytes {
             Some(needed) => place(
                 &host,

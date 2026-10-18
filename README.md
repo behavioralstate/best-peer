@@ -90,7 +90,8 @@ Their client's next poll receives a key under that name. No accounts, no passwor
 decides who is in, as with SSH keys, and what they may do: approved with nothing more said, a key may do everything;
 `--may deploy,prompt --memory 40G` makes one that may deploy models and prompt them but run no job, and hold 40 GiB
 of device memory at most across its workloads, which it alone sees, prompts and ends. A key with a share runs on
-the accelerators alone, never on the host's CPU.
+the accelerators alone, never on the host's CPU, and one deployment and one job at a time unless the operator allows
+more.
 
 **4. More than one machine.** Run a peer on each, and one more `best-peer` anywhere as the door your team enters
 by: a laptop will do, with `BEST_PEER_GPU=none` and the runtime it has (`BEST_PEER_RUNTIME=fake` when it has none:
@@ -203,7 +204,8 @@ itself reaches the engines' ports, which are bound there and nowhere else whatev
 when the container engine is on this host, on that host's interfaces when it is elsewhere, so a container engine
 on another host sits on a network you trust. The peer alone reaches them: a prompt is a command on the door, and
 the peer carries it to the engine. Prompts are answered sixteen at a time per peer; the rest wait their turn,
-accepted, in order.
+accepted, in order. `BEST_PEER_DEPLOYMENTS_PER_HOLDER` and `BEST_PEER_JOBS_PER_HOLDER` (default 1 each) are how many
+deployments and jobs a key with a share may run at once across the door; a number below 1 is refused at start.
 
 ## Deploy
 
@@ -307,6 +309,12 @@ accelerators alone, since its share counts their memory and the host's CPU and m
 refused with `ACCELERATORS_ONLY` and what it may name instead, and a job without `memory_bytes`, which would run on
 the host, with `JOB_NEEDS_DEVICE`; a key with scopes and no share is not held to them. In a workspace the rule holds
 for the cloud's devices, and a member's owner who approved the cloud with a share holds every tenant of the cloud to
-that member's accelerators. Another sign-in is another holder, as the spec has it: what a key that expired or was
-replaced left running is the owner's to end with a key approved for all. The spec has no per-command scope field
-yet, so the requirement is in the description text; that is an entry on the spec follow-ups.
+that member's accelerators. Such a key also runs one deployment and one job at a time, counted across the door like
+the share, every workspace's included (`BEST_PEER_DEPLOYMENTS_PER_HOLDER`, `BEST_PEER_JOBS_PER_HOLDER`), and the one
+past that is refused with `DEPLOYMENTS_EXCEEDED` or `JOBS_EXCEEDED`: what a workload claims in `memory_bytes` is its
+client's own word, so the share bounds what is promised and the counts how many, while neither bounds what a
+workload uses on a card that cannot be partitioned. On a member the cloud's own credential is one holder, so a
+member's owner who approved the cloud with a share counts every tenant of the cloud together. Another sign-in is
+another holder, as the spec has it: what a key that expired or was replaced left running is the owner's to end with
+a key approved for all. The spec has no per-command scope field yet, so the requirement is in the description text;
+that is an entry on the spec follow-ups.

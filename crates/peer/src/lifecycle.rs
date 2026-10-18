@@ -189,8 +189,8 @@ impl Peer {
         let weak = Arc::downgrade(self);
         self.holdings.add(move |holder| {
             weak.upgrade()
-                .map(|p| p.state.lock().unwrap().held_by(holder))
-                .unwrap_or(0)
+                .map(|p| p.state.lock().unwrap().holdings_of(holder))
+                .unwrap_or_default()
         });
     }
 
@@ -462,9 +462,15 @@ impl Peer {
         // One admission at a time across the door, and what the credential holds is read before the state is
         // locked, since the door's holdings read this state too.
         let _admitting = self.holdings.admitting();
-        let held = self.holdings.held_by(&who.holder());
+        let held = self.holdings.of(&who.holder());
         let mut state = self.state.lock().unwrap();
-        within_share(held, &who, data.memory_bytes)?;
+        within_share(held.memory_bytes, &who, data.memory_bytes)?;
+        within_count(
+            &who,
+            "deployment",
+            held.deployments,
+            self.holdings.ceilings().deployments,
+        )?;
         let (device, compute) = place(
             &host,
             &state,
@@ -804,9 +810,10 @@ impl Peer {
             None => None,
         };
         let _admitting = self.holdings.admitting();
-        let held = self.holdings.held_by(&who.holder());
+        let held = self.holdings.of(&who.holder());
         let mut state = self.state.lock().unwrap();
-        within_share(held, &who, data.memory_bytes.unwrap_or(0))?;
+        within_share(held.memory_bytes, &who, data.memory_bytes.unwrap_or(0))?;
+        within_count(&who, "job", held.jobs, self.holdings.ceilings().jobs)?;
         let placement = match (data.memory_bytes, &host) {
             (Some(needed), Some(host)) => Some(place(
                 host,
@@ -1307,6 +1314,25 @@ pub(crate) fn usable_by(host: Host, who: &Credential, pinned: Option<&str>) -> R
         format!("{condition}, and this credential runs on the accelerators alone, since its share counts their memory: {fix}"),
     )
     .with_details(json!({ "device": pinned, "devices": ids })))
+}
+
+/// A credential with a share runs `ceiling` workloads of `kind` at once across the door, `running` of them already,
+/// every workspace counted: one more is refused with what it runs and how to make room.
+pub(crate) fn within_count(who: &Credential, kind: &str, running: usize, ceiling: usize) -> Result<(), BestError> {
+    if !has_share(who) || running < ceiling {
+        return Ok(());
+    }
+    let (code, room) = match kind {
+        "job" => ("JOBS_EXCEEDED", "stop one or let one finish first"),
+        _ => ("DEPLOYMENTS_EXCEEDED", "undeploy one first"),
+    };
+    Err(BestError::bad_request(
+        code,
+        format!(
+            "this credential may run {ceiling} {kind}(s) at once and runs {running} across this door, every workspace counted: {room} (get-workloads on each door you use lists them), or ask the operator for more"
+        ),
+    )
+    .with_details(json!({ "ceiling": ceiling, "running": running })))
 }
 
 /// A workload another credential holds is not this one's to end.

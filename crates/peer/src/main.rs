@@ -175,6 +175,20 @@ fn main() {
     }
 }
 
+/// How many workloads of a kind a credential with a share may run at once, from the operator's `variable`: the
+/// default unless it says more; nothing is not a number of workloads.
+pub fn per_holder(variable: &str, text: Option<&str>, default: usize) -> Result<usize, String> {
+    match text.map(str::trim).filter(|t| !t.is_empty()) {
+        None => Ok(default),
+        Some(t) => match t.parse::<usize>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(format!(
+                "{variable} is {t}: say how many a credential with a share may run at once, 1 or more"
+            )),
+        },
+    }
+}
+
 /// Whether a host name or address is this machine's loopback.
 fn is_loopback(host: &str) -> bool {
     host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
@@ -337,7 +351,15 @@ async fn peer_app(endpoint: &str, dir: &std::path::Path, log: Arc<EventLog>, aut
         load: seconds("BEST_PEER_LOAD_SECONDS", 3600),
         ..Patience::default()
     };
-    let holdings = Arc::new(holdings::Holdings::default());
+    let defaults = holdings::Ceilings::default();
+    let count = |variable: &str, default: usize| {
+        per_holder(variable, std::env::var(variable).ok().as_deref(), default).unwrap_or_else(|why| fail(&why))
+    };
+    let ceilings = holdings::Ceilings {
+        deployments: count("BEST_PEER_DEPLOYMENTS_PER_HOLDER", defaults.deployments),
+        jobs: count("BEST_PEER_JOBS_PER_HOLDER", defaults.jobs),
+    };
+    let holdings = Arc::new(holdings::Holdings::default().counting(ceilings));
     let peer = peer(
         endpoint,
         &engine_host,
@@ -625,10 +647,32 @@ mod tests {
         engine_host: &str,
         auth: Option<Arc<Auth>>,
     ) -> Bed {
+        bed_counting(
+            gpu,
+            log,
+            runtime,
+            engine,
+            engine_host,
+            auth,
+            holdings::Ceilings::default(),
+        )
+        .await
+    }
+
+    /// The same, with a credential with a share allowed `ceilings` workloads at once.
+    async fn bed_counting(
+        gpu: Arc<best_peer_gpu::Fake>,
+        log: Arc<EventLog>,
+        runtime: Arc<best_peer_runtime::Fake>,
+        engine: Arc<best_peer_engine::Fake>,
+        engine_host: &str,
+        auth: Option<Arc<Auth>>,
+        ceilings: holdings::Ceilings,
+    ) -> Bed {
         for image in ["ollama/ollama", "vllm/vllm-openai", "busybox", "ollama/ollama:0.6"] {
             runtime.registry_has(best_peer_runtime::ImageRef(image.into()));
         }
-        let holdings = Arc::new(holdings::Holdings::default());
+        let holdings = Arc::new(holdings::Holdings::default().counting(ceilings));
         let peer = peer(
             EP,
             engine_host,
@@ -888,11 +932,17 @@ mod tests {
 
     /// The members as `endpoint => bed`, the bed's own key being what its owner's approval would give the cloud.
     async fn site(members: Vec<(&str, Bed)>) -> Site {
+        site_counting(members, holdings::Ceilings::default()).await
+    }
+
+    /// The same, with a credential with a share allowed `ceilings` workloads at once across the door.
+    async fn site_counting(members: Vec<(&str, Bed)>, ceilings: holdings::Ceilings) -> Site {
         site_over(
             members,
             Arc::new(tempfile::tempdir().unwrap()),
             Arc::new(EventLog::ephemeral()),
             None,
+            ceilings,
         )
         .await
     }
@@ -902,6 +952,7 @@ mod tests {
         data: Arc<tempfile::TempDir>,
         log: Arc<EventLog>,
         auth: Option<Arc<Auth>>,
+        ceilings: holdings::Ceilings,
     ) -> Site {
         let switchboard = Arc::new(Switchboard::default());
         let mut down = std::collections::HashMap::new();
@@ -914,7 +965,7 @@ mod tests {
             compute: vec![best_peer_gpu::Compute::Cpu],
             ..best_peer_gpu::Fake::cuda_card("cpu-0", "Host", 16, "0")
         };
-        let holdings = Arc::new(holdings::Holdings::default());
+        let holdings = Arc::new(holdings::Holdings::default().counting(ceilings));
         let runtime = Arc::new(best_peer_runtime::Fake::new(vec![], vec![]));
         let peer = peer(
             EP,
@@ -1400,7 +1451,15 @@ mod tests {
     async fn an_identity_invited_into_a_workspace_sees_it_and_deploys_in_it_and_one_that_left_sees_neither() {
         let (a, b) = two_members().await;
         let (key_a, key_b) = (a.key.clone(), b.key.clone());
-        let site = site(vec![(A, a), (B, b)]).await;
+        // A door whose operator lets a credential with a share run two deployments at once, so one lands in each.
+        let site = site_counting(
+            vec![(A, a), (B, b)],
+            holdings::Ceilings {
+                deployments: 2,
+                jobs: 1,
+            },
+        )
+        .await;
         let ws1 = site.workspace("c1", "Research").await;
         let ws2 = site.workspace("c2", "Ops").await;
         site.cloud(&ws1, "k1", "lab", &[("a", A, &key_a)]).await;
@@ -2287,7 +2346,14 @@ mod tests {
         let (key_a, key_b) = (a.key.clone(), b.key.clone());
         let data = Arc::new(tempfile::tempdir().unwrap());
         let log = Arc::new(EventLog::ephemeral());
-        let first = site_over(vec![(A, a), (B, b)], data.clone(), log.clone(), None).await;
+        let first = site_over(
+            vec![(A, a), (B, b)],
+            data.clone(),
+            log.clone(),
+            None,
+            holdings::Ceilings::default(),
+        )
+        .await;
         let ws = first.workspace("c1", "Research").await;
         first
             .cloud(&ws, "k1", "lab", &[("a", A, &key_a), ("b", B, &key_b)])
@@ -2323,7 +2389,7 @@ mod tests {
         // The door starts again over the same data directory, root log and credentials (on a host, all on disk):
         // the workspace, its members and invitations, its cloud with the members' credentials and the deployment it
         // placed are all back.
-        let again = site_over(Vec::new(), data.clone(), log, Some(auth)).await;
+        let again = site_over(Vec::new(), data.clone(), log, Some(auth), holdings::Ceilings::default()).await;
         for (endpoint, bed) in [(A, &members[0]), (B, &members[1])] {
             again.switchboard.connect(endpoint, bed.app.clone());
         }
@@ -3255,9 +3321,269 @@ mod tests {
         assert_eq!(s, StatusCode::CREATED, "{b}");
     }
 
+    /// The data of the last event of `until` with `correlation`, as `key` reads it at the root.
+    async fn last_of(app: &axum::Router, key: &str, correlation: &str, until: &str) -> Value {
+        let events = events_as(app, "", key, correlation, until).await;
+        events.iter().rev().find(|e| e["type"] == until).unwrap()["data"].clone()
+    }
+
+    #[tokio::test]
+    async fn a_credential_with_a_share_runs_as_many_workloads_at_once_as_the_operator_allows() {
+        let log = Arc::new(EventLog::ephemeral());
+        let runtime = Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![]));
+        let engine = Arc::new(best_peer_engine::Fake::new());
+        let bed = bed_with(
+            card(),
+            log.clone(),
+            runtime.clone(),
+            engine.clone(),
+            "engines.local",
+            None,
+        )
+        .await;
+        let team = key_with(&bed.app, Some("deploy,jobs"), Some(8 * GB)).await;
+        let deploy = |id: &'static str, model: &'static str| {
+            let (app, team) = (bed.app.clone(), team.clone());
+            async move {
+                send_as(
+                    &app,
+                    "",
+                    &team,
+                    id,
+                    "DeployModel",
+                    "deploy-model",
+                    json!({ "model": model, "engine": "ollama", "memory_bytes": 1 }),
+                )
+                .await
+            }
+        };
+        let run = |id: &'static str| {
+            let (app, team) = (bed.app.clone(), team.clone());
+            async move {
+                send_as(
+                    &app,
+                    "",
+                    &team,
+                    id,
+                    "RunJob",
+                    "run-job",
+                    json!({ "image": "busybox", "memory_bytes": 1 }),
+                )
+                .await
+            }
+        };
+        // One deployment at a time, however small each claims to be; the owner is not counted.
+        let (s, b) = deploy("d1", "a:7b").await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let first = last_of(&bed.app, &team, "d1", "DeploymentReady").await["deployment"].clone();
+        let (s, b) = deploy("d2", "b:7b").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "DEPLOYMENTS_EXCEEDED");
+        assert_eq!(b["error"]["details"], json!({ "ceiling": 1, "running": 1 }));
+        assert!(b["error"]["message"].as_str().unwrap().contains("undeploy one first"));
+        bed.deployed("o1", "owner-a:7b", 1).await;
+        bed.deployed("o2", "owner-b:7b", 1).await;
+        // Room comes back when the deployment is undeployed, and when one fails.
+        let (s, _) = send_as(
+            &bed.app,
+            "",
+            &team,
+            "u1",
+            "UndeployModel",
+            "undeploy-model",
+            json!({ "deployment": first }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        events_as(&bed.app, "", &team, "u1", "Undeployed").await;
+        engine.missing("gone:7b");
+        let (s, b) = deploy("d3", "gone:7b").await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        last_of(&bed.app, &team, "d3", "DeploymentFailed").await;
+        let (s, b) = deploy("d4", "b:7b").await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        last_of(&bed.app, &team, "d4", "DeploymentReady").await;
+        // One job at a time: room comes back when it finishes and when it is stopped.
+        let (s, b) = run("j1").await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let started = last_of(&bed.app, &team, "j1", "JobStarted").await;
+        let (s, b) = run("j2").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "JOBS_EXCEEDED");
+        assert_eq!(b["error"]["details"], json!({ "ceiling": 1, "running": 1 }));
+        assert!(b["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("stop one or let one finish first"));
+        runtime
+            .stop(&ContainerId(started["container"].as_str().unwrap().into()))
+            .await
+            .unwrap();
+        last_of(&bed.app, &team, "j1", "JobFinished").await;
+        let (s, b) = run("j3").await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let started = last_of(&bed.app, &team, "j3", "JobStarted").await;
+        let (s, _) = send_as(
+            &bed.app,
+            "",
+            &team,
+            "s3",
+            "StopJob",
+            "stop-job",
+            json!({ "job": started["job"] }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        events_as(&bed.app, "", &team, "s3", "JobStopped").await;
+        let (s, b) = run("j4").await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        last_of(&bed.app, &team, "j4", "JobStarted").await;
+        // A restart counts again what still runs, from the log.
+        bed.peer.halt();
+        let credentials = bed.door.auth.clone();
+        drop(bed);
+        let again = bed_with(card(), log, runtime, engine, "engines.local", Some(credentials)).await;
+        let (s, b) = send_as(
+            &again.app,
+            "",
+            &team,
+            "d5",
+            "DeployModel",
+            "deploy-model",
+            json!({ "model": "c:7b", "engine": "ollama", "memory_bytes": 1 }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "DEPLOYMENTS_EXCEEDED");
+        let (s, b) = send_as(
+            &again.app,
+            "",
+            &team,
+            "j5",
+            "RunJob",
+            "run-job",
+            json!({ "image": "busybox", "memory_bytes": 1 }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "JOBS_EXCEEDED");
+        // The ceilings are the operator's to raise, never to zero.
+        let variable = "BEST_PEER_JOBS_PER_HOLDER";
+        assert_eq!(per_holder(variable, None, 1).unwrap(), 1);
+        assert_eq!(per_holder(variable, Some(" 3 "), 1).unwrap(), 3);
+        let zero = per_holder(variable, Some("0"), 1).unwrap_err();
+        assert!(zero.contains(variable) && zero.contains("1 or more"), "{zero}");
+        assert!(per_holder(variable, Some("many"), 1).unwrap_err().contains("many"));
+    }
+
+    #[tokio::test]
+    async fn a_credential_with_a_share_is_counted_across_the_door_every_workspace_included() {
+        let (a, b) = two_members().await;
+        let (key_a, key_b) = (a.key.clone(), b.key.clone());
+        let site = site(vec![(A, a), (B, b)]).await;
+        let ws1 = site.workspace("c1", "Research").await;
+        let ws2 = site.workspace("c2", "Ops").await;
+        site.cloud(&ws1, "k1", "lab", &[("a", A, &key_a)]).await;
+        site.cloud(&ws2, "k2", "ops-pool", &[("b", B, &key_b)]).await;
+        let bob = key_with(&site.app, Some("deploy"), Some(4 * GB)).await;
+        let (_, w) = get_as(&site.app, "", &bob, "/queries/get-workspaces").await;
+        let bob_id = w["identity"].as_str().unwrap().to_string();
+        for (n, ws) in [&ws1, &ws2].into_iter().enumerate() {
+            let (s, _) = send_as(
+                &site.app,
+                "",
+                &site.key,
+                &format!("i{n}"),
+                "InviteMember",
+                "invite-member",
+                json!({ "workspace": ws, "identity": bob_id }),
+            )
+            .await;
+            assert_eq!(s, StatusCode::CREATED);
+            events_as(&site.app, "", &site.key, &format!("i{n}"), "MemberInvitedV1").await;
+            let (s, _) = send_as(
+                &site.app,
+                "",
+                &bob,
+                &format!("a{n}"),
+                "AcceptInvitation",
+                "accept-invitation",
+                json!({ "workspace": ws }),
+            )
+            .await;
+            assert_eq!(s, StatusCode::CREATED);
+            events_as(&site.app, "", &bob, &format!("a{n}"), "MemberJoinedV1").await;
+        }
+        let (s, b) = send_as(
+            &site.app,
+            &format!("/workspaces/{ws1}"),
+            &bob,
+            "bd1",
+            "DeployModel",
+            "deploy-model",
+            json!({ "model": "m", "engine": "ollama", "memory_bytes": GB, "cloud": "lab" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let (s, e) = send_as(
+            &site.app,
+            &format!("/workspaces/{ws2}"),
+            &bob,
+            "bd2",
+            "DeployModel",
+            "deploy-model",
+            json!({ "model": "m", "engine": "ollama", "memory_bytes": GB, "cloud": "ops-pool" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "DEPLOYMENTS_EXCEEDED");
+        assert_eq!(e["error"]["details"]["running"], 1);
+        assert!(e["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("every workspace counted"));
+    }
+
+    #[tokio::test]
+    async fn a_member_that_gave_the_cloud_a_share_counts_the_whole_cloud_as_one() {
+        let (a, _) = two_members().await;
+        let cloud_key = key_with(&a.app, Some("deploy,jobs"), Some(16 * GB)).await;
+        let site = site(vec![(A, a)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &cloud_key)]).await;
+        let (s, b) = site.deploy(&ws, "d1", Some("lab"), 4, None).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "d1", "DeploymentReady").await;
+        // The owner of the workspace is not counted by the cloud, but the member counts the cloud as one holder.
+        let (s, b) = site.deploy(&ws, "d2", Some("lab"), 4, None).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let events = site.events(&ws, "d2", "DeploymentFailed").await;
+        let failed = &events.last().unwrap()["data"];
+        assert!(
+            failed["reason"]
+                .as_str()
+                .unwrap()
+                .contains("may run 1 deployment(s) at once"),
+            "{failed}"
+        );
+    }
+
     #[tokio::test]
     async fn a_credential_does_what_it_was_approved_for_holds_its_share_and_ends_only_its_own() {
-        let bed = fresh().await;
+        // Several workloads per key here: this test is about the share, the counts have their own.
+        let bed = bed_counting(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+            Arc::new(best_peer_engine::Fake::new()),
+            "engines.local",
+            None,
+            holdings::Ceilings {
+                deployments: 8,
+                jobs: 8,
+            },
+        )
+        .await;
         // A team key: may deploy, 8 GiB of device memory at most, no jobs; nothing in the door changed for the
         // owner's own key, which was approved with nothing said.
         let team = key_with(&bed.app, Some("deploy"), Some(8 * GB)).await;
