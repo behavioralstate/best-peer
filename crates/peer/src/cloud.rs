@@ -112,6 +112,8 @@ fn read_saved(file: &Path) -> Vec<Saved> {
 #[derive(Clone)]
 struct Issued {
     em: Emitter,
+    /// The command's type, for the fact told when the member is lost before it answered.
+    r#type: String,
     /// The cloud command's key when this is one part of a pull fanned out to every member.
     pull: Option<String>,
     /// The workload this command ends, for an undeploy or a stop.
@@ -507,11 +509,20 @@ impl Cloud {
         (envelope, mc)
     }
 
-    fn listen_for(&self, member: &str, mc: &str, em: &Emitter, pull: Option<String>, ends: Option<String>) {
+    fn listen_for(
+        &self,
+        member: &str,
+        mc: &str,
+        em: &Emitter,
+        r#type: &str,
+        pull: Option<String>,
+        ends: Option<String>,
+    ) {
         self.issued.lock().unwrap().insert(
             (member.into(), mc.into()),
             Issued {
                 em: em.clone(),
+                r#type: r#type.into(),
                 pull,
                 ends,
             },
@@ -527,10 +538,13 @@ impl Cloud {
         schema: &str,
         data: Value,
     ) -> Result<(), BestError> {
-        let ends = data["deployment"].as_str().or(data["job"].as_str()).map(str::to_string);
+        // An undeploy or a stop ends the workload it names; a prompt names one and ends nothing.
+        let ends = matches!(r#type, "UndeployModel" | "StopJob")
+            .then(|| data["deployment"].as_str().or(data["job"].as_str()).map(str::to_string))
+            .flatten();
         let base = member.schema_base().await;
         let (envelope, mc) = self.to_member(member, &base, em.command_key(), r#type, schema, data);
-        self.listen_for(&member.name, &mc, em, None, ends);
+        self.listen_for(&member.name, &mc, em, r#type, None, ends);
         member.send(&envelope).await.map(|_| ()).map_err(|e| {
             self.issued.lock().unwrap().remove(&(member.name.clone(), mc));
             e.relayed(&member.name)
@@ -966,6 +980,13 @@ impl Cloud {
             let key = i.em.command_key().to_string();
             if let Some(pull) = &i.pull {
                 self.on_pull_fact(m, pull, &i.em, "ImagePullFailed", json!({ "reason": why }));
+            } else if i.r#type == "Prompt" {
+                // The answer is not coming: the prompt is told as failed, to be sent again when the peer is back.
+                self.tell(
+                    &i.em,
+                    "PromptFailed",
+                    json!({ "reason": why, "fix": "prompt again once the peer answers: PeerJoined on this stream says so", "peer": m.name }),
+                );
             } else if i.ends.is_some() || key.is_empty() {
                 self.tell(
                     &i.em,
@@ -1121,7 +1142,7 @@ impl Service for Cloud {
         for m in members {
             let base = m.schema_base().await;
             let (envelope, mc) = self.to_member(&m, &base, &key, "PullImage", "pull-image", json!({ "image": image }));
-            self.listen_for(&m.name, &mc, &em, Some(key.clone()), None);
+            self.listen_for(&m.name, &mc, &em, "PullImage", Some(key.clone()), None);
             if let Err(e) = m.send(&envelope).await {
                 self.issued.lock().unwrap().remove(&(m.name.clone(), mc));
                 self.on_pull_fact(
@@ -1178,7 +1199,7 @@ impl Service for Cloud {
         // Run again after a restart: the member runs it; listen for the rest of its facts and say nothing twice.
         if let Some(peer) = self.already_placed(em.command_key()) {
             let mc = member_correlation(em.command_key(), &json!({}), None);
-            self.listen_for(&peer, &mc, &em, None, None);
+            self.listen_for(&peer, &mc, &em, "DeployModel", None, None);
             return;
         }
         let reservation = self.state.lock().unwrap().reserved.get(em.command_key()).cloned();
@@ -1348,7 +1369,7 @@ impl Service for Cloud {
         };
         if let Some(peer) = self.already_placed(em.command_key()) {
             let mc = member_correlation(em.command_key(), &json!({}), None);
-            self.listen_for(&peer, &mc, &em, None, None);
+            self.listen_for(&peer, &mc, &em, "RunJob", None, None);
             return;
         }
         let reservation = self.state.lock().unwrap().reserved.get(em.command_key()).cloned();

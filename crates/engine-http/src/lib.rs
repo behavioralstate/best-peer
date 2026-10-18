@@ -111,10 +111,12 @@ impl HttpEngine {
         options: &Options,
         within: Duration,
     ) -> Result<Answer, EngineError> {
+        // A refusal is read, not thrown: the engine's own message is what the caller needs.
         let config = ureq::Agent::config_builder()
             .timeout_connect(Some(Duration::from_secs(5)))
             .timeout_recv_response(Some(within))
             .timeout_global(Some(within))
+            .http_status_as_error(false)
             .build();
         let agent = ureq::Agent::new_with_config(config);
         let mut body = serde_json::json!({ "model": model, "messages": messages, "stream": false });
@@ -130,18 +132,31 @@ impl HttpEngine {
         let mut res = agent
             .post(format!("{base}/v1/chat/completions"))
             .send_json(&body)
-            .map_err(|e| match e {
-                ureq::Error::StatusCode(404) => EngineError::ModelNotFound(model.into()),
-                ureq::Error::StatusCode(code) => EngineError::Engine(format!("the engine answered {code}")),
-                other => EngineError::Engine(other.to_string()),
-            })?;
-        let v: serde_json::Value = res
+            .map_err(|e| EngineError::Engine(e.to_string()))?;
+        let status = res.status().as_u16();
+        let text = res
             .body_mut()
-            .read_json()
+            .read_to_string()
             .map_err(|e| EngineError::Engine(format!("the engine's answer could not be read: {e}")))?;
-        if let Some(err) = v.get("error") {
-            let text = err["message"].as_str().unwrap_or("the engine refused the prompt");
-            return Err(EngineError::Engine(text.into()));
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+        // Both engines say why in `error`: as an object with a message (the OpenAI shape) or as a string (Ollama).
+        let said = v["error"]["message"]
+            .as_str()
+            .or(v["error"].as_str())
+            .map(str::to_string);
+        if status >= 400 {
+            let said = said.unwrap_or_else(|| text.trim().chars().take(300).collect());
+            let lower = said.to_ascii_lowercase();
+            return Err(
+                if status == 404 && lower.contains("not found") && lower.contains("model") {
+                    EngineError::ModelNotFound(model.into())
+                } else {
+                    EngineError::Engine(format!("the engine answered {status}: {said}"))
+                },
+            );
+        }
+        if let Some(said) = said {
+            return Err(EngineError::Engine(said));
         }
         let choice = &v["choices"][0];
         let content = choice["message"]["content"].as_str().unwrap_or("").to_string();

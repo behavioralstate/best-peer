@@ -125,7 +125,12 @@ async fn best_shaped(res: Response) -> Response {
             "METHOD_NOT_ALLOWED",
             "this route does not take that method: the manifest's endpoints say which".into(),
         ),
-        StatusCode::PAYLOAD_TOO_LARGE => ("PAYLOAD_TOO_LARGE", format!("the body exceeds {MAX_BODY} bytes")),
+        StatusCode::PAYLOAD_TOO_LARGE => (
+            "PAYLOAD_TOO_LARGE",
+            format!(
+                "the body exceeds {MAX_BODY} bytes: send less in one command; for a prompt, fewer or shorter messages"
+            ),
+        ),
         StatusCode::BAD_REQUEST => (
             "BAD_REQUEST",
             if text.is_empty() {

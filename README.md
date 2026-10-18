@@ -36,7 +36,7 @@ the CPU is the one device. Then one of two ways to run models, each with what it
 | Way | What the machine needs | Settings |
 |---|---|---|
 | **Docker** (the default) | Docker Engine running and reachable by your user (`docker ps` without `sudo`, or run the peer with it), and the NVIDIA container toolkit registered with it, so that `docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi` lists the card. Room under Docker's storage for the engine image and the model weights, a few GB. | None: the peer pulls the engine image, starts the container, publishes its port. |
-| **Native** | Ollama installed and running as a service on its own port. The peer pulls the model through it and claims its port; nothing is started or stopped. No jobs: `run-job` is refused at ingest, with the fix. | `BEST_PEER_RUNTIME=native`. Ollama keeps its own bind, loopback as installed: prompts reach it through the door. |
+| **Native** | Ollama installed and running as a service on its own port. The peer pulls the model through it and claims its port; nothing is started or stopped. No jobs: `run-job` is refused at ingest, with the fix. | `BEST_PEER_RUNTIME=native`. Ollama keeps its own bind, loopback as installed: a prompt reaches it as a command through the door. |
 
 `BEST_PEER_RUNTIME=fake` is a third way for a machine with neither: the surface answers, nothing runs. Every other
 variable has a default that fits these two ways; [Run](#run) lists them for a setup that differs.
@@ -200,9 +200,9 @@ outside any container (an installed Ollama; no jobs), `fake` serves the whole su
 (default 3600) how long a model may take to load, and a prompt is given ten minutes to be answered. `BEST_PEER_ENGINE_HOST` (default `127.0.0.1`) is where the peer
 itself reaches the engines' ports, which are bound there and nowhere else whatever the door listens on: on loopback
 when the container engine is on this host, on that host's interfaces when it is elsewhere, so a container engine
-on another host sits on a network you trust. The peer alone reaches them: a prompt is a command on the door, under
-the deployment. A deployment made by a peer older than 0.0.4 is served through the door too, but its engine's port
-stays published as that peer bound it until it is undeployed and deployed again.
+on another host sits on a network you trust. The peer alone reaches them: a prompt is a command on the door, and
+the peer carries it to the engine. Prompts are answered sixteen at a time per peer; the rest wait their turn,
+accepted, in order.
 
 ## Deploy
 

@@ -18,7 +18,7 @@ use best_peer_gpu::{Compute, DeviceId, Gpu, Host};
 use best_peer_runtime::{ContainerId, Event as RuntimeEvent, Runtime, RuntimeError, Spec};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Semaphore};
 
 use crate::domain::Service;
 use crate::holdings::Holdings;
@@ -64,6 +64,10 @@ impl Default for Patience {
 /// How often the state is squared with what the engine runs, for the exits the event feed may have missed.
 const RECONCILE_EVERY: Duration = Duration::from_secs(30);
 
+/// How many prompts a peer has in flight at once: each holds a blocking thread while the engine answers, and the
+/// engines answer a few at a time anyway; the rest wait their turn, accepted, in order.
+const PROMPTS_AT_ONCE: usize = 16;
+
 /// The most runtime events kept for containers the state does not know yet: a job can exit before its start is
 /// told, and its exit is replayed once it is.
 const MAX_UNOWNED: usize = 64;
@@ -85,6 +89,8 @@ pub struct Peer {
     unowned: Mutex<HashMap<ContainerId, RuntimeEvent>>,
     /// The tasks that follow the engine, so a peer that stops stops hearing.
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// The turns to prompt the engines, `PROMPTS_AT_ONCE` of them.
+    prompts: Semaphore,
     /// What a credential holds across the door, for its share: this peer's own promises and every workspace's.
     holdings: Arc<Holdings>,
 }
@@ -167,6 +173,7 @@ impl Peer {
             state: Mutex::new(State::default()),
             unowned: Mutex::new(HashMap::new()),
             tasks: Mutex::new(Vec::new()),
+            prompts: Semaphore::new(PROMPTS_AT_ONCE),
             holdings: Arc::new(Holdings::default()),
         }
     }
@@ -364,8 +371,17 @@ impl Peer {
     /// engine could not do is `PromptFailed` with the reason and the fix. The engine's API is reached here and
     /// nowhere else.
     pub async fn prompt(&self, cmd: Envelope, em: Emitter) {
-        let Ok(data) = parse::<PromptData>(&cmd.data) else {
-            return;
+        let data = match parse::<PromptData>(&cmd.data) {
+            Ok(d) => d,
+            Err(e) => {
+                // Accepted by the schema and still not readable here: the outcome is told, never silence.
+                self.tell(
+                    &em,
+                    "PromptFailed",
+                    json!({ "deployment": cmd.data["deployment"], "reason": format!("the prompt could not be read: {}", e.message), "fix": "send it as the schema at the catalogue's dataschema for prompt describes" }),
+                );
+                return;
+            }
         };
         let Some(d) = self.state.lock().unwrap().deployments.get(&data.deployment).cloned() else {
             self.tell(
@@ -381,6 +397,8 @@ impl Peer {
             stop: data.stop,
         };
         let within = self.patience.prompt;
+        // A turn: the engine is asked a few prompts at a time, the rest wait, accepted.
+        let _turn = self.prompts.acquire().await;
         let asked = tokio::time::timeout(
             within,
             self.engine.complete(

@@ -341,7 +341,7 @@ fn prompt(peer: Arc<dyn Service>, at: Where) -> CommandDef {
                         }
                     }
                 },
-                "max_tokens": { "type": "integer", "minimum": 1, "description": "The most tokens the answer may have; the engine's default when not given" },
+                "max_tokens": { "type": "integer", "minimum": 1, "maximum": 1048576, "description": "The most tokens the answer may have; the engine's default when not given" },
                 "temperature": { "type": "number", "minimum": 0, "maximum": 2, "description": "The sampling temperature; the engine's default when not given" },
                 "stop": { "type": "array", "items": { "type": "string", "minLength": 1 }, "maxItems": 4, "description": "Strings at which the answer stops" }
             },

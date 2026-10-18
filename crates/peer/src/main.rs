@@ -2909,6 +2909,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_deployment_that_is_starting_is_not_yet_to_prompt_and_says_what_to_follow() {
+        let bed = fresh().await;
+        // A deployment whose engine is still coming up, as the state holds it between DeploymentStarted and ready.
+        let dep = "dep-starting".to_string();
+        bed.peer.state.lock().unwrap().deployments.insert(
+            dep.clone(),
+            state::Deployment {
+                id: dep.clone(),
+                model: "llama3.2:3b".into(),
+                engine: best_peer_engine::Kind::Ollama,
+                device: "gpu-0".into(),
+                memory_bytes: 8 * GB,
+                container: ContainerId("c-starting".into()),
+                port: 41434,
+                ready: false,
+                holder: String::new(),
+                correlation: "d-starting".into(),
+                phase: state::Phase::Starting,
+                peer: None,
+            },
+        );
+        let (s, b) = bed
+            .send(
+                "p1",
+                "Prompt",
+                "prompt",
+                json!({ "deployment": dep, "messages": [{ "role": "user", "content": "hi" }] }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "DEPLOYMENT_NOT_READY");
+        assert!(
+            b["error"]["message"].as_str().unwrap().contains("DeploymentReady"),
+            "{b}"
+        );
+        assert_eq!(b["error"]["details"]["deployment"], dep);
+        // A prompt over the schema's bounds is refused naming the field, never accepted and lost.
+        let (s, b) = bed
+            .send(
+                "p2",
+                "Prompt",
+                "prompt",
+                json!({ "deployment": dep, "messages": [{ "role": "user", "content": "hi" }], "max_tokens": 5_000_000_000u64 }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(b["error"]["code"], "SCHEMA_VALIDATION");
+        assert!(b["error"]["message"].as_str().unwrap().contains("max_tokens"), "{b}");
+    }
+
+    #[tokio::test]
     async fn a_prompt_the_engine_does_not_answer_is_a_failed_prompt_with_the_fix() {
         let bed = fresh().await;
         let dep = bed.deployed("d1", "llama3.2:3b", 8).await;
