@@ -158,6 +158,9 @@ host changes or fewer than thirty days of it remain, which the start-up line say
 `~/.best-peer`) holds the event log, the credentials as hashes, the admin token, that certificate, and the record of
 where the door is that `best-peer approve` reads, so it reaches the peer over the same TLS, pinned to that
 certificate and no other.
+Every request to the door, a workspace's included, is one line in the peer's log at info: where it came from, the
+method and the path as it arrived (never the query string), the status, the holder when a credential opened it,
+refused or not, and how long the answer took. The key is never in it.
 
 Every door hosts **workspaces**, the BEST tenants. The root manifest declares their template
 (`/.well-known/best/{tenantId}`), and a workspace's own door is at `/workspaces/<id>` under the root, with its own

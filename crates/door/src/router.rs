@@ -5,10 +5,12 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -75,6 +77,45 @@ fn shaped(routes: Router<Shared>, door: Shared) -> Router {
         .with_state(door)
 }
 
+/// Who a request was answered for, set by whichever check opened it to a credential, for the access log: the holder
+/// id, never the key. A request no credential opened has none.
+#[derive(Clone, Debug, Default)]
+pub struct Answered(Arc<OnceLock<String>>);
+
+impl Answered {
+    /// Records the holder a credential opened the request for, on the request's own record when it has one.
+    pub fn record(req: &Request, credential: &Credential) {
+        if let Some(a) = req.extensions().get::<Answered>() {
+            let _ = a.0.set(credential.holder());
+        }
+    }
+}
+
+/// One line per request, at info, once it is answered: where it came from when the transport said, what it asked
+/// (the method and the path as it arrived, without the query string), what it got, the holder when a credential
+/// opened it, refused or not, and how long the answer took. The headers and the body are never in it: a key travels
+/// in a header, and the line never carries one. Layered once, around everything a door serves, workspaces included.
+pub async fn access_log(from: Option<ConnectInfo<SocketAddr>>, mut req: Request, next: Next) -> Response {
+    let answered = Answered::default();
+    req.extensions_mut().insert(answered.clone());
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let started = Instant::now();
+    let res = next.run(req).await;
+    let from = from.map(|c| c.0.to_string()).unwrap_or_else(|| "-".into());
+    let holder = answered.0.get().map(String::as_str).unwrap_or("-");
+    tracing::info!(
+        %from,
+        %method,
+        %path,
+        status = res.status().as_u16(),
+        %holder,
+        ms = started.elapsed().as_millis() as u64,
+        "request"
+    );
+    res
+}
+
 async fn require_key(State(door): State<Shared>, mut req: Request, next: Next) -> Response {
     let key = req
         .headers()
@@ -85,6 +126,7 @@ async fn require_key(State(door): State<Shared>, mut req: Request, next: Next) -
     let Some(credential) = (!key.is_empty()).then(|| door.auth.authenticate(key)).flatten() else {
         return BestError::unauthorized().into_response();
     };
+    Answered::record(&req, &credential);
     req.extensions_mut().insert(credential);
     next.run(req).await
 }

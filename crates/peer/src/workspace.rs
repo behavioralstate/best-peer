@@ -329,6 +329,7 @@ async fn dispatch(
     let Some(who) = (!key.is_empty()).then(|| reg.ctx.auth.authenticate(key)).flatten() else {
         return BestError::unauthorized().into_response();
     };
+    best_peer_door::router::Answered::record(&req, &who);
     let ws = reg.get(&id).filter(|ws| ws.is_member(&who.holder()));
     let Some(ws) = ws else {
         return BestError::not_found(
