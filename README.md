@@ -255,7 +255,9 @@ Every command of this peer follows one pattern, and nothing else is needed to dr
    reads is the facts under its own correlations. A chain of commands under one correlation is one credential's. From that moment the
    command ends in a completing event, through a restart if need be: a command accepted and not yet run when the
    peer stops is run when it starts again, through the same state check, or failed with a `CommandFailed` that
-   says why; one whose workload had already started and did not survive the restart is failed with the fix.
+   says why; one whose workload had already started and did not survive the restart is failed with the fix. The
+   door keeps the command whole until it completes, then only its id, hash and correlation, which still answer a
+   retry as before, in memory and after a restart alike.
 2. Everything that happens is an event carrying that correlation id, in the order it happened. The command's
    schema document lists what it `produces` and, among those, what `completes` it: the events after which the
    command's outcome is known (`DeploymentReady` for a deploy, or `DeploymentFailed`, `DeploymentEnded` or
