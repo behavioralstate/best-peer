@@ -556,6 +556,9 @@ impl Auth {
     /// the authority's. A scope the service does not have is refused by name, so a typo cannot admit more or
     /// less than the person meant.
     pub async fn approve(&self, user_code: &str, proof: &str, grant: Grant) -> Result<Admitted, OAuthError> {
+        // The proof first: what this door's scopes are and whether a code is pending is told to the authority alone.
+        let code = normalise_user_code(user_code);
+        self.approver.admit(&code, proof).await?;
         if let Some(scopes) = &grant.scopes {
             if scopes.is_empty() {
                 return Err(OAuthError::invalid_request(
@@ -573,7 +576,6 @@ impl Auth {
             }
         }
         self.expire_pending();
-        let code = normalise_user_code(user_code);
         let exists = self
             .pending
             .lock()
@@ -586,7 +588,6 @@ impl Auth {
                 DEVICE_CODE_TTL.as_secs()
             )));
         }
-        self.approver.admit(&code, proof).await?;
         let mut pending = self.pending.lock().unwrap();
         let p = pending
             .values_mut()
@@ -875,6 +876,39 @@ mod tests {
         assert!(is_connection_name("acme-payroll-dev"));
         assert!(!is_connection_name("-x"));
         assert!(!is_connection_name(""));
+    }
+
+    #[tokio::test]
+    async fn without_the_proof_approve_tells_nothing_of_the_door() {
+        let auth = auth().with_scopes(&["deploy"]);
+        let a = start(&auth, Some("my-peer"));
+        let bogus = Grant {
+            scopes: Some(vec!["bogus".into()]),
+            ..Grant::default()
+        };
+        for (code, grant) in [
+            (a.user_code.as_str(), bogus.clone()),
+            ("NOPE-CODE", Grant::default()),
+            ("NOPE-CODE", bogus.clone()),
+        ] {
+            let refused = auth.approve(code, "wrong", grant).await.unwrap_err();
+            assert_eq!(refused.error, "access_denied");
+            assert!(!refused.description.contains("deploy"), "{}", refused.description);
+            assert!(!refused.description.contains("pending"), "{}", refused.description);
+        }
+        // With the proof, the refusals say what is wrong.
+        let unknown = auth.approve(&a.user_code, "ok", bogus).await.unwrap_err();
+        assert!(
+            unknown.description.contains("no such scope bogus"),
+            "{}",
+            unknown.description
+        );
+        let missing = auth.approve("NOPE-CODE", "ok", Grant::default()).await.unwrap_err();
+        assert!(
+            missing.description.contains("no pending registration"),
+            "{}",
+            missing.description
+        );
     }
 
     #[tokio::test]

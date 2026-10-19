@@ -282,7 +282,8 @@ best-peer approve ABCD-EFGH
 ```
 
 That presents the machine's admin token, which only its owner can read, and the agent's next poll gets its credential:
-a key shown once, kept hashed, bound to the connection name the person gave. An operator who wants an identity
+a key shown once, kept hashed, bound to the connection name the person gave. The token is checked before anything
+else, so without it an approval learns neither whether a code is pending nor which scopes the door has. An operator who wants an identity
 provider instead plugs one in behind the `Approver` trait; the door never knows which stands behind it.
 
 **Where a credential belongs** is the workspaces it created or accepted an invitation into, on this door, and
