@@ -390,6 +390,13 @@ async fn peer_app(endpoint: &str, dir: &std::path::Path, log: Arc<EventLog>, aut
         load: seconds("BEST_PEER_LOAD_SECONDS", 3600),
         ..Patience::default()
     };
+    for gone in ["BEST_PEER_DEPLOYMENTS_PER_HOLDER", "BEST_PEER_JOBS_PER_HOLDER"] {
+        if std::env::var_os(gone).is_some() {
+            fail(&format!(
+                "{gone} is gone: how many deployments and jobs a credential runs at once is set when it is approved, best-peer approve <code> --deployments N --jobs N"
+            ));
+        }
+    }
     let holdings = Arc::new(holdings::Holdings::default());
     let confine = confine(
         std::env::var("BEST_PEER_JOB_MEMORY").ok().as_deref(),
@@ -475,9 +482,16 @@ fn parse_memory(text: &str) -> Result<u64, String> {
 /// person was shown. The token goes to the listen address only, never to the public endpoint, and over TLS to the
 /// certificate the peer serves and no other, when it serves one.
 fn approve(args: &[String]) {
-    const USAGE: &str = "usage: best-peer approve <code> [--may deploy,jobs,prompt | all] [--memory 40G] [--open-jobs]: the code the agent showed the person; what the credential may do (all when not said); the most device memory its workloads may hold together (no share when not said); with a share, whether its jobs leave the closed box (no network, a ceiling on host memory) a tenant's job gets";
+    const USAGE: &str = "usage: best-peer approve <code> [--may deploy,jobs,prompt | all] [--memory 40G] [--deployments N] [--jobs N] [--open-jobs]: the code the agent showed the person; what the credential may do (all when not said); the most device memory its workloads may hold together (no share when not said); how many deployments and jobs it may run at once across the door (no count when not said); with a share, whether its jobs leave the closed box (no network, a ceiling on host memory) a tenant's job gets";
     let Some(code) = args.first() else { fail(USAGE) };
     let (mut may, mut memory, mut open_jobs) = (None::<String>, None::<u64>, false);
+    let (mut deployments, mut jobs) = (None::<u32>, None::<u32>);
+    let count = |flag: &str, text: Option<&String>| -> u32 {
+        match text.map(|t| t.trim().parse::<u32>()) {
+            Some(Ok(n)) if n > 0 => n,
+            _ => fail(&format!("{flag} needs how many at once, 1 or more")),
+        }
+    };
     let mut rest = args[1..].iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -495,6 +509,8 @@ fn approve(args: &[String]) {
                 memory = Some(parse_memory(amount).unwrap_or_else(|why| fail(&why)));
             }
             "--open-jobs" => open_jobs = true,
+            "--deployments" => deployments = Some(count("--deployments", rest.next())),
+            "--jobs" => jobs = Some(count("--jobs", rest.next())),
             other => fail(&format!("unknown argument {other:?}. {USAGE}")),
         }
     }
@@ -527,6 +543,12 @@ fn approve(args: &[String]) {
             fail("--open-jobs opens the jobs of a credential with a share, and this one has none: a credential without --memory runs its jobs open already");
         }
         form.push(("open_jobs", "true".into()));
+    }
+    if let Some(n) = deployments {
+        form.push(("deployments", n.to_string()));
+    }
+    if let Some(n) = jobs {
+        form.push(("jobs", n.to_string()));
     }
     let body = serde_urlencoded::to_string(&form).unwrap_or_else(|e| fail(&format!("cannot encode the request: {e}")));
     let req = axum::http::Request::post("/auth/approve")
@@ -564,7 +586,7 @@ fn approve(args: &[String]) {
         Some(s) => s.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(","),
         None => "all".into(),
     };
-    let share = match (
+    let mut share = match (
         a["grant"]["memory_bytes"].as_u64(),
         a["grant"]["open_jobs"].as_bool() == Some(true),
     ) {
@@ -572,6 +594,11 @@ fn approve(args: &[String]) {
         (Some(b), true) => format!("{b} bytes of device memory at most, its jobs open"),
         (None, _) => "no share set".into(),
     };
+    for kind in ["deployments", "jobs"] {
+        if let Some(n) = a["grant"][kind].as_u64() {
+            share.push_str(&format!(", {n} {kind} at once at most"));
+        }
+    }
     println!(
         "admitted {who} as connection {} with a {} credential that may {may}, {share}: the agent's next poll gets it",
         a["connection"].as_str().unwrap_or("(the host's name)"),
@@ -769,11 +796,34 @@ mod tests {
 
     /// A credential approved with `may` and `memory`, as `best-peer approve --may --memory` would.
     async fn key_with(app: &axum::Router, may: Option<&str>, memory: Option<u64>) -> String {
-        key_opened(app, may, memory, false).await
+        key_full(app, may, memory, None, None, false).await
     }
 
     /// The same, its jobs opened by the approver when `open_jobs`, as `best-peer approve --open-jobs` would.
     async fn key_opened(app: &axum::Router, may: Option<&str>, memory: Option<u64>, open_jobs: bool) -> String {
+        key_full(app, may, memory, None, None, open_jobs).await
+    }
+
+    /// The same, allowed so many deployments and jobs at once when given, as `approve --deployments --jobs` would.
+    async fn key_counted(
+        app: &axum::Router,
+        may: Option<&str>,
+        memory: Option<u64>,
+        deployments: Option<u32>,
+        jobs: Option<u32>,
+    ) -> String {
+        key_full(app, may, memory, deployments, jobs, false).await
+    }
+
+    /// A credential approved with all of `best-peer approve`'s words: `may`, `memory`, the counts and `open_jobs`.
+    async fn key_full(
+        app: &axum::Router,
+        may: Option<&str>,
+        memory: Option<u64>,
+        deployments: Option<u32>,
+        jobs: Option<u32>,
+        open_jobs: bool,
+    ) -> String {
         let form = |f: &[(&str, &str)]| {
             Request::post("/auth/device")
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
@@ -791,6 +841,13 @@ mod tests {
         }
         if open_jobs {
             fields.push(("open_jobs", "true"));
+        }
+        let (deployments, jobs) = (deployments.map(|n| n.to_string()), jobs.map(|n| n.to_string()));
+        if let Some(n) = &deployments {
+            fields.push(("deployments", n));
+        }
+        if let Some(n) = &jobs {
+            fields.push(("jobs", n));
         }
         let approve = Request::post("/auth/approve")
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
@@ -3153,6 +3210,422 @@ mod tests {
             assert!(err.contains(why), "{err}");
             assert!(err.contains("none"), "the refusal names the way to no ceiling: {err}");
         }
+    }
+
+    /// The strings and arrays in `schema` with no bound on their length, by path.
+    fn unbounded(schema: &Value, at: &str, found: &mut Vec<String>) {
+        match schema["type"].as_str() {
+            Some("string") if schema.get("maxLength").is_none() && schema.get("enum").is_none() => {
+                found.push(at.to_string())
+            }
+            Some("array") if schema.get("maxItems").is_none() => found.push(at.to_string()),
+            _ => {}
+        }
+        if let Some(properties) = schema["properties"].as_object() {
+            for (name, p) in properties {
+                unbounded(p, &format!("{at}.{name}"), found);
+            }
+        }
+        if schema.get("items").is_some() {
+            unbounded(&schema["items"], &format!("{at}[]"), found);
+        }
+    }
+
+    #[tokio::test]
+    async fn every_string_and_collection_a_command_carries_is_bounded() {
+        let (a, _) = two_members().await;
+        let key_a = a.key.clone();
+        let site = site(vec![(A, a)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a)]).await;
+        let mut found = Vec::new();
+        for prefix in [String::new(), format!("/workspaces/{ws}")] {
+            let (_, c) = get_as(&site.app, &prefix, &site.key, "/commands").await;
+            for entry in c["commands"].as_array().unwrap() {
+                let path = format!(
+                    "/commands/{}/{}",
+                    entry["schema"].as_str().unwrap(),
+                    entry["version"].as_str().unwrap()
+                );
+                let (s, doc) = get_as(&site.app, &prefix, &site.key, &path).await;
+                assert_eq!(s, StatusCode::OK, "{doc}");
+                unbounded(&doc, &format!("{prefix}{path}"), &mut found);
+            }
+        }
+        assert!(found.is_empty(), "unbounded: {found:#?}");
+        // A workspace's door takes a little less than the root's, so what its cloud took a member's door takes.
+        let limit = best_peer_door::router::MAX_BODY - best_peer_door::router::TENANT_ROOM;
+        let req = Request::post(format!("/workspaces/{ws}/commands"))
+            .header("X-Api-Key", &site.key)
+            .header(header::CONTENT_TYPE, "application/cloudevents+json")
+            .body(Body::from("x".repeat(limit + 1)))
+            .unwrap();
+        let res = site.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body(res).await["error"]["details"]["limit_bytes"], limit);
+    }
+
+    #[tokio::test]
+    async fn a_credential_with_a_share_runs_its_jobs_on_a_device_where_its_share_counts_them() {
+        let bed = fresh().await;
+        let team = key_with(&bed.app, Some("jobs"), Some(8 * GB)).await;
+        let scoped = key_with(&bed.app, Some("jobs"), None).await;
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &team,
+            "t0",
+            "RunJob",
+            "run-job",
+            json!({ "image": "busybox" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "JOB_NEEDS_DEVICE");
+        assert_eq!(b["error"]["details"]["field"], "memory_bytes");
+        assert!(
+            b["error"]["message"].as_str().unwrap().contains("send memory_bytes"),
+            "{b}"
+        );
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &team,
+            "t1",
+            "RunJob",
+            "run-job",
+            json!({ "image": "busybox", "memory_bytes": GB }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        // A key with no share is not held to a device, whatever its scopes.
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &scoped,
+            "s0",
+            "RunJob",
+            "run-job",
+            json!({ "image": "busybox" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+    }
+
+    #[tokio::test]
+    async fn a_credential_with_a_share_runs_its_jobs_on_a_device_in_a_cloud_too() {
+        let (a, b) = two_members().await;
+        let (key_a, key_b) = (a.key.clone(), b.key.clone());
+        let site = site(vec![(A, a), (B, b)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a), ("b", B, &key_b)])
+            .await;
+        let bob = key_with(&site.app, Some("jobs"), Some(4 * GB)).await;
+        let (_, w) = get_as(&site.app, "", &bob, "/queries/get-workspaces").await;
+        let bob_id = w["identity"].as_str().unwrap().to_string();
+        let (s, _) = send_as(
+            &site.app,
+            "",
+            &site.key,
+            "i0",
+            "InviteMember",
+            "invite-member",
+            json!({ "workspace": ws, "identity": bob_id }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        events_as(&site.app, "", &site.key, "i0", "MemberInvitedV1").await;
+        let (s, _) = send_as(
+            &site.app,
+            "",
+            &bob,
+            "a0",
+            "AcceptInvitation",
+            "accept-invitation",
+            json!({ "workspace": ws }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        events_as(&site.app, "", &bob, "a0", "MemberJoinedV1").await;
+        let prefix = format!("/workspaces/{ws}");
+        let (s, e) = send_as(
+            &site.app,
+            &prefix,
+            &bob,
+            "bj0",
+            "RunJob",
+            "run-job",
+            json!({ "image": "busybox", "cloud": "lab" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "JOB_NEEDS_DEVICE");
+        let (s, e) = send_as(
+            &site.app,
+            &prefix,
+            &bob,
+            "bj1",
+            "RunJob",
+            "run-job",
+            json!({ "image": "busybox", "cloud": "lab", "memory_bytes": GB }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{e}");
+    }
+
+    /// The data of the last event of `until` with `correlation`, as `key` reads it at the root.
+    async fn last_of(app: &axum::Router, key: &str, correlation: &str, until: &str) -> Value {
+        let events = events_as(app, "", key, correlation, until).await;
+        events.iter().rev().find(|e| e["type"] == until).unwrap()["data"].clone()
+    }
+
+    #[tokio::test]
+    async fn a_credential_runs_as_many_workloads_at_once_as_its_approver_allows() {
+        let log = Arc::new(EventLog::ephemeral());
+        let runtime = Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![]));
+        let engine = Arc::new(best_peer_engine::Fake::new());
+        let bed = bed_with(
+            card(),
+            log.clone(),
+            runtime.clone(),
+            engine.clone(),
+            "engines.local",
+            None,
+        )
+        .await;
+        let team = key_counted(&bed.app, Some("deploy,jobs"), Some(8 * GB), Some(1), Some(1)).await;
+        let deploy = |id: &'static str, model: &'static str| {
+            let (app, team) = (bed.app.clone(), team.clone());
+            async move {
+                send_as(
+                    &app,
+                    "",
+                    &team,
+                    id,
+                    "DeployModel",
+                    "deploy-model",
+                    json!({ "model": model, "engine": "ollama", "memory_bytes": 1 }),
+                )
+                .await
+            }
+        };
+        let run = |id: &'static str| {
+            let (app, team) = (bed.app.clone(), team.clone());
+            async move {
+                send_as(
+                    &app,
+                    "",
+                    &team,
+                    id,
+                    "RunJob",
+                    "run-job",
+                    json!({ "image": "busybox", "memory_bytes": 1 }),
+                )
+                .await
+            }
+        };
+        // One deployment at a time, however small each claims to be; the owner, approved with no count, is not counted.
+        let (s, b) = deploy("d1", "a:7b").await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let first = last_of(&bed.app, &team, "d1", "DeploymentReady").await["deployment"].clone();
+        let (s, b) = deploy("d2", "b:7b").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "DEPLOYMENTS_EXCEEDED");
+        assert_eq!(b["error"]["details"], json!({ "ceiling": 1, "running": 1 }));
+        assert!(b["error"]["message"].as_str().unwrap().contains("undeploy one first"));
+        bed.deployed("o1", "owner-a:7b", 1).await;
+        bed.deployed("o2", "owner-b:7b", 1).await;
+        // Room comes back when the deployment is undeployed, and when one fails.
+        let (s, _) = send_as(
+            &bed.app,
+            "",
+            &team,
+            "u1",
+            "UndeployModel",
+            "undeploy-model",
+            json!({ "deployment": first }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        events_as(&bed.app, "", &team, "u1", "Undeployed").await;
+        engine.missing("gone:7b");
+        let (s, b) = deploy("d3", "gone:7b").await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        last_of(&bed.app, &team, "d3", "DeploymentFailed").await;
+        let (s, b) = deploy("d4", "b:7b").await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        last_of(&bed.app, &team, "d4", "DeploymentReady").await;
+        // One job at a time: room comes back when it finishes and when it is stopped.
+        let (s, b) = run("j1").await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let started = last_of(&bed.app, &team, "j1", "JobStarted").await;
+        let (s, b) = run("j2").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "JOBS_EXCEEDED");
+        assert_eq!(b["error"]["details"], json!({ "ceiling": 1, "running": 1 }));
+        assert!(b["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("stop one or let one finish first"));
+        runtime
+            .stop(&ContainerId(started["container"].as_str().unwrap().into()))
+            .await
+            .unwrap();
+        last_of(&bed.app, &team, "j1", "JobFinished").await;
+        let (s, b) = run("j3").await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let started = last_of(&bed.app, &team, "j3", "JobStarted").await;
+        let (s, _) = send_as(
+            &bed.app,
+            "",
+            &team,
+            "s3",
+            "StopJob",
+            "stop-job",
+            json!({ "job": started["job"] }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        events_as(&bed.app, "", &team, "s3", "JobStopped").await;
+        let (s, b) = run("j4").await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        last_of(&bed.app, &team, "j4", "JobStarted").await;
+        // A restart counts again what still runs, from the log.
+        bed.peer.halt();
+        let credentials = bed.door.auth.clone();
+        drop(bed);
+        let again = bed_with(card(), log, runtime, engine, "engines.local", Some(credentials)).await;
+        let (s, b) = send_as(
+            &again.app,
+            "",
+            &team,
+            "d5",
+            "DeployModel",
+            "deploy-model",
+            json!({ "model": "c:7b", "engine": "ollama", "memory_bytes": 1 }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "DEPLOYMENTS_EXCEEDED");
+        let (s, b) = send_as(
+            &again.app,
+            "",
+            &team,
+            "j5",
+            "RunJob",
+            "run-job",
+            json!({ "image": "busybox", "memory_bytes": 1 }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "JOBS_EXCEEDED");
+        // A share with no count runs as many as fit in it: the counts are the approver's word, never a default.
+        let shared = key_with(&again.app, Some("deploy"), Some(8 * GB)).await;
+        for (id, model) in [("x1", "x:7b"), ("x2", "y:7b"), ("x3", "z:7b")] {
+            let (s, b) = send_as(
+                &again.app,
+                "",
+                &shared,
+                id,
+                "DeployModel",
+                "deploy-model",
+                json!({ "model": model, "engine": "ollama", "memory_bytes": 1 }),
+            )
+            .await;
+            assert_eq!(s, StatusCode::CREATED, "{b}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_credential_with_a_share_is_counted_across_the_door_every_workspace_included() {
+        let (a, b) = two_members().await;
+        let (key_a, key_b) = (a.key.clone(), b.key.clone());
+        let site = site(vec![(A, a), (B, b)]).await;
+        let ws1 = site.workspace("c1", "Research").await;
+        let ws2 = site.workspace("c2", "Ops").await;
+        site.cloud(&ws1, "k1", "lab", &[("a", A, &key_a)]).await;
+        site.cloud(&ws2, "k2", "ops-pool", &[("b", B, &key_b)]).await;
+        let bob = key_counted(&site.app, Some("deploy"), Some(4 * GB), Some(1), None).await;
+        let (_, w) = get_as(&site.app, "", &bob, "/queries/get-workspaces").await;
+        let bob_id = w["identity"].as_str().unwrap().to_string();
+        for (n, ws) in [&ws1, &ws2].into_iter().enumerate() {
+            let (s, _) = send_as(
+                &site.app,
+                "",
+                &site.key,
+                &format!("i{n}"),
+                "InviteMember",
+                "invite-member",
+                json!({ "workspace": ws, "identity": bob_id }),
+            )
+            .await;
+            assert_eq!(s, StatusCode::CREATED);
+            events_as(&site.app, "", &site.key, &format!("i{n}"), "MemberInvitedV1").await;
+            let (s, _) = send_as(
+                &site.app,
+                "",
+                &bob,
+                &format!("a{n}"),
+                "AcceptInvitation",
+                "accept-invitation",
+                json!({ "workspace": ws }),
+            )
+            .await;
+            assert_eq!(s, StatusCode::CREATED);
+            events_as(&site.app, "", &bob, &format!("a{n}"), "MemberJoinedV1").await;
+        }
+        let (s, b) = send_as(
+            &site.app,
+            &format!("/workspaces/{ws1}"),
+            &bob,
+            "bd1",
+            "DeployModel",
+            "deploy-model",
+            json!({ "model": "m", "engine": "ollama", "memory_bytes": GB, "cloud": "lab" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let (s, e) = send_as(
+            &site.app,
+            &format!("/workspaces/{ws2}"),
+            &bob,
+            "bd2",
+            "DeployModel",
+            "deploy-model",
+            json!({ "model": "m", "engine": "ollama", "memory_bytes": GB, "cloud": "ops-pool" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "DEPLOYMENTS_EXCEEDED");
+        assert_eq!(e["error"]["details"]["running"], 1);
+        assert!(e["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("every workspace counted"));
+    }
+
+    #[tokio::test]
+    async fn a_member_that_gave_the_cloud_a_count_counts_the_whole_cloud_as_one() {
+        let (a, _) = two_members().await;
+        let cloud_key = key_counted(&a.app, Some("deploy,jobs"), Some(16 * GB), Some(1), None).await;
+        let site = site(vec![(A, a)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &cloud_key)]).await;
+        let (s, b) = site.deploy(&ws, "d1", Some("lab"), 4, None).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "d1", "DeploymentReady").await;
+        // The owner of the workspace is not counted by the cloud, but the member counts the cloud as one holder.
+        let (s, b) = site.deploy(&ws, "d2", Some("lab"), 4, None).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let events = site.events(&ws, "d2", "DeploymentFailed").await;
+        let failed = &events.last().unwrap()["data"];
+        assert!(
+            failed["reason"]
+                .as_str()
+                .unwrap()
+                .contains("may run 1 deployment(s) at once"),
+            "{failed}"
+        );
     }
 
     #[tokio::test]

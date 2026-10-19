@@ -152,6 +152,9 @@ impl EventLog {
                         // A later line for a known command only ever says it finished, or what it made.
                         Some(known) => {
                             known.finished |= a.finished;
+                            if known.finished {
+                                known.envelope = None;
+                            }
                             if a.workload.is_some() {
                                 known.workload = a.workload;
                             }
@@ -272,6 +275,7 @@ impl EventLog {
             return;
         }
         a.finished = true;
+        a.envelope = None;
         let line = AcceptedLine {
             sender: sender.into(),
             id: id.into(),
@@ -343,6 +347,17 @@ impl EventLog {
         for (sender, id) in owed {
             self.finish_command(&sender, &id);
         }
+    }
+
+    /// How many accepted commands are kept whole in memory.
+    #[cfg(test)]
+    fn kept_whole(&self) -> usize {
+        self.accepted
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|a| a.envelope.is_some())
+            .count()
     }
 
     /// The accepted commands no completing event was told for, oldest first by acceptance: what a restart owes.
@@ -594,6 +609,32 @@ mod tests {
             log.since_id("never-seen").len(),
             0,
             "an id the log never told replays nothing"
+        );
+    }
+
+    #[test]
+    fn a_finished_command_is_kept_as_a_line_and_stays_so_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = EventLog::open(dir.path()).unwrap();
+        let cmd = ev("PullImage", "c");
+        assert_eq!(first.accept_command("alice", "cmd-1", "h", "c", &cmd), Accept::New);
+        assert_eq!(first.accept_command("alice", "cmd-2", "h", "c", &cmd), Accept::New);
+        assert_eq!(first.kept_whole(), 2);
+        first.finish_command("alice", "cmd-2");
+        assert_eq!(first.kept_whole(), 1, "the finished command is not kept whole");
+        drop(first);
+        let again = EventLog::open(dir.path()).unwrap();
+        assert_eq!(again.kept_whole(), 1, "nor after a restart");
+        assert_eq!(
+            again.accept_command("alice", "cmd-2", "h", "c", &cmd),
+            Accept::Duplicate {
+                correlation: "c".into()
+            },
+            "its retry is still answered as it was"
+        );
+        assert_eq!(
+            again.accept_command("alice", "cmd-2", "other", "c", &cmd),
+            Accept::Conflict
         );
     }
 
