@@ -545,6 +545,7 @@ async fn stream_events(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, BestError> {
     let filter = filter_from(&q)?;
+    let slot = door.streams.take(&sender.hash)?;
     let last = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
@@ -570,7 +571,8 @@ async fn stream_events(
                 .filter(|s| s.seq > seen_up_to && filter.matches(s) && door2.visible_to(&sender, s));
             async move { keep }
         });
-    let out = replayed.chain(live).map(|s| {
+    let out = replayed.chain(live).map(move |s| {
+        let _held = &slot;
         Ok(SseEvent::default()
             .id(s.envelope.id.clone())
             .data(serde_json::to_string(&s.envelope).unwrap_or_default()))
@@ -937,6 +939,45 @@ mod tests {
         let (s, _, b) = call(&app, post_form("/auth/device", &[("client_id", "x")])).await;
         assert_eq!(s, StatusCode::NOT_FOUND, "sign-in is the root's: {b}");
         assert_eq!(b["error"]["code"], "NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn a_credential_holds_so_many_event_streams_open_and_a_closed_one_gives_its_place_back() {
+        let d = door();
+        let app = router(d.clone());
+        let key = sign_in(&app, "test", "my-peer").await;
+        let other = sign_in(&app, "other", "other-peer").await;
+        let open = |key: String| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::get("/events/stream")
+                        .header(AUTH_HEADER, &key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let mut held = Vec::new();
+        for _ in 0..crate::streams::STREAMS_PER_CREDENTIAL {
+            let res = open(key.clone()).await;
+            assert_eq!(res.status(), StatusCode::OK);
+            held.push(res);
+        }
+        let refused = open(key.clone()).await;
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        let b: Value = serde_json::from_slice(&refused.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(b["error"]["code"], "TOO_MANY_STREAMS");
+        assert_eq!(b["error"]["details"]["streams"], crate::streams::STREAMS_PER_CREDENTIAL);
+        assert_eq!(
+            open(other.clone()).await.status(),
+            StatusCode::OK,
+            "another credential's streams are its own"
+        );
+        drop(held.pop());
+        assert_eq!(open(key.clone()).await.status(), StatusCode::OK);
     }
 
     #[tokio::test]

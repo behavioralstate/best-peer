@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use best_peer_door::{Auth, Door, EventLog, LocalApprover};
+use best_peer_door::{Auth, Door, EventLog, LocalApprover, Streams};
 use best_peer_engine::Engine;
 use best_peer_gpu::Gpu;
 use best_peer_runtime::Runtime;
@@ -129,11 +129,13 @@ pub fn door(peer: Arc<Peer>, workspaces: Arc<workspace::Workspaces>, auth: Arc<A
     )
     .with_tenants(&ctx.manifest_template())
     .with_partition(workspace::Workspaces::root_partition(peer.log.clone()))
+    .with_streams(ctx.streams.clone())
 }
 
 /// What the workspaces of this door are built with: the root's endpoint and credentials, the data directory, the
 /// transport their clouds reach members through (HTTP with the trust `BEST_PEER_TRUST` adds, the PEM files of
-/// members' own certificates), and the holdings every surface counts a share against.
+/// members' own certificates), the holdings every surface counts a share against, and the event streams every
+/// surface counts a credential's against.
 fn context(
     endpoint: &str,
     dir: &std::path::Path,
@@ -157,6 +159,7 @@ fn context(
         auth,
         transport: Arc::new(transport::Http::new(&trust).unwrap_or_else(|why| fail(&why))),
         holdings,
+        streams: Arc::new(Streams::default()),
     }
 }
 
@@ -658,6 +661,7 @@ mod tests {
                 auth: auth.clone(),
                 transport: Arc::new(Switchboard::default()),
                 holdings,
+                streams: Arc::new(Streams::default()),
             }),
             log,
         );
@@ -939,6 +943,7 @@ mod tests {
                 auth: auth.clone(),
                 transport: switchboard.clone(),
                 holdings,
+                streams: Arc::new(Streams::default()),
             }),
             log.clone(),
         );
@@ -2598,6 +2603,7 @@ mod tests {
                 auth: auth.clone(),
                 transport: Arc::new(Switchboard::default()),
                 holdings,
+                streams: Arc::new(Streams::default()),
             }),
             log,
         );
@@ -3019,6 +3025,57 @@ mod tests {
         assert_eq!(parse_memory("1073741824").unwrap(), 1 << 30);
         assert!(parse_memory("lots").unwrap_err().contains("40G"));
         assert!(parse_memory("4X").unwrap_err().contains("unit"));
+    }
+
+    #[tokio::test]
+    async fn a_credential_holds_its_event_streams_across_the_root_and_every_workspace_together() {
+        let site = site(Vec::new()).await;
+        let bob = key_with(&site.app, None, None).await;
+        let (s, b) = send_as(
+            &site.app,
+            "",
+            &bob,
+            "w1",
+            "CreateWorkspace",
+            "create-workspace",
+            json!({ "name": "Bob's" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let ws = events_as(&site.app, "", &bob, "w1", "WorkspaceCreatedV1").await[0]["data"]["workspace"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let open = |prefix: String| {
+            let (app, bob) = (site.app.clone(), bob.clone());
+            async move {
+                app.oneshot(
+                    Request::get(format!("{prefix}/events/stream"))
+                        .header("X-Api-Key", &bob)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let mut held = Vec::new();
+        for n in 0..best_peer_door::streams::STREAMS_PER_CREDENTIAL {
+            let prefix = if n % 2 == 0 {
+                String::new()
+            } else {
+                format!("/workspaces/{ws}")
+            };
+            let res = open(prefix).await;
+            assert_eq!(res.status(), StatusCode::OK);
+            held.push(res);
+        }
+        let refused = open(format!("/workspaces/{ws}")).await;
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body(refused).await["error"]["code"], "TOO_MANY_STREAMS");
+        assert_eq!(open(String::new()).await.status(), StatusCode::TOO_MANY_REQUESTS);
+        drop(held.pop());
+        assert_eq!(open(String::new()).await.status(), StatusCode::OK);
     }
 
     #[tokio::test]

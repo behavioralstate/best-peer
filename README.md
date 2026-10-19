@@ -269,6 +269,11 @@ Every command of this peer follows one pattern, and nothing else is needed to dr
    the end, and follows from there with `GET /events/stream` and `Last-Event-ID`. There is no other channel for
    progress or outcome, and nothing to poll.
 
+A credential holds 4 event streams open at once, counted across the door and every workspace on it; the fifth is
+refused with `TOO_MANY_STREAMS` and 429 until one closes. One stream without `correlationId` follows everything the
+credential may read. A cloud holds one stream on each member, and a stream whose client went away gives its place
+back when the door's next keep-alive finds the connection gone.
+
 ## Sign in
 
 An agent signs a person in the way every BEST service is signed in to: it reads the manifest, posts to

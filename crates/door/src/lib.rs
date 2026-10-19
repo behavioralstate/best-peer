@@ -21,12 +21,14 @@ pub mod guidance;
 pub mod log;
 pub mod manifest;
 pub mod router;
+pub mod streams;
 
 pub use auth::{Approver, Auth, FakeApprover, LocalApprover};
 pub use catalogue::{AdmitHook, Catalogue, CommandDef, Emitter, EventDef, QueryDef};
 pub use envelope::Envelope;
 pub use error::BestError;
 pub use log::{Accept, EventLog, Filter, Stored, Unfinished};
+pub use streams::Streams;
 
 /// What a credential may read of an event, beyond the door's own rule: `Some(visible)` decides, `None` leaves it to
 /// the rule (a credential that acts for every holder reads everything; another reads the events under its own
@@ -65,6 +67,8 @@ pub struct Door {
     pub tenants: Option<String>,
     /// What a credential may read of this log's events, when the door's own rule is not the whole answer.
     pub partition: Option<Partition>,
+    /// The event streams each credential holds open, counted with every door that shares them.
+    pub streams: Arc<Streams>,
 }
 
 impl Door {
@@ -91,7 +95,14 @@ impl Door {
             completions,
             tenants: None,
             partition: None,
+            streams: Arc::new(Streams::default()),
         }
+    }
+
+    /// The same door, counting open event streams in `streams`, which other doors may share.
+    pub fn with_streams(mut self, streams: Arc<Streams>) -> Self {
+        self.streams = streams;
+        self
     }
 
     /// Decides what a credential reads beyond the door's own rule.
