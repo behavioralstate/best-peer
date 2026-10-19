@@ -3655,6 +3655,16 @@ mod tests {
             .filter_map(|e| e["data"]["peer"].as_str())
             .collect();
         assert_eq!(progressed.into_iter().collect::<Vec<_>>(), ["a", "b"]);
+        // A member that has the image is not the cloud's pull ended: 100 is told once, by the cloud, with the outcome.
+        let hundreds: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e["type"] == "ImagePulling" && e["data"]["progress_pct"] == 100)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(hundreds.len(), 1, "{events:#?}");
+        assert!(events[hundreds[0]]["data"]["peer"].is_null(), "{events:#?}");
+        assert_eq!(events[hundreds[0] + 1]["type"], "ImagePulled");
         let (s, b) = site
             .send(
                 &ws,

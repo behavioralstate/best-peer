@@ -1645,7 +1645,7 @@ fn api_name(c: &Compute) -> String {
 
 /// The pace progress is told at. An engine reports every percent, sometimes every byte; a consumer that catches up
 /// on the log reads every event told, so one workload tells its progress at steps of ten points on from the last
-/// value told, at once when the value is final or went back (a new layer appeared, extraction began), and at least
+/// value told, at once when the value is final or went back (a new layer appeared), and at least
 /// every few seconds while the engine keeps reporting, so a slow pull is seen to move. A report without a value
 /// (the engine knows it is working, not how far) is told by time alone and moves no baseline.
 pub struct Pace {
