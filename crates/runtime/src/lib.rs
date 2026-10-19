@@ -318,6 +318,13 @@ impl Fake {
         self
     }
 
+    /// A fake whose pull reports `steps`, in order: a share that reaches 100 and falls back, as an engine that learns
+    /// of more to fetch as it goes does.
+    pub fn reporting(mut self, steps: &[u8]) -> Self {
+        self.steps = steps.iter().copied().map(Some).collect();
+        self
+    }
+
     /// Publishes container port `container` at host port `host` instead of the fake's own numbering, for a test
     /// that listens there itself and sees what reaches the engine.
     pub fn publishes(mut self, container: u16, host: u16) -> Self {

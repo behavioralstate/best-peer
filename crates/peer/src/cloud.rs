@@ -742,7 +742,7 @@ impl Cloud {
                 Err(isolation_refused(
                     a,
                     &offered,
-                    &format!("cloud {}'s members", self.name),
+                    &format!("cloud {}'s members offer", self.name),
                 ))
             }
             _ => Ok(held),

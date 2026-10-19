@@ -4,7 +4,8 @@
 //! adapter. A mount is a bind the engine refuses when its source is not there. A container is confined as its spec
 //! says, in the engine's own words: capabilities dropped, no new privileges, a read-only root with a private `/tmp`,
 //! ceilings on processes and on memory with swap counted in, and its network. Containers are removed by the engine
-//! when they exit. Thin; proven on a host by hand, never unit-tested.
+//! when they exit. Thin; proven on a host by hand. Only the share of a pull, which is arithmetic over what the engine
+//! reports, is unit-tested.
 
 use std::collections::HashMap;
 
@@ -126,6 +127,43 @@ fn image_error(image: &ImageRef, message: &str) -> RuntimeError {
     }
 }
 
+/// The share of a pull across every layer, not per layer. The engine reports each layer twice over its own bytes:
+/// downloading it, then extracting it, each from 0 to the layer's size. So a layer counts half when downloaded and
+/// whole when extracted, and the start of its extraction is not read as a fall back to nothing.
+#[derive(Default)]
+struct Layers {
+    /// Each layer's size, and the bytes it has downloaded and extracted.
+    of: HashMap<String, (i64, i64, i64)>,
+}
+
+impl Layers {
+    /// One line of the engine's pull stream about `layer`: its status, and the bytes it reports where it says.
+    fn report(&mut self, layer: &str, status: &str, current: Option<i64>, total: Option<i64>) {
+        let entry = self.of.entry(layer.to_string()).or_insert((0, 0, 0));
+        if let Some(t) = total.filter(|t| *t > 0) {
+            entry.0 = entry.0.max(t);
+        }
+        let size = entry.0;
+        let at = current.unwrap_or(0).clamp(0, size);
+        match status {
+            "Downloading" => entry.1 = entry.1.max(at),
+            "Verifying Checksum" | "Download complete" => entry.1 = size,
+            "Extracting" => (entry.1, entry.2) = (size, entry.2.max(at)),
+            "Pull complete" => (entry.1, entry.2) = (size, size),
+            _ => {}
+        }
+    }
+
+    /// The share done, in percent, once any layer has said its size.
+    fn share(&self) -> Option<u8> {
+        let (done, whole) = self
+            .of
+            .values()
+            .fold((0i64, 0i64), |(d, w), (size, down, out)| (d + down + out, w + 2 * size));
+        (done * 100).checked_div(whole).map(|p| p.clamp(0, 100) as u8)
+    }
+}
+
 #[async_trait]
 impl Runtime for DockerRuntime {
     async fn pull(&self, image: &ImageRef, progress: Progress) -> Result<(), RuntimeError> {
@@ -135,28 +173,21 @@ impl Runtime for DockerRuntime {
             options = options.tag(tag);
         }
         let mut stream = self.docker.create_image(Some(options.build()), None, None);
-        // Progress across every layer, not per layer: the engine reports each layer's own bytes.
-        let mut layers: HashMap<String, (i64, i64)> = HashMap::new();
+        let mut layers = Layers::default();
         let mut last: Option<u8> = None;
         while let Some(next) = stream.next().await {
             let info = next.map_err(|e| image_error(image, &e.to_string()))?;
             if let Some(err) = info.error_detail.and_then(|d| d.message) {
                 return Err(image_error(image, &err));
             }
-            if let (Some(layer), Some(p)) = (info.id, info.progress_detail) {
-                if let (Some(c), Some(t)) = (p.current, p.total) {
-                    if t > 0 {
-                        layers.insert(layer, (c.clamp(0, t), t));
-                    }
-                }
+            if let Some(layer) = info.id {
+                let (current, total) = info.progress_detail.map(|p| (p.current, p.total)).unwrap_or_default();
+                layers.report(&layer, info.status.as_deref().unwrap_or_default(), current, total);
             }
-            let (done, total) = layers.values().fold((0i64, 0i64), |(d, t), (c, lt)| (d + c, t + lt));
-            if let Some(share) = (done * 100).checked_div(total) {
-                let pct = Some(share.clamp(0, 100) as u8);
-                if pct != last {
-                    last = pct;
-                    progress(pct);
-                }
+            let pct = layers.share();
+            if pct.is_some() && pct != last {
+                last = pct;
+                progress(pct);
             }
         }
         Ok(())
@@ -353,5 +384,42 @@ impl Runtime for DockerRuntime {
 
     fn events(&self) -> broadcast::Receiver<Event> {
         self.tx.subscribe()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_layer_extracted_after_it_downloaded_moves_the_share_on_and_never_back() {
+        let mut l = Layers::default();
+        l.report("a", "Pulling fs layer", None, None);
+        l.report("b", "Pulling fs layer", None, None);
+        assert_eq!(l.share(), None, "no size known yet");
+        l.report("a", "Downloading", Some(50), Some(100));
+        l.report("b", "Downloading", Some(100), Some(100));
+        l.report("b", "Download complete", None, None);
+        assert_eq!(l.share(), Some(37), "a half downloaded and b downloaded: 150 of 400");
+        l.report("a", "Downloading", Some(100), Some(100));
+        l.report("a", "Download complete", None, None);
+        assert_eq!(l.share(), Some(50), "both downloaded, nothing extracted");
+        // The engine starts extracting a at 0 of its size: that is progress past the download, not a fall to 0.
+        l.report("a", "Extracting", Some(0), Some(100));
+        assert_eq!(l.share(), Some(50));
+        l.report("a", "Extracting", Some(100), Some(100));
+        l.report("a", "Pull complete", None, None);
+        l.report("b", "Extracting", Some(40), Some(100));
+        assert_eq!(l.share(), Some(85));
+        l.report("b", "Pull complete", None, None);
+        assert_eq!(l.share(), Some(100));
+    }
+
+    #[test]
+    fn a_layer_the_engine_already_holds_counts_for_nothing_and_takes_nothing_away() {
+        let mut l = Layers::default();
+        l.report("held", "Already exists", None, None);
+        l.report("new", "Downloading", Some(10), Some(100));
+        assert_eq!(l.share(), Some(5));
     }
 }

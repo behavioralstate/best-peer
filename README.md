@@ -327,7 +327,9 @@ On a workspace's door the same commands take the `cloud` to place in (or a `devi
 names it), the devices are every cloud's peers', and every row and event carries `cloud` and `peer`.
 The facts follow on the event stream under the command's correlation id, in order: `ImagePulling`, `ImagePulled`
 (`held: true` when the image was already here and not pulled, `ImagePulling` then told once, at 100),
-`DeploymentStarted`, `WeightsLoading`, then `DeploymentReady`, or `DeploymentFailed`. What the engine does on its own
+`DeploymentStarted`, `WeightsLoading`, then `DeploymentReady`, or `DeploymentFailed`. While an image is pulled,
+`ImagePulling` says 99 at most and may fall back, since the engine learns of more to fetch as it goes; 100 comes with
+the pull's end, just before `ImagePulled`. What the engine does on its own
 later (`OutOfMemory`, `DeploymentEnded`) is told under the same correlation id. `prompt` names a ready deployment and
 the conversation so far, and `PromptAnswered` follows under its own correlation id with the answer whole, or
 `PromptFailed` with the reason and the fix. `run-job` runs an image once, a tenant's in a closed box, and tells
@@ -344,7 +346,10 @@ says it was never placed), and `deadline_seconds` the run from `JobStarted` (pas
 and it ends in `JobStopped` before it started. A member lost under an order queues it again once, `JobQueued`
 telling `attempt: 2`, and fails it the second time. `get-workloads` lists the orders not started yet as `queued`,
 oldest first. An order that waits counts against its credential's share and its count of jobs, as an admitted one
-always has. The queue is the cloud's state, folded from these facts; [docs/queue.md](docs/queue.md) says what it does
+always has. Every member lists its host's CPU after its cards, with the host's memory, so an order the cards cannot
+hold runs on the CPU rather than waiting, unless it names a device or its key is approved `--accelerators-only`:
+approve the tenants of a GPU cloud that way until the menu's sizes ([spec#63](https://github.com/behavioralstate/spec/issues/63))
+name a compute API. The queue is the cloud's state, folded from these facts; [docs/queue.md](docs/queue.md) says what it does
 not do yet that Verda's batch jobs and RunPod Serverless do.
 
 The peer's state is the fold of the events it told. After a restart it is rebuilt from the log and squared with what
