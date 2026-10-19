@@ -458,19 +458,14 @@ impl Peer {
     pub async fn admit_deploy(&self, cmd: Envelope, who: Credential, key: String) -> Result<(), BestError> {
         require(&who, "deploy")?;
         let data: DeployData = parse(&cmd.data)?;
-        let host = usable_by(self.hardware().await?, &who, data.device.as_deref())?;
+        let host = self.hardware().await?;
         // One admission at a time across the door, and what the credential holds is read before the state is
         // locked, since the door's holdings read this state too.
         let _admitting = self.holdings.admitting();
         let held = self.holdings.of(&who.holder());
         let mut state = self.state.lock().unwrap();
         within_share(held.memory_bytes, &who, data.memory_bytes)?;
-        within_count(
-            &who,
-            "deployment",
-            held.deployments,
-            self.holdings.ceilings().deployments,
-        )?;
+        within_count("deployment", held.deployments, who.grant.deployments)?;
         let (device, compute) = place(
             &host,
             &state,
@@ -801,19 +796,19 @@ impl Peer {
         if has_share(&who) && data.memory_bytes.is_none() {
             return Err(BestError::bad_request(
                 "JOB_NEEDS_DEVICE",
-                "this credential runs jobs on the accelerators alone, where its share counts them: send memory_bytes, the device memory the job needs",
+                "this credential has a share, so its jobs run on a device, where the share counts them, never on the host with no device: send memory_bytes, the device memory the job needs",
             )
             .with_details(json!({ "field": "memory_bytes" })));
         }
         let host = match data.memory_bytes {
-            Some(_) => Some(usable_by(self.hardware().await?, &who, data.device.as_deref())?),
+            Some(_) => Some(self.hardware().await?),
             None => None,
         };
         let _admitting = self.holdings.admitting();
         let held = self.holdings.of(&who.holder());
         let mut state = self.state.lock().unwrap();
         within_share(held.memory_bytes, &who, data.memory_bytes.unwrap_or(0))?;
-        within_count(&who, "job", held.jobs, self.holdings.ceilings().jobs)?;
+        within_count("job", held.jobs, who.grant.jobs)?;
         let placement = match (data.memory_bytes, &host) {
             (Some(needed), Some(host)) => Some(place(
                 host,
@@ -1098,8 +1093,8 @@ impl Peer {
 
 #[async_trait]
 impl Service for Peer {
-    async fn hardware_state(&self, who: &Credential) -> Result<Value, BestError> {
-        Ok(crate::domain::host_state(&shown_to(self.hardware().await?, who)))
+    async fn hardware_state(&self) -> Result<Value, BestError> {
+        Ok(crate::domain::host_state(&self.hardware().await?))
     }
 
     fn workloads(&self, who: &Credential) -> Result<Value, BestError> {
@@ -1259,67 +1254,19 @@ pub(crate) fn within_share(held: u64, who: &Credential, needed: u64) -> Result<(
     .with_details(json!({ "share_bytes": share, "held_bytes": held, "needed_bytes": needed, "room_bytes": share.saturating_sub(held) })))
 }
 
-/// Whether `who` was approved for a share of device memory. Such a credential runs on the accelerators alone, since
-/// its share counts their memory and the host's CPU and memory are the operator's.
+/// Whether `who` was approved for a share of device memory. Such a credential runs its jobs on a device, where its
+/// share counts them: a job with no device would hold the host's memory and processors outside the share.
 pub(crate) fn has_share(who: &Credential) -> bool {
     who.grant.memory_bytes.is_some()
 }
 
-/// `host` without the devices that offer the CPU alone.
-pub(crate) fn accelerators(host: &Host) -> Host {
-    Host {
-        driver: host.driver.clone(),
-        devices: host
-            .devices
-            .iter()
-            .filter(|d| d.compute.iter().any(|c| *c != Compute::Cpu))
-            .cloned()
-            .collect(),
-        observed_at: host.observed_at,
-    }
-}
-
-/// The devices `who` is shown: every one, or the accelerators alone for a credential with a share.
-pub(crate) fn shown_to(host: Host, who: &Credential) -> Host {
-    if has_share(who) {
-        accelerators(&host)
-    } else {
-        host
-    }
-}
-
-/// The devices a workload of `who` may be placed on. A credential with a share that names a device offering the CPU
-/// alone, or asks on a host with no accelerator, is refused with why and what it may do instead.
-pub(crate) fn usable_by(host: Host, who: &Credential, pinned: Option<&str>) -> Result<Host, BestError> {
-    if !has_share(who) {
-        return Ok(host);
-    }
-    let usable = accelerators(&host);
-    let ids: Vec<String> = usable.devices.iter().map(|d| d.id.0.clone()).collect();
-    let cpu = pinned.filter(|p| host.devices.iter().any(|d| d.id.0 == *p) && !ids.iter().any(|i| i == p));
-    if cpu.is_none() && !ids.is_empty() {
-        return Ok(usable);
-    }
-    let condition = match cpu {
-        Some(p) => format!("device {p} offers the CPU alone"),
-        None => "no device here is an accelerator".into(),
+/// A credential whose approver set a count runs `ceiling` workloads of `kind` at once across the door, `running` of
+/// them already, every workspace counted: one more is refused with what it runs and how to make room.
+pub(crate) fn within_count(kind: &str, running: usize, ceiling: Option<u32>) -> Result<(), BestError> {
+    let Some(ceiling) = ceiling.map(|c| c as usize) else {
+        return Ok(());
     };
-    let fix = if ids.is_empty() {
-        "the owner can approve a key without a share for work on the CPU".into()
-    } else {
-        format!("name one of {}, or leave device out", list(ids.iter()))
-    };
-    Err(BestError::bad_request(
-        "ACCELERATORS_ONLY",
-        format!("{condition}, and this credential runs on the accelerators alone, since its share counts their memory: {fix}"),
-    )
-    .with_details(json!({ "device": pinned, "devices": ids })))
-}
-
-/// A credential with a share runs `ceiling` workloads of `kind` at once across the door, `running` of them already,
-/// every workspace counted: one more is refused with what it runs and how to make room.
-pub(crate) fn within_count(who: &Credential, kind: &str, running: usize, ceiling: usize) -> Result<(), BestError> {
-    if !has_share(who) || running < ceiling {
+    if running < ceiling {
         return Ok(());
     }
     let (code, room) = match kind {
@@ -1329,7 +1276,7 @@ pub(crate) fn within_count(who: &Credential, kind: &str, running: usize, ceiling
     Err(BestError::bad_request(
         code,
         format!(
-            "this credential may run {ceiling} {kind}(s) at once and runs {running} across this door, every workspace counted: {room} (get-workloads on each door you use lists them), or ask the operator for more"
+            "this credential may run {ceiling} {kind}(s) at once and runs {running} across this door, every workspace counted: {room} (get-workloads on each door you use lists them), or ask whoever approved it for more"
         ),
     )
     .with_details(json!({ "ceiling": ceiling, "running": running })))

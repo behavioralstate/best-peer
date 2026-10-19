@@ -2,26 +2,10 @@
 //! hold together, set at the approval) is one number for the door, and the door has several surfaces that promise
 //! memory: the machine's own hardware at the root, and every cloud of every workspace. Each registers here what it
 //! has promised to a holder, and a share is measured against the sum, so a workload admitted in one workspace is
-//! counted when another is asked for. So are how many deployments and jobs a credential with a share runs, since
-//! what each claims in `memory_bytes` is its own word: one count for the door, every surface included.
+//! counted when another is asked for. So are how many deployments and jobs a credential runs, for the counts its
+//! approver may set: one count for the door, every surface included.
 
 use std::sync::{Mutex, MutexGuard};
-
-/// How many workloads a credential with a share may run at once across the door.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Ceilings {
-    pub deployments: usize,
-    pub jobs: usize,
-}
-
-impl Default for Ceilings {
-    fn default() -> Self {
-        Self {
-            deployments: 1,
-            jobs: 1,
-        }
-    }
-}
 
 /// What one surface has promised a holder, admitted workloads included.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -39,21 +23,9 @@ pub struct Holdings {
     /// Held while a surface measures a share and reserves against it, so two admissions cannot both read the room
     /// before either takes it. Taken before any surface's state lock, never after one.
     admission: Mutex<()>,
-    ceilings: Ceilings,
 }
 
 impl Holdings {
-    /// The same holdings, with the operator's ceilings.
-    pub fn counting(mut self, ceilings: Ceilings) -> Self {
-        self.ceilings = ceilings;
-        self
-    }
-
-    /// How many workloads a credential with a share may run at once.
-    pub fn ceilings(&self) -> Ceilings {
-        self.ceilings
-    }
-
     /// One admission at a time across the door: the guard is held from the share's measure to the reservation.
     pub fn admitting(&self) -> MutexGuard<'_, ()> {
         self.admission.lock().unwrap_or_else(|e| e.into_inner())
@@ -112,17 +84,5 @@ mod tests {
                 jobs: 1
             }
         );
-        assert_eq!(
-            h.ceilings(),
-            Ceilings {
-                deployments: 1,
-                jobs: 1
-            }
-        );
-        let more = Ceilings {
-            deployments: 3,
-            jobs: 2,
-        };
-        assert_eq!(Holdings::default().counting(more).ceilings(), more);
     }
 }

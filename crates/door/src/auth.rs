@@ -115,6 +115,12 @@ pub struct Grant {
     /// The most device memory the credential's workloads may hold together; absent means no share is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_bytes: Option<u64>,
+    /// The most deployments the credential may run at once across the door; absent means no count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployments: Option<u32>,
+    /// The most jobs the credential may run at once across the door; absent means no count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jobs: Option<u32>,
 }
 
 impl Grant {
