@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use best_peer_runtime::{
-    ContainerId, Event, ImageRef, Network, Progress, Published, Runtime, RuntimeError, Spec, Started,
+    ContainerId, Event, ImageRef, Isolation, Network, Progress, Published, Runtime, RuntimeError, Spec, Started,
 };
 use bollard::models::{
     ContainerCreateBody, DeviceRequest, EventMessageTypeEnum, HostConfig, Mount, MountType, PortBinding,
@@ -160,6 +160,18 @@ impl Runtime for DockerRuntime {
             }
         }
         Ok(())
+    }
+
+    /// A container, or a user namespace when the engine runs rootless or remaps its users, as its own `info` says.
+    /// An engine that does not answer is still the one the peer confines every container in.
+    async fn isolation(&self) -> Isolation {
+        match self.docker.info().await {
+            Ok(info) => Isolation::of_container_engine(&info.security_options.unwrap_or_default()),
+            Err(e) => {
+                tracing::warn!(error = %e, "the container engine did not say whether it runs rootless; told as a container");
+                Isolation::Container
+            }
+        }
     }
 
     async fn holds(&self, image: &ImageRef) -> Result<bool, RuntimeError> {

@@ -148,6 +148,58 @@ pub enum RuntimeError {
 }
 
 /// What the door needs from a container engine.
+/// What stands between a workload and the host and the other workloads on it, weakest first, so a workload that asks
+/// for one is placed only where at least that is offered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Isolation {
+    /// A process of an engine already installed on the host: nothing of the peer's own between it and the host.
+    Process,
+    /// A container with no capability and no new privilege, a ceiling on tasks, and a tenant's job in a closed box.
+    Container,
+    /// The same, its users mapped to unprivileged ones on the host (a rootless or user-namespaced container engine):
+    /// root in the container is nobody outside it.
+    UserNamespace,
+    /// A virtual machine with the device passed through. No adapter offers it yet.
+    Vm,
+}
+
+impl Isolation {
+    /// Every level, weakest first: what a workload may ask for.
+    pub const ALL: [Isolation; 4] = [
+        Isolation::Process,
+        Isolation::Container,
+        Isolation::UserNamespace,
+        Isolation::Vm,
+    ];
+
+    /// The level's name, as the hardware state and a command say it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Isolation::Process => "process",
+            Isolation::Container => "container",
+            Isolation::UserNamespace => "user-namespace",
+            Isolation::Vm => "vm",
+        }
+    }
+
+    /// What a container engine offers by the security options it reports (Docker's `SecurityOptions`, entries such
+    /// as `name=seccomp,profile=builtin`): a user namespace when it runs rootless or remaps its users, a container
+    /// otherwise.
+    pub fn of_container_engine<S: AsRef<str>>(security_options: &[S]) -> Isolation {
+        let user_namespace = security_options.iter().any(|o| {
+            o.as_ref()
+                .split(',')
+                .any(|kv| kv.trim() == "name=rootless" || kv.trim() == "name=userns")
+        });
+        if user_namespace {
+            Isolation::UserNamespace
+        } else {
+            Isolation::Container
+        }
+    }
+}
+
 #[async_trait]
 pub trait Runtime: Send + Sync {
     /// Makes the image present, telling `progress` as it goes: from the registry, whether or not it is held.
@@ -170,6 +222,10 @@ pub trait Runtime: Send + Sync {
     /// than accepting it and failing it later.
     fn runs_jobs(&self) -> bool {
         true
+    }
+    /// What stands between a workload this engine runs and the host. An engine that cannot say claims the least.
+    async fn isolation(&self) -> Isolation {
+        Isolation::Process
     }
 }
 
@@ -196,6 +252,8 @@ pub struct Fake {
     tx: broadcast::Sender<Event>,
     /// When set, a pull waits for a permit: a test holds a workload between its pull and its start.
     gate: Mutex<Option<std::sync::Arc<tokio::sync::Semaphore>>>,
+    /// What it says stands between its containers and the host: a container, unless a test says otherwise.
+    isolation: Isolation,
 }
 
 impl Fake {
@@ -215,7 +273,14 @@ impl Fake {
             next: Mutex::new(0),
             tx,
             gate: Mutex::new(None),
+            isolation: Isolation::Container,
         }
+    }
+
+    /// An engine that offers `isolation`, as a rootless one offers a user namespace.
+    pub fn with_isolation(mut self, isolation: Isolation) -> Self {
+        self.isolation = isolation;
+        self
     }
 
     /// Holds every pull from now on until the gate answered gives it a permit (`add_permits`).
@@ -373,11 +438,32 @@ impl Runtime for Fake {
     fn runs_jobs(&self) -> bool {
         self.jobs
     }
+
+    async fn isolation(&self) -> Isolation {
+        self.isolation
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_container_engine_that_runs_rootless_or_remaps_its_users_offers_a_user_namespace() {
+        let plain = ["name=seccomp,profile=builtin", "name=cgroupns"];
+        assert_eq!(Isolation::of_container_engine(&plain), Isolation::Container);
+        let rootless = ["name=seccomp,profile=builtin", "name=rootless", "name=cgroupns"];
+        assert_eq!(Isolation::of_container_engine(&rootless), Isolation::UserNamespace);
+        let remapped = ["name=apparmor", "name=userns"];
+        assert_eq!(Isolation::of_container_engine(&remapped), Isolation::UserNamespace);
+        assert_eq!(Isolation::of_container_engine::<&str>(&[]), Isolation::Container);
+        assert!(Isolation::Process < Isolation::Container);
+        assert!(Isolation::Container < Isolation::UserNamespace && Isolation::UserNamespace < Isolation::Vm);
+        assert_eq!(
+            Isolation::ALL.iter().map(|i| i.name()).collect::<Vec<_>>(),
+            ["process", "container", "user-namespace", "vm"]
+        );
+    }
 
     fn fake() -> Fake {
         Fake::new(vec!["gpu-0".into()], vec![ImageRef("ollama/ollama:0.6".into())])

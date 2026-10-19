@@ -296,6 +296,17 @@ filesystem, which they keep the models on. Capabilities, privileges and the box 
 workspace's cloud, a job runs on the member as the cloud's credential: boxed when the member's owner approved the
 cloud with a share and did not open its jobs.
 
+What stands between a workload and the host is a property of each device, and `get-hardware-state` says it as
+`isolation`, weakest first: `process` for an engine installed on the host (`BEST_PEER_RUNTIME=native`), `container`
+for the confinement above, and `user-namespace` when the container engine also maps its users to unprivileged ones on
+the host, which Docker run rootless or with `userns-remap` does, so root in a container is nobody outside it; the peer
+reads it from the engine's own `info`, and the user namespace is the operator's to set up there. `vm`, a virtual
+machine with the device passed through, is a level no peer offers yet. `deploy-model` and `run-job` may ask for one
+as `isolation`: the workload is placed only on a device offering at least that, and refused at once
+(`ISOLATION_UNAVAILABLE`, with what is offered and the fix) where none does. On a workspace's cloud each device says
+what its member says, a member that says nothing counting as `process`, and an order that asks for a level waits only
+for a device that offers it.
+
 `BEST_PEER_MODEL_STORE` names a store of models beside the registry: Ollama's library (`blobs/` and `manifests/`,
 what `OLLAMA_MODELS` holds after an `ollama pull`). A deploy on Ollama of a model the store holds is served from it,
 the store mounted read-only at `/models`, and pulls nothing; a model the store lacks is pulled from the registry as

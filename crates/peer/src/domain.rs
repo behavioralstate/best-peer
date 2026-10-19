@@ -226,8 +226,8 @@ pub const NAME_SHAPE: &str =
 
 fn hardware_query(svc: Arc<dyn Service>, at: Where) -> QueryDef {
     let description = match at {
-        Where::Root => "The accelerators on this host right now: each device's compute APIs with their versions, its memory total and free, temperature, power and utilisation, and the driver. Read it before deploying: a model needs an API the device offers and memory it has free; get-workloads says what already holds memory.",
-        Where::Workspace => "The accelerators of this workspace's clouds right now: every device of every peer that answers in a cloud that is not archived, named cloud/peer/device, with the cloud and the peer on each, its compute APIs with their versions, its memory total and free (less what the peer has promised), temperature, power and utilisation; and peers, every member of every cloud with whether it answers (up), has not admitted the cloud yet (joining) or does not answer (unreachable). Read it before deploying: a model needs an API a device offers and memory it has free; get-workloads says what already holds memory.",
+        Where::Root => "The accelerators on this host right now: each device's compute APIs with their versions, its memory total and free, temperature, power and utilisation, the isolation a workload on it gets, and the driver. Read it before deploying: a model needs an API the device offers and memory it has free; get-workloads says what already holds memory.",
+        Where::Workspace => "The accelerators of this workspace's clouds right now: every device of every peer that answers in a cloud that is not archived, named cloud/peer/device, with the cloud and the peer on each, its compute APIs with their versions, its memory total and free (less what the peer has promised), temperature, power and utilisation, and the isolation a workload on it gets as its peer says (process for a peer that says nothing); and peers, every member of every cloud with whether it answers (up), has not admitted the cloud yet (joining) or does not answer (unreachable). Read it before deploying: a model needs an API a device offers and memory it has free; get-workloads says what already holds memory.",
     };
     let mut device_properties = json!({
         "id": { "type": "string", "description": "Stable device id, the value a command names a device by" },
@@ -237,7 +237,8 @@ fn hardware_query(svc: Arc<dyn Service>, at: Where) -> QueryDef {
         "compute": { "type": "array", "description": "The compute APIs the device offers, with versions: what a workload asks for", "items": { "type": "object", "properties": { "api": { "type": "string" }, "version": { "type": "string" } } } },
         "temperature_c": { "type": ["number", "null"] },
         "power_w": { "type": ["number", "null"] },
-        "utilisation_pct": { "type": ["integer", "null"] }
+        "utilisation_pct": { "type": ["integer", "null"] },
+        "isolation": { "type": "string", "enum": ["process", "container", "user-namespace", "vm"], "description": "What stands between a workload on this device and the host and the other workloads, weakest first: process (an engine installed on the host), container (no capability, no new privilege, a ceiling on tasks, a tenant's job in a closed box), user-namespace (the same in a rootless or user-remapped container engine, so root in the container is nobody on the host), vm (a virtual machine; no peer offers it yet). deploy-model and run-job may ask for at least one of these" }
     });
     let mut properties = json!({
         "driver": { "type": ["string", "null"], "description": "The accelerator driver's version, when there is one" },
@@ -453,6 +454,7 @@ fn deploy_model(peer: Arc<dyn Service>, at: Where) -> CommandDef {
     properties["model"] = json!({ "type": "string", "minLength": 1, "maxLength": 256, "description": "The model as the engine names it: the name in the engine's own library or registry, tag included where the engine uses one" });
     properties["engine"] = json!({ "type": "string", "enum": ["ollama", "vllm"], "description": "ollama runs on cuda, rocm or cpu; vllm on cuda" });
     properties["memory_bytes"] = json!({ "type": "integer", "minimum": 1, "description": "The device memory the model needs; the deploy is placed where that much is free after what is already promised" });
+    properties["isolation"] = json!({ "type": "string", "enum": ["process", "container", "user-namespace", "vm"], "description": "The least isolation the workload needs between it and the host and other workloads, weakest first: process, container, user-namespace, vm. It is placed only on a device whose isolation in get-hardware-state is at least this, and refused at once (ISOLATION_UNAVAILABLE) with what is offered and the fix when no device offers it; without it, any device will do" });
     CommandDef {
         schema: "deploy-model".into(),
         version: "1.0".into(),
@@ -554,6 +556,7 @@ fn run_job(peer: Arc<dyn Service>, at: Where) -> CommandDef {
     properties["image"] = json!({ "type": "string", "minLength": 1, "maxLength": 512, "description": "The image to run, as the container engine understands it" });
     properties["args"] = json!({ "type": "array", "maxItems": 256, "items": { "type": "string", "maxLength": 4096 }, "description": "The command line passed to the image's entrypoint" });
     properties["memory_bytes"] = json!({ "type": "integer", "minimum": 1, "description": "Device memory the job needs; omit to run it with no device" });
+    properties["isolation"] = json!({ "type": "string", "enum": ["process", "container", "user-namespace", "vm"], "description": "The least isolation the workload needs between it and the host and other workloads, weakest first: process, container, user-namespace, vm. It is placed only on a device whose isolation in get-hardware-state is at least this, and refused at once (ISOLATION_UNAVAILABLE) with what is offered and the fix when no device offers it; without it, any device will do" });
     CommandDef {
         schema: "run-job".into(),
         version: "1.0".into(),
@@ -1118,6 +1121,7 @@ pub fn cloud_event_defs() -> Vec<EventDef> {
                 "deadline_seconds": { "type": ["integer", "null"], "description": "How long its job may run, from JobStarted" },
                 "holder": s("The credential that ordered it, an opaque id"),
                 "accelerators_only": { "type": "boolean", "description": "True when its credential runs on the accelerators alone" },
+                "isolation": { "type": ["string", "null"], "description": "The least isolation it asked for; it is placed only where that is offered" },
                 "attempt": { "type": "integer", "description": "1; 2 once queued again after a member peer was lost under it" },
                 "waiting": { "type": "boolean", "description": "True when no member peer has the room now" },
                 "reason": s("Why it waits, or why it was queued again"),

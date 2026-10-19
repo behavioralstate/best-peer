@@ -11,7 +11,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use best_peer_runtime::{ContainerId, Event, ImageRef, Progress, Published, Runtime, RuntimeError, Spec, Started};
+use best_peer_runtime::{
+    ContainerId, Event, ImageRef, Isolation, Progress, Published, Runtime, RuntimeError, Spec, Started,
+};
 use tokio::sync::broadcast;
 
 pub struct NativeRuntime {
@@ -114,5 +116,10 @@ impl Runtime for NativeRuntime {
     /// A job needs a container engine; this runtime has none, so the door refuses the job at ingest.
     fn runs_jobs(&self) -> bool {
         false
+    }
+
+    /// An engine installed on the host runs its models as its own processes: nothing of the peer's stands between.
+    async fn isolation(&self) -> Isolation {
+        Isolation::Process
     }
 }

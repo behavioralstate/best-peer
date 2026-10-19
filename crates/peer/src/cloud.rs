@@ -27,6 +27,7 @@ use best_peer_door::envelope::now_rfc3339;
 use best_peer_door::{BestError, Emitter, Envelope, EventLog};
 use best_peer_engine::Kind;
 use best_peer_gpu::{Device, DeviceId, Host};
+use best_peer_runtime::Isolation;
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -37,8 +38,8 @@ use time::OffsetDateTime;
 use crate::domain::Service;
 use crate::holdings::Holdings;
 use crate::lifecycle::{
-    accelerators, accelerators_only, any_compute, has_share, mine, new_id, not_yours, parse, place, ready_deployment,
-    require, shown_to, usable_by, within_count, within_share, workloads_view,
+    accelerators, accelerators_only, any_compute, has_share, isolation_refused, mine, new_id, not_yours, parse, place,
+    ready_deployment, require, shown_to, usable_by, within_count, within_share, workloads_view,
 };
 use crate::member::{Heard, Member, Refusal};
 use crate::state::{JobPhase, Order, Phase, Reservation, State};
@@ -92,6 +93,9 @@ async fn read_until_stopped(
         }
     }
 }
+
+/// What each device of the cloud offers between a workload and its host, by `cloud/peer/device`.
+type Isolations = HashMap<String, Isolation>;
 
 /// A member's credential and the cloud's place on its stream, kept across restarts in the cloud's `members.json`.
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -243,7 +247,7 @@ fn queued_fact(o: &Order, attempt: u32, waiting: bool, reason: Option<String>, i
     let mut v = json!({
         "job": o.id, "image": o.image, "args": o.args, "memory_bytes": o.memory_bytes, "device": o.device,
         "queue_seconds": o.queue_seconds, "deadline_seconds": o.deadline_seconds, "holder": o.holder,
-        "accelerators_only": o.accelerators_only, "attempt": attempt, "waiting": waiting,
+        "accelerators_only": o.accelerators_only, "isolation": o.isolation, "attempt": attempt, "waiting": waiting,
     });
     if let Some(r) = reason {
         v["reason"] = json!(r);
@@ -269,6 +273,8 @@ struct DeployData {
     memory_bytes: u64,
     #[serde(default)]
     device: Option<String>,
+    #[serde(default)]
+    isolation: Option<Isolation>,
 }
 
 #[derive(Deserialize)]
@@ -284,6 +290,8 @@ struct RunJobData {
     queue_seconds: Option<u64>,
     #[serde(default)]
     deadline_seconds: Option<u64>,
+    #[serde(default)]
+    isolation: Option<Isolation>,
 }
 
 impl Cloud {
@@ -617,9 +625,10 @@ impl Cloud {
     /// answered this time. A device's free memory is what the member's own placement would allow: the free memory
     /// it reports, less what the member has promised to workloads there that have not taken it yet. Whether a
     /// member is lost is the reconcile tick's to say, not a read's.
-    async fn combined(&self) -> (Host, Vec<Value>) {
+    async fn combined(&self) -> (Host, Vec<Value>, Isolations) {
         let mut devices = Vec::new();
         let mut peers = Vec::new();
+        let mut isolations = Isolations::new();
         for m in self.members() {
             let row =
                 |state: &str| json!({ "cloud": self.name, "peer": m.name, "endpoint": m.endpoint, "state": state });
@@ -647,7 +656,21 @@ impl Cloud {
                     };
                     up["driver"] = json!(seen.driver);
                     peers.push(up);
+                    // What each device offers, as the member says; a member that says nothing offers nothing more
+                    // than a process.
+                    let offered: HashMap<String, Isolation> = hs["devices"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|d| {
+                            let id = d["id"].as_str()?.to_string();
+                            let i = serde_json::from_value(d["isolation"].clone()).unwrap_or(Isolation::Process);
+                            Some((id, i))
+                        })
+                        .collect();
                     for mut d in seen.devices {
+                        let isolation = offered.get(&d.id.0).copied().unwrap_or(Isolation::Process);
+                        isolations.insert(format!("{}/{}/{}", self.name, m.name, d.id.0), isolation);
                         let held = promised.get(&d.id.0).copied().unwrap_or(0);
                         d.memory.free_bytes = d.memory.free_bytes.min(d.memory.total_bytes.saturating_sub(held));
                         devices.push(Device {
@@ -670,7 +693,54 @@ impl Cloud {
                 observed_at: std::time::SystemTime::now(),
             },
             peers,
+            isolations,
         )
+    }
+
+    /// The devices of `host` that offer at least `asked`; all of them when nothing is asked. The member that runs a
+    /// job with no device is one with a device that offers it.
+    fn offering(host: &Host, isolations: &Isolations, asked: Option<Isolation>) -> Host {
+        let Some(asked) = asked else { return host.clone() };
+        Host {
+            devices: host
+                .devices
+                .iter()
+                .filter(|d| isolations.get(&d.id.0).is_some_and(|i| *i >= asked))
+                .cloned()
+                .collect(),
+            ..host.clone()
+        }
+    }
+
+    /// The first member that answers, for a job with no device: with nothing asked, as before; with an isolation
+    /// asked, the first with a device in `host`, which holds only the devices that offer it.
+    fn first_up(&self, host: &Host, asked: Option<Isolation>) -> Option<String> {
+        self.up()
+            .into_iter()
+            .find(|m| {
+                asked.is_none()
+                    || host
+                        .devices
+                        .iter()
+                        .any(|d| d.id.0.starts_with(&format!("{}/{}/", self.name, m.name)))
+            })
+            .map(|m| m.name.clone())
+    }
+
+    /// `host` held to `asked`: the devices that offer it, or the refusal naming what the cloud's members offer.
+    fn held_to(&self, host: Host, isolations: &Isolations, asked: Option<Isolation>) -> Result<Host, BestError> {
+        let held = Self::offering(&host, isolations, asked);
+        match asked {
+            Some(a) if held.devices.is_empty() => {
+                let offered: Vec<Isolation> = isolations.values().copied().collect();
+                Err(isolation_refused(
+                    a,
+                    &offered,
+                    &format!("no device of cloud {}: its members", self.name),
+                ))
+            }
+            _ => Ok(held),
+        }
     }
 
     /// The member a device id of this cloud names, and the device's id on it: `cloud/peer/device`.
@@ -1533,7 +1603,7 @@ impl Cloud {
         if waiting.is_empty() {
             return;
         }
-        let (host, _) = self.combined().await;
+        let (host, _, isolations) = self.combined().await;
         for o in waiting {
             let device = {
                 let mut s = self.state.lock().unwrap();
@@ -1541,21 +1611,21 @@ impl Cloud {
                 if !s.orders.get(&o.id).is_some_and(|x| x.waiting()) {
                     continue;
                 }
+                let isolated = Self::offering(&host, &isolations, o.isolation);
                 let pick = match o.memory_bytes {
                     Some(needed) => {
                         let on = if o.accelerators_only {
-                            accelerators(&host)
+                            accelerators(&isolated)
                         } else {
-                            host.clone()
+                            isolated
                         };
                         place(&on, &s, &any_compute(), needed, o.device.as_deref(), "", None)
                             .ok()
                             .map(|(d, _)| d)
                     }
                     None => self
-                        .up()
-                        .first()
-                        .map(|m| DeviceId(format!("{}/{}/", self.name, m.name))),
+                        .first_up(&isolated, o.isolation)
+                        .map(|m| DeviceId(format!("{}/{}/", self.name, m))),
                 };
                 let Some(device) = pick else {
                     continue;
@@ -1646,15 +1716,14 @@ impl Cloud {
 #[async_trait]
 impl Service for Cloud {
     async fn hardware_state(&self, who: &Credential) -> Result<Value, BestError> {
-        let (host, peers) = self.combined().await;
+        let (host, peers, isolations) = self.combined().await;
         let host = shown_to(host, who);
         let mut v = crate::domain::host_state(&host);
         if let Some(devices) = v["devices"].as_array_mut() {
             for d in devices {
-                let peer = d["id"]
-                    .as_str()
-                    .and_then(|id| self.split_device(id))
-                    .map(|(peer, _)| peer.to_string());
+                let id = d["id"].as_str().unwrap_or_default().to_string();
+                d["isolation"] = json!(isolations.get(&id).copied().unwrap_or(Isolation::Process));
+                let peer = self.split_device(&id).map(|(peer, _)| peer.to_string());
                 if let Some(peer) = peer {
                     d["cloud"] = json!(self.name);
                     d["peer"] = json!(peer);
@@ -1735,8 +1804,11 @@ impl Service for Cloud {
         if self.already_placed(&key).is_some() {
             return Ok(());
         }
-        let (host, peers) = self.combined().await;
+        let (host, peers, isolations) = self.combined().await;
         let host = usable_by(host, &who, data.device.as_deref()).map_err(|e| Self::with_peers(e, peers.clone()))?;
+        let host = self
+            .held_to(host, &isolations, data.isolation)
+            .map_err(|e| Self::with_peers(e, peers.clone()))?;
         // One admission at a time across the door, and what the credential holds is read before the state is
         // locked, since the door's holdings read this state too.
         let _admitting = self.holdings.admitting();
@@ -1900,11 +1972,14 @@ impl Service for Cloud {
         if self.already_placed(&key).is_some() || self.state.lock().unwrap().orders.contains_key(&order_id(&key)) {
             return Ok(());
         }
-        let (host, peers) = self.combined().await;
+        let (host, peers, isolations) = self.combined().await;
         let host = match data.memory_bytes {
             Some(_) => usable_by(host, &who, data.device.as_deref()).map_err(|e| Self::with_peers(e, peers.clone()))?,
             None => host,
         };
+        let host = self
+            .held_to(host, &isolations, data.isolation)
+            .map_err(|e| Self::with_peers(e, peers.clone()))?;
         let _admitting = self.holdings.admitting();
         let held = self.holdings.of(&who.holder());
         let mut state = self.state.lock().unwrap();
@@ -1929,7 +2004,7 @@ impl Service for Cloud {
             },
             None => Some({
                 // No device wanted: the first member answering takes it, which is the same one every time.
-                let first = self.up().into_iter().next().ok_or_else(|| {
+                let first = self.first_up(&host, data.isolation).ok_or_else(|| {
                     BestError::bad_request(
                         "NO_PEER",
                         format!(
@@ -1940,7 +2015,7 @@ impl Service for Cloud {
                     .with_details(json!({ "cloud": self.name, "peers": peers }))
                 })?;
                 (
-                    DeviceId(format!("{}/{}/", self.name, first.name)),
+                    DeviceId(format!("{}/{}/", self.name, first)),
                     best_peer_gpu::Compute::Cpu,
                 )
             }),
@@ -2003,6 +2078,7 @@ impl Service for Cloud {
             queue_seconds: Some(data.queue_seconds.unwrap_or(DEFAULT_QUEUE_SECONDS)),
             deadline_seconds: data.deadline_seconds,
             accelerators_only: self.held_to_accelerators.lock().unwrap().remove(&key),
+            isolation: data.isolation,
             attempt: 1,
             queued_at: String::new(),
             arrival: 0,

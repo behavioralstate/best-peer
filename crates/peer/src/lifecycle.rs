@@ -15,7 +15,9 @@ use best_peer_door::auth::{holder_of_hash, Credential};
 use best_peer_door::{BestError, Emitter, Envelope, EventLog};
 use best_peer_engine::{Engine, EngineError, Kind, Message, Options, Source};
 use best_peer_gpu::{Compute, DeviceId, Gpu, Host};
-use best_peer_runtime::{Confinement, ContainerId, Event as RuntimeEvent, Mount, Runtime, RuntimeError, Spec};
+use best_peer_runtime::{
+    Confinement, ContainerId, Event as RuntimeEvent, Isolation, Mount, Runtime, RuntimeError, Spec,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, Semaphore};
@@ -144,6 +146,8 @@ struct DeployData {
     memory_bytes: u64,
     #[serde(default)]
     device: Option<String>,
+    #[serde(default)]
+    isolation: Option<Isolation>,
 }
 
 #[derive(Deserialize)]
@@ -167,6 +171,8 @@ struct RunJobData {
     memory_bytes: Option<u64>,
     #[serde(default)]
     device: Option<String>,
+    #[serde(default)]
+    isolation: Option<Isolation>,
 }
 
 /// Where a deploy stands when it fails: before its start was told, with the container to stop if one was started
@@ -511,6 +517,7 @@ impl Peer {
     pub async fn admit_deploy(&self, cmd: Envelope, who: Credential, key: String) -> Result<(), BestError> {
         require(&who, "deploy")?;
         let data: DeployData = parse(&cmd.data)?;
+        within_isolation(data.isolation, self.runtime.isolation().await, "this peer")?;
         let host = usable_by(self.hardware().await?, &who, data.device.as_deref())?;
         // One admission at a time across the door, and what the credential holds is read before the state is
         // locked, since the door's holdings read this state too.
@@ -884,6 +891,7 @@ impl Peer {
             )
             .with_details(json!({ "field": "memory_bytes" })));
         }
+        within_isolation(data.isolation, self.runtime.isolation().await, "this peer")?;
         let host = match data.memory_bytes {
             Some(_) => Some(usable_by(self.hardware().await?, &who, data.device.as_deref())?),
             None => None,
@@ -1213,7 +1221,13 @@ impl Peer {
 #[async_trait]
 impl Service for Peer {
     async fn hardware_state(&self, who: &Credential) -> Result<Value, BestError> {
-        Ok(crate::domain::host_state(&shown_to(self.hardware().await?, who)))
+        let mut v = crate::domain::host_state(&shown_to(self.hardware().await?, who));
+        // Every device here offers what the container engine stands between a workload and the host.
+        let isolation = self.runtime.isolation().await;
+        for d in v["devices"].as_array_mut().into_iter().flatten() {
+            d["isolation"] = json!(isolation);
+        }
+        Ok(v)
     }
 
     fn workloads(&self, who: &Credential) -> Result<Value, BestError> {
@@ -1456,6 +1470,44 @@ pub(crate) fn usable_by(host: Host, who: &Credential, pinned: Option<&str>) -> R
         format!("{condition}, and this credential runs on the accelerators alone, as its approver said: {fix}"),
     )
     .with_details(json!({ "device": pinned, "devices": ids })))
+}
+
+/// A workload asking for `asked` isolation where `offered` is the most there is, `where_` (this peer, or a cloud's
+/// members), is refused with what is offered and what would meet it.
+pub(crate) fn within_isolation(asked: Option<Isolation>, offered: Isolation, where_: &str) -> Result<(), BestError> {
+    let Some(asked) = asked.filter(|a| *a > offered) else {
+        return Ok(());
+    };
+    Err(isolation_refused(asked, &[offered], where_))
+}
+
+/// The refusal of a workload asking for `asked` isolation where only `offered` is: what each level needs.
+pub(crate) fn isolation_refused(asked: Isolation, offered: &[Isolation], where_: &str) -> BestError {
+    let fix = match asked {
+        Isolation::Process | Isolation::Container => {
+            "the owner runs the peer over a container engine (BEST_PEER_RUNTIME=docker), not an engine installed on the host"
+        }
+        Isolation::UserNamespace => {
+            "the owner runs the container engine rootless, or with its users remapped (userns-remap), or the workload goes where get-hardware-state says user-namespace"
+        }
+        Isolation::Vm => "no peer runs a workload in a virtual machine yet: ask for user-namespace or container",
+    };
+    let mut names: Vec<&str> = offered.iter().map(|o| o.name()).collect();
+    names.sort();
+    names.dedup();
+    let offered_text = if names.is_empty() {
+        "nothing".to_string()
+    } else {
+        names.join(", ")
+    };
+    BestError::bad_request(
+        "ISOLATION_UNAVAILABLE",
+        format!(
+            "it asks for {} isolation and {where_} offers {offered_text}: {fix}",
+            asked.name()
+        ),
+    )
+    .with_details(json!({ "field": "isolation", "isolation": asked, "offered": names }))
 }
 
 /// A workload another credential holds is not this one's to end.
