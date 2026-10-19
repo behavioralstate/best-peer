@@ -54,10 +54,10 @@ impl Kind {
                 env: vec![("OLLAMA_HOST".into(), "0.0.0.0".into())],
                 port: 11434,
                 openai_path: "/v1".into(),
-                store: Store {
+                store: Some(Store {
                     path: STORE_PATH.into(),
                     env: vec![("OLLAMA_MODELS".into(), STORE_PATH.into())],
-                },
+                }),
             },
             Kind::Vllm => Recipe {
                 image: ImageRef(image.unwrap_or("vllm/vllm-openai").into()),
@@ -65,13 +65,7 @@ impl Kind {
                 env: vec![],
                 port: 8000,
                 openai_path: "/v1".into(),
-                store: Store {
-                    path: STORE_PATH.into(),
-                    env: vec![
-                        ("HF_HOME".into(), STORE_PATH.into()),
-                        ("HF_HUB_OFFLINE".into(), "1".into()),
-                    ],
-                },
+                store: None,
             },
         }
     }
@@ -95,14 +89,15 @@ pub struct Recipe {
     pub env: Vec<(String, String)>,
     pub port: u16,
     pub openai_path: String,
-    pub store: Store,
+    /// Where it reads a store of models the operator shares, for an engine that can; none for one that cannot.
+    pub store: Option<Store>,
 }
 
 /// Where every engine sees a store of models the operator shares.
 pub const STORE_PATH: &str = "/models";
 
-/// Where an engine keeps its models in the container, and what points it there and keeps it from the network when
-/// they come from a store: Ollama's library (`OLLAMA_MODELS`), vLLM's Hugging Face cache (`HF_HOME`, offline).
+/// Where an engine keeps its models in the container, and what points it there when they come from a store: Ollama's
+/// library (`OLLAMA_MODELS`). vLLM has none yet: it is not proven serving from one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Store {
     pub path: String,
@@ -383,13 +378,10 @@ mod tests {
         assert!(Kind::Vllm.runs_on().iter().all(|c| matches!(c, Compute::Cuda(_))));
         assert!(Kind::Ollama.runs_on().contains(&Compute::Cpu));
         assert_eq!(serde_json::to_value(Kind::Vllm).unwrap(), "vllm");
-        assert_eq!(o.store.env, vec![("OLLAMA_MODELS".into(), STORE_PATH.into())]);
-        assert!(v.store.env.contains(&("HF_HOME".into(), STORE_PATH.into())));
-        assert!(
-            v.store.env.contains(&("HF_HUB_OFFLINE".into(), "1".into())),
-            "vLLM never downloads what a store lacks"
-        );
-        assert_eq!(o.store.path, v.store.path, "one store for every engine");
+        let store = o.store.unwrap();
+        assert_eq!(store.env, vec![("OLLAMA_MODELS".into(), STORE_PATH.into())]);
+        assert_eq!(store.path, STORE_PATH);
+        assert!(v.store.is_none(), "vLLM is not served from a store");
     }
 
     #[tokio::test]

@@ -212,10 +212,13 @@ impl Runtime for DockerRuntime {
             other => {
                 let said = other.to_string();
                 match spec.mounts.iter().find(|m| said.contains(&m.host)) {
-                    Some(m) => RuntimeError::Engine(format!(
-                        "the container engine cannot mount {} at {}: {said}; it must be a directory on the container engine's host",
-                        m.host, m.container
-                    )),
+                    Some(m) => {
+                        tracing::warn!(host = %m.host, container = %m.container, error = %said, "the container engine cannot mount a directory of this host");
+                        RuntimeError::Engine(format!(
+                            "the container engine cannot mount the operator's directory at {}: whoever runs the peer reads why in its log",
+                            m.container
+                        ))
+                    }
                     None => RuntimeError::Engine(said),
                 }
             }

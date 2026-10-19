@@ -206,17 +206,23 @@ fn accelerator(kind: Option<&str>) -> Result<Arc<dyn Gpu>, String> {
     }
 }
 
-/// The store of models every engine sees read-only, from `BEST_PEER_MODEL_STORE`: a directory on the container
-/// engine's host, in that host's own form, so the peer leaves the path to the engine, which refuses one that is not
-/// there. Only containers mount it: under `native` or `fake` the store would be ignored, so it is refused.
+/// The store of models beside the registry, from `BEST_PEER_MODEL_STORE`: a directory the peer reads to find a
+/// model in it, and the container engine mounts read-only into the engine that serves it, so it is the same path on
+/// both, which it is when they share a host. Only containers mount it: under `native` or `fake` the store would be
+/// ignored, so it is refused, as is a directory the peer cannot read.
 pub fn model_store(text: Option<&str>, runtime: Option<&str>) -> Result<Option<String>, String> {
     let Some(store) = text.map(str::trim).filter(|t| !t.is_empty()) else {
         return Ok(None);
     };
-    match runtime.map(str::trim) {
-        None | Some("docker") => Ok(Some(store.to_string())),
-        Some(other) => Err(format!(
+    if let Some(other) = runtime.map(str::trim).filter(|r| *r != "docker") {
+        return Err(format!(
             "BEST_PEER_MODEL_STORE is set with BEST_PEER_RUNTIME={other}, which mounts nothing: the store serves engines in containers, so unset it or run with BEST_PEER_RUNTIME=docker"
+        ));
+    }
+    match std::fs::read_dir(store) {
+        Ok(_) => Ok(Some(store.to_string())),
+        Err(e) => Err(format!(
+            "BEST_PEER_MODEL_STORE is {store}, which the peer cannot read here ({e}): the peer looks for each model in the store before it starts an engine, so the store must be a directory at the same path for the peer and the container engine"
         )),
     }
 }
@@ -3385,9 +3391,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_store_of_models_is_mounted_read_only_into_every_engine_and_nothing_is_pulled() {
+    async fn a_model_in_the_store_is_served_from_it_read_only_and_one_not_in_it_is_pulled() {
+        let store = tempfile::tempdir().unwrap();
+        let manifest = store.path().join("manifests/registry.ollama.ai/library/llama3.2/3b");
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::write(&manifest, "{}").unwrap();
+        let at = store.path().to_str().unwrap().to_string();
         let images = Images {
-            model_store: Some("/srv/models".into()),
+            model_store: Some(at.clone()),
             ..Images::default()
         };
         let bed = bed_imaging(
@@ -3400,30 +3411,35 @@ mod tests {
             images,
         )
         .await;
+        let base_of = |id: &str, events: &[Envelope]| {
+            let started = events.iter().find(|e| e.r#type == "DeploymentStarted").unwrap();
+            assert_eq!(started.data["deployment"], id);
+            format!("http://engines.local:{}", started.data["port"].as_u64().unwrap())
+        };
+        // In the store: mounted read-only, the engine pointed at it, nothing pulled.
         let dep = bed.deployed("d1", "llama3.2:3b", 8).await;
         let spec = bed.runtime.spec_of(&bed.container_of(&dep)).unwrap();
         assert_eq!(
             spec.mounts,
             vec![best_peer_runtime::Mount {
-                host: "/srv/models".into(),
+                host: at.clone(),
                 container: best_peer_engine::STORE_PATH.into(),
                 read_only: true
             }]
         );
-        assert!(
-            spec.env
-                .contains(&("OLLAMA_MODELS".into(), best_peer_engine::STORE_PATH.into())),
-            "the engine is pointed at the store: {:?}",
-            spec.env
-        );
-        let ready = bed.events_of("d1", "DeploymentReady").await;
-        let port = ready.iter().find(|e| e.r#type == "DeploymentStarted").unwrap().data["port"]
-            .as_u64()
-            .unwrap();
-        let base = format!("http://engines.local:{port}");
+        assert!(spec
+            .env
+            .contains(&("OLLAMA_MODELS".into(), best_peer_engine::STORE_PATH.into())));
+        let base = base_of(&dep, &bed.events_of("d1", "DeploymentReady").await);
         assert_eq!(bed.engine.loaded_at(&base), vec!["llama3.2:3b"]);
         assert!(bed.engine.pulled_at(&base).is_empty(), "a store is never pulled into");
-        // A vLLM engine is pointed at the store too, and kept off the network.
+        // Not in the store: no mount, and pulled from the registry as before.
+        let other = bed.deployed("d2", "qwen3:0.6b", 1).await;
+        let spec = bed.runtime.spec_of(&bed.container_of(&other)).unwrap();
+        assert!(spec.mounts.is_empty() && !spec.env.iter().any(|(k, _)| k == "OLLAMA_MODELS"));
+        let base = base_of(&other, &bed.events_of("d2", "DeploymentReady").await);
+        assert_eq!(bed.engine.pulled_at(&base), vec!["qwen3:0.6b"]);
+        // vLLM is not served from a store: it pulls as before.
         let (s, b) = bed
             .send(
                 "v1",
@@ -3436,34 +3452,60 @@ mod tests {
         let v = bed.events_of("v1", "DeploymentReady").await;
         let vdep = v.last().unwrap().data["deployment"].as_str().unwrap().to_string();
         let vspec = bed.runtime.spec_of(&bed.container_of(&vdep)).unwrap();
-        assert!(
-            vspec.env.contains(&("HF_HUB_OFFLINE".into(), "1".into())),
-            "{:?}",
-            vspec.env
-        );
-        assert_eq!(vspec.mounts.len(), 1);
-        // A model the store lacks fails at once, and the fix says where it was looked for.
-        bed.engine.missing("nobody/none:1b");
-        let (s, _) = bed.deploy("d2", "nobody/none:1b", "ollama", 1).await;
+        assert!(vspec.mounts.is_empty(), "{vspec:?}");
+        // A model the store holds only in part fails with a fix that names no path of the host's.
+        bed.engine.missing("llama3.2:3b");
+        let (s, _) = bed.deploy("d3", "llama3.2:3b", "ollama", 1).await;
         assert_eq!(s, StatusCode::CREATED);
-        let failed = bed.events_of("d2", "DeploymentFailed").await;
+        let failed = bed.events_of("d3", "DeploymentFailed").await;
         let why = &failed.last().unwrap().data;
-        assert!(why["fix"].as_str().unwrap().contains("the store /srv/models"), "{why}");
+        let fix = why["fix"].as_str().unwrap();
+        assert!(
+            fix.contains("the operator's model store") && !fix.contains(&at),
+            "{why}"
+        );
         // A job shares nothing of it.
         let (s, _) = bed.send("j1", "RunJob", "run-job", json!({ "image": "busybox" })).await;
         assert_eq!(s, StatusCode::CREATED);
         let started = bed.events_of("j1", "JobStarted").await;
         let container = ContainerId(started.last().unwrap().data["container"].as_str().unwrap().into());
         assert!(bed.runtime.spec_of(&container).unwrap().mounts.is_empty());
-        // The path is the container engine's host's, in its own form: the peer does not judge it, on any OS.
+        // The store is read where the peer runs, and a container engine is what mounts it.
         assert_eq!(model_store(None, None).unwrap(), None);
         assert_eq!(model_store(Some(" "), None).unwrap(), None);
-        for path in ["/srv/models", "D:\\models", "models"] {
-            assert_eq!(model_store(Some(path), Some("docker")).unwrap().as_deref(), Some(path));
-        }
+        assert_eq!(
+            model_store(Some(&at), Some("docker")).unwrap().as_deref(),
+            Some(at.as_str())
+        );
+        let missing = model_store(Some("/nowhere/models"), None).unwrap_err();
+        assert!(
+            missing.contains("cannot read") && missing.contains("same path"),
+            "{missing}"
+        );
         for runtime in ["native", "fake"] {
-            let refused = model_store(Some("/srv/models"), Some(runtime)).unwrap_err();
+            let refused = model_store(Some(&at), Some(runtime)).unwrap_err();
             assert!(refused.contains(&format!("BEST_PEER_RUNTIME={runtime}")), "{refused}");
+        }
+    }
+
+    #[test]
+    fn a_model_is_looked_for_where_ollama_writes_its_manifest() {
+        let store = tempfile::tempdir().unwrap();
+        for path in [
+            "registry.ollama.ai/library/qwen3/0.6b",
+            "registry.ollama.ai/library/tiny/latest",
+            "registry.ollama.ai/team/coder/7b",
+            "hf.co/org/repo/Q4_K_M",
+        ] {
+            let m = store.path().join("manifests").join(path);
+            std::fs::create_dir_all(m.parent().unwrap()).unwrap();
+            std::fs::write(m, "{}").unwrap();
+        }
+        for model in ["qwen3:0.6b", "tiny", "team/coder:7b", "hf.co/org/repo:Q4_K_M"] {
+            assert!(lifecycle::in_store(store.path(), model), "{model}");
+        }
+        for model in ["qwen3:8b", "qwen3", "other/coder:7b", "../manifests:x", "tiny:"] {
+            assert!(!lifecycle::in_store(store.path(), model), "{model}");
         }
     }
 

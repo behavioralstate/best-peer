@@ -204,16 +204,15 @@ on another host sits on a network you trust. The peer alone reaches them: a prom
 the peer carries it to the engine. Prompts are answered sixteen at a time per peer; the rest wait their turn,
 accepted, in order.
 
-`BEST_PEER_MODEL_STORE` names a directory on the container engine's host, in that host's own form, that every
-engine container sees read-only at `/models`; a deploy then serves the model from it and pulls nothing, so a model
-put there once serves every deployment and engines need no way to a registry for models. Its layout is each
-engine's own: Ollama's library (`blobs/` and `manifests/`, what `OLLAMA_MODELS` holds after an `ollama pull`) and
-vLLM's Hugging Face cache (`hub/`, what `HF_HOME` holds after a download; the engine runs offline). A model Ollama
-does not find in it fails the deploy at once with the store named; vLLM stops at start when the model is not there,
-which the deploy tells after `BEST_PEER_READY_SECONDS` with its container's logs to read. A directory that is not
-there is refused by the container engine when the first engine starts. A store is for containers: with
+`BEST_PEER_MODEL_STORE` names a store of models beside the registry: Ollama's library (`blobs/` and `manifests/`,
+what `OLLAMA_MODELS` holds after an `ollama pull`). A deploy on Ollama of a model the store holds is served from it,
+the store mounted read-only at `/models`, and pulls nothing; a model the store lacks is pulled from the registry as
+before. The peer looks for the model's manifest in the store itself before it starts the engine, so the store is a
+directory at the same path for the peer and the container engine, which it is when they share a host; one the peer
+cannot read refuses the start. vLLM is not served from a store: it pulls as before. A store is for containers: with
 `BEST_PEER_RUNTIME=native` or `fake` the peer refuses to start. An embedding model cannot be deployed from it, since
-a deployment answers conversations.
+a deployment answers conversations. A tenant told that a model failed reads of "the operator's model store", never
+its path.
 
 ## Deploy
 
