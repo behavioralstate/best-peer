@@ -3021,6 +3021,59 @@ mod tests {
         assert!(parse_memory("4X").unwrap_err().contains("unit"));
     }
 
+    /// The strings and arrays in `schema` with no bound on their length, by path.
+    fn unbounded(schema: &Value, at: &str, found: &mut Vec<String>) {
+        match schema["type"].as_str() {
+            Some("string") if schema.get("maxLength").is_none() && schema.get("enum").is_none() => {
+                found.push(at.to_string())
+            }
+            Some("array") if schema.get("maxItems").is_none() => found.push(at.to_string()),
+            _ => {}
+        }
+        if let Some(properties) = schema["properties"].as_object() {
+            for (name, p) in properties {
+                unbounded(p, &format!("{at}.{name}"), found);
+            }
+        }
+        if schema.get("items").is_some() {
+            unbounded(&schema["items"], &format!("{at}[]"), found);
+        }
+    }
+
+    #[tokio::test]
+    async fn every_string_and_collection_a_command_carries_is_bounded() {
+        let (a, _) = two_members().await;
+        let key_a = a.key.clone();
+        let site = site(vec![(A, a)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a)]).await;
+        let mut found = Vec::new();
+        for prefix in [String::new(), format!("/workspaces/{ws}")] {
+            let (_, c) = get_as(&site.app, &prefix, &site.key, "/commands").await;
+            for entry in c["commands"].as_array().unwrap() {
+                let path = format!(
+                    "/commands/{}/{}",
+                    entry["schema"].as_str().unwrap(),
+                    entry["version"].as_str().unwrap()
+                );
+                let (s, doc) = get_as(&site.app, &prefix, &site.key, &path).await;
+                assert_eq!(s, StatusCode::OK, "{doc}");
+                unbounded(&doc, &format!("{prefix}{path}"), &mut found);
+            }
+        }
+        assert!(found.is_empty(), "unbounded: {found:#?}");
+        // A workspace's door takes a little less than the root's, so what its cloud took a member's door takes.
+        let limit = best_peer_door::router::MAX_BODY - best_peer_door::router::TENANT_ROOM;
+        let req = Request::post(format!("/workspaces/{ws}/commands"))
+            .header("X-Api-Key", &site.key)
+            .header(header::CONTENT_TYPE, "application/cloudevents+json")
+            .body(Body::from("x".repeat(limit + 1)))
+            .unwrap();
+        let res = site.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body(res).await["error"]["details"]["limit_bytes"], limit);
+    }
+
     #[tokio::test]
     async fn a_credential_does_what_it_was_approved_for_holds_its_share_and_ends_only_its_own() {
         let bed = fresh().await;

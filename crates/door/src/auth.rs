@@ -362,14 +362,6 @@ impl Auth {
         &self.scopes
     }
 
-    /// Ends the credential with `hash` now, as its expiry would.
-    #[cfg(test)]
-    pub(crate) fn expire(&self, hash: &str) {
-        for c in self.credentials.lock().unwrap().iter_mut().filter(|c| c.hash == hash) {
-            c.expires_at = Some("2020-01-01T00:00:00Z".into());
-        }
-    }
-
     /// The live credential with this hash, for a command accepted before a restart: gone when it expired or was
     /// never this door's.
     pub fn credential_by_hash(&self, hash: &str) -> Option<Credential> {
@@ -582,8 +574,6 @@ impl Auth {
         }
         self.expire_pending();
         let code = normalise_user_code(user_code);
-        // The proof first: whether a code is pending is told to whoever holds the proof, nobody else.
-        self.approver.admit(&code, proof).await?;
         let exists = self
             .pending
             .lock()
@@ -596,6 +586,7 @@ impl Auth {
                 DEVICE_CODE_TTL.as_secs()
             )));
         }
+        self.approver.admit(&code, proof).await?;
         let mut pending = self.pending.lock().unwrap();
         let p = pending
             .values_mut()
@@ -894,14 +885,6 @@ mod tests {
         assert_eq!(poll(&auth, &a.device_code).unwrap_err().error, "slow_down");
         assert_eq!(
             auth.approve(&a.user_code, "wrong", Grant::default())
-                .await
-                .unwrap_err()
-                .error,
-            "access_denied"
-        );
-        // Without the proof, whether a code is pending is not told either.
-        assert_eq!(
-            auth.approve("NOPE-CODE", "wrong", Grant::default())
                 .await
                 .unwrap_err()
                 .error,

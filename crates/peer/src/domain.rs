@@ -311,7 +311,7 @@ fn workloads_query(peer: Arc<dyn Service>, at: Where) -> QueryDef {
 
 /// The `cloud` a workspace's placing commands take.
 fn cloud_property(what: &str) -> Value {
-    json!({ "type": "string", "description": format!("The cloud of this workspace {what}; get-clouds lists them") })
+    json!({ "type": "string", "maxLength": 64, "description": format!("The cloud of this workspace {what}; get-clouds lists them") })
 }
 
 fn prompt(peer: Arc<dyn Service>, at: Where) -> CommandDef {
@@ -329,21 +329,21 @@ fn prompt(peer: Arc<dyn Service>, at: Where) -> CommandDef {
             "type": "object",
             "required": ["deployment", "messages"],
             "properties": {
-                "deployment": { "type": "string", "minLength": 1, "description": "The deployment to ask, as DeploymentReady and get-workloads name it; it must be ready" },
+                "deployment": { "type": "string", "minLength": 1, "maxLength": 128, "description": "The deployment to ask, as DeploymentReady and get-workloads name it; it must be ready" },
                 "messages": {
-                    "type": "array", "minItems": 1,
+                    "type": "array", "minItems": 1, "maxItems": 1024,
                     "description": "The conversation so far, oldest first; the last is what the model answers",
                     "items": {
                         "type": "object", "required": ["role", "content"], "additionalProperties": false,
                         "properties": {
                             "role": { "type": "string", "enum": ["system", "user", "assistant"] },
-                            "content": { "type": "string" }
+                            "content": { "type": "string", "maxLength": 131072 }
                         }
                     }
                 },
                 "max_tokens": { "type": "integer", "minimum": 1, "maximum": 1048576, "description": "The most tokens the answer may have; the engine's default when not given" },
                 "temperature": { "type": "number", "minimum": 0, "maximum": 2, "description": "The sampling temperature; the engine's default when not given" },
-                "stop": { "type": "array", "items": { "type": "string", "minLength": 1 }, "maxItems": 4, "description": "Strings at which the answer stops" }
+                "stop": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 256 }, "maxItems": 4, "description": "Strings at which the answer stops" }
             },
             "additionalProperties": false
         }),
@@ -375,7 +375,7 @@ fn pull_image(peer: Arc<dyn Service>, at: Where) -> CommandDef {
             vec!["image", "cloud"],
         ),
     };
-    properties["image"] = json!({ "type": "string", "minLength": 1, "description": "The image reference as the container engine understands it, name and tag" });
+    properties["image"] = json!({ "type": "string", "minLength": 1, "maxLength": 512, "description": "The image reference as the container engine understands it, name and tag" });
     CommandDef {
         schema: "pull-image".into(),
         version: "1.0".into(),
@@ -402,18 +402,18 @@ fn deploy_model(peer: Arc<dyn Service>, at: Where) -> CommandDef {
         Where::Root => (
             "Serves a model on this peer with the engine named, on a device that offers an API the engine runs on and has the memory asked for free. Refused at once, with the reason and what to do, when no device fits. Otherwise the facts follow on the stream with this command's correlation id: ImagePulling and ImagePulled, DeploymentStarted, WeightsLoading, then DeploymentReady, after which prompt commands naming the deployment are answered, or DeploymentFailed, which complete it. Later, OutOfMemory or DeploymentEnded if the engine ends it or stops on its own, under the same correlation id. Needs the deploy scope, and room in the credential's share when one was set.",
             json!({
-                "device": { "type": "string", "description": "A device id from get-hardware-state, to pin the placement; otherwise the fitting device with the most room" }
+                "device": { "type": "string", "maxLength": 256, "description": "A device id from get-hardware-state, to pin the placement; otherwise the fitting device with the most room" }
             }),
         ),
         Where::Workspace => (
             "Serves a model in a cloud of this workspace with the engine named, on the member peer whose device offers an API the engine runs on and has the memory asked for free; name the cloud, or a device (cloud/peer/device) to pin the placement, which names the cloud too. Refused at once, with the reason and what to do, when the cloud is not this workspace's, is archived, or no device in it fits. Otherwise the facts follow on this workspace's stream with this command's correlation id, each with the cloud and the peer named: ImagePulling and ImagePulled, DeploymentStarted with the device as cloud/peer/device, WeightsLoading, then DeploymentReady, after which prompt commands naming the deployment are answered on this workspace's door, or DeploymentFailed, which complete it. Later, OutOfMemory or DeploymentEnded if the engine ends it, the peer stops on its own, or the peer is lost, under the same correlation id. Needs the deploy scope, and room in the credential's share when one was set.",
             json!({
                 "cloud": cloud_property("to place in; may be left out when device names it"),
-                "device": { "type": "string", "description": "A device id from this workspace's get-hardware-state, cloud/peer/device, to pin the placement; otherwise the fitting device of the cloud with the most room" }
+                "device": { "type": "string", "maxLength": 256, "description": "A device id from this workspace's get-hardware-state, cloud/peer/device, to pin the placement; otherwise the fitting device of the cloud with the most room" }
             }),
         ),
     };
-    properties["model"] = json!({ "type": "string", "minLength": 1, "description": "The model as the engine names it: the name in the engine's own library or registry, tag included where the engine uses one" });
+    properties["model"] = json!({ "type": "string", "minLength": 1, "maxLength": 256, "description": "The model as the engine names it: the name in the engine's own library or registry, tag included where the engine uses one" });
     properties["engine"] = json!({ "type": "string", "enum": ["ollama", "vllm"], "description": "ollama runs on cuda, rocm or cpu; vllm on cuda" });
     properties["memory_bytes"] = json!({ "type": "integer", "minimum": 1, "description": "The device memory the model needs; the deploy is placed where that much is free after what is already promised" });
     CommandDef {
@@ -461,7 +461,7 @@ fn undeploy_model(peer: Arc<dyn Service>) -> CommandDef {
             "type": "object",
             "required": ["deployment"],
             "properties": {
-                "deployment": { "type": "string", "minLength": 1, "description": "The deployment id from DeploymentStarted or get-workloads" }
+                "deployment": { "type": "string", "minLength": 1, "maxLength": 128, "description": "The deployment id from DeploymentStarted or get-workloads" }
             },
             "additionalProperties": false
         }),
@@ -485,19 +485,19 @@ fn run_job(peer: Arc<dyn Service>, at: Where) -> CommandDef {
         Where::Root => (
             "Runs an image once, with the arguments given, and tells its end. With memory_bytes the job is placed on a device with that much room and handed that device; without, it runs with no device. The facts follow with this command's correlation id: ImagePulling and ImagePulled, then JobStarted or JobFailed, which complete the command; the job's own end follows as JobFinished with the exit code, or JobFailed. Needs the jobs scope, and room in the credential's share when one was set and memory_bytes is given.",
             json!({
-                "device": { "type": "string", "description": "A device id from get-hardware-state, to pin the placement; refused without memory_bytes" }
+                "device": { "type": "string", "maxLength": 256, "description": "A device id from get-hardware-state, to pin the placement; refused without memory_bytes" }
             }),
         ),
         Where::Workspace => (
             "Runs an image once in a cloud of this workspace, with the arguments given, and tells its end. With memory_bytes the job is placed on a member peer's device with that much room and handed that device; without, it runs on the first peer of the cloud that answers, with no device. Name the cloud, or a device (cloud/peer/device) to pin the placement, which names the cloud too. Refused at once when the cloud is not this workspace's or is archived. The facts follow on this workspace's stream with this command's correlation id, each with the cloud and the peer named: ImagePulling and ImagePulled, then JobStarted or JobFailed, which complete the command; the job's own end follows as JobFinished with the exit code, or JobFailed. Needs the jobs scope, and room in the credential's share when one was set and memory_bytes is given.",
             json!({
                 "cloud": cloud_property("to run in; may be left out when device names it"),
-                "device": { "type": "string", "description": "A device id from this workspace's get-hardware-state, cloud/peer/device, to pin the placement; refused without memory_bytes" }
+                "device": { "type": "string", "maxLength": 256, "description": "A device id from this workspace's get-hardware-state, cloud/peer/device, to pin the placement; refused without memory_bytes" }
             }),
         ),
     };
-    properties["image"] = json!({ "type": "string", "minLength": 1, "description": "The image to run, as the container engine understands it" });
-    properties["args"] = json!({ "type": "array", "items": { "type": "string" }, "description": "The command line passed to the image's entrypoint" });
+    properties["image"] = json!({ "type": "string", "minLength": 1, "maxLength": 512, "description": "The image to run, as the container engine understands it" });
+    properties["args"] = json!({ "type": "array", "maxItems": 256, "items": { "type": "string", "maxLength": 4096 }, "description": "The command line passed to the image's entrypoint" });
     properties["memory_bytes"] = json!({ "type": "integer", "minimum": 1, "description": "Device memory the job needs; omit to run it with no device" });
     CommandDef {
         schema: "run-job".into(),
@@ -541,7 +541,7 @@ fn stop_job(peer: Arc<dyn Service>) -> CommandDef {
             "type": "object",
             "required": ["job"],
             "properties": {
-                "job": { "type": "string", "minLength": 1, "description": "The job id from JobStarted or get-workloads" }
+                "job": { "type": "string", "minLength": 1, "maxLength": 128, "description": "The job id from JobStarted or get-workloads" }
             },
             "additionalProperties": false
         }),
@@ -659,8 +659,8 @@ fn invite_member(m: Arc<dyn Membership>) -> CommandDef {
             "type": "object",
             "required": ["workspace", "identity"],
             "properties": {
-                "workspace": { "type": "string", "minLength": 1, "description": "The workspace id from get-workspaces" },
-                "identity": { "type": "string", "pattern": "^[0-9a-f]{16}$", "description": "The invitee's identity on this door, as their get-workspaces shows it" }
+                "workspace": { "type": "string", "minLength": 1, "maxLength": 128, "description": "The workspace id from get-workspaces" },
+                "identity": { "type": "string", "maxLength": 16, "pattern": "^[0-9a-f]{16}$", "description": "The invitee's identity on this door, as their get-workspaces shows it" }
             },
             "additionalProperties": false
         }),
@@ -689,7 +689,7 @@ fn accept_invitation(m: Arc<dyn Membership>) -> CommandDef {
             "type": "object",
             "required": ["workspace"],
             "properties": {
-                "workspace": { "type": "string", "minLength": 1, "description": "The workspace id, from the invitations in get-workspaces" }
+                "workspace": { "type": "string", "minLength": 1, "maxLength": 128, "description": "The workspace id, from the invitations in get-workspaces" }
             },
             "additionalProperties": false
         }),
@@ -718,7 +718,7 @@ fn leave_workspace(m: Arc<dyn Membership>) -> CommandDef {
             "type": "object",
             "required": ["workspace"],
             "properties": {
-                "workspace": { "type": "string", "minLength": 1, "description": "The workspace id from get-workspaces" }
+                "workspace": { "type": "string", "minLength": 1, "maxLength": 128, "description": "The workspace id from get-workspaces" }
             },
             "additionalProperties": false
         }),
@@ -751,11 +751,11 @@ fn configure_cloud(ws: Arc<dyn Clouds>) -> CommandDef {
             "properties": {
                 "cloud": { "type": "string", "minLength": 1, "maxLength": 64, "description": "The cloud's name, one word: what deploy-model names and the first part of its device ids" },
                 "members": {
-                    "type": "array", "minItems": 1,
+                    "type": "array", "minItems": 1, "maxItems": 64,
                     "description": "The machines in the cloud: each a peer's name, one word, and the base URL of its door",
                     "items": { "type": "object", "required": ["peer", "endpoint"], "properties": {
                         "peer": { "type": "string", "minLength": 1, "maxLength": 64, "description": "The name this cloud knows the machine by: the middle part of its device ids, and what every fact about a workload there carries as peer" },
-                        "endpoint": { "type": "string", "pattern": "^https?://", "description": "The base URL of the peer's door, as its manifest advertises it" }
+                        "endpoint": { "type": "string", "maxLength": 2048, "pattern": "^https?://", "description": "The base URL of the peer's door, as its manifest advertises it" }
                     }, "additionalProperties": false }
                 }
             },
@@ -786,7 +786,7 @@ fn archive_cloud(ws: Arc<dyn Clouds>) -> CommandDef {
             "type": "object",
             "required": ["cloud"],
             "properties": {
-                "cloud": { "type": "string", "minLength": 1, "description": "The cloud's name from get-clouds" }
+                "cloud": { "type": "string", "minLength": 1, "maxLength": 64, "description": "The cloud's name from get-clouds" }
             },
             "additionalProperties": false
         }),
