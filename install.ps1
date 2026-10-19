@@ -24,6 +24,11 @@ else { $dir = Join-Path $env:LOCALAPPDATA "Programs\best-peer"; $why = "the defa
 if (-not [System.IO.Path]::IsPathRooted($dir)) { $dir = Join-Path (Get-Location).Path $dir }
 $dir = [System.IO.Path]::GetFullPath($dir)
 Write-Host "Installing into $dir ($why)"
+# Writable before anything is downloaded: a best-peer.exe that an administrator put on the PATH names a folder this
+# user cannot write, and the refusal says what to set rather than failing on the copy.
+New-Item -ItemType Directory -Path $dir -Force -ErrorAction SilentlyContinue | Out-Null
+try { $probe = Join-Path $dir ([System.IO.Path]::GetRandomFileName()); [System.IO.File]::WriteAllText($probe, ""); Remove-Item $probe -Force }
+catch { throw "best-peer: $dir is not writable by you ($why); rerun with `$env:BEST_PEER_INSTALL_DIR = '<a folder you can write>', or from an elevated PowerShell to keep it there" }
 $arch = if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq "Arm64") { "aarch64" } else { "x86_64" }
 if ($arch -ne "x86_64") { throw "best-peer: no release for Windows on $arch yet; build it with: cargo install --git https://github.com/$repo best-peer" }
 $target = "$arch-pc-windows-msvc"
@@ -59,8 +64,10 @@ try {
     foreach ($file in "best-peer.exe", "LICENSE", "README.md") {
         Copy-Item (Join-Path $tmp "best-peer-$target\$file") (Join-Path $dir $file) -Force
     }
+    # The user's PATH is written only when the folder is on no PATH at all: one already reached through the machine's
+    # PATH, or this session's, is left as it is.
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-    if (($userPath -split ";") -notcontains $dir) {
+    if (($env:Path -split ";") -notcontains $dir -and ($userPath -split ";") -notcontains $dir) {
         [Environment]::SetEnvironmentVariable("Path", "$userPath;$dir", "User")
         $env:Path = "$env:Path;$dir"
         Write-Host "Added $dir to your PATH (open a new terminal for other windows to see it)."

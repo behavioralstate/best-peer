@@ -20,6 +20,13 @@ else
 fi
 case "$dir" in /*) ;; *) dir="$PWD/$dir" ;; esac   # absolute before the cd into the temp folder below
 echo "Installing into $dir ($why)"
+# Writable before anything is downloaded: a best-peer that root or a package put on the PATH names a folder this user
+# cannot write, and the refusal says what to set rather than dying on the install.
+mkdir -p "$dir" 2>/dev/null || true
+[ -d "$dir" ] && [ -w "$dir" ] || {
+  echo "best-peer: $dir is not writable by you ($why); rerun with BEST_PEER_INSTALL_DIR=<a folder you can write>, or with sudo to keep it there" >&2
+  exit 1
+}
 
 os=$(uname -s)
 arch=$(uname -m)
@@ -74,9 +81,15 @@ version=$("$dir/best-peer" --version) || {
   exit 1
 }
 echo "Installed $version in $dir"
-if pgrep -x best-peer >/dev/null 2>&1; then
-  echo "A peer is running: it keeps the binary it started with until it is restarted."
-fi
+# The note is about this binary alone: a running best-peer whose executable was $dir/best-peer (now replaced, so the
+# kernel marks the old one deleted). Where /proc is not there (macOS), no claim is made.
+for p in $(pgrep -x best-peer 2>/dev/null); do
+  case "$(readlink "/proc/$p/exe" 2>/dev/null)" in
+    "$dir/best-peer"|"$dir/best-peer (deleted)")
+      echo "A peer (process $p) is running from here: it keeps the binary it started with until it is restarted."
+      break ;;
+  esac
+done
 case ":$PATH:" in
   *":$dir:"*) echo "Next: best-peer (the README's 'Try it on your machine' says what to set first)" ;;
   *) echo "Add $dir to your PATH, then: best-peer (the README's 'Try it on your machine' says what to set first)" ;;
