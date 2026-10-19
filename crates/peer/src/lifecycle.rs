@@ -24,11 +24,22 @@ use crate::domain::Service;
 use crate::holdings::Holdings;
 use crate::state::{JobPhase, Owner, Phase, Reservation, State};
 
-/// The operator's overrides for the engines' images (a pinned tag, a mirror); none means the engine's default.
+/// The operator's overrides for the engines' images (a pinned tag, a mirror); none means the engine's default. And
+/// when a deploy or a job pulls its image.
 #[derive(Clone, Debug, Default)]
 pub struct Images {
     pub ollama: Option<String>,
     pub vllm: Option<String>,
+    pub pull: Pull,
+}
+
+/// When a deploy or a job pulls its image: `Tags`, a reference by tag each time, since a tag may have moved, and one
+/// pinned by digest only when it is not held; `Missing`, any image only when it is not held.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Pull {
+    #[default]
+    Tags,
+    Missing,
 }
 
 impl Images {
@@ -639,10 +650,13 @@ impl Peer {
         }
     }
 
-    /// Makes an image present for a deploy or a job: one the engine holds is not pulled, so a host with no way to a
-    /// registry runs what it holds, and is told at 100 at once; another is pulled. Says whether it was held.
+    /// Makes an image present for a deploy or a job. A reference by tag is pulled each time unless the operator said
+    /// `missing`, since a tag may have moved; one pinned by digest, or any under `missing`, is not pulled when the
+    /// engine holds it, so a host with no way to a registry runs what it holds, told at 100 at once. Says whether it
+    /// was held.
     async fn ensure(self: &Arc<Self>, em: &Emitter, image: &best_peer_runtime::ImageRef) -> Result<bool, RuntimeError> {
-        if self.runtime.holds(image).await? {
+        let pinned = image.0.contains('@');
+        if (pinned || self.images.pull == Pull::Missing) && self.runtime.holds(image).await? {
             self.pulling(em, image)(Some(100));
             return Ok(true);
         }

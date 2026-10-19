@@ -35,7 +35,7 @@ the CPU is the one device. Then one of two ways to run models, each with what it
 
 | Way | What the machine needs | Settings |
 |---|---|---|
-| **Docker** (the default) | Docker Engine running and reachable by your user (`docker ps` without `sudo`, or run the peer with it), and the NVIDIA container toolkit registered with it, so that `docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi` lists the card. Room under Docker's storage for the engine image and the model weights, a few GB. | None: the peer pulls the engine image when Docker does not hold it, starts the container, publishes its port. |
+| **Docker** (the default) | Docker Engine running and reachable by your user (`docker ps` without `sudo`, or run the peer with it), and the NVIDIA container toolkit registered with it, so that `docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi` lists the card. Room under Docker's storage for the engine image and the model weights, a few GB. | None: the peer pulls the engine image, starts the container, publishes its port. |
 | **Native** | Ollama installed and running as a service on its own port. The peer pulls the model through it and claims its port; nothing is started or stopped. No jobs: `run-job` is refused at ingest, with the fix. | `BEST_PEER_RUNTIME=native`. Ollama keeps its own bind, loopback as installed: a prompt reaches it as a command through the door. |
 
 `BEST_PEER_RUNTIME=fake` is a third way for a machine with neither: the surface answers, nothing runs. Every other
@@ -195,9 +195,12 @@ The container engine is Docker on the same host, reached through its socket or n
 without it unless `BEST_PEER_RUNTIME` says otherwise: `native` deploys to an engine already running on the host
 outside any container (an installed Ollama; no jobs), `fake` serves the whole surface against the in-memory fakes
 (what CI runs).
-A deploy or a job runs an image Docker already holds as it is, with no registry, and pulls only one it lacks; so a
-held image, the engines' unpinned defaults included, is refreshed only by `pull-image`, which always pulls, or by
-pinning a tag or a digest (`name@sha256:...`, handed to Docker whole).
+A deploy or a job pulls an image named by tag each time, since a tag may have moved, as before; one pinned by digest
+(`name@sha256:...`, handed to Docker whole) names one image for good and is pulled only when Docker does not hold it.
+`BEST_PEER_PULL=missing` pulls any image only when Docker does not hold it: for a host with no way to a registry,
+whose images were put there by hand, a held image then runs as it is and is refreshed only by `pull-image`, which
+always pulls. Either way a credential may run any image Docker holds, the operator's own and locally built ones
+included, by naming it: a host shared with a tenant keeps in Docker only the images it would let that tenant run.
 `BEST_PEER_OLLAMA_IMAGE` and `BEST_PEER_VLLM_IMAGE` pin or mirror the engines' images; `BEST_PEER_READY_SECONDS`
 (default 900) is how long an engine may take to answer after its container started, `BEST_PEER_LOAD_SECONDS`
 (default 3600) how long a model may take to load, and a prompt is given ten minutes to be answered. `BEST_PEER_ENGINE_HOST` (default `127.0.0.1`) is where the peer
@@ -216,7 +219,7 @@ engine runs on with that much room after what is already promised, or refuses at
 On a workspace's door the same commands take the `cloud` to place in (or a `device` as `cloud/peer/device`, which
 names it), the devices are every cloud's peers', and every row and event carries `cloud` and `peer`.
 The facts follow on the event stream under the command's correlation id, in order: `ImagePulling`, `ImagePulled`
-(`held: true` when the image was already here and nothing was downloaded, `ImagePulling` then told once, at 100),
+(`held: true` when the image was already here and not pulled, `ImagePulling` then told once, at 100),
 `DeploymentStarted`, `WeightsLoading`, then `DeploymentReady`, or `DeploymentFailed`. What the engine does on its own
 later (`OutOfMemory`, `DeploymentEnded`) is told under the same correlation id. `prompt` names a ready deployment and
 the conversation so far, and `PromptAnswered` follows under its own correlation id with the answer whole, or

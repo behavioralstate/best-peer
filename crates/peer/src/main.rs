@@ -28,7 +28,7 @@ use best_peer_door::{Auth, Door, EventLog, LocalApprover};
 use best_peer_engine::Engine;
 use best_peer_gpu::Gpu;
 use best_peer_runtime::Runtime;
-use lifecycle::{Images, Patience, Peer};
+use lifecycle::{Images, Patience, Peer, Pull};
 use tls::Tls;
 
 /// Where to listen, what to advertise and whether TLS serves it, from `BEST_PEER_LISTEN` (ip:port, default
@@ -157,6 +157,19 @@ fn context(
         auth,
         transport: Arc::new(transport::Http::new(&trust).unwrap_or_else(|why| fail(&why))),
         holdings,
+    }
+}
+
+/// When a deploy or a job pulls its image, from `BEST_PEER_PULL`: unset, a reference by tag is pulled each time, since
+/// a tag may have moved, and one pinned by digest only when it is not held; `missing`, any image only when it is not
+/// held, for a host with no way to a registry, whose images were put there by hand.
+pub fn pull_rule(text: Option<&str>) -> Result<Pull, String> {
+    match text.map(str::trim).filter(|t| !t.is_empty()) {
+        None => Ok(Pull::Tags),
+        Some("missing") => Ok(Pull::Missing),
+        Some(t) => Err(format!(
+            "BEST_PEER_PULL is {t}: set it to missing, to pull an image only when Docker does not hold it, or leave it unset to pull a tag each time"
+        )),
     }
 }
 
@@ -328,6 +341,7 @@ async fn peer_app(endpoint: &str, dir: &std::path::Path, log: Arc<EventLog>, aut
     let images = Images {
         ollama: std::env::var("BEST_PEER_OLLAMA_IMAGE").ok(),
         vllm: std::env::var("BEST_PEER_VLLM_IMAGE").ok(),
+        pull: pull_rule(std::env::var("BEST_PEER_PULL").ok().as_deref()).unwrap_or_else(|why| fail(&why)),
     };
     let seconds = |name: &str, default: u64| {
         Duration::from_secs(std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default))
@@ -625,6 +639,19 @@ mod tests {
         engine_host: &str,
         auth: Option<Arc<Auth>>,
     ) -> Bed {
+        bed_imaging(gpu, log, runtime, engine, engine_host, auth, Images::default()).await
+    }
+
+    /// The same, with the operator's word on the engines' images and on pulling.
+    async fn bed_imaging(
+        gpu: Arc<best_peer_gpu::Fake>,
+        log: Arc<EventLog>,
+        runtime: Arc<best_peer_runtime::Fake>,
+        engine: Arc<best_peer_engine::Fake>,
+        engine_host: &str,
+        auth: Option<Arc<Auth>>,
+        images: Images,
+    ) -> Bed {
         for image in ["ollama/ollama", "vllm/vllm-openai", "busybox", "ollama/ollama:0.6"] {
             runtime.registry_has(best_peer_runtime::ImageRef(image.into()));
         }
@@ -636,7 +663,7 @@ mod tests {
             runtime.clone(),
             engine.clone(),
             log.clone(),
-            Images::default(),
+            images,
             Patience {
                 ready: Duration::from_secs(1),
                 load: Duration::from_secs(1),
@@ -3431,13 +3458,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_deploy_or_a_job_runs_what_the_peer_holds_without_a_registry_and_pull_image_always_pulls() {
+    async fn by_default_a_tag_is_pulled_again_and_a_digest_the_peer_holds_is_not() {
+        let tag = best_peer_runtime::ImageRef("team/trainer:1".into());
+        let pinned = best_peer_runtime::ImageRef(format!("team/trainer@sha256:{}", "a".repeat(64)));
+        let runtime = Arc::new(best_peer_runtime::Fake::new(
+            vec!["gpu-0".into()],
+            vec![tag.clone(), pinned.clone()],
+        ));
+        runtime.registry_has(tag.clone());
+        let bed = bed(card(), Arc::new(EventLog::ephemeral()), runtime.clone()).await;
+        let (s, b) = bed
+            .send("t1", "RunJob", "run-job", json!({ "image": tag.0, "memory_bytes": GB }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        assert_eq!(
+            bed.events_of("t1", "JobStarted")
+                .await
+                .iter()
+                .find(|e| e.r#type == "ImagePulled")
+                .unwrap()
+                .data["held"],
+            false
+        );
+        assert!(
+            runtime.pulled().contains(&tag),
+            "a tag may have moved: it is pulled again"
+        );
+        let (s, b) = bed
+            .send(
+                "t2",
+                "RunJob",
+                "run-job",
+                json!({ "image": pinned.0, "memory_bytes": GB }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        assert_eq!(
+            bed.events_of("t2", "JobStarted")
+                .await
+                .iter()
+                .find(|e| e.r#type == "ImagePulled")
+                .unwrap()
+                .data["held"],
+            true
+        );
+        assert!(
+            !runtime.pulled().contains(&pinned),
+            "a digest names one image: held, it is not pulled"
+        );
+        assert_eq!(pull_rule(None).unwrap(), Pull::Tags);
+        assert_eq!(pull_rule(Some(" missing ")).unwrap(), Pull::Missing);
+        assert!(pull_rule(Some("never")).unwrap_err().contains("missing"));
+    }
+
+    #[tokio::test]
+    async fn with_pull_missing_a_deploy_or_a_job_runs_what_the_peer_holds_without_a_registry_and_pull_image_always_pulls(
+    ) {
         let held = best_peer_runtime::ImageRef("held/trainer:1".into());
         let runtime = Arc::new(best_peer_runtime::Fake::new(
             vec!["gpu-0".into()],
             vec![held.clone(), best_peer_runtime::ImageRef("ollama/ollama".into())],
         ));
-        let bed = bed(card(), Arc::new(EventLog::ephemeral()), runtime.clone()).await;
+        let bed = bed_imaging(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            runtime.clone(),
+            Arc::new(best_peer_engine::Fake::new()),
+            "engines.local",
+            None,
+            Images {
+                pull: Pull::Missing,
+                ..Images::default()
+            },
+        )
+        .await;
         // Held and in no registry, as on a host with no way out: the job runs, and nothing went to a registry.
         let (s, b) = bed
             .send(
@@ -3547,8 +3641,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(
             types(&bed.log_of("j2")),
-            vec!["ImagePulling", "ImagePulled", "JobStarted"],
-            "no JobFinished for a stop; busybox is held since j1, so it is not pulled again"
+            vec!["ImagePulling", "ImagePulling", "ImagePulled", "JobStarted"],
+            "no JobFinished for a stop"
         );
         // A device without the memory to place it by is refused, not ignored.
         let (s, b) = bed
