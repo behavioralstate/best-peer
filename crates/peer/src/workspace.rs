@@ -1055,6 +1055,7 @@ impl Service for Workspace {
     fn workloads(&self, who: &Credential) -> Result<Value, BestError> {
         let mut deployments = Vec::new();
         let mut jobs = Vec::new();
+        let mut queued = Vec::new();
         for c in self.live_clouds() {
             let mut v = c.workloads(who)?;
             if let Some(d) = v["deployments"].as_array_mut() {
@@ -1063,9 +1064,12 @@ impl Service for Workspace {
             if let Some(j) = v["jobs"].as_array_mut() {
                 jobs.append(j);
             }
+            if let Some(q) = v["queued"].as_array_mut() {
+                queued.append(q);
+            }
         }
         Ok(json!({
-            "deployments": deployments, "jobs": jobs,
+            "deployments": deployments, "jobs": jobs, "queued": queued,
             "held_bytes": self.ctx.holdings.held_by(&who.holder()), "share_bytes": who.grant.memory_bytes
         }))
     }

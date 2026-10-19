@@ -1508,6 +1508,310 @@ mod tests {
     const A: &str = "https://a.test";
     const B: &str = "https://b.test";
 
+    impl Site {
+        /// The workspace's events with `correlation` once `n` of type `until` are among them.
+        async fn events_n(&self, ws: &str, correlation: &str, until: &str, n: usize) -> Vec<Value> {
+            let mut last = Vec::new();
+            for _ in 0..2000 {
+                let (_, b) = get_as(
+                    &self.app,
+                    &format!("/workspaces/{ws}"),
+                    &self.key,
+                    &format!("/events?correlationId={correlation}&limit=200"),
+                )
+                .await;
+                last = b["events"].as_array().cloned().unwrap_or_default();
+                if last.iter().filter(|e| e["type"] == until).count() >= n {
+                    return last;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("not {n} {until} for {correlation}; got {:?}", type_names(&last));
+        }
+
+        /// Orders a job of `gb` GiB in cloud `lab`, with `more` merged in, and answers its JobQueued.
+        async fn order(&self, ws: &str, id: &str, gb: u64, more: Value) -> Value {
+            let mut data = json!({ "cloud": "lab", "image": "busybox", "memory_bytes": gb * GB });
+            for (k, v) in more.as_object().into_iter().flatten() {
+                data[k] = v.clone();
+            }
+            let (s, b) = self.send(ws, id, "RunJob", "run-job", data).await;
+            assert_eq!(s, StatusCode::CREATED, "{b}");
+            self.events(ws, id, "JobQueued").await[0]["data"].clone()
+        }
+    }
+
+    /// The facts of a correlation, by type, oldest first, with the progress of a pull left out.
+    fn facts(events: &[Value]) -> Vec<String> {
+        type_names(events)
+            .into_iter()
+            .filter(|t| !matches!(t.as_str(), "ImagePulling" | "ImagePulled"))
+            .collect()
+    }
+
+    fn later(seconds: i64) -> time::OffsetDateTime {
+        time::OffsetDateTime::now_utc() + time::Duration::seconds(seconds)
+    }
+
+    #[tokio::test]
+    async fn an_order_with_no_room_waits_its_turn_and_one_that_fits_now_is_not_held_back_by_it() {
+        let (a, b) = two_members().await;
+        let key_a = a.key.clone();
+        let site = site(vec![(A, a), (B, b)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a)]).await;
+        let lab = site.live_cloud(&ws, "lab");
+
+        // 20 GiB of the 24 is taken and placed at once: the order whole, where it went, then the job, naming it.
+        let first = site.order(&ws, "j1", 20, json!({ "args": ["sleep", "100"] })).await;
+        assert_eq!(first["waiting"], false);
+        assert_eq!(first["attempt"], 1);
+        assert_eq!(first["args"], json!(["sleep", "100"]));
+        let events = site.events(&ws, "j1", "JobStarted").await;
+        assert_eq!(facts(&events), ["JobQueued", "JobPlaced", "JobStarted"]);
+        assert_eq!(events[1]["data"]["peer"], "a");
+        assert_eq!(events[1]["data"]["device"], "lab/a/gpu-0");
+        let started = events.last().unwrap()["data"].clone();
+        assert_eq!(started["order"], first["job"]);
+
+        // 10 GiB has no room beside it, where room can come free: taken, and it waits.
+        let waits = site.order(&ws, "j2", 10, json!({})).await;
+        assert_eq!(waits["waiting"], true);
+        assert!(waits["reason"].as_str().unwrap().contains("as soon as"), "{waits}");
+        // 4 GiB fits beside the first now: placed ahead of the order that waits, which holds it back not.
+        assert_eq!(site.order(&ws, "j3", 4, json!({})).await["waiting"], false);
+        site.events(&ws, "j3", "JobStarted").await;
+        let w = site.query(&ws, "get-workloads").await;
+        assert_eq!(w["queued"].as_array().unwrap().len(), 1, "{w}");
+        assert_eq!(w["queued"][0]["job"], waits["job"]);
+        assert_eq!(w["queued"][0]["waiting"], true);
+        assert_eq!(
+            w["held_bytes"],
+            34 * GB,
+            "the order that waits counts against what its credential holds"
+        );
+        // 30 GiB fits on no device of the cloud, whatever comes free: refused at once, as before.
+        let (s, b) = site
+            .send(
+                &ws,
+                "j4",
+                "RunJob",
+                "run-job",
+                json!({ "cloud": "lab", "image": "busybox", "memory_bytes": 30 * GB }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "INSUFFICIENT_MEMORY");
+
+        // The first ends: the order that waited is placed.
+        let container = ContainerId(started["container"].as_str().unwrap().into());
+        site.members[0].runtime.stop(&container).await.unwrap();
+        site.events(&ws, "j1", "JobFinished").await;
+        lab.step(later(0)).await;
+        let events = site.events(&ws, "j2", "JobStarted").await;
+        assert_eq!(facts(&events), ["JobQueued", "JobPlaced", "JobStarted"]);
+        assert_eq!(events.last().unwrap()["data"]["order"], waits["job"]);
+        assert_eq!(site.query(&ws, "get-workloads").await["queued"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn an_order_waiting_past_its_queue_seconds_ends_unplaced_and_a_job_past_its_deadline_is_stopped() {
+        let (a, b) = two_members().await;
+        let key_a = a.key.clone();
+        let site = site(vec![(A, a), (B, b)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a)]).await;
+        let lab = site.live_cloud(&ws, "lab");
+        let runs = site.order(&ws, "j1", 20, json!({ "deadline_seconds": 60 })).await;
+        site.events(&ws, "j1", "JobStarted").await;
+        let bounded = site.order(&ws, "j2", 10, json!({ "queue_seconds": 60 })).await;
+        assert_eq!(bounded["waiting"], true);
+        assert_eq!(bounded["queue_seconds"], 60);
+        let unbounded = site.order(&ws, "j3", 10, json!({})).await;
+
+        // Within both bounds nothing happens.
+        lab.step(later(30)).await;
+        assert_eq!(facts(&site.events(&ws, "j2", "JobQueued").await), ["JobQueued"]);
+        assert_eq!(
+            facts(&site.events(&ws, "j1", "JobStarted").await),
+            ["JobQueued", "JobPlaced", "JobStarted"]
+        );
+
+        // Past them: the order that waited ends never placed, and the job that ran too long is stopped.
+        lab.step(later(120)).await;
+        let failed = site.events(&ws, "j2", "JobFailed").await;
+        assert_eq!(facts(&failed), ["JobQueued", "JobFailed"]);
+        let failed = &failed.last().unwrap()["data"];
+        assert_eq!(failed["job"], bounded["job"]);
+        assert!(failed["reason"].as_str().unwrap().contains("never placed"), "{failed}");
+        let stopped = site.events(&ws, "j1", "JobStopped").await;
+        let stopped = &stopped.last().unwrap()["data"];
+        assert!(
+            stopped["reason"].as_str().unwrap().contains("deadline_seconds"),
+            "{stopped}"
+        );
+        assert_eq!(stopped["peer"], "a");
+        let door = site.workspaces.get(&ws).unwrap().door().clone();
+        assert!(
+            door.log.unfinished().iter().all(|u| u.envelope.id != "j2"),
+            "the order that ended unplaced completed its command"
+        );
+        // The stopped job freed the card: the order with no bound is placed.
+        lab.step(later(120)).await;
+        let placed = site.events(&ws, "j3", "JobStarted").await;
+        assert_eq!(placed.last().unwrap()["data"]["order"], unbounded["job"]);
+        assert_eq!(runs["deadline_seconds"], 60);
+    }
+
+    #[tokio::test]
+    async fn stop_job_ends_an_order_that_waits_before_it_started_and_a_running_one_by_its_order_id() {
+        let (a, b) = two_members().await;
+        let key_a = a.key.clone();
+        let site = site(vec![(A, a), (B, b)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a)]).await;
+        let runs = site.order(&ws, "j1", 20, json!({})).await;
+        site.events(&ws, "j1", "JobStarted").await;
+        let waits = site.order(&ws, "j2", 10, json!({})).await;
+        let job = waits["job"].as_str().unwrap();
+
+        let (s, b) = site.send(&ws, "s1", "StopJob", "stop-job", json!({ "job": job })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let stopped = site.events(&ws, "s1", "JobStopped").await;
+        assert_eq!(stopped[0]["data"]["job"], job);
+        assert_eq!(stopped[0]["data"]["reason"], "stopped before it started");
+        assert_eq!(
+            facts(&site.events(&ws, "j2", "JobStopped").await),
+            ["JobQueued", "JobStopped"],
+            "the order ends under its own correlation too"
+        );
+        let door = site.workspaces.get(&ws).unwrap().door().clone();
+        assert!(
+            door.log.unfinished().iter().all(|u| u.envelope.id != "j2"),
+            "its command is complete"
+        );
+        let w = site.query(&ws, "get-workloads").await;
+        assert_eq!(w["queued"], json!([]));
+        assert_eq!(w["held_bytes"], 20 * GB, "what it was promised is free");
+
+        // A running order is stopped by its order's id as by its job's.
+        let (s, b) = site
+            .send(&ws, "s2", "StopJob", "stop-job", json!({ "job": runs["job"] }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "s2", "JobStopped").await;
+        assert_eq!(site.query(&ws, "get-workloads").await["jobs"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn a_member_lost_under_an_order_queues_it_again_once_and_the_second_time_it_fails() {
+        let (a, b) = two_members().await;
+        let (key_a, key_b) = (a.key.clone(), b.key.clone());
+        let site = site(vec![(A, a), (B, b)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a), ("b", B, &key_b)])
+            .await;
+        let lab = site.live_cloud(&ws, "lab");
+        let order = site.order(&ws, "j1", 4, json!({})).await;
+        let first = site.events(&ws, "j1", "JobStarted").await;
+        let first = first.last().unwrap()["data"].clone();
+        assert_eq!(first["peer"], "a", "the device with the most room");
+
+        // a is lost: the order waits again, attempt 2, instead of the job it had there, and runs on b.
+        site.down[A].store(true, std::sync::atomic::Ordering::SeqCst);
+        lab.reconcile().await;
+        let events = site.events_n(&ws, "j1", "JobQueued", 2).await;
+        let again = events.iter().filter(|e| e["type"] == "JobQueued").nth(1).unwrap()["data"].clone();
+        assert_eq!(again["job"], order["job"]);
+        assert_eq!(again["attempt"], 2);
+        assert_eq!(again["instead_of"], first["job"]);
+        assert!(
+            again["reason"].as_str().unwrap().contains("peer a is unreachable"),
+            "{again}"
+        );
+        lab.step(later(0)).await;
+        let events = site.events_n(&ws, "j1", "JobStarted", 2).await;
+        let second = events.iter().filter(|e| e["type"] == "JobStarted").nth(1).unwrap()["data"].clone();
+        assert_eq!(second["peer"], "b");
+        assert_eq!(second["order"], order["job"]);
+        assert!(
+            !events.iter().any(|e| e["type"] == "JobFailed"),
+            "{:?}",
+            type_names(&events)
+        );
+
+        // b is lost too: it was queued again once already, so it fails.
+        site.down[B].store(true, std::sync::atomic::Ordering::SeqCst);
+        lab.reconcile().await;
+        let events = site.events(&ws, "j1", "JobFailed").await;
+        let failed = &events.last().unwrap()["data"];
+        assert_eq!(failed["job"], second["job"]);
+        assert!(
+            failed["reason"].as_str().unwrap().contains("queued again once already"),
+            "{failed}"
+        );
+        assert_eq!(site.query(&ws, "get-workloads").await["queued"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn a_door_restarted_under_a_running_job_tells_its_end_and_places_what_waited() {
+        let (a, b) = two_members().await;
+        let (key_a, key_b) = (a.key.clone(), b.key.clone());
+        let data = Arc::new(tempfile::tempdir().unwrap());
+        let log = Arc::new(EventLog::ephemeral());
+        let first = site_over(
+            vec![(A, a), (B, b)],
+            data.clone(),
+            log.clone(),
+            None,
+            Arc::new(Limits::default()),
+        )
+        .await;
+        let ws = first.workspace("c1", "Research").await;
+        first
+            .cloud(&ws, "k1", "lab", &[("a", A, &key_a), ("b", B, &key_b)])
+            .await;
+        first.order(&ws, "j1", 20, json!({})).await;
+        let started = first.events(&ws, "j1", "JobStarted").await.last().unwrap()["data"].clone();
+        let waits = first.order(&ws, "j2", 20, json!({})).await;
+        assert_eq!(waits["waiting"], true, "a has 4 GiB left and b has 8");
+        let owner = first.key.clone();
+        let (auth, members) = (first.auth.clone(), first.members);
+        first.workspaces.get(&ws).unwrap().cloud_for_test("lab").halt();
+        drop(first.app);
+        drop(first.workspaces);
+        drop(first.switchboard);
+
+        let again = site_over(Vec::new(), data.clone(), log, Some(auth), Arc::new(Limits::default())).await;
+        for (endpoint, bed) in [(A, &members[0]), (B, &members[1])] {
+            again.switchboard.connect(endpoint, bed.app.clone());
+        }
+        let again = Site { key: owner, ..again };
+        let w = again.query(&ws, "get-workloads").await;
+        assert_eq!(w["jobs"][0]["job"], started["job"], "{w}");
+        assert_eq!(w["queued"][0]["job"], waits["job"], "the order still waits");
+
+        // The job ends after the restart: its end is told, with its exit code, not failed.
+        let container = ContainerId(started["container"].as_str().unwrap().into());
+        members[0].runtime.stop(&container).await.unwrap();
+        let events = again.events(&ws, "j1", "JobFinished").await;
+        assert_eq!(events.last().unwrap()["data"]["exit_code"], 0);
+        assert!(
+            !events.iter().any(|e| e["type"] == "JobFailed"),
+            "{:?}",
+            type_names(&events)
+        );
+        // And the order that waited across the restart is placed in the room it left.
+        again.live_cloud(&ws, "lab").step(later(0)).await;
+        let placed = again.events(&ws, "j2", "JobStarted").await;
+        assert_eq!(placed.last().unwrap()["data"]["order"], waits["job"]);
+        assert_eq!(
+            facts(&placed),
+            ["JobQueued", "JobPlaced", "JobStarted"],
+            "nothing told twice"
+        );
+    }
+
     #[tokio::test]
     async fn two_workspaces_on_one_door_each_hold_a_cloud_one_machine_serves_both_and_each_sees_places_on_and_hears_only_its_own(
     ) {

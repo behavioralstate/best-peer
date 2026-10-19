@@ -131,7 +131,8 @@ pub fn completions() -> HashMap<String, HashSet<String>> {
             set(&["DeploymentReady", "DeploymentFailed", "DeploymentEnded", "OutOfMemory"]),
         ),
         ("UndeployModel".to_string(), set(&["Undeployed"])),
-        ("RunJob".to_string(), set(&["JobStarted", "JobFailed"])),
+        // JobStopped: on a workspace's door, an order stopped before it started.
+        ("RunJob".to_string(), set(&["JobStarted", "JobFailed", "JobStopped"])),
         ("StopJob".to_string(), set(&["JobStopped"])),
         ("Prompt".to_string(), set(&["PromptAnswered", "PromptFailed"])),
         ("CreateWorkspace".to_string(), set(&["WorkspaceCreatedV1"])),
@@ -277,7 +278,7 @@ fn hardware_query(svc: Arc<dyn Service>, at: Where) -> QueryDef {
 fn workloads_query(peer: Arc<dyn Service>, at: Where) -> QueryDef {
     let description = match at {
         Where::Root => "What this peer runs for you now: each deployment with its model, engine, device, the memory promised to it, its phase (starting, ready, ending); each job with its image, device and phase (running, stopping); and held_bytes, the device memory your workloads hold together on this door, against share_bytes, the most your credential may hold (null when no share was set). A credential approved for all sees every holder's workloads, with the holder. The ids here are what undeploy-model and stop-job name.",
-        Where::Workspace => "What this workspace runs for you now, across its clouds: each deployment with its cloud, the peer it is on, its model, engine, device (cloud/peer/device), the memory promised to it, its phase (starting, ready, ending); each job with its cloud, peer, image, device and phase (running, stopping); and held_bytes, the device memory your workloads hold together on this door, every workspace counted, against share_bytes, the most your credential may hold (null when no share was set). A credential approved for all sees every holder's workloads, with the holder. The ids here are what undeploy-model and stop-job name.",
+        Where::Workspace => "What this workspace runs for you now, across its clouds: each deployment with its cloud, the peer it is on, its model, engine, device (cloud/peer/device), the memory promised to it, its phase (starting, ready, ending); each job with its cloud, peer, image, device and phase (running, stopping); queued, the orders not started yet, oldest first, each with its id (what stop-job names while it waits), its cloud, image and memory, whether it waits or the peer it was sent to, its attempt and when it was queued; and held_bytes, the device memory your workloads hold together on this door, every workspace counted, orders that wait included, against share_bytes, the most your credential may hold (null when no share was set). A credential approved for all sees every holder's workloads, with the holder. The ids here are what undeploy-model and stop-job name.",
     };
     let mut deployment = json!({
         "deployment": { "type": "string" }, "model": { "type": "string" }, "engine": { "type": "string", "enum": ["ollama", "vllm"] },
@@ -500,13 +501,31 @@ fn run_job(peer: Arc<dyn Service>, at: Where) -> CommandDef {
             }),
         ),
         Where::Workspace => (
-            "Runs an image once in a cloud of this workspace, with the arguments given, and tells its end. With memory_bytes the job is placed on a member peer's device with that much room and handed that device; without, it runs on the first peer of the cloud that answers, with no device. Name the cloud, or a device (cloud/peer/device) to pin the placement, which names the cloud too. Refused at once when the cloud is not this workspace's or is archived. The facts follow on this workspace's stream with this command's correlation id, each with the cloud and the peer named: ImagePulling and ImagePulled (an image the peer holds is used as it is, not pulled again, when it is pinned by digest or the operator pulls only what is missing; one named by tag is otherwise pulled each time), then JobStarted or JobFailed, which complete the command; the job's own end follows as JobFinished with the exit code, or JobFailed. No container gets a capability or a new privilege, and each has a ceiling on tasks (threads count). The job of a credential with a share runs in a closed box besides: no network, a read-only filesystem with a private /tmp of 1 GiB, and a ceiling on host memory that whoever runs that peer sets, unless its approver opened its jobs; JobStarted says boxed. An image that needs the network fails inside the box, not at the door, and a boxed job that reaches the host memory ceiling ends in JobFailed naming it, whatever memory_bytes it asked for, since memory_bytes is device memory. Needs the jobs scope, and room in the credential's share when one was set and memory_bytes is given; a credential with a share sends memory_bytes, since its jobs run on a device where the share counts them (JOB_NEEDS_DEVICE without); refused when the credential already runs as many jobs across this door as its approver allowed (JOBS_EXCEEDED); one held to the accelerators names no device offering the CPU alone (ACCELERATORS_ONLY).",
+            "Orders an image run once in a cloud of this workspace, with the arguments given, and tells its end. With memory_bytes the job is placed on a member peer's device with that much room and handed that device; without, it runs on the first peer of the cloud that answers, with no device. Name the cloud, or a device (cloud/peer/device) to pin the placement, which names the cloud too. Refused at once when the cloud is not this workspace's or is archived, and when no device of the cloud's members that answer could ever hold it (INSUFFICIENT_MEMORY, NO_DEVICE_FOR_ENGINE, NO_SUCH_DEVICE, with the devices); a cloud with no room now takes the order and it waits its turn. JobQueued follows first, with the order's id as job and waiting true when it waits; the cloud places its orders first come, first served, as soon as a member has the memory free, and an order that does not fit yet holds back none that does. JobPlaced names the member peer it was sent to. queue_seconds bounds the wait: an order not placed within it ends in JobFailed saying it was never placed. deadline_seconds bounds the run from JobStarted: a job still running past it is stopped, and JobStopped says why. stop-job names a waiting order by its id, which ends it in JobStopped before it started. A member peer lost under an order queues it again once, JobQueued telling attempt 2, and fails it the second time. The facts follow on this workspace's stream with this command's correlation id, each with the cloud and the peer named: ImagePulling and ImagePulled (an image the peer holds is used as it is, not pulled again, when it is pinned by digest or the operator pulls only what is missing; one named by tag is otherwise pulled each time), then JobStarted or JobFailed, which complete the command; the job's own end follows as JobFinished with the exit code, or JobFailed. No container gets a capability or a new privilege, and each has a ceiling on tasks (threads count). The job of a credential with a share runs in a closed box besides: no network, a read-only filesystem with a private /tmp of 1 GiB, and a ceiling on host memory that whoever runs that peer sets, unless its approver opened its jobs; JobStarted says boxed. An image that needs the network fails inside the box, not at the door, and a boxed job that reaches the host memory ceiling ends in JobFailed naming it, whatever memory_bytes it asked for, since memory_bytes is device memory. Needs the jobs scope, and room in the credential's share when one was set and memory_bytes is given; a credential with a share sends memory_bytes, since its jobs run on a device where the share counts them (JOB_NEEDS_DEVICE without); refused when the credential already runs as many jobs across this door as its approver allowed (JOBS_EXCEEDED); one held to the accelerators names no device offering the CPU alone (ACCELERATORS_ONLY).",
             json!({
                 "cloud": cloud_property("to run in; may be left out when device names it"),
-                "device": { "type": "string", "maxLength": 256, "description": "A device id from this workspace's get-hardware-state, cloud/peer/device, to pin the placement; refused without memory_bytes" }
+                "device": { "type": "string", "maxLength": 256, "description": "A device id from this workspace's get-hardware-state, cloud/peer/device, to pin the placement; refused without memory_bytes" },
+                "queue_seconds": { "type": "integer", "minimum": 1, "maximum": 604800, "description": "How long the order may wait for room before it ends unplaced, counted from JobQueued; at most seven days; without it the order waits until it is placed or stopped" },
+                "deadline_seconds": { "type": "integer", "minimum": 1, "maximum": 2592000, "description": "How long the job may run before it is stopped, counted from JobStarted; at most thirty days; without it the job runs to its end" }
             }),
         ),
     };
+    let produces: Vec<String> = match at {
+        Where::Root => vec!["ImagePulling", "ImagePulled", "JobStarted", "JobFinished", "JobFailed"],
+        Where::Workspace => vec![
+            "JobQueued",
+            "JobPlaced",
+            "ImagePulling",
+            "ImagePulled",
+            "JobStarted",
+            "JobFinished",
+            "JobFailed",
+            "JobStopped",
+        ],
+    }
+    .into_iter()
+    .map(String::from)
+    .collect();
     properties["image"] = json!({ "type": "string", "minLength": 1, "maxLength": 512, "description": "The image to run, as the container engine understands it" });
     properties["args"] = json!({ "type": "array", "maxItems": 256, "items": { "type": "string", "maxLength": 4096 }, "description": "The command line passed to the image's entrypoint" });
     properties["memory_bytes"] = json!({ "type": "integer", "minimum": 1, "description": "Device memory the job needs; omit to run it with no device" });
@@ -521,14 +540,12 @@ fn run_job(peer: Arc<dyn Service>, at: Where) -> CommandDef {
             "properties": properties,
             "additionalProperties": false
         }),
-        produces: vec![
-            "ImagePulling".into(),
-            "ImagePulled".into(),
-            "JobStarted".into(),
-            "JobFinished".into(),
-            "JobFailed".into(),
-        ],
-        completes: completes("RunJob"),
+        // An order stopped before it started is a workspace's alone; the root's run-job never tells JobStopped.
+        completes: completes("RunJob")
+            .into_iter()
+            .filter(|t| produces.contains(t))
+            .collect(),
+        produces,
         impact: None,
         admit: Some(Arc::new(move |cmd, who, key| {
             let peer = admit.clone();
@@ -547,12 +564,12 @@ fn stop_job(peer: Arc<dyn Service>) -> CommandDef {
         schema: "stop-job".into(),
         version: "1.0".into(),
         command_type: "StopJob".into(),
-        description: "Stops a running job. Refused when no such job is running, or when another credential started it. The outcome is a JobStopped event with this command's correlation id. Needs the jobs scope.".into(),
+        description: "Stops a running job; on a workspace's door, also an order that waits or is not yet started, named by the id JobQueued gave it, which ends before it started: JobStopped under the order's own correlation id too. Refused when no such job or order is there, or when another credential started it. The outcome is a JobStopped event with this command's correlation id. Needs the jobs scope.".into(),
         data_schema: json!({
             "type": "object",
             "required": ["job"],
             "properties": {
-                "job": { "type": "string", "minLength": 1, "maxLength": 128, "description": "The job id from JobStarted or get-workloads" }
+                "job": { "type": "string", "minLength": 1, "maxLength": 128, "description": "The job id from JobStarted or get-workloads; on a workspace's door, or an order's id from JobQueued" }
             },
             "additionalProperties": false
         }),
@@ -974,7 +991,7 @@ pub fn event_defs() -> Vec<EventDef> {
             "JobStarted",
             "The job's container runs.",
             &["job", "image", "container"],
-            placed(json!({ "job": s("The id stop-job names"), "holder": s("The credential that ran it, an opaque id; absent for one run before holders were told"), "image": s("The image"), "device": { "type": ["string", "null"] }, "memory_bytes": n("The memory promised to it"), "container": s("The engine's container id"), "boxed": { "type": "boolean", "description": "True when the job runs in the closed box a credential with a share gets: no network, a read-only filesystem, a ceiling on host memory" }, "host_memory_bytes": { "type": ["integer", "null"], "description": "The most host memory its container may hold; null for no ceiling" } })),
+            placed(json!({ "job": s("The id stop-job names"), "order": s("On a workspace's door, the order it ran for: the id JobQueued gave it"), "holder": s("The credential that ran it, an opaque id; absent for one run before holders were told"), "image": s("The image"), "device": { "type": ["string", "null"] }, "memory_bytes": n("The memory promised to it"), "container": s("The engine's container id"), "boxed": { "type": "boolean", "description": "True when the job runs in the closed box a credential with a share gets: no network, a read-only filesystem, a ceiling on host memory" }, "host_memory_bytes": { "type": ["integer", "null"], "description": "The most host memory its container may hold; null for no ceiling" } })),
         ),
         event(
             "job-finished",
@@ -993,9 +1010,9 @@ pub fn event_defs() -> Vec<EventDef> {
         event(
             "job-stopped",
             "JobStopped",
-            "The job was stopped on request.",
+            "The job was stopped on request; on a workspace's door also an order stopped before it started, or a job stopped by the door when it ran past its deadline_seconds, which the reason says.",
             &["job"],
-            placed(json!({ "job": s("The job") })),
+            placed(json!({ "job": s("The job, or the order"), "reason": s("Why, when the door stopped it rather than a stop-job: its deadline, or before it started") })),
         ),
         event(
             "command-failed",
@@ -1060,6 +1077,35 @@ pub fn cloud_event_defs() -> Vec<EventDef> {
             "A cloud of this workspace is archived: it places nothing and answers no device until configure-cloud brings it back.",
             &["workspace", "cloud"],
             json!({ "workspace": s("The workspace"), "cloud": s("The cloud's name") }),
+        ),
+        event(
+            "job-queued",
+            "JobQueued",
+            "A cloud took a run-job order: the order whole, as it is placed. waiting is true when no member peer has the room now; the cloud places it as soon as one does, first come, first served. attempt 2 says a member peer was lost under it and it was queued again, once.",
+            &["job", "image", "attempt", "waiting", "cloud"],
+            json!({
+                "job": s("The order's id, what stop-job names while it waits"),
+                "image": s("The image"),
+                "args": { "type": "array", "items": { "type": "string" }, "description": "The command line passed to the image's entrypoint" },
+                "memory_bytes": { "type": ["integer", "null"], "description": "Device memory the order needs; null for none" },
+                "device": { "type": ["string", "null"], "description": "The device the order pinned, cloud/peer/device" },
+                "queue_seconds": { "type": ["integer", "null"], "description": "How long it may wait, from this event" },
+                "deadline_seconds": { "type": ["integer", "null"], "description": "How long its job may run, from JobStarted" },
+                "holder": s("The credential that ordered it, an opaque id"),
+                "accelerators_only": { "type": "boolean", "description": "True when its credential runs on the accelerators alone" },
+                "attempt": { "type": "integer", "description": "1; 2 once queued again after a member peer was lost under it" },
+                "waiting": { "type": "boolean", "description": "True when no member peer has the room now" },
+                "reason": s("Why it waits, or why it was queued again"),
+                "instead_of": s("Queued again: the job the lost member peer was running for it"),
+                "cloud": s("The cloud that took it")
+            }),
+        ),
+        event(
+            "job-placed",
+            "JobPlaced",
+            "An order was sent to a member peer, which pulls the image and starts it: JobStarted follows, naming the order.",
+            &["job", "peer", "cloud"],
+            json!({ "job": s("The order's id"), "peer": s("The member peer it was sent to"), "device": { "type": ["string", "null"], "description": "The device there, cloud/peer/device; null for a job with no device" }, "cloud": s("The cloud") }),
         ),
         event(
             "peer-joined",

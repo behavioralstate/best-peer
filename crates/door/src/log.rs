@@ -417,6 +417,18 @@ impl EventLog {
             .and_then(|a| a.workload.clone())
     }
 
+    /// The key (`sender:id`) of the first accepted command `matches` says yes to, given the sender, the id and the
+    /// workload it made: what a restart uses to find the command behind a workload or an order it rebuilt.
+    pub fn command_where(&self, matches: impl Fn(&str, &str, Option<&str>) -> bool) -> Option<String> {
+        let accepted = self.accepted.lock().unwrap();
+        let mut found: Vec<&AcceptedLine> = accepted
+            .values()
+            .filter(|a| matches(&a.sender, &a.id, a.workload.as_deref()))
+            .collect();
+        found.sort_by_key(|a| a.order);
+        found.first().map(|a| format!("{}:{}", a.sender, a.id))
+    }
+
     /// The stored hash of `sender`'s command `id`, for a restart to check the stored envelope against.
     pub fn hash_of(&self, sender: &str, id: &str) -> Option<String> {
         self.accepted

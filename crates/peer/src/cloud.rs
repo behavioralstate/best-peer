@@ -6,10 +6,19 @@
 //! the members' streams, and squares its state with theirs on a timer, so a member that is gone is told as such for
 //! every workload it held. Members are what `configure-cloud` listed; each admits the cloud by its own sign-in, the
 //! device flow, with the code shown in the door's log for the person at that member's machine.
+//!
+//! A job is an order the cloud takes and places when it can. `JobQueued` holds the order whole, `JobPlaced` names
+//! the member it was sent to, and the member's `JobStarted`, relayed, names the order; the state folds orders from
+//! these facts, so the queue and every placement survive a restart. One placement step at a time takes the orders
+//! that wait, oldest first, and sends each that a member has the room for; an order that does not fit yet holds back
+//! none that does. The step runs when room may have come free (a workload ended, a member joined), on the reconcile
+//! tick, and when an order is taken; it also ends an order waiting past its `queue_seconds` and stops a job running
+//! past its `deadline_seconds`, both counted from the facts' own times.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -22,14 +31,17 @@ use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
+
 use crate::domain::Service;
 use crate::holdings::Holdings;
 use crate::lifecycle::{
-    any_compute, has_share, mine, new_id, not_yours, parse, place, ready_deployment, require, shown_to, usable_by,
-    within_count, within_share, workloads_view,
+    accelerators, accelerators_only, any_compute, has_share, mine, new_id, not_yours, parse, place, ready_deployment,
+    require, shown_to, usable_by, within_count, within_share, workloads_view,
 };
 use crate::member::{Heard, Member, Refusal};
-use crate::state::{JobPhase, Phase, Reservation, State};
+use crate::state::{JobPhase, Order, Phase, Reservation, State};
 use crate::transport::Transport;
 
 /// How often the cloud squares its state with its members', and the most a member may be silent before its
@@ -119,6 +131,10 @@ struct Issued {
     pull: Option<String>,
     /// The workload this command ends, for an undeploy or a stop.
     ends: Option<String>,
+    /// The order this command runs, for a run-job the queue sent.
+    order: Option<String>,
+    /// What the door adds to the fact that answers it: why the door, not a caller, asked.
+    note: Option<Value>,
 }
 
 /// A pull fanned out to every member: who is still to hear from, and who failed.
@@ -166,6 +182,73 @@ pub struct Cloud {
     ticking: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Whether `follow` was called: a member added after it is followed at once.
     following: std::sync::atomic::AtomicBool,
+    /// This cloud, for a placement step started from where only a reference is at hand.
+    me: Weak<Cloud>,
+    /// The command behind each order, by the order's id: what completes the command and names its holder.
+    keys: Mutex<HashMap<String, String>>,
+    /// The commands admitted from a credential held to the accelerators, until the order is told.
+    held_to_accelerators: Mutex<HashSet<String>>,
+    /// A placement step runs, and whether another was asked for meanwhile.
+    stepping: AtomicBool,
+    again: AtomicBool,
+    /// One step at a time, however it was started: an order is placed once.
+    steps: tokio::sync::Mutex<()>,
+    /// Orders stopped after they were sent and before the member started them: their listener stays, so the job
+    /// the member starts all the same is stopped there.
+    stopped_unstarted: Mutex<HashSet<String>>,
+}
+
+/// An order's id: the command's key hashed, so the command run again after a restart finds its order.
+fn order_id(key: &str) -> String {
+    format!("job-{}", &hash_key(key)[..12])
+}
+
+/// The id and correlation a member is given for an order: the order and its attempt, so an order queued again is a
+/// new command there, even on the member that had it.
+fn order_correlation(o: &Order) -> String {
+    format!("{}-{}", o.id, o.attempt)
+}
+
+/// Whether `seconds` from `since` have passed at `now`; a bound not set, or a time that does not read, never has.
+fn past(since: Option<&str>, seconds: Option<u64>, now: OffsetDateTime) -> bool {
+    match (since.and_then(|t| OffsetDateTime::parse(t, &Rfc3339).ok()), seconds) {
+        (Some(t), Some(s)) => now >= t + time::Duration::seconds(s as i64),
+        _ => false,
+    }
+}
+
+/// Whether a device of `host` that runs a job could hold `needed` once nothing else held it there: an order that
+/// fits nowhere now waits only when room can come free.
+fn could_ever_hold(host: &Host, needed: u64, pinned: Option<&str>) -> bool {
+    let empty = Host {
+        devices: host
+            .devices
+            .iter()
+            .cloned()
+            .map(|mut d| {
+                d.memory.free_bytes = d.memory.total_bytes;
+                d
+            })
+            .collect(),
+        ..host.clone()
+    };
+    place(&empty, &State::default(), &any_compute(), needed, pinned, "", None).is_ok()
+}
+
+/// `JobQueued`'s body for `o`, at `attempt`.
+fn queued_fact(o: &Order, attempt: u32, waiting: bool, reason: Option<String>, instead_of: Option<&str>) -> Value {
+    let mut v = json!({
+        "job": o.id, "image": o.image, "args": o.args, "memory_bytes": o.memory_bytes, "device": o.device,
+        "queue_seconds": o.queue_seconds, "deadline_seconds": o.deadline_seconds, "holder": o.holder,
+        "accelerators_only": o.accelerators_only, "attempt": attempt, "waiting": waiting,
+    });
+    if let Some(r) = reason {
+        v["reason"] = json!(r);
+    }
+    if let Some(i) = instead_of {
+        v["instead_of"] = json!(i);
+    }
+    v
 }
 
 /// A member's `get-hardware-state`, as the abstraction's types.
@@ -194,6 +277,10 @@ struct RunJobData {
     memory_bytes: Option<u64>,
     #[serde(default)]
     device: Option<String>,
+    #[serde(default)]
+    queue_seconds: Option<u64>,
+    #[serde(default)]
+    deadline_seconds: Option<u64>,
 }
 
 impl Cloud {
@@ -226,7 +313,14 @@ impl Cloud {
                 Arc::new(Member::new(n, e, kept.and_then(|s| s.key.clone()), transport.clone()))
             })
             .collect();
-        let cloud = Arc::new(Self {
+        let cloud = Arc::new_cyclic(|me| Self {
+            me: me.clone(),
+            keys: Mutex::new(HashMap::new()),
+            held_to_accelerators: Mutex::new(HashSet::new()),
+            stepping: AtomicBool::new(false),
+            again: AtomicBool::new(false),
+            steps: tokio::sync::Mutex::new(()),
+            stopped_unstarted: Mutex::new(HashSet::new()),
             name: name.into(),
             workspace: workspace.into(),
             log,
@@ -257,14 +351,112 @@ impl Cloud {
         cloud
     }
 
-    /// Folds every fact the log holds about this cloud into the state. Run once, before the cloud is used.
+    /// Folds every fact the log holds about this cloud into the state, then listens again for what the members will
+    /// still tell: every order sent and every workload running, so a fact told after a restart reaches the caller
+    /// under its correlation, and an order that waits keeps what it was promised. Run once, before the cloud is used.
     pub fn rebuild(&self) {
-        let mut state = self.state.lock().unwrap();
-        self.log.replay(|e| {
-            if e.data["cloud"].as_str() == Some(&self.name) {
-                state.apply(e)
+        {
+            let mut state = self.state.lock().unwrap();
+            self.log.replay(|e| {
+                if e.data["cloud"].as_str() == Some(&self.name) {
+                    state.apply(e)
+                }
+            });
+        }
+        self.relink();
+    }
+
+    fn relink(&self) {
+        let (orders, jobs, deployments) = {
+            let s = self.state.lock().unwrap();
+            let orders: Vec<Order> = s.orders.values().cloned().collect();
+            let jobs: Vec<(String, String, Option<String>)> = s
+                .jobs
+                .values()
+                .map(|j| (j.id.clone(), j.correlation.clone(), j.peer.clone()))
+                .collect();
+            let deployments: Vec<(String, String, Option<String>)> = s
+                .deployments
+                .values()
+                .map(|d| (d.id.clone(), d.correlation.clone(), d.peer.clone()))
+                .collect();
+            (orders, jobs, deployments)
+        };
+        for o in &orders {
+            if let Some(key) = self
+                .log
+                .command_where(|sender, id, _| order_id(&format!("{sender}:{id}")) == o.id)
+            {
+                self.keys.lock().unwrap().insert(o.id.clone(), key);
             }
+            if o.job.is_none() {
+                // Not started: what it was promised counts, on the device it was placed on when it was.
+                let device = o
+                    .placed
+                    .as_ref()
+                    .map(|(peer, d)| DeviceId(d.clone().unwrap_or_else(|| format!("{}/{peer}/", self.name))));
+                self.promise(o, device);
+            }
+            let peer = match (&o.job, &o.placed) {
+                (Some(j), _) => jobs.iter().find(|(id, ..)| id == j).and_then(|(.., p)| p.clone()),
+                (None, Some((p, _))) => Some(p.clone()),
+                (None, None) => None,
+            };
+            if let Some(peer) = peer {
+                self.listen_order(&peer, &order_correlation(o), &self.order_emitter(o), &o.id);
+            }
+        }
+        // Workloads placed before orders were told: the member was given the command's own correlation.
+        let ordered = |id: &str| orders.iter().any(|o| o.job.as_deref() == Some(id));
+        for (id, correlation, peer, r#type) in jobs
+            .iter()
+            .map(|(i, c, p)| (i, c, p, "RunJob"))
+            .chain(deployments.iter().map(|(i, c, p)| (i, c, p, "DeployModel")))
+        {
+            let Some(peer) = peer.as_deref().filter(|_| !ordered(id)) else {
+                continue;
+            };
+            let Some(key) = self.log.command_where(|_, _, w| w == Some(id.as_str())) else {
+                continue;
+            };
+            let mc = member_correlation(&key, &json!({}), None);
+            let em = self.emitter(correlation).with_key(&key);
+            self.listen_for(peer, &mc, &em, r#type, None, None);
+        }
+    }
+
+    /// The order `o` holds what it asked for, on `device` once it is placed: a share and the count of jobs count it
+    /// while it waits, and the placement step sees it promised there.
+    fn promise(&self, o: &Order, device: Option<DeviceId>) {
+        let key = self
+            .keys
+            .lock()
+            .unwrap()
+            .get(&o.id)
+            .cloned()
+            .unwrap_or_else(|| o.id.clone());
+        let mut s = self.state.lock().unwrap();
+        s.reserved.retain(|k, r| r.id != o.id || *k == key);
+        let r = s.reserved.entry(key).or_insert_with(|| Reservation {
+            id: o.id.clone(),
+            device: None,
+            compute: None,
+            memory_bytes: o.memory_bytes.unwrap_or(0),
+            holder: o.holder.clone(),
+            boxed: false,
         });
+        r.device = device;
+    }
+
+    /// The emitter of the command behind order `o`: its correlation, its key when known, and what completes it.
+    fn order_emitter(&self, o: &Order) -> Emitter {
+        let key = self.keys.lock().unwrap().get(&o.id).cloned().unwrap_or_default();
+        let completes: Vec<String> = self
+            .completions
+            .get("RunJob")
+            .map(|c| c.iter().cloned().collect())
+            .unwrap_or_default();
+        self.emitter(&o.correlation).with_key(&key).with_completes(&completes)
     }
 
     pub fn members(&self) -> Vec<Arc<Member>> {
@@ -411,6 +603,7 @@ impl Cloud {
                     "PeerJoined",
                     json!({ "peer": member.name, "endpoint": member.endpoint }),
                 );
+                self.kick();
                 Contact::Joined
             }
             _ => Contact::Same,
@@ -495,10 +688,15 @@ impl Cloud {
         data: Value,
     ) -> (Envelope, String) {
         let mc = member_correlation(key, &data, self.holder_on(member).as_deref());
-        let envelope = Envelope {
+        (self.to_member_as(schema_base, &mc, r#type, schema, data), mc)
+    }
+
+    /// The command as the member receives it, under the id and correlation `mc`.
+    fn to_member_as(&self, schema_base: &str, mc: &str, r#type: &str, schema: &str, data: Value) -> Envelope {
+        Envelope {
             specversion: "1.0".into(),
-            id: mc.clone(),
-            correlationid: Some(mc.clone()),
+            id: mc.into(),
+            correlationid: Some(mc.into()),
             source: self.endpoint.clone(),
             r#type: r#type.into(),
             datacontenttype: "application/json".into(),
@@ -506,8 +704,7 @@ impl Cloud {
             time: now_rfc3339(),
             data,
             extensions: Default::default(),
-        };
-        (envelope, mc)
+        }
     }
 
     fn listen_for(
@@ -526,6 +723,23 @@ impl Cloud {
                 r#type: r#type.into(),
                 pull,
                 ends,
+                order: None,
+                note: None,
+            },
+        );
+    }
+
+    /// Listens for what a member tells about the order `order` it was sent.
+    fn listen_order(&self, member: &str, mc: &str, em: &Emitter, order: &str) {
+        self.issued.lock().unwrap().insert(
+            (member.into(), mc.into()),
+            Issued {
+                em: em.clone(),
+                r#type: "RunJob".into(),
+                pull: None,
+                ends: None,
+                order: Some(order.into()),
+                note: None,
             },
         );
     }
@@ -539,6 +753,19 @@ impl Cloud {
         schema: &str,
         data: Value,
     ) -> Result<(), BestError> {
+        self.place_on_noting(member, em, r#type, schema, data, None).await
+    }
+
+    /// The same, `note` added to the fact that answers it.
+    async fn place_on_noting(
+        &self,
+        member: &Member,
+        em: &Emitter,
+        r#type: &str,
+        schema: &str,
+        data: Value,
+        note: Option<Value>,
+    ) -> Result<(), BestError> {
         // An undeploy or a stop ends the workload it names; a prompt names one and ends nothing.
         let ends = matches!(r#type, "UndeployModel" | "StopJob")
             .then(|| data["deployment"].as_str().or(data["job"].as_str()).map(str::to_string))
@@ -546,6 +773,11 @@ impl Cloud {
         let base = member.schema_base().await;
         let (envelope, mc) = self.to_member(member, &base, em.command_key(), r#type, schema, data);
         self.listen_for(&member.name, &mc, em, r#type, None, ends);
+        if note.is_some() {
+            if let Some(i) = self.issued.lock().unwrap().get_mut(&(member.name.clone(), mc.clone())) {
+                i.note = note;
+            }
+        }
         member.send(&envelope).await.map(|_| ()).map_err(|e| {
             self.issued.lock().unwrap().remove(&(member.name.clone(), mc));
             e.relayed(&member.name)
@@ -595,10 +827,10 @@ impl Cloud {
         out
     }
 
-    /// Whether this cloud holds the workload `id`, as a deployment or a job.
+    /// Whether this cloud holds the workload `id`, as a deployment, a job or an order.
     pub fn holds_workload(&self, id: &str) -> bool {
         let s = self.state.lock().unwrap();
-        s.deployments.contains_key(id) || s.jobs.contains_key(id)
+        s.deployments.contains_key(id) || s.jobs.contains_key(id) || s.orders.contains_key(id)
     }
 
     // ----- what the members tell ----------------------------------------------------------------------------------
@@ -614,14 +846,38 @@ impl Cloud {
                 .get(&(member.name.clone(), mc.to_string()))
                 .cloned()
         });
-        if let Some(Issued { em, pull, .. }) = issued {
+        if let Some(Issued {
+            em, pull, order, note, ..
+        }) = issued
+        {
             let mut data = e.data.clone();
             data["peer"] = json!(member.name);
             if let Some(device) = data["device"].as_str().filter(|d| !d.is_empty() && !d.contains('/')) {
                 data["device"] = json!(format!("{}/{}/{device}", self.name, member.name));
             }
+            // The holder of the order, while it is one; an order no longer there was stopped before it started.
+            let ordered = order.as_ref().map(|o| {
+                let s = self.state.lock().unwrap();
+                (o.clone(), s.orders.get(o).map(|x| x.holder.clone()))
+            });
             if let Some(key) = pull {
                 self.on_pull_fact(member, &key, &em, &e.r#type, data);
+            } else if let Some((_, None)) = &ordered {
+                // Stopped before it started, and the member started it all the same: it is stopped there, and
+                // nothing more is told about it.
+                if let Some(mc) = e.correlationid.as_deref() {
+                    self.issued
+                        .lock()
+                        .unwrap()
+                        .remove(&(member.name.clone(), mc.to_string()));
+                }
+                if let Some((o, _)) = &ordered {
+                    self.stopped_unstarted.lock().unwrap().remove(o);
+                }
+                if let (true, Some(job)) = (e.r#type == "JobStarted", data["job"].as_str()) {
+                    tracing::info!(cloud = %self.name, peer = %member.name, %job, "a job stopped before it started was started on the member; stopping it there");
+                    self.stop_stray(&member.name, job);
+                }
             } else {
                 let key = em.command_key().to_string();
                 let (sender, _) = Self::sender_of(&key);
@@ -631,14 +887,24 @@ impl Cloud {
                 }
                 match e.r#type.as_str() {
                     "DeploymentStarted" | "JobStarted" => {
-                        if !sender.is_empty() {
-                            data["holder"] = json!(holder_of_hash(sender));
+                        match &ordered {
+                            Some((o, Some(holder))) => {
+                                data["order"] = json!(o);
+                                data["holder"] = json!(holder);
+                            }
+                            _ if !sender.is_empty() => data["holder"] = json!(holder_of_hash(sender)),
+                            _ => {}
                         }
                         if let Some(w) = data["deployment"].as_str().or(data["job"].as_str()) {
                             em.bind_workload(w);
                         }
                     }
                     _ => {}
+                }
+                if let Some(n) = note.as_ref().and_then(|n| n.as_object()) {
+                    for (k, v) in n {
+                        data[k] = v.clone();
+                    }
                 }
                 self.tell(&em, &e.r#type, data);
                 if TERMINAL.contains(&e.r#type.as_str()) {
@@ -648,11 +914,38 @@ impl Cloud {
                             .unwrap()
                             .remove(&(member.name.clone(), mc.to_string()));
                     }
+                    self.forget_ended_orders();
+                    self.kick();
                 }
             }
         }
         self.cursors.lock().unwrap().insert(member.name.clone(), id.to_string());
         self.save();
+    }
+
+    /// Stops what listens for orders that ended: a job stopped by a stop-job ends under the stop's correlation, and
+    /// its order's own listener would otherwise wait for nothing.
+    fn forget_ended_orders(&self) {
+        let mut live: HashSet<String> = self.state.lock().unwrap().orders.keys().cloned().collect();
+        live.extend(self.stopped_unstarted.lock().unwrap().iter().cloned());
+        self.issued
+            .lock()
+            .unwrap()
+            .retain(|_, i| i.order.as_ref().is_none_or(|o| live.contains(o)));
+    }
+
+    /// Stops `job` on `member` as the cloud's own command, telling nothing under any caller's correlation.
+    fn stop_stray(&self, member: &str, job: &str) {
+        let (Some(me), Some(m)) = (self.me.upgrade(), self.member(member)) else {
+            return;
+        };
+        let job = job.to_string();
+        tokio::spawn(async move {
+            let em = me.emitter(&format!("{}/{}", me.name, m.name));
+            if let Err(e) = me.place_on(&m, &em, "StopJob", "stop-job", json!({ "job": job })).await {
+                tracing::warn!(cloud = %me.name, peer = %m.name, %job, why = %e.message, "a job stopped before it started could not be stopped on the member");
+            }
+        });
     }
 
     /// A pull is on every member at once: progress is relayed as it comes, the outcome is told once all answered,
@@ -709,6 +1002,8 @@ impl Cloud {
         for m in self.members() {
             self.follow_member(&m);
         }
+        // Orders that waited across a restart are placed as soon as the members answer.
+        self.kick();
         let me = self.clone();
         *self.ticking.lock().unwrap() = Some(tokio::spawn(async move {
             loop {
@@ -907,6 +1202,8 @@ impl Cloud {
                 .map(|m| async move { self.reconcile_member(&m).await }),
         )
         .await;
+        // The tick is also when bounds are checked and what waits is tried again.
+        self.kick();
     }
 
     async fn reconcile_member(&self, m: &Arc<Member>) {
@@ -964,11 +1261,32 @@ impl Cloud {
     }
 
     /// A member is lost: every workload it held ends now, whatever its phase, and every command in flight there
-    /// that no fact can complete any more is failed.
+    /// that no fact can complete any more is failed. An order it held, running or sent and not started, is queued
+    /// again, once; the second time it fails.
     fn lost(&self, m: &Member, held: &[(String, bool)]) {
         let why = format!("peer {} is unreachable", m.name);
         for (id, deployment) in held {
+            if !deployment {
+                let order = self.state.lock().unwrap().order_of_job(id);
+                if let Some(o) = order {
+                    self.missing.lock().unwrap().remove(id);
+                    self.queue_again(&o, Some(id), &m.name, &why);
+                    continue;
+                }
+            }
             self.end(id, *deployment, &why);
+        }
+        let sent: Vec<Order> = self
+            .state
+            .lock()
+            .unwrap()
+            .orders
+            .values()
+            .filter(|o| o.job.is_none() && o.placed.as_ref().is_some_and(|(p, _)| *p == m.name))
+            .cloned()
+            .collect();
+        for o in sent {
+            self.queue_again(&o, None, &m.name, &why);
         }
         let in_flight: Vec<((String, String), Issued)> = {
             let mut issued = self.issued.lock().unwrap();
@@ -979,6 +1297,10 @@ impl Cloud {
         };
         for ((_, mc), i) in in_flight {
             let key = i.em.command_key().to_string();
+            if i.order.is_some() {
+                // Queued again or failed above.
+                continue;
+            }
             if let Some(pull) = &i.pull {
                 self.on_pull_fact(m, pull, &i.em, "ImagePullFailed", json!({ "reason": why }));
             } else if i.r#type == "Prompt" {
@@ -1079,6 +1401,222 @@ impl Cloud {
         }
     }
 
+    // ----- the queue ----------------------------------------------------------------------------------------------
+
+    /// An order a lost member held, running or sent and not started, waits again, once, keeping its place: the job
+    /// it had become, `instead_of`, is gone with the member. The second time it fails.
+    fn queue_again(&self, o: &Order, instead_of: Option<&str>, peer: &str, why: &str) {
+        let em = self.order_emitter(o);
+        if o.attempt >= 2 {
+            self.tell(
+                &em,
+                "JobFailed",
+                json!({ "job": instead_of.unwrap_or(&o.id), "image": o.image, "reason": format!("{why}, and the order was queued again once already"), "fix": "order it again once the cloud's peers answer: PeerJoined on this stream says so", "peer": peer }),
+            );
+            return;
+        }
+        self.promise(o, None);
+        self.tell(
+            &em,
+            "JobQueued",
+            queued_fact(
+                o,
+                o.attempt + 1,
+                true,
+                Some(format!("{why}; queued again, once")),
+                instead_of,
+            ),
+        );
+        self.kick();
+    }
+
+    /// Starts a placement step, unless one runs, which then runs once more when it ends.
+    fn kick(&self) {
+        if self.stepping.swap(true, Ordering::SeqCst) {
+            self.again.store(true, Ordering::SeqCst);
+            return;
+        }
+        let Some(me) = self.me.upgrade() else {
+            self.stepping.store(false, Ordering::SeqCst);
+            return;
+        };
+        tokio::spawn(async move {
+            loop {
+                me.again.store(false, Ordering::SeqCst);
+                me.step(OffsetDateTime::now_utc()).await;
+                if me.again.load(Ordering::SeqCst) {
+                    continue;
+                }
+                me.stepping.store(false, Ordering::SeqCst);
+                // Asked for between the last look and now: this task takes it, unless another already has.
+                if me.again.load(Ordering::SeqCst) && !me.stepping.swap(true, Ordering::SeqCst) {
+                    continue;
+                }
+                break;
+            }
+        });
+    }
+
+    /// One placement step at `now`: an order waiting past its `queue_seconds` ends unplaced; a job running past its
+    /// `deadline_seconds` is stopped; then every order that waits, oldest first, is placed where a member has the
+    /// room, an order that does not fit holding back none after it.
+    pub async fn step(&self, now: OffsetDateTime) {
+        let _one = self.steps.lock().await;
+        let (expired, overdue) = {
+            let s = self.state.lock().unwrap();
+            let expired: Vec<Order> = s
+                .waiting()
+                .into_iter()
+                .filter(|o| past(Some(&o.queued_at), o.queue_seconds, now))
+                .collect();
+            let overdue: Vec<(Order, String, Option<String>)> = s
+                .orders
+                .values()
+                .filter(|o| past(o.started_at.as_deref(), o.deadline_seconds, now))
+                .filter_map(|o| {
+                    let j = s.jobs.get(o.job.as_deref()?)?;
+                    (j.phase == JobPhase::Running).then(|| (o.clone(), j.id.clone(), j.peer.clone()))
+                })
+                .collect();
+            (expired, overdue)
+        };
+        for o in expired {
+            self.tell(
+                &self.order_emitter(&o),
+                "JobFailed",
+                json!({ "job": o.id, "image": o.image, "reason": format!("no member peer had the room for it within its queue_seconds ({} s): it was never placed", o.queue_seconds.unwrap_or(0)), "fix": "order it again with a longer queue_seconds or less memory_bytes, or when get-workloads shows room" }),
+            );
+        }
+        for (o, job, peer) in overdue {
+            let Some(m) = peer.as_deref().and_then(|p| self.member(p)) else {
+                continue;
+            };
+            if let Some(j) = self.state.lock().unwrap().jobs.get_mut(&job) {
+                j.phase = JobPhase::Stopping;
+            }
+            let note = json!({ "reason": format!("it ran past its deadline_seconds ({} s), so the door stopped it", o.deadline_seconds.unwrap_or(0)) });
+            let stopped = self
+                .place_on_noting(
+                    &m,
+                    &self.emitter(&o.correlation),
+                    "StopJob",
+                    "stop-job",
+                    json!({ "job": job }),
+                    Some(note),
+                )
+                .await;
+            if let Err(e) = stopped {
+                tracing::warn!(cloud = %self.name, peer = %m.name, %job, why = %e.message, "a job past its deadline could not be stopped; trying again at the next tick");
+                if let Some(j) = self.state.lock().unwrap().jobs.get_mut(&job) {
+                    j.phase = JobPhase::Running;
+                }
+            }
+        }
+        let waiting = self.state.lock().unwrap().waiting();
+        if waiting.is_empty() {
+            return;
+        }
+        let (host, _) = self.combined().await;
+        for o in waiting {
+            let device = {
+                let mut s = self.state.lock().unwrap();
+                // Stopped while the members were read.
+                if !s.orders.get(&o.id).is_some_and(|x| x.waiting()) {
+                    continue;
+                }
+                let pick = match o.memory_bytes {
+                    Some(needed) => {
+                        let on = if o.accelerators_only {
+                            accelerators(&host)
+                        } else {
+                            host.clone()
+                        };
+                        place(&on, &s, &any_compute(), needed, o.device.as_deref(), "", None)
+                            .ok()
+                            .map(|(d, _)| d)
+                    }
+                    None => self
+                        .up()
+                        .first()
+                        .map(|m| DeviceId(format!("{}/{}/", self.name, m.name))),
+                };
+                let Some(device) = pick else {
+                    continue;
+                };
+                // Promised there now, so the next order in this step sees the room taken.
+                if let Some(r) = s.reserved.values_mut().find(|r| r.id == o.id) {
+                    r.device = Some(device.clone());
+                }
+                device
+            };
+            self.dispatch(&o, device).await;
+        }
+    }
+
+    /// Sends order `o` to the member `device` names, after telling `JobPlaced`. A member that turns out to have no
+    /// room, or does not answer, leaves the order waiting where it was; any other refusal fails it, with the
+    /// member's reason.
+    async fn dispatch(&self, o: &Order, device: DeviceId) {
+        let em = self.order_emitter(o);
+        let fail = |reason: String, fix: &str, peer: Option<&str>| {
+            self.tell(
+                &em,
+                "JobFailed",
+                json!({ "job": o.id, "image": o.image, "reason": reason, "fix": fix, "peer": peer }),
+            );
+        };
+        let Some((member, member_device)) = self
+            .split_device(&device.0)
+            .and_then(|(peer, d)| self.member(peer).map(|m| (m, d.to_string())))
+        else {
+            fail(
+                format!("device {} names no member of this cloud", device.0),
+                "get-hardware-state lists the devices; order it again on one of them",
+                None,
+            );
+            return;
+        };
+        let with_device = o.memory_bytes.is_some();
+        self.tell(
+            &em,
+            "JobPlaced",
+            json!({ "job": o.id, "peer": member.name, "device": with_device.then(|| device.0.clone()) }),
+        );
+        let mut body = json!({ "image": o.image, "args": o.args });
+        if let Some(m) = o.memory_bytes {
+            body["memory_bytes"] = json!(m);
+            body["device"] = json!(member_device);
+        }
+        let mc = order_correlation(o);
+        let base = member.schema_base().await;
+        let envelope = self.to_member_as(&base, &mc, "RunJob", "run-job", body);
+        self.listen_order(&member.name, &mc, &em, &o.id);
+        let Err(e) = member.send(&envelope).await else {
+            return;
+        };
+        self.issued.lock().unwrap().remove(&(member.name.clone(), mc));
+        let room = match &e {
+            Refusal::Unreachable(_) => true,
+            Refusal::Refused { body, .. } => body["error"]["code"] == "INSUFFICIENT_MEMORY",
+        };
+        let refused = e.relayed(&member.name);
+        if room {
+            // Waiting again, in its place: the next step tries it on whatever has the room then.
+            self.promise(o, None);
+            self.tell(
+                &em,
+                "JobQueued",
+                queued_fact(o, o.attempt, true, Some(refused.message), None),
+            );
+        } else {
+            fail(
+                refused.message,
+                "read the peer's refusal in the reason, then order it again",
+                Some(&member.name),
+            );
+        }
+    }
+
     /// A placement refused with every member's room says which members were not asked, and why.
     fn with_peers(mut e: BestError, peers: Vec<Value>) -> BestError {
         if let Some(o) = e.details.as_object_mut() {
@@ -1112,8 +1650,24 @@ impl Service for Cloud {
 
     fn workloads(&self, who: &Credential) -> Result<Value, BestError> {
         let held = self.holdings.held_by(&who.holder());
-        let mut v = workloads_view(&self.state.lock().unwrap(), who, Some(&self.name));
+        let s = self.state.lock().unwrap();
+        let mut v = workloads_view(&s, who, Some(&self.name));
         v["held_bytes"] = json!(held);
+        // The orders not started yet, oldest first: each waits, or was sent to the peer named.
+        let mut orders: Vec<&Order> = s
+            .orders
+            .values()
+            .filter(|o| o.job.is_none() && (who.grant.is_all() || o.holder == who.holder()))
+            .collect();
+        orders.sort_by_key(|o| o.arrival);
+        v["queued"] = json!(orders
+            .iter()
+            .map(|o| json!({
+                "job": o.id, "cloud": self.name, "image": o.image, "memory_bytes": o.memory_bytes, "device": o.device,
+                "holder": o.holder, "attempt": o.attempt, "queued_at": o.queued_at,
+                "queue_seconds": o.queue_seconds, "waiting": o.waiting(), "peer": o.placed.as_ref().map(|(p, _)| p)
+            }))
+            .collect::<Vec<_>>());
         Ok(v)
     }
 
@@ -1325,7 +1879,8 @@ impl Service for Cloud {
             )
             .with_details(json!({ "field": "memory_bytes" })));
         }
-        if self.already_placed(&key).is_some() {
+        // Run again after a restart: placed before orders were told, or an order the fold already holds.
+        if self.already_placed(&key).is_some() || self.state.lock().unwrap().orders.contains_key(&order_id(&key)) {
             return Ok(());
         }
         let (host, peers) = self.combined().await;
@@ -1339,7 +1894,7 @@ impl Service for Cloud {
         within_share(held.memory_bytes, &who, data.memory_bytes.unwrap_or(0))?;
         within_count("job", held.jobs, who.grant.jobs)?;
         let placement = match data.memory_bytes {
-            Some(needed) => place(
+            Some(needed) => match place(
                 &host,
                 &state,
                 &any_compute(),
@@ -1347,9 +1902,15 @@ impl Service for Cloud {
                 data.device.as_deref(),
                 &format!("a job from {}", data.image),
                 mine(&who).as_deref(),
-            )
-            .map_err(|e| Self::with_peers(e, peers))?,
-            None => {
+            ) {
+                Ok(p) => Some(p),
+                // No room now, where room can come free: the order is taken, and waits its turn.
+                Err(e) if e.code == "INSUFFICIENT_MEMORY" && could_ever_hold(&host, needed, data.device.as_deref()) => {
+                    None
+                }
+                Err(e) => return Err(Self::with_peers(e, peers)),
+            },
+            None => Some({
                 // No device wanted: the first member answering takes it, which is the same one every time.
                 let first = self.up().into_iter().next().ok_or_else(|| {
                     BestError::bad_request(
@@ -1365,14 +1926,17 @@ impl Service for Cloud {
                     DeviceId(format!("{}/{}/", self.name, first.name)),
                     best_peer_gpu::Compute::Cpu,
                 )
-            }
+            }),
         };
+        if accelerators_only(&who) {
+            self.held_to_accelerators.lock().unwrap().insert(key.clone());
+        }
         state.reserved.insert(
-            key,
+            key.clone(),
             Reservation {
-                id: new_id("job"),
-                device: Some(placement.0),
-                compute: Some(placement.1),
+                id: order_id(&key),
+                device: placement.as_ref().map(|(d, _)| d.clone()),
+                compute: placement.map(|(_, c)| c),
                 memory_bytes: data.memory_bytes.unwrap_or(0),
                 holder: who.holder(),
                 boxed: crate::lifecycle::boxed(&who),
@@ -1381,22 +1945,28 @@ impl Service for Cloud {
         Ok(())
     }
 
+    /// Takes the order: `JobQueued` holds it whole, then it is sent at once when admission found it the room, or
+    /// waits for the placement step.
     async fn run_job(self: Arc<Self>, cmd: Envelope, em: Emitter) {
         let Ok(data) = parse::<RunJobData>(&cmd.data) else {
             return;
         };
-        if let Some(peer) = self.already_placed(em.command_key()) {
-            let mc = member_correlation(em.command_key(), &json!({}), None);
+        let key = em.command_key().to_string();
+        let id = order_id(&key);
+        self.keys.lock().unwrap().insert(id.clone(), key.clone());
+        // Run again after a restart: the fold holds the order and the rebuild listens for it; the queue goes on.
+        if self.state.lock().unwrap().orders.contains_key(&id) {
+            self.kick();
+            return;
+        }
+        // Placed before orders were told: the member runs it; listen for the rest of its facts.
+        if let Some(peer) = self.already_placed(&key) {
+            let mc = member_correlation(&key, &json!({}), None);
             self.listen_for(&peer, &mc, &em, "RunJob", None, None);
             return;
         }
-        let reservation = self.state.lock().unwrap().reserved.get(em.command_key()).cloned();
-        let Some(Reservation {
-            id,
-            device: Some(device),
-            ..
-        }) = reservation
-        else {
+        let reservation = self.state.lock().unwrap().reserved.get(&key).cloned();
+        let Some(r) = reservation else {
             self.tell(
                 &em,
                 "CommandFailed",
@@ -1404,35 +1974,53 @@ impl Service for Cloud {
             );
             return;
         };
-        let member = self
-            .split_device(&device.0)
-            .and_then(|(peer, d)| self.member(peer).map(|m| (m, d)));
-        let Some((member, member_device)) = member else {
-            self.tell(
-                &em,
-                "JobFailed",
-                json!({ "job": id, "image": data.image, "reason": format!("device {} names no member of this cloud", device.0), "fix": "get-hardware-state lists the devices; run it again on one of them" }),
-            );
-            return;
+        let waiting = r.device.is_none();
+        let order = Order {
+            id: id.clone(),
+            correlation: em.correlation().to_string(),
+            holder: r.holder.clone(),
+            image: data.image.clone(),
+            args: data.args.clone(),
+            memory_bytes: data.memory_bytes,
+            device: data.device.clone(),
+            queue_seconds: data.queue_seconds,
+            deadline_seconds: data.deadline_seconds,
+            accelerators_only: self.held_to_accelerators.lock().unwrap().remove(&key),
+            attempt: 1,
+            queued_at: String::new(),
+            arrival: 0,
+            placed: None,
+            job: None,
+            started_at: None,
         };
-        let mut body = json!({ "image": data.image, "args": data.args });
-        if let Some(m) = data.memory_bytes {
-            body["memory_bytes"] = json!(m);
-            body["device"] = json!(member_device);
-        }
-        if let Err(e) = self.place_on(&member, &em, "RunJob", "run-job", body).await {
-            self.tell(
-                &em,
-                "JobFailed",
-                json!({ "job": id, "image": data.image, "reason": e.message, "fix": "read the peer's refusal in the reason, then run it again", "peer": member.name }),
-            );
+        let reason = waiting.then(|| {
+            format!(
+                "no member peer of cloud {} has {} bytes free on a device that runs it now: it is placed as soon as one has, after the orders before it",
+                self.name,
+                data.memory_bytes.unwrap_or(0)
+            )
+        });
+        self.tell(&em, "JobQueued", queued_fact(&order, 1, waiting, reason, None));
+        match r.device {
+            Some(device) => self.dispatch(&order, device).await,
+            None => self.kick(),
         }
     }
 
     fn admit_stop_job(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError> {
         require(who, "jobs")?;
-        let id = cmd.data["job"].as_str().unwrap_or_default();
+        let named = cmd.data["job"].as_str().unwrap_or_default();
         let mut s = self.state.lock().unwrap();
+        // An order: one not started is stopped here; one running is its job.
+        let id = match s.orders.get(named) {
+            Some(o) if !who.grant.is_all() && o.holder != who.holder() => return Err(not_yours("job", named)),
+            Some(o) => match &o.job {
+                None => return Ok(()),
+                Some(j) => j.clone(),
+            },
+            None => named.to_string(),
+        };
+        let id = id.as_str();
         let running: Vec<String> = s
             .jobs
             .values()
@@ -1462,7 +2050,20 @@ impl Service for Cloud {
     }
 
     async fn stop_job(self: Arc<Self>, cmd: Envelope, em: Emitter) {
-        let id = cmd.data["job"].as_str().unwrap_or_default().to_string();
+        let named = cmd.data["job"].as_str().unwrap_or_default().to_string();
+        let order = self.state.lock().unwrap().orders.get(&named).cloned();
+        // An order not started ends before it started: under its own correlation, which completes it, and under
+        // the stop's. A member it was sent to that starts it all the same is told to stop it when it says so.
+        if let Some(o) = order.as_ref().filter(|o| o.job.is_none()) {
+            if o.placed.is_some() {
+                self.stopped_unstarted.lock().unwrap().insert(o.id.clone());
+            }
+            let stopped = json!({ "job": o.id, "reason": "stopped before it started" });
+            self.tell(&self.order_emitter(o), "JobStopped", stopped.clone());
+            self.tell(&em, "JobStopped", stopped);
+            return;
+        }
+        let id = order.and_then(|o| o.job).unwrap_or(named);
         let Some(j) = self.state.lock().unwrap().jobs.get(&id).cloned() else {
             self.tell(&em, "JobStopped", json!({ "job": id }));
             return;

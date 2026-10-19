@@ -246,8 +246,11 @@ while `vpn` was set) stops the peer at start, naming the workspace, the cloud, t
 name it by `https://` instead. Every thirty seconds each cloud squares its state with its members: one that does not answer within
 fifteen seconds is told as `PeerLost`, with its workloads told as ended and its commands in flight failed;
 `PeerJoined` when it answers again, and what it still runs of the cloud's by then is ended there, so the two agree;
-a workload a member no longer lists at two ticks running is told as ended. A credential's share is counted across
-the whole door: its workloads at the root and in every workspace together.
+a workload a member no longer lists at two ticks running is told as ended. A job is the exception: a member lost under
+it queues its order again, once, and fails it the second time (see [Deploy](#deploy)). After a restart the cloud
+listens again for every workload and order it had sent, so a job that ends while the door was down, or after, is
+told with its exit code, not as lost. A credential's share is counted across the whole door: its workloads at the
+root and in every workspace together, orders that wait included.
 
 `BEST_PEER_GPU` (default `nvml`) is how the peer sees the hardware: through the NVIDIA driver's own library, every
 card with its memory, temperature, power, utilisation and the CUDA version the driver offers, read live at every
@@ -318,6 +321,20 @@ later (`OutOfMemory`, `DeploymentEnded`) is told under the same correlation id. 
 the conversation so far, and `PromptAnswered` follows under its own correlation id with the answer whole, or
 `PromptFailed` with the reason and the fix. `run-job` runs an image once, a tenant's in a closed box, and tells
 `JobStarted` and `JobFinished` with the exit code; `undeploy-model` and `stop-job` end them.
+
+On a workspace's door `run-job` is an order, and a cloud with no room now takes it to wait its turn, as the
+serverless GPU platforms do. It is refused at once only when no device of the cloud's members that answer could ever
+hold it. `JobQueued` comes first, holding the order whole, with its id as `job` and `waiting: true` when it waits;
+the cloud places orders first come, first served, as soon as a member has the memory free, and an order that does not
+fit yet holds back none that does. `JobPlaced` names the member it was sent to, then the member's facts follow, and
+`JobStarted` names the order. `queue_seconds` bounds the wait (past it, `JobFailed` says it was never placed) and
+`deadline_seconds` the run from `JobStarted` (past it, the job is stopped and `JobStopped` says why); both are counted
+from the facts' own times, so a restart neither resets nor extends them. `stop-job` names a waiting order by its id,
+and it ends in `JobStopped` before it started. A member lost under an order queues it again once, `JobQueued`
+telling `attempt: 2`, and fails it the second time. `get-workloads` lists the orders not started yet as `queued`,
+oldest first. An order that waits counts against its credential's share and its count of jobs, as an admitted one
+always has. The queue is the cloud's state, folded from these facts; [docs/queue.md](docs/queue.md) says what it does
+not do yet that Verda's batch jobs and RunPod Serverless do.
 
 The peer's state is the fold of the events it told. After a restart it is rebuilt from the log and squared with what
 the engine still runs; a workload that ended while the peer was down is told so then.
