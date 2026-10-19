@@ -188,7 +188,9 @@ placed on the member that holds the deployment, as the cloud's own command there
 way. `BEST_PEER_TRUST` lists PEM files to trust beyond the public roots, for members serving their own
 certificates. A member named by an `http://` endpoint off loopback is refused at `configure-cloud`
 (`CLEARTEXT_MEMBER`), and nothing is sent to one, since the cloud's credential would travel in the clear, unless this
-door's operator set `BEST_PEER_CLEARTEXT=vpn`. Every thirty seconds each cloud squares its state with its members: one that does not answer within
+door's operator set `BEST_PEER_CLEARTEXT=vpn`. A cloud recorded with such a member before (under an older peer, or
+while `vpn` was set) stops the peer at start, naming the workspace, the cloud, the peer and its endpoint, and how to
+name it by `https://` instead. Every thirty seconds each cloud squares its state with its members: one that does not answer within
 fifteen seconds is told as `PeerLost`, with its workloads told as ended and its commands in flight failed;
 `PeerJoined` when it answers again, and what it still runs of the cloud's by then is ended there, so the two agree;
 a workload a member no longer lists at two ticks running is told as ended. A credential's share is counted across

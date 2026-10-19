@@ -337,6 +337,22 @@ async fn serve() {
         .unwrap_or_else(|e| fail(&format!("serving failed: {e}")));
 }
 
+/// Why the peer will not start when a cloud it hosts has a member recorded at a cleartext endpoint off loopback:
+/// the cloud would send its credential there in the clear. Each is named, with the way out.
+fn cleartext_members_refused(members: &[(String, String, String, String)]) -> Option<String> {
+    if members.is_empty() {
+        return None;
+    }
+    let named: Vec<String> = members
+        .iter()
+        .map(|(ws, cloud, peer, endpoint)| format!("workspace {ws}, cloud {cloud}, peer {peer} at {endpoint}"))
+        .collect();
+    Some(format!(
+        "a cloud here has a member recorded at a cleartext endpoint off loopback, where its credential would travel unencrypted: {}. Send configure-cloud in that workspace naming the member by its https:// endpoint, or archive the cloud; to start meanwhile, set BEST_PEER_CLEARTEXT=vpn, which is what the cloud ran under, and only when a VPN carries the hop",
+        named.join("; ")
+    ))
+}
+
 /// The peer over this host's hardware and engines, its door and its endpoints, and the workspaces it hosts under
 /// `/workspaces`.
 async fn peer_app(
@@ -385,6 +401,9 @@ async fn peer_app(
     .await;
     let ctx = Arc::new(context(endpoint, dir, auth.clone(), holdings, cleartext));
     let workspaces = workspace::Workspaces::open(ctx, log);
+    if let Some(why) = cleartext_members_refused(&workspaces.cleartext_members()) {
+        fail(&why);
+    }
     let door = Arc::new(door(peer.clone(), workspaces.clone(), auth.clone()));
     // What the last run accepted and never completed is run now, before anyone can send more: at the root, then in
     // every workspace, whose clouds then start following their members.
@@ -937,6 +956,17 @@ mod tests {
         log: Arc<EventLog>,
         auth: Option<Arc<Auth>>,
     ) -> Site {
+        site_under(members, data, log, auth, Cleartext::Loopback).await
+    }
+
+    /// The same, under the cleartext rule given.
+    async fn site_under(
+        members: Vec<(&str, Bed)>,
+        data: Arc<tempfile::TempDir>,
+        log: Arc<EventLog>,
+        auth: Option<Arc<Auth>>,
+        cleartext: Cleartext,
+    ) -> Site {
         let switchboard = Arc::new(Switchboard::default());
         let mut down = std::collections::HashMap::new();
         let mut beds = Vec::new();
@@ -973,7 +1003,7 @@ mod tests {
                 auth: auth.clone(),
                 transport: switchboard.clone(),
                 holdings,
-                cleartext: Cleartext::Loopback,
+                cleartext,
             }),
             log.clone(),
         );
@@ -2710,6 +2740,39 @@ mod tests {
             assert!(!Cleartext::Loopback.allows(url), "{url}");
         }
         assert!(Cleartext::Vpn.allows("http://100.64.0.7:7777"));
+    }
+
+    #[tokio::test]
+    async fn a_door_with_a_cloud_member_recorded_in_cleartext_off_loopback_names_it_at_start() {
+        const OFF: &str = "http://203.0.113.5:7777";
+        let (a, _) = two_members().await;
+        let key_a = a.key.clone();
+        let data = Arc::new(tempfile::tempdir().unwrap());
+        let log = Arc::new(EventLog::ephemeral());
+        let first = site_under(vec![(OFF, a)], data.clone(), log.clone(), None, Cleartext::Vpn).await;
+        let ws = first.workspace("c1", "Research").await;
+        first.cloud(&ws, "k1", "lab", &[("a", OFF, &key_a)]).await;
+        let auth = first.auth.clone();
+        first.workspaces.get(&ws).unwrap().cloud_for_test("lab").halt();
+        drop(first.app);
+        drop(first.workspaces);
+
+        let again = site_over(Vec::new(), data.clone(), log, Some(auth)).await;
+        let found = again.workspaces.cleartext_members();
+        assert_eq!(found, vec![(ws.clone(), "lab".into(), "a".into(), OFF.into())]);
+        let why = cleartext_members_refused(&found).unwrap();
+        for named in [
+            ws.as_str(),
+            "cloud lab",
+            "peer a",
+            OFF,
+            "configure-cloud",
+            "https://",
+            "BEST_PEER_CLEARTEXT=vpn",
+        ] {
+            assert!(why.contains(named), "{named} in {why}");
+        }
+        assert!(cleartext_members_refused(&[]).is_none());
     }
 
     #[tokio::test]

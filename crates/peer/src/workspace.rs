@@ -146,6 +146,20 @@ impl Workspaces {
         self.live.lock().unwrap().get(id).cloned()
     }
 
+    /// The members of a live cloud whose recorded endpoint this peer's cleartext rule refuses, as
+    /// `(workspace, cloud, peer, endpoint)`: recorded before the rule, or while `BEST_PEER_CLEARTEXT=vpn` was set.
+    pub fn cleartext_members(&self) -> Vec<(String, String, String, String)> {
+        let mut out = Vec::new();
+        for ws in self.all() {
+            for (cloud, r) in ws.clouds.lock().unwrap().iter().filter(|(_, r)| !r.archived) {
+                for (peer, endpoint) in r.members.iter().filter(|(_, e)| !self.ctx.cleartext.allows(e)) {
+                    out.push((ws.id.clone(), cloud.clone(), peer.clone(), endpoint.clone()));
+                }
+            }
+        }
+        out
+    }
+
     /// Follows every cloud's members, and from here on a workspace or a cloud made later starts at once.
     pub async fn start(&self) {
         for ws in self.all() {
