@@ -10,6 +10,8 @@
   agent's side, numbered decisions, and a "Done when" list. A spec gap met while implementing is an entry on the
   spec follow-ups issue, never a silent patch and never a spec change up front.
 - Ambiguity is resolved by reading the spec and the running code, never by guessing.
+- Work on an issue starts by moving it to In progress on the board (its Status), before the first change, so the
+  board says what is being worked on.
 
 ## 2. Design rules every change is held to
 
