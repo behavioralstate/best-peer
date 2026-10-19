@@ -6,6 +6,7 @@
 #
 #   pwsh scripts/gate.ps1 [fmt|clippy|test|build|validate|all]      default: all
 param([string]$What = "all")
+if ($What -notin "fmt", "clippy", "test", "build", "validate", "all") { "scripts/gate.ps1: unknown step '$What'; one of fmt, clippy, test, build, validate, all"; "GATE RED"; exit 1 }
 $repo = Split-Path -Parent $PSScriptRoot
 $bt = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\BuildTools"
 if (Test-Path "$bt\VC\Auxiliary\Build\vcvars64.bat") {
@@ -40,17 +41,23 @@ if ($What -in "all", "validate") {
         $env:BEST_PEER_LISTEN = "127.0.0.1:7791"
         $env:BEST_PEER_ENDPOINT = "http://127.0.0.1:7791"
         $p = Start-Process -FilePath .\target\release\best-peer.exe -PassThru -WindowStyle Hidden
-        $up = $false
-        for ($i = 0; $i -lt 60 -and -not $up; $i++) {
-            Start-Sleep -Milliseconds 500
-            try { Invoke-RestMethod -Uri "http://127.0.0.1:7791/.well-known/best" -ErrorAction Stop | Out-Null; $up = $true } catch {}
+        try {
+            # The process is checked before the port is trusted: a peer left on the port by an earlier run would
+            # answer in place of the one that could not bind, and the gate would validate the wrong binary.
+            $up = $false
+            for ($i = 0; $i -lt 60 -and -not $up -and -not $p.HasExited; $i++) {
+                Start-Sleep -Milliseconds 500
+                try { Invoke-RestMethod -Uri "http://127.0.0.1:7791/.well-known/best" -ErrorAction Stop | Out-Null; $up = $true } catch {}
+            }
+            if ($up) {
+                npx -y "@behavioralstate/best-validate@$validate" http://127.0.0.1:7791 2>&1 | Select-String -Pattern 'FAIL|WARN|CONFORMANT'
+                $code = $LASTEXITCODE
+            } elseif ($p.HasExited) { "the peer for 127.0.0.1:7791 exited before it answered"; $code = 1 }
+            else { "the peer at 127.0.0.1:7791 did not answer"; $code = 1 }
+        } finally {
+            if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force; $p.WaitForExit(5000) | Out-Null }
+            Remove-Item -Recurse -Force $data -ErrorAction SilentlyContinue
         }
-        if ($up) {
-            npx -y "@behavioralstate/best-validate@$validate" http://127.0.0.1:7791 2>&1 | Select-String -Pattern 'FAIL|WARN|CONFORMANT'
-            $code = $LASTEXITCODE
-        } else { "the peer at 127.0.0.1:7791 did not answer"; $code = 1 }
-        if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force }
-        Remove-Item -Recurse -Force $data -ErrorAction SilentlyContinue
         $global:LASTEXITCODE = $code
     }
     Step "validate, signed in over https, with the registration probe" { pwsh -NoProfile -File "$PSScriptRoot\gate\validate-signed-in.ps1" 2>&1 | Select-Object -Last 8 }

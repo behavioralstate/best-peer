@@ -25,10 +25,13 @@ try {
     $curl = "$env:ProgramFiles\Git\mingw64\bin\curl.exe"
     if (-not (Test-Path $curl)) { $curl = "curl.exe" }
     $up = $false
-    for ($i = 0; $i -lt 60 -and -not $up; $i++) {
+    # The process is checked before the port is trusted: a peer left on the port by an earlier run would answer in
+    # place of the one that could not bind.
+    for ($i = 0; $i -lt 60 -and -not $up -and -not $peer.HasExited; $i++) {
         Start-Sleep -Milliseconds 500
         if (Test-Path $cert) { & $curl -sf --cacert $cert "$base/.well-known/best" 2>&1 | Out-Null; $up = ($LASTEXITCODE -eq 0) }
     }
+    if ($peer.HasExited -and -not $up) { "the peer exited before it answered"; exit 1 }
     if (-not $up) { "the peer did not answer over https with the certificate it made"; exit 1 }
     "https: the peer serves with $cert"
     $device = & $curl -sf --cacert $cert -X POST "$base/auth/device" -d client_id=gate -d connection=gate-peer -d "agent_label=the gate" | ConvertFrom-Json
@@ -49,6 +52,6 @@ try {
     if ($code -eq 0) { "SIGNED-IN VALIDATION GREEN" } else { "SIGNED-IN VALIDATION RED ($code)" }
     exit $code
 } finally {
-    if ($peer -and -not $peer.HasExited) { Stop-Process -Id $peer.Id -Force }
+    if ($peer -and -not $peer.HasExited) { Stop-Process -Id $peer.Id -Force; $peer.WaitForExit(5000) | Out-Null }
     Remove-Item -Recurse -Force $data -ErrorAction SilentlyContinue
 }

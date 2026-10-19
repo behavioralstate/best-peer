@@ -20,12 +20,17 @@ function Start-Door([string]$name, [hashtable]$extra) {
     $procs[$name] = Start-Process -FilePath $exe -PassThru -WindowStyle Hidden -RedirectStandardOutput (Join-Path $dirs[$name] "log") -RedirectStandardError (Join-Path $dirs[$name] "err") -Environment $env
 }
 function Wait-Manifest([string]$name) {
+    # Returns the boolean alone; the diagnostics go to the host, since anything else written here would join the
+    # output and make `-not (Wait-Manifest ...)` false whatever the verdict.
     foreach ($i in 1..60) {
         Start-Sleep -Milliseconds 500
         try { Invoke-RestMethod -Uri "http://127.0.0.1:$($ports[$name])/.well-known/best" -ErrorAction Stop | Out-Null; return $true } catch {}
         if ($procs[$name].HasExited) { break }
     }
-    "the $name door is not up:"; Get-Content (Join-Path $dirs[$name] "log"); Get-Content (Join-Path $dirs[$name] "err"); return $false
+    Write-Host "the $name door is not up:"
+    Get-Content (Join-Path $dirs[$name] "log") -ErrorAction SilentlyContinue | Write-Host
+    Get-Content (Join-Path $dirs[$name] "err") -ErrorAction SilentlyContinue | Write-Host
+    return $false
 }
 function Send-Command([string]$base, [string]$key, [string]$id, [string]$type, [string]$schema, [hashtable]$data) {
     $envelope = @{ specversion = "1.0"; id = $id; source = "https://gate.test/agent"; type = $type; datacontenttype = "application/json"; dataschema = "$base/commands/$schema/1.0"; time = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ"); data = $data } | ConvertTo-Json -Depth 6 -Compress
@@ -94,6 +99,6 @@ try {
     if (-not $variable) { "BEST_PEER_MEMBERS was not refused with the fix: $refused" }
     if ($anon -eq 0 -and $signed -eq 0 -and $variable) { "CLOUD VALIDATION GREEN"; exit 0 } else { "CLOUD VALIDATION RED ($anon/$signed/$variable)"; exit 1 }
 } finally {
-    foreach ($p in $procs.Values) { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force } }
+    foreach ($p in $procs.Values) { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force; $p.WaitForExit(5000) | Out-Null } }
     Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
 }

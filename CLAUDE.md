@@ -4,8 +4,9 @@ How this repository is built and shipped is [`SDLC.md`](SDLC.md), the one place 
 before changing anything, and keep it the current rule when a change moves the process. In short:
 
 - Every change is a branch and a pull request to `main`, squash-merged as one commit, the owner's included. The
-  subject is one plain sentence saying what changed and why, no prefix; open work is an issue on the Behavioralstate
-  board, never a plan file or a `TODO`.
+  subject is one plain sentence saying what changed and why, with no type prefix (`feat:`, `fix:`); the one prefix
+  is `Review:` on a commit that answers the review, as the history has it. Open work is an issue on the
+  Behavioralstate board, never a plan file or a `TODO`.
 - Before the push, the local proof: `scripts/gate.sh all` (`pwsh scripts/gate.ps1 all` on Windows) must end in
   `GATE GREEN`. CI runs the same script, so what passes here passes there.
 - Once the pull request is open, its review: `/best-review` runs `.claude/skills/best-reviewer` on a separate worker
