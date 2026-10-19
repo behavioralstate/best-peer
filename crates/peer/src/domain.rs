@@ -25,7 +25,7 @@ use time::OffsetDateTime;
 /// admit each command before it is recorded.
 #[async_trait]
 pub trait Service: Send + Sync + 'static {
-    async fn hardware_state(&self, who: &Credential) -> Result<Value, BestError>;
+    async fn hardware_state(&self) -> Result<Value, BestError>;
     fn workloads(&self, who: &Credential) -> Result<Value, BestError>;
     fn admit_pull(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError>;
     async fn pull_image(self: Arc<Self>, cmd: Envelope, em: Emitter);
@@ -256,9 +256,9 @@ fn hardware_query(svc: Arc<dyn Service>, at: Where) -> QueryDef {
         description: description.into(),
         parameters: None,
         response: json!({ "type": "object", "required": ["devices", "observed_at"], "properties": properties }),
-        handler: Arc::new(move |who, _params| {
+        handler: Arc::new(move |_who, _params| {
             let svc = svc.clone();
-            Box::pin(async move { svc.hardware_state(&who).await })
+            Box::pin(async move { svc.hardware_state().await })
         }),
     }
 }
@@ -400,13 +400,13 @@ fn deploy_model(peer: Arc<dyn Service>, at: Where) -> CommandDef {
     let admit = peer.clone();
     let (description, mut properties) = match at {
         Where::Root => (
-            "Serves a model on this peer with the engine named, on a device that offers an API the engine runs on and has the memory asked for free. Refused at once, with the reason and what to do, when no device fits; a credential with a share runs on the accelerators get-hardware-state shows it alone, never on a host's CPU (ACCELERATORS_ONLY). Otherwise the facts follow on the stream with this command's correlation id: ImagePulling and ImagePulled, DeploymentStarted, WeightsLoading, then DeploymentReady, after which prompt commands naming the deployment are answered, or DeploymentFailed, which complete it. Later, OutOfMemory or DeploymentEnded if the engine ends it or stops on its own, under the same correlation id. Needs the deploy scope, and room in the credential's share when one was set.",
+            "Serves a model on this peer with the engine named, on a device that offers an API the engine runs on and has the memory asked for free. Refused at once, with the reason and what to do, when no device fits. Otherwise the facts follow on the stream with this command's correlation id: ImagePulling and ImagePulled, DeploymentStarted, WeightsLoading, then DeploymentReady, after which prompt commands naming the deployment are answered, or DeploymentFailed, which complete it. Later, OutOfMemory or DeploymentEnded if the engine ends it or stops on its own, under the same correlation id. Needs the deploy scope, and room in the credential's share when one was set.",
             json!({
                 "device": { "type": "string", "description": "A device id from get-hardware-state, to pin the placement; otherwise the fitting device with the most room" }
             }),
         ),
         Where::Workspace => (
-            "Serves a model in a cloud of this workspace with the engine named, on the member peer whose device offers an API the engine runs on and has the memory asked for free; name the cloud, or a device (cloud/peer/device) to pin the placement, which names the cloud too. Refused at once, with the reason and what to do, when the cloud is not this workspace's, is archived, or no device in it fits; a credential with a share runs on the accelerators get-hardware-state shows it alone, never on a host's CPU (ACCELERATORS_ONLY). Otherwise the facts follow on this workspace's stream with this command's correlation id, each with the cloud and the peer named: ImagePulling and ImagePulled, DeploymentStarted with the device as cloud/peer/device, WeightsLoading, then DeploymentReady, after which prompt commands naming the deployment are answered on this workspace's door, or DeploymentFailed, which complete it. Later, OutOfMemory or DeploymentEnded if the engine ends it, the peer stops on its own, or the peer is lost, under the same correlation id. Needs the deploy scope, and room in the credential's share when one was set.",
+            "Serves a model in a cloud of this workspace with the engine named, on the member peer whose device offers an API the engine runs on and has the memory asked for free; name the cloud, or a device (cloud/peer/device) to pin the placement, which names the cloud too. Refused at once, with the reason and what to do, when the cloud is not this workspace's, is archived, or no device in it fits. Otherwise the facts follow on this workspace's stream with this command's correlation id, each with the cloud and the peer named: ImagePulling and ImagePulled, DeploymentStarted with the device as cloud/peer/device, WeightsLoading, then DeploymentReady, after which prompt commands naming the deployment are answered on this workspace's door, or DeploymentFailed, which complete it. Later, OutOfMemory or DeploymentEnded if the engine ends it, the peer stops on its own, or the peer is lost, under the same correlation id. Needs the deploy scope, and room in the credential's share when one was set.",
             json!({
                 "cloud": cloud_property("to place in; may be left out when device names it"),
                 "device": { "type": "string", "description": "A device id from this workspace's get-hardware-state, cloud/peer/device, to pin the placement; otherwise the fitting device of the cloud with the most room" }
@@ -483,13 +483,13 @@ fn run_job(peer: Arc<dyn Service>, at: Where) -> CommandDef {
     let admit = peer.clone();
     let (description, mut properties) = match at {
         Where::Root => (
-            "Runs an image once, with the arguments given, and tells its end. With memory_bytes the job is placed on a device with that much room and handed that device; without, it runs with no device. The facts follow with this command's correlation id: ImagePulling and ImagePulled, then JobStarted or JobFailed, which complete the command; the job's own end follows as JobFinished with the exit code, or JobFailed. Needs the jobs scope, and room in the credential's share when one was set and memory_bytes is given; a credential with a share runs its jobs on the accelerators alone, so it sends memory_bytes (JOB_NEEDS_DEVICE without, ACCELERATORS_ONLY for a device offering the CPU alone).",
+            "Runs an image once, with the arguments given, and tells its end. With memory_bytes the job is placed on a device with that much room and handed that device; without, it runs with no device. The facts follow with this command's correlation id: ImagePulling and ImagePulled, then JobStarted or JobFailed, which complete the command; the job's own end follows as JobFinished with the exit code, or JobFailed. Needs the jobs scope, and room in the credential's share when one was set and memory_bytes is given; a credential with a share sends memory_bytes, since its jobs run on a device where the share counts them (JOB_NEEDS_DEVICE without).",
             json!({
                 "device": { "type": "string", "description": "A device id from get-hardware-state, to pin the placement; refused without memory_bytes" }
             }),
         ),
         Where::Workspace => (
-            "Runs an image once in a cloud of this workspace, with the arguments given, and tells its end. With memory_bytes the job is placed on a member peer's device with that much room and handed that device; without, it runs on the first peer of the cloud that answers, with no device. Name the cloud, or a device (cloud/peer/device) to pin the placement, which names the cloud too. Refused at once when the cloud is not this workspace's or is archived. The facts follow on this workspace's stream with this command's correlation id, each with the cloud and the peer named: ImagePulling and ImagePulled, then JobStarted or JobFailed, which complete the command; the job's own end follows as JobFinished with the exit code, or JobFailed. Needs the jobs scope, and room in the credential's share when one was set and memory_bytes is given; a credential with a share runs its jobs on the accelerators alone, so it sends memory_bytes (JOB_NEEDS_DEVICE without, ACCELERATORS_ONLY for a device offering the CPU alone).",
+            "Runs an image once in a cloud of this workspace, with the arguments given, and tells its end. With memory_bytes the job is placed on a member peer's device with that much room and handed that device; without, it runs on the first peer of the cloud that answers, with no device. Name the cloud, or a device (cloud/peer/device) to pin the placement, which names the cloud too. Refused at once when the cloud is not this workspace's or is archived. The facts follow on this workspace's stream with this command's correlation id, each with the cloud and the peer named: ImagePulling and ImagePulled, then JobStarted or JobFailed, which complete the command; the job's own end follows as JobFinished with the exit code, or JobFailed. Needs the jobs scope, and room in the credential's share when one was set and memory_bytes is given; a credential with a share sends memory_bytes, since its jobs run on a device where the share counts them (JOB_NEEDS_DEVICE without).",
             json!({
                 "cloud": cloud_property("to run in; may be left out when device names it"),
                 "device": { "type": "string", "description": "A device id from this workspace's get-hardware-state, cloud/peer/device, to pin the placement; refused without memory_bytes" }
@@ -498,7 +498,7 @@ fn run_job(peer: Arc<dyn Service>, at: Where) -> CommandDef {
     };
     properties["image"] = json!({ "type": "string", "minLength": 1, "description": "The image to run, as the container engine understands it" });
     properties["args"] = json!({ "type": "array", "items": { "type": "string" }, "description": "The command line passed to the image's entrypoint" });
-    properties["memory_bytes"] = json!({ "type": "integer", "minimum": 1, "description": "Device memory the job needs; omit to run it with no device, which a credential with a share may not (JOB_NEEDS_DEVICE)" });
+    properties["memory_bytes"] = json!({ "type": "integer", "minimum": 1, "description": "Device memory the job needs; omit to run it with no device" });
     CommandDef {
         schema: "run-job".into(),
         version: "1.0".into(),
