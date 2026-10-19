@@ -202,7 +202,8 @@ itself reaches the engines' ports, which are bound there and nowhere else whatev
 when the container engine is on this host, on that host's interfaces when it is elsewhere, so a container engine
 on another host sits on a network you trust. The peer alone reaches them: a prompt is a command on the door, and
 the peer carries it to the engine. Prompts are answered sixteen at a time per peer; the rest wait their turn,
-accepted, in order.
+accepted, in order. `BEST_PEER_COMMANDS_PER_MINUTE` (default 60) is how many new commands one credential may send
+a minute across the door; a number below 1 is refused at start.
 
 ## Deploy
 
@@ -268,6 +269,13 @@ Every command of this peer follows one pattern, and nothing else is needed to dr
 4. A consumer that was not listening catches up with `GET /events?correlationId=...`, following `nextCursor` to
    the end, and follows from there with `GET /events/stream` and `Last-Event-ID`. There is no other channel for
    progress or outcome, and nothing to poll.
+
+A credential sends 60 new commands a minute at most, counted across the door and every workspace on it
+(`BEST_PEER_COMMANDS_PER_MINUTE`): the one past that is refused with `TOO_MANY_COMMANDS`, 429 and `Retry-After`,
+and was not accepted. A retry of an accepted command is answered as it was and is not counted, nor is a command
+refused before it is whole. On a member, a cloud is one credential: every tenant of the cloud shares the member's
+minute, and a member that refuses the cloud's command is told on the cloud's stream as the command's failure, with
+the member's reason, so a member's owner who hosts a busy cloud raises the pace.
 
 ## Sign in
 

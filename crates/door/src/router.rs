@@ -356,6 +356,21 @@ async fn ingest(
             key: key.clone(),
         }
     };
+    // Counted once it is new and whole: a retry of an accepted command, or one refused before this, costs nothing.
+    if let Err(wait) = door.pace.take(&sender.hash, std::time::Instant::now()) {
+        let per_minute = door.pace.limit();
+        let mut refused = BestError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "TOO_MANY_COMMANDS",
+            format!(
+                "this credential sent {per_minute} commands within the last minute, the most this door takes: this one was not accepted; send it again in {wait} s"
+            ),
+        )
+        .with_details(json!({ "per_minute": per_minute, "retry_after_seconds": wait }))
+        .into_response();
+        refused.headers_mut().insert(header::RETRY_AFTER, wait.into());
+        return Ok(refused);
+    }
     if let Some(admit) = &def.admit {
         admit(
             envelope.clone(),
@@ -695,6 +710,11 @@ mod tests {
 
     /// A door over `log` with the credentials of a previous door, when it is that door restarted.
     fn door_over_with(log: Arc<EventLog>, auth: Option<Arc<Auth>>) -> Shared {
+        door_built(log, auth, crate::Pace::default())
+    }
+
+    /// The same, taking commands at `pace`.
+    fn door_built(log: Arc<EventLog>, auth: Option<Arc<Auth>>, pace: crate::Pace) -> Shared {
         let catalogue = Catalogue::new()
             .command(CommandDef {
                 schema: "pull-image".into(),
@@ -754,7 +774,7 @@ mod tests {
         let auth = auth.unwrap_or_else(|| {
             Arc::new(Auth::ephemeral(EP, Box::new(FakeApprover { proof: "ok".into() })).with_scopes(&["deploy"]))
         });
-        Arc::new(Door::new(EP, "io.best.agents", "A test peer.", catalogue, log, auth))
+        Arc::new(Door::new(EP, "io.best.agents", "A test peer.", catalogue, log, auth).with_pace(Arc::new(pace)))
     }
 
     async fn call(app: &Router, req: Request) -> (StatusCode, HeaderMap, Value) {
@@ -937,6 +957,41 @@ mod tests {
         let (s, _, b) = call(&app, post_form("/auth/device", &[("client_id", "x")])).await;
         assert_eq!(s, StatusCode::NOT_FOUND, "sign-in is the root's: {b}");
         assert_eq!(b["error"]["code"], "NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn a_credential_sends_so_many_new_commands_a_minute_and_is_told_when_to_send_again() {
+        let d = door_built(Arc::new(EventLog::ephemeral()), None, crate::Pace::per_minute(3));
+        let app = router(d.clone());
+        let key = sign_in(&app, "test", "my-peer").await;
+        let other = sign_in(&app, "other", "other-peer").await;
+        let send = |key: &str, c: Value| call(&app, post_json("/commands", key, "application/json", c));
+        // A command refused before it is whole costs nothing.
+        for id in ["bad-1", "bad-2"] {
+            let (s, _, b) = send(&key, command(id, json!(5))).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        }
+        for id in ["p1", "p2", "p3"] {
+            let (s, _, b) = send(&key, command(id, json!("ollama/ollama:0.6"))).await;
+            assert_eq!(s, StatusCode::CREATED, "{b}");
+        }
+        let (s, h, b) = send(&key, command("p4", json!("ollama/ollama:0.6"))).await;
+        assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{b}");
+        assert_eq!(b["error"]["code"], "TOO_MANY_COMMANDS");
+        assert_eq!(b["error"]["details"]["per_minute"], 3);
+        let wait = b["error"]["details"]["retry_after_seconds"].as_u64().unwrap();
+        assert!((1..=60).contains(&wait), "{b}");
+        assert_eq!(h[header::RETRY_AFTER].to_str().unwrap(), wait.to_string());
+        let message = b["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("was not accepted") && message.contains(&format!("again in {wait} s")),
+            "{message}"
+        );
+        // A retry of an accepted command is answered as it was, full minute or not.
+        let (s, _, b) = send(&key, command("p1", json!("ollama/ollama:0.6"))).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let (s, _, b) = send(&other, command("o1", json!("ollama/ollama:0.6"))).await;
+        assert_eq!(s, StatusCode::CREATED, "another credential has its own minute: {b}");
     }
 
     #[tokio::test]
