@@ -742,7 +742,7 @@ impl Cloud {
                 Err(isolation_refused(
                     a,
                     &offered,
-                    &format!("cloud {}'s members", self.name),
+                    &format!("cloud {}'s members offer", self.name),
                 ))
             }
             _ => Ok(held),
@@ -1042,9 +1042,13 @@ impl Cloud {
     }
 
     /// A pull is on every member at once: progress is relayed as it comes, the outcome is told once all answered,
-    /// a member that fails or is lost counted as failed.
-    fn on_pull_fact(&self, member: &Member, key: &str, em: &Emitter, r#type: &str, data: Value) {
+    /// a member that fails or is lost counted as failed. A member that has its image is not the cloud's pull ended,
+    /// so a member's share is relayed as 99 at most, and 100 is the cloud's own, told with ImagePulled.
+    fn on_pull_fact(&self, member: &Member, key: &str, em: &Emitter, r#type: &str, mut data: Value) {
         if r#type == "ImagePulling" {
+            if let Some(pct) = data["progress_pct"].as_u64() {
+                data["progress_pct"] = json!(pct.min(99));
+            }
             self.tell(em, r#type, data);
             return;
         }
@@ -1073,6 +1077,7 @@ impl Cloud {
                 .unwrap()
                 .retain(|_, i| i.pull.as_deref() != Some(key));
             if p.failed.is_empty() {
+                self.tell(em, "ImagePulling", json!({ "image": p.image, "progress_pct": 100 }));
                 self.tell(em, "ImagePulled", json!({ "image": p.image }));
             } else {
                 self.tell(

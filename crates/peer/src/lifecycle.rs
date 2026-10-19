@@ -517,7 +517,7 @@ impl Peer {
     pub async fn admit_deploy(&self, cmd: Envelope, who: Credential, key: String) -> Result<(), BestError> {
         require(&who, "deploy")?;
         let data: DeployData = parse(&cmd.data)?;
-        within_isolation(data.isolation, self.runtime.isolation().await, "this peer")?;
+        within_isolation(data.isolation, self.runtime.isolation().await, "this peer offers")?;
         let host = usable_by(self.hardware().await?, &who, data.device.as_deref())?;
         // One admission at a time across the door, and what the credential holds is read before the state is
         // locked, since the door's holdings read this state too.
@@ -728,11 +728,17 @@ impl Peer {
     }
 
     /// Pulls an image from the registry, held or not, telling its progress; a pull that completed is 100, whether or
-    /// not the engine said so. What pull-image does, so that is how a held image is refreshed.
+    /// not the engine said so. What pull-image does, so that is how a held image is refreshed. While the pull runs
+    /// the share told is 99 at most: the engine learns of more to fetch as it goes, so a share it reports as whole
+    /// is not the end, and 100 is told only once the pull has ended, before ImagePulled.
     async fn pull(self: &Arc<Self>, em: &Emitter, image: &best_peer_runtime::ImageRef) -> Result<(), RuntimeError> {
-        let progress = self.pulling(em, image);
-        self.runtime.pull(image, progress.clone()).await?;
-        progress(Some(100));
+        let told = self.pulling(em, image);
+        let running: best_peer_runtime::Progress = {
+            let told = told.clone();
+            Arc::new(move |pct| told(pct.map(|p| p.min(99))))
+        };
+        self.runtime.pull(image, running).await?;
+        told(Some(100));
         Ok(())
     }
 
@@ -891,7 +897,7 @@ impl Peer {
             )
             .with_details(json!({ "field": "memory_bytes" })));
         }
-        within_isolation(data.isolation, self.runtime.isolation().await, "this peer")?;
+        within_isolation(data.isolation, self.runtime.isolation().await, "this peer offers")?;
         let host = match data.memory_bytes {
             Some(_) => Some(usable_by(self.hardware().await?, &who, data.device.as_deref())?),
             None => None,
@@ -1472,17 +1478,22 @@ pub(crate) fn usable_by(host: Host, who: &Credential, pinned: Option<&str>) -> R
     .with_details(json!({ "device": pinned, "devices": ids })))
 }
 
-/// A workload asking for `asked` isolation where `offered` is the most there is, `where_` (this peer, or a cloud's
-/// members), is refused with what is offered and what would meet it.
-pub(crate) fn within_isolation(asked: Option<Isolation>, offered: Isolation, where_: &str) -> Result<(), BestError> {
+/// A workload asking for `asked` isolation where `offered` is the most there is is refused with what is offered and
+/// what would meet it; `who_offers` says where, with its verb ("this peer offers").
+pub(crate) fn within_isolation(
+    asked: Option<Isolation>,
+    offered: Isolation,
+    who_offers: &str,
+) -> Result<(), BestError> {
     let Some(asked) = asked.filter(|a| *a > offered) else {
         return Ok(());
     };
-    Err(isolation_refused(asked, &[offered], where_))
+    Err(isolation_refused(asked, &[offered], who_offers))
 }
 
-/// The refusal of a workload asking for `asked` isolation where only `offered` is: what each level needs.
-pub(crate) fn isolation_refused(asked: Isolation, offered: &[Isolation], where_: &str) -> BestError {
+/// The refusal of a workload asking for `asked` isolation where only `offered` is: what each level needs. `who_offers`
+/// is the subject with its verb, as it agrees ("this peer offers", "cloud lab's members offer").
+pub(crate) fn isolation_refused(asked: Isolation, offered: &[Isolation], who_offers: &str) -> BestError {
     let fix = match asked {
         Isolation::Process | Isolation::Container => {
             "the owner runs the peer over a container engine (BEST_PEER_RUNTIME=docker), not an engine installed on the host"
@@ -1503,7 +1514,7 @@ pub(crate) fn isolation_refused(asked: Isolation, offered: &[Isolation], where_:
     BestError::bad_request(
         "ISOLATION_UNAVAILABLE",
         format!(
-            "it asks for {} isolation and {where_} offers {offered_text}: {fix}",
+            "it asks for {} isolation and {who_offers} {offered_text}: {fix}",
             asked.name()
         ),
     )
@@ -1634,7 +1645,7 @@ fn api_name(c: &Compute) -> String {
 
 /// The pace progress is told at. An engine reports every percent, sometimes every byte; a consumer that catches up
 /// on the log reads every event told, so one workload tells its progress at steps of ten points on from the last
-/// value told, at once when the value is final or went back (a new layer appeared, extraction began), and at least
+/// value told, at once when the value is final or went back (a new layer appeared), and at least
 /// every few seconds while the engine keeps reporting, so a slow pull is seen to move. A report without a value
 /// (the engine knows it is working, not how far) is told by time alone and moves no baseline.
 pub struct Pace {

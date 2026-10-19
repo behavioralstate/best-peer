@@ -791,7 +791,12 @@ fn approve(args: &[String]) {
                 .unwrap_or_else(|| format!("is {code} a live code shown by an agent in the last ten minutes?"))
         ));
     }
-    let a = &answer["admitted"];
+    println!("{}", admitted_line(&answer["admitted"]));
+}
+
+/// The one line `approve` prints for an admission the door answered: who, as which connection, what the credential
+/// may do, its share, and how long it lasts.
+fn admitted_line(a: &serde_json::Value) -> String {
     let who = match a["agent_label"].as_str() {
         Some(l) => format!("{l} ({})", a["client_id"].as_str().unwrap_or("?")),
         None => a["client_id"].as_str().unwrap_or("?").to_string(),
@@ -820,14 +825,11 @@ fn approve(args: &[String]) {
         Some(s) => format!("ending in {s} s"),
         None => "never ending".into(),
     };
-    if a["grant"]["accelerators_only"].as_bool() == Some(true) {
-        share.push_str(", on the accelerators alone");
-    }
-    println!(
+    format!(
         "admitted {who} as connection {} with a {} credential that may {may}, {share}, {lasts}: the agent's next poll gets it",
         a["connection"].as_str().unwrap_or("(the host's name)"),
         a["lifetime"].as_str().unwrap_or("durable")
-    );
+    )
 }
 
 fn fail(why: &str) -> ! {
@@ -844,6 +846,24 @@ mod tests {
     use best_peer_runtime::{ContainerId, Network};
     use futures::StreamExt;
     use http_body_util::BodyExt;
+
+    #[test]
+    fn the_admission_line_says_each_part_of_the_grant_once() {
+        let line = admitted_line(&json!({
+            "agent_label": "the host proof",
+            "client_id": "proof",
+            "connection": "proof",
+            "lifetime": "durable",
+            "grant": { "scopes": ["deploy", "jobs"], "memory_bytes": 1024, "jobs": 2, "accelerators_only": true }
+        }));
+        assert_eq!(
+            line,
+            "admitted the host proof (proof) as connection proof with a durable credential that may deploy,jobs, 1024 bytes of device memory at most, its jobs in the closed box, 2 jobs at once at most, on the accelerators alone, never ending: the agent's next poll gets it"
+        );
+        let plain = admitted_line(&json!({ "client_id": "proof", "expires_in": 60, "grant": {} }));
+        assert!(plain.contains("may all, no share set, ending in 60 s"), "{plain}");
+        assert!(!plain.contains("accelerators"), "{plain}");
+    }
 
     #[test]
     fn the_hardware_switch_names_its_values_and_none_is_the_host_alone() {
@@ -1886,6 +1906,11 @@ mod tests {
         assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
         assert_eq!(e["error"]["code"], "ISOLATION_UNAVAILABLE");
         assert_eq!(e["error"]["details"]["offered"], json!(["container", "user-namespace"]));
+        let said = e["error"]["message"].as_str().unwrap();
+        assert!(
+            said.starts_with("it asks for vm isolation and cloud lab's members offer container, user-namespace: "),
+            "{said}"
+        );
         // A job with no device asking for a user namespace runs on the member that offers it.
         let (s, b) = site
             .send(
@@ -3635,6 +3660,16 @@ mod tests {
             .filter_map(|e| e["data"]["peer"].as_str())
             .collect();
         assert_eq!(progressed.into_iter().collect::<Vec<_>>(), ["a", "b"]);
+        // A member that has the image is not the cloud's pull ended: 100 is told once, by the cloud, with the outcome.
+        let hundreds: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e["type"] == "ImagePulling" && e["data"]["progress_pct"] == 100)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(hundreds.len(), 1, "{events:#?}");
+        assert!(events[hundreds[0]]["data"]["peer"].is_null(), "{events:#?}");
+        assert_eq!(events[hundreds[0] + 1]["type"], "ImagePulled");
         let (s, b) = site
             .send(
                 &ws,
@@ -4365,6 +4400,35 @@ mod tests {
         );
         let w = bed.query("get-workloads").await;
         assert_eq!(w["deployments"], json!([]), "{w}");
+    }
+
+    #[tokio::test]
+    async fn a_pull_says_100_only_once_it_has_ended_whatever_the_engine_reported_on_the_way() {
+        // The engine reaches 100 for the layers it knew of, learns of more and falls back, as Docker does.
+        let bed = bed_with(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![]).reporting(&[0, 40, 100, 25, 60, 100])),
+            Arc::new(best_peer_engine::Fake::new()),
+            "engines.local",
+            None,
+        )
+        .await;
+        let (s, b) = bed.deploy("d1", "llama3.2:3b", "ollama", 8).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let events = bed.events_of("d1", "DeploymentReady").await;
+        let pulling: Vec<u64> = events
+            .iter()
+            .filter(|e| e.r#type == "ImagePulling")
+            .map(|e| e.data["progress_pct"].as_u64().unwrap())
+            .collect();
+        assert_eq!(pulling, vec![0, 40, 99, 25, 60, 99, 100], "{:?}", types(&events));
+        let last = events.iter().rposition(|e| e.r#type == "ImagePulling").unwrap();
+        assert_eq!(
+            events[last + 1].r#type,
+            "ImagePulled",
+            "the 100 comes with the end of the pull"
+        );
     }
 
     #[test]
