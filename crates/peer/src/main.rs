@@ -3133,9 +3133,37 @@ mod tests {
             .to_string();
         let at_ws = format!("/workspaces/{ws}");
         assert_eq!(get_as(&bed.app, &at_ws, &team, "/commands").await.0, StatusCode::OK);
+        let res = bed
+            .app
+            .clone()
+            .oneshot(
+                Request::get("/events/stream")
+                    .header("X-Api-Key", &team)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let mut stream = res.into_body().into_data_stream();
         // Any credential may revoke itself, whatever it was approved for, and nothing else is named.
         let (s, b) = send_as(&bed.app, "", &team, "r1", "RevokeAgent", "revoke-agent", json!({})).await;
         assert_eq!(s, StatusCode::CREATED, "{b}");
+        let told = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(frame) = stream.next().await {
+                let frame = String::from_utf8_lossy(&frame.unwrap()).to_string();
+                if frame.contains("AgentRevokedV1") {
+                    return frame.contains("\"correlationid\":\"r1\"");
+                }
+            }
+            false
+        })
+        .await;
+        assert_eq!(
+            told,
+            Ok(true),
+            "the stream it held open read the outcome of its own revoke"
+        );
         let revoked = &bed.events_of("r1", "AgentRevokedV1").await[0].data;
         assert!(revoked["revoked_at"].is_string() && revoked["holder"].is_string());
         for prefix in ["", at_ws.as_str()] {

@@ -89,7 +89,16 @@ At your machine:
 Their client's next poll receives a key under that name. No accounts, no passwords: whoever controls the machine
 decides who is in, as with SSH keys, and what they may do: approved with nothing more said, a key may do everything;
 `--may deploy,prompt --memory 40G` makes one that may deploy models and prompt them but run no job, and hold 40 GiB
-of device memory at most across its workloads, which it alone sees, prompts and ends.
+of device memory at most across its workloads, which it alone sees, prompts and ends. `--expires 8h` ends the key
+after eight hours, so access lent for an afternoon ends without anyone remembering to take it back. To take a key
+back sooner, at your machine:
+
+```bash
+./best-peer revoke <name>
+```
+
+with the name it was approved under: every request carrying it is refused from then on, and an event stream it holds
+open ends within seconds. The agent can also give its key back itself, with the `revoke-agent` command.
 
 **4. More than one machine.** Run a peer on each, and one more `best-peer` anywhere as the door your team enters
 by: a laptop will do, with `BEST_PEER_GPU=none` and the runtime it has (`BEST_PEER_RUNTIME=fake` when it has none:
@@ -282,8 +291,11 @@ best-peer approve ABCD-EFGH
 ```
 
 That presents the machine's admin token, which only its owner can read, and the agent's next poll gets its credential:
-a key shown once, kept hashed, bound to the connection name the person gave. An operator who wants an identity
-provider instead plugs one in behind the `Approver` trait; the door never knows which stands behind it.
+a key shown once, kept hashed, bound to the connection name the person gave. The token is checked before anything
+else, so without it an approval learns neither whether a code is pending nor which scopes the door has. An operator
+who wants an identity provider instead plugs one in behind the `Approver` trait, which says whether a proof is the
+authority's (`attest`, asked first, and for a revoke) and admits a registration (`admit`); the door never knows which
+stands behind it.
 
 **Where a credential belongs** is the workspaces it created or accepted an invitation into, on this door, and
 `get-workspaces` says which, with the identity the credential is known by there, an opaque id another workspace's

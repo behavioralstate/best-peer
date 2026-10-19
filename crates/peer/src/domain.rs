@@ -754,7 +754,7 @@ fn revoke_agent(auth: Arc<Auth>) -> CommandDef {
         schema: "revoke-agent".into(),
         version: "1.0".into(),
         command_type: "RevokeAgent".into(),
-        description: "Takes back the credential this command is sent under, at once and for good: from then on every request carrying it is refused with 401, on this door and every workspace door here, and an event stream open under it ends within seconds. What it left running stays, for the owner to end. The outcome is an AgentRevokedV1 event with this command's correlation id, which the credential itself can no longer read; the way back is to sign in again, from the manifest. Any credential may revoke itself, and only itself.".into(),
+        description: "Takes back the credential this command is sent under, at once and for good: from then on every request carrying it is refused with 401, on this door and every workspace door here, and an event stream open under it ends within seconds. What it left running stays, for the owner to end. The outcome is an AgentRevokedV1 event with this command's correlation id: an event stream open under the credential delivers it, then ends, and nothing else under it reads it after; the way back is to sign in again, from the manifest. Any credential may revoke itself, and only itself.".into(),
         data_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         produces: vec!["AgentRevokedV1".into(), "CommandFailed".into()],
         completes: completes("RevokeAgent"),

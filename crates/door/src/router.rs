@@ -25,7 +25,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::auth::{Credential, DeviceRequest, Grant, OAuthError, TokenRequest, AUTH_HEADER};
+use crate::auth::{holder_of_hash, Credential, DeviceRequest, Grant, OAuthError, TokenRequest, AUTH_HEADER};
 use crate::catalogue::{CommandDef, Emitter};
 use crate::envelope::Envelope;
 use crate::error::BestError;
@@ -579,7 +579,8 @@ const CREDENTIAL_RECHECK: Duration = Duration::from_secs(5);
 /// Replays what came after `Last-Event-ID`, then follows live; the two never overlap. A client that falls behind
 /// the buffer is cut off, so it reconnects with its last id and misses nothing silently. A credential taken back or
 /// run out ends the stream with it, within seconds whether or not events flow: its end is looked at on every event
-/// and every few seconds between, and the credential itself whenever one was taken back since.
+/// and every few seconds between, and the credential itself whenever one was taken back since. A credential taken
+/// back still reads its own AgentRevokedV1, the outcome of the revoke-agent it sent, and the stream ends after it.
 async fn stream_events(
     State(door): State<Shared>,
     Extension(sender): Extension<Credential>,
@@ -623,16 +624,33 @@ async fn stream_events(
                 .filter(|s| s.seq > seen_up_to && filter.matches(s) && door2.visible_to(&sender, s));
             async move { Some(keep) }
         });
-    let still_open = move |_: &Option<Stored>| {
-        let open = ends.is_none_or(|e| OffsetDateTime::now_utc() < e)
-            && (auth.revocations() == seen || auth.credential_by_hash(&hash).is_some());
+    let holder = holder_of_hash(&hash);
+    let mut closing: Option<tokio::time::Instant> = None;
+    let mut told = false;
+    let mut step = move |item: Option<Stored>| {
+        if told || ends.is_some_and(|e| OffsetDateTime::now_utc() >= e) {
+            return futures::future::ready(None);
+        }
+        if closing.is_none() && auth.revocations() != seen && auth.credential_by_hash(&hash).is_none() {
+            closing = Some(tokio::time::Instant::now());
+        }
         seen = auth.revocations();
-        futures::future::ready(open)
+        let Some(since) = closing else {
+            return futures::future::ready(Some(item));
+        };
+        if item
+            .as_ref()
+            .is_some_and(|s| s.envelope.r#type == "AgentRevokedV1" && s.envelope.data["holder"] == holder)
+        {
+            told = true;
+            return futures::future::ready(Some(item));
+        }
+        futures::future::ready((since.elapsed() < CREDENTIAL_RECHECK).then_some(None))
     };
     let out = replayed
         .map(Some)
         .chain(live)
-        .take_while(still_open)
+        .scan((), move |_, item| step(item))
         .filter_map(futures::future::ready)
         .map(|s| {
             Ok(SseEvent::default()

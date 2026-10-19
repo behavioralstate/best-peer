@@ -243,17 +243,12 @@ pub struct TokenRequest {
 pub trait Approver: Send + Sync {
     /// What the verification page tells the person to do for this user code.
     fn instructions(&self, user_code: &str) -> String;
-    /// Admits the registration `user_code` names when `proof` is the authority's: an error says why not.
+    /// Whether `proof` is the authority's: asked before anything else on an approval, so a caller without it learns
+    /// nothing of the door, and before taking a credential back.
+    async fn attest(&self, proof: &str) -> Result<(), OAuthError>;
+    /// Admits the registration `user_code` names, once `attest` has said the proof is the authority's: an error says
+    /// why not.
     async fn admit(&self, user_code: &str, proof: &str) -> Result<(), OAuthError>;
-    /// Whether `proof` is the authority's, for what the authority alone does beyond admitting: taking a credential
-    /// back. An approver that does not say takes nothing back this way; the agent's own revoke-agent still does.
-    async fn attest(&self, _proof: &str) -> Result<(), OAuthError> {
-        Err(OAuthError {
-            status: 403,
-            error: "access_denied",
-            description: "this door's approver does not take credentials back: the agent revokes its own with the revoke-agent command".into(),
-        })
-    }
 }
 
 /// Approval by whoever controls the machine: a token the peer wrote to its data directory, which only that person
@@ -697,6 +692,7 @@ impl Auth {
         grant: Grant,
         expires: Option<Duration>,
     ) -> Result<Admitted, OAuthError> {
+        self.approver.attest(proof).await?;
         if expires.is_some_and(|d| d.is_zero() || d > MAX_EXPIRES) {
             return Err(OAuthError::invalid_request(format!(
                 "expires_in must be seconds above zero and {} at most (366 days): how long the credential lasts, or leave it out",
@@ -1329,21 +1325,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_approver_that_does_not_take_credentials_back_refuses_a_revoke() {
-        struct AdmitsOnly;
-        #[async_trait]
-        impl Approver for AdmitsOnly {
-            fn instructions(&self, _user_code: &str) -> String {
-                String::new()
-            }
-            async fn admit(&self, _user_code: &str, _proof: &str) -> Result<(), OAuthError> {
-                Ok(())
+    async fn without_the_proof_approve_tells_nothing_of_the_door() {
+        let auth = auth().with_scopes(&["deploy"]);
+        let a = start(&auth, Some("my-peer"));
+        let session = auth
+            .start_device(DeviceRequest {
+                client_id: Some("best-validate".into()),
+                credential_lifetime: Some("session".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let bogus = Grant {
+            scopes: Some(vec!["bogus".into()]),
+            ..Grant::default()
+        };
+        let day = Some(Duration::from_secs(24 * 3600));
+        for (code, grant, expires) in [
+            (a.user_code.as_str(), bogus.clone(), None),
+            ("NOPE-CODE", Grant::default(), None),
+            ("NOPE-CODE", bogus.clone(), None),
+            (session.user_code.as_str(), Grant::default(), day),
+            (a.user_code.as_str(), Grant::default(), Some(Duration::ZERO)),
+            (a.user_code.as_str(), Grant::default(), Some(Duration::MAX)),
+        ] {
+            let refused = auth.approve(code, "wrong", grant, expires).await.unwrap_err();
+            assert_eq!((refused.status, refused.error), (403, "access_denied"));
+            for told in ["deploy", "pending", "session", "28800", "expires_in"] {
+                assert!(!refused.description.contains(told), "{}", refused.description);
             }
         }
-        let auth = Auth::ephemeral("http://peer.test", Box::new(AdmitsOnly));
-        let err = auth.revoke("anyone", "anything").await.unwrap_err();
-        assert_eq!((err.status, err.error), (403, "access_denied"));
-        assert!(err.description.contains("revoke-agent"), "{}", err.description);
+        let unknown = auth.approve(&a.user_code, "ok", bogus, None).await.unwrap_err();
+        assert!(
+            unknown.description.contains("no such scope bogus"),
+            "{}",
+            unknown.description
+        );
+        let missing = auth
+            .approve("NOPE-CODE", "ok", Grant::default(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            missing.description.contains("no pending registration"),
+            "{}",
+            missing.description
+        );
+        let long = auth
+            .approve(&session.user_code, "ok", Grant::default(), day)
+            .await
+            .unwrap_err();
+        assert!(long.description.contains("28800"), "{}", long.description);
     }
 
     #[tokio::test]
