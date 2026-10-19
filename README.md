@@ -89,7 +89,8 @@ At your machine:
 Their client's next poll receives a key under that name. No accounts, no passwords: whoever controls the machine
 decides who is in, as with SSH keys, and what they may do: approved with nothing more said, a key may do everything;
 `--may deploy,prompt --memory 40G` makes one that may deploy models and prompt them but run no job, and hold 40 GiB
-of device memory at most across its workloads, which it alone sees, prompts and ends.
+of device memory at most across its workloads, which it alone sees, prompts and ends. `--accelerators-only` holds a
+key to the accelerators, never the host's CPU.
 
 **4. More than one machine.** Run a peer on each, and one more `best-peer` anywhere as the door your team enters
 by: a laptop will do, with `BEST_PEER_GPU=none` and the runtime it has (`BEST_PEER_RUNTIME=fake` when it has none:
@@ -304,6 +305,12 @@ see. `get-workloads` shows a key its own, with `held_bytes` against `share_bytes
 a device, where its share counts them: a job without `memory_bytes`, which would run on the host with no device and
 hold the host's memory and processors outside the share, is refused with `JOB_NEEDS_DEVICE`; a key with scopes and
 no share is not held to it. In a workspace the rule holds for the cloud's jobs, and a member's owner who approved the
-cloud with a share holds every tenant of the cloud to it on that member. Another sign-in is another holder, as the spec has it: what a key that expired or was
+cloud with a share holds every tenant of the cloud to it on that member. A key approved with `--accelerators-only`
+sees and uses the accelerators alone, so the host's CPU and memory stay the operator's: `get-hardware-state` shows it
+only those, and a device that offers the CPU alone, or a host with no accelerator, is refused with
+`ACCELERATORS_ONLY` and what it may name instead. A share does not imply it: a key approved with `--memory` alone may
+still be placed on the CPU device, within its share. In a workspace the rule holds for the cloud's devices, and a
+member's owner who approved the cloud with `--accelerators-only` holds every tenant of the cloud to that member's
+accelerators. Another sign-in is another holder, as the spec has it: what a key that expired or was
 replaced left running is the owner's to end with a key approved for all. The spec has no per-command scope field
 yet, so the requirement is in the description text; that is an entry on the spec follow-ups.

@@ -458,7 +458,7 @@ impl Peer {
     pub async fn admit_deploy(&self, cmd: Envelope, who: Credential, key: String) -> Result<(), BestError> {
         require(&who, "deploy")?;
         let data: DeployData = parse(&cmd.data)?;
-        let host = self.hardware().await?;
+        let host = usable_by(self.hardware().await?, &who, data.device.as_deref())?;
         // One admission at a time across the door, and what the credential holds is read before the state is
         // locked, since the door's holdings read this state too.
         let _admitting = self.holdings.admitting();
@@ -800,7 +800,7 @@ impl Peer {
             .with_details(json!({ "field": "memory_bytes" })));
         }
         let host = match data.memory_bytes {
-            Some(_) => Some(self.hardware().await?),
+            Some(_) => Some(usable_by(self.hardware().await?, &who, data.device.as_deref())?),
             None => None,
         };
         let _admitting = self.holdings.admitting();
@@ -1091,8 +1091,8 @@ impl Peer {
 
 #[async_trait]
 impl Service for Peer {
-    async fn hardware_state(&self) -> Result<Value, BestError> {
-        Ok(crate::domain::host_state(&self.hardware().await?))
+    async fn hardware_state(&self, who: &Credential) -> Result<Value, BestError> {
+        Ok(crate::domain::host_state(&shown_to(self.hardware().await?, who)))
     }
 
     fn workloads(&self, who: &Credential) -> Result<Value, BestError> {
@@ -1256,6 +1256,63 @@ pub(crate) fn within_share(held: u64, who: &Credential, needed: u64) -> Result<(
 /// share counts them: a job with no device would hold the host's memory and processors outside the share.
 pub(crate) fn has_share(who: &Credential) -> bool {
     who.grant.memory_bytes.is_some()
+}
+
+/// Whether `who` sees and uses the accelerators alone, as its approver said (`approve --accelerators-only`): the
+/// host's CPU and memory stay the operator's.
+pub(crate) fn accelerators_only(who: &Credential) -> bool {
+    who.grant.accelerators_only
+}
+
+/// `host` without the devices that offer the CPU alone.
+pub(crate) fn accelerators(host: &Host) -> Host {
+    Host {
+        driver: host.driver.clone(),
+        devices: host
+            .devices
+            .iter()
+            .filter(|d| d.compute.iter().any(|c| *c != Compute::Cpu))
+            .cloned()
+            .collect(),
+        observed_at: host.observed_at,
+    }
+}
+
+/// The devices `who` is shown: every one, or the accelerators alone for a credential held to them.
+pub(crate) fn shown_to(host: Host, who: &Credential) -> Host {
+    if accelerators_only(who) {
+        accelerators(&host)
+    } else {
+        host
+    }
+}
+
+/// The devices a workload of `who` may be placed on. A credential held to the accelerators that names a device
+/// offering the CPU alone, or asks on a host with no accelerator, is refused with why and what it may do instead.
+pub(crate) fn usable_by(host: Host, who: &Credential, pinned: Option<&str>) -> Result<Host, BestError> {
+    if !accelerators_only(who) {
+        return Ok(host);
+    }
+    let usable = accelerators(&host);
+    let ids: Vec<String> = usable.devices.iter().map(|d| d.id.0.clone()).collect();
+    let cpu = pinned.filter(|p| host.devices.iter().any(|d| d.id.0 == *p) && !ids.iter().any(|i| i == p));
+    if cpu.is_none() && !ids.is_empty() {
+        return Ok(usable);
+    }
+    let condition = match cpu {
+        Some(p) => format!("device {p} offers the CPU alone"),
+        None => "no device here is an accelerator".into(),
+    };
+    let fix = if ids.is_empty() {
+        "the owner can approve a key that is not held to the accelerators for work on the CPU".into()
+    } else {
+        format!("name one of {}, or leave device out", list(ids.iter()))
+    };
+    Err(BestError::bad_request(
+        "ACCELERATORS_ONLY",
+        format!("{condition}, and this credential runs on the accelerators alone, as its approver said: {fix}"),
+    )
+    .with_details(json!({ "device": pinned, "devices": ids })))
 }
 
 /// A workload another credential holds is not this one's to end.

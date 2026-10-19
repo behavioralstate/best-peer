@@ -25,8 +25,8 @@ use serde_json::{json, Value};
 use crate::domain::Service;
 use crate::holdings::Holdings;
 use crate::lifecycle::{
-    any_compute, has_share, mine, new_id, not_yours, parse, place, ready_deployment, require, within_share,
-    workloads_view,
+    any_compute, has_share, mine, new_id, not_yours, parse, place, ready_deployment, require, shown_to, usable_by,
+    within_share, workloads_view,
 };
 use crate::member::{Heard, Member, Refusal};
 use crate::state::{JobPhase, Phase, Reservation, State};
@@ -1090,8 +1090,9 @@ impl Cloud {
 
 #[async_trait]
 impl Service for Cloud {
-    async fn hardware_state(&self) -> Result<Value, BestError> {
+    async fn hardware_state(&self, who: &Credential) -> Result<Value, BestError> {
         let (host, peers) = self.combined().await;
+        let host = shown_to(host, who);
         let mut v = crate::domain::host_state(&host);
         if let Some(devices) = v["devices"].as_array_mut() {
             for d in devices {
@@ -1164,6 +1165,7 @@ impl Service for Cloud {
             return Ok(());
         }
         let (host, peers) = self.combined().await;
+        let host = usable_by(host, &who, data.device.as_deref()).map_err(|e| Self::with_peers(e, peers.clone()))?;
         // One admission at a time across the door, and what the credential holds is read before the state is
         // locked, since the door's holdings read this state too.
         let _admitting = self.holdings.admitting();
@@ -1325,6 +1327,10 @@ impl Service for Cloud {
             return Ok(());
         }
         let (host, peers) = self.combined().await;
+        let host = match data.memory_bytes {
+            Some(_) => usable_by(host, &who, data.device.as_deref()).map_err(|e| Self::with_peers(e, peers.clone()))?,
+            None => host,
+        };
         let _admitting = self.holdings.admitting();
         let held = self.holdings.held_by(&who.holder());
         let mut state = self.state.lock().unwrap();

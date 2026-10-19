@@ -115,6 +115,10 @@ pub struct Grant {
     /// The most device memory the credential's workloads may hold together; absent means no share is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_bytes: Option<u64>,
+    /// Whether the credential sees and uses the accelerators alone, never a device that offers the host's CPU. The
+    /// approver's word alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub accelerators_only: bool,
 }
 
 impl Grant {
