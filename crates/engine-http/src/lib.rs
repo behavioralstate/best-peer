@@ -21,8 +21,8 @@ pub struct HttpEngine {
 /// How a pull from the registry is watched. The engine's stream says how the pull goes, but its end is not the only
 /// way to know the model arrived: when the stream says nothing for `check_after`, the engine is asked whether it has
 /// the model, and a stream that says nothing for `quiet_limit` while the engine does not have it ends the pull as
-/// stalled. A stream that breaks or ends without success is resumed, the engine going on from what it has, up to
-/// `attempts` times in all.
+/// stalled. A stream that breaks, ends without success or says the engine gave up is resumed, the engine going on
+/// from what it has, up to `attempts` times in all.
 #[derive(Clone, Copy, Debug)]
 pub struct PullBounds {
     pub check_after: Duration,
@@ -30,9 +30,15 @@ pub struct PullBounds {
     pub attempts: u32,
 }
 
+impl PullBounds {
+    /// The slowest a disk is taken to read while the engine checks a model's digests: 50 MiB a second.
+    const CHECKED_PER_SECOND: u64 = 50 << 20;
+}
+
 impl Default for PullBounds {
-    /// Five minutes of silence is longer than the engine takes to check the digest of a model of tens of gigabytes
-    /// on a slow disk, the one step of a pull that says nothing while it runs.
+    /// Five minutes of silence while a model downloads. Once the engine says it is verifying the model's digests, the
+    /// one step of a pull that says nothing while it runs, the bound is as long as reading every byte of the model
+    /// at 50 MiB a second, when that is longer: a model of 40 GB is given fourteen minutes.
     fn default() -> Self {
         Self {
             check_after: Duration::from_secs(15),
@@ -147,6 +153,7 @@ impl HttpEngine {
                     match stream.line(&line, model)? {
                         Said::Progress(pct) => progress(Some(pct)),
                         Said::Success => return Ok(Pulled::Ended),
+                        Said::Fault(why) => return Ok(Pulled::Broke(format!("the engine said: {why}"))),
                         Said::Nothing => {}
                     }
                 }
@@ -159,7 +166,7 @@ impl HttpEngine {
                         tracing::warn!(%base, %model, "the pull stream went quiet with the model in the engine: the pull has ended");
                         return Ok(Pulled::Ended);
                     }
-                    if said_last.elapsed() >= self.pull.quiet_limit {
+                    if said_last.elapsed() >= stream.quiet_allowed(self.pull.quiet_limit) {
                         return Err(EngineError::Engine(format!(
                             "the engine said nothing of the pull for {} s and does not have the model: the registry or the engine stalled",
                             said_last.elapsed().as_secs()
@@ -338,6 +345,8 @@ enum Pulled {
 enum Said {
     Progress(u8),
     Success,
+    /// The engine gave up on this attempt, after its own retries: a registry that dropped it, a disk that filled.
+    Fault(String),
     Nothing,
 }
 
@@ -349,6 +358,8 @@ enum Said {
 struct PullStream {
     blobs: std::collections::HashMap<String, (u64, u64)>,
     last: Option<u8>,
+    /// Whether the engine said it is checking the model's digests, which it does without a word.
+    verifying: bool,
 }
 
 impl PullStream {
@@ -357,15 +368,17 @@ impl PullStream {
             return Ok(Said::Nothing);
         };
         if let Some(err) = v["error"].as_str() {
-            return Err(if err.contains("not found") || err.contains("pull model manifest") {
-                EngineError::ModelNotFound(model.into())
+            // A model the registry does not have is final; anything else is this attempt's end.
+            return if err.contains("not found") || err.contains("pull model manifest") {
+                Err(EngineError::ModelNotFound(model.into()))
             } else {
-                EngineError::Engine(err.into())
-            });
+                Ok(Said::Fault(err.into()))
+            };
         }
         if v["status"] == "success" {
             return Ok(Said::Success);
         }
+        self.verifying = v["status"].as_str().is_some_and(|s| s.starts_with("verifying"));
         if let (Some(digest), Some(total)) = (v["digest"].as_str(), v["total"].as_u64()) {
             if total > 0 {
                 // A resumed stream names each blob again from its start; what came of it before is still there.
@@ -385,6 +398,16 @@ impl PullStream {
             }
             _ => Ok(Said::Nothing),
         }
+    }
+
+    /// How long the stream may say nothing: `quiet` while the model downloads, and while the engine checks its
+    /// digests, as long as reading every byte of it takes on a slow disk, when that is longer.
+    fn quiet_allowed(&self, quiet: Duration) -> Duration {
+        if !self.verifying {
+            return quiet;
+        }
+        let bytes: u64 = self.blobs.values().map(|(_, total)| total).sum();
+        quiet.max(Duration::from_secs(bytes / PullBounds::CHECKED_PER_SECOND))
     }
 }
 
@@ -503,6 +526,7 @@ mod tests {
             match stream.line(line, "qwen2.5:0.5b").unwrap() {
                 Said::Progress(p) => shares.push(p),
                 Said::Success => ended = true,
+                Said::Fault(why) => panic!("{why}"),
                 Said::Nothing => {}
             }
         }
@@ -519,21 +543,23 @@ mod tests {
     }
 
     #[test]
-    fn an_error_line_ends_the_pull_with_what_the_engine_said() {
+    fn an_error_line_ends_the_attempt_with_what_the_engine_said_and_a_missing_model_ends_the_pull() {
         let mut stream = PullStream::default();
         let missing = stream.line(r#"{"error":"pull model manifest: file does not exist"}"#, "nope:1b");
         assert!(matches!(missing, Err(EngineError::ModelNotFound(m)) if m == "nope:1b"));
         let full = stream.line(r#"{"error":"no space left on device"}"#, "a:1b");
-        assert!(matches!(full, Err(EngineError::Engine(m)) if m == "no space left on device"));
+        assert_eq!(full.unwrap(), Said::Fault("no space left on device".into()));
     }
 
     /// What the fake engine does after the recorded lines it sends of a pull's stream: ends the stream, breaks the
-    /// connection, or holds it open saying nothing.
+    /// connection, holds it open saying nothing, or says it gave up.
     #[derive(Clone, Copy)]
     enum Then {
         End,
         Break,
         Hold,
+        /// Says it gave up, as Ollama does when the registry dropped it past its own retries, and ends.
+        Fail,
     }
 
     type Answer = Arc<dyn Fn(usize) -> (usize, Then) + Send + Sync>;
@@ -581,6 +607,10 @@ mod tests {
                         }
                         Then::Break => {}
                         Then::Hold => std::thread::sleep(Duration::from_secs(120)),
+                        Then::Fail => {
+                            let line = "{\"error\":\"max retries exceeded: EOF\"}";
+                            let _ = write!(conn, "{:x}\r\n{line}\n\r\n0\r\n\r\n", line.len() + 1);
+                        }
                     }
                 });
             }
@@ -618,6 +648,64 @@ mod tests {
     }
 
     const ALL: usize = usize::MAX;
+
+    #[test]
+    fn while_the_engine_checks_the_digests_the_stream_may_say_nothing_for_as_long_as_the_model_takes_to_read() {
+        let quiet = Duration::from_secs(300);
+        let mut stream = PullStream::default();
+        let blob = |digest: &str, gb: u64| {
+            format!(
+                r#"{{"status":"pulling {digest}","digest":"{digest}","total":{},"completed":{}}}"#,
+                gb << 30,
+                gb << 30
+            )
+        };
+        stream.line(&blob("sha256:a", 30), "big:70b").unwrap();
+        stream.line(&blob("sha256:b", 10), "big:70b").unwrap();
+        assert_eq!(stream.quiet_allowed(quiet), quiet, "a download is held to the bound");
+        stream
+            .line(r#"{"status":"verifying sha256 digest"}"#, "big:70b")
+            .unwrap();
+        assert_eq!(
+            stream.quiet_allowed(quiet),
+            Duration::from_secs((40 << 30) / (50 << 20))
+        );
+        stream.line(r#"{"status":"writing manifest"}"#, "big:70b").unwrap();
+        assert_eq!(stream.quiet_allowed(quiet), quiet);
+        let mut small = PullStream::default();
+        small.line(&blob("sha256:c", 1), "small:1b").unwrap();
+        small
+            .line(r#"{"status":"verifying sha256 digest"}"#, "small:1b")
+            .unwrap();
+        assert_eq!(small.quiet_allowed(quiet), quiet, "a small model keeps the bound");
+    }
+
+    #[test]
+    fn a_stream_that_ends_short_with_the_model_in_the_engine_has_ended_without_a_second_pull() {
+        for then in [Then::End, Then::Break] {
+            let (base, pulls) = engine(move |_| (100, then), Arc::new(Mutex::new(true)));
+            let (progress, _) = told();
+            HttpEngine::new()
+                .with_pull_bounds(quick())
+                .pull_ollama(&base, "qwen2.5:0.5b", &progress)
+                .unwrap();
+            assert_eq!(pulls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn an_engine_that_gives_up_on_an_attempt_is_asked_again() {
+        let (base, pulls) = engine(
+            |n| if n == 1 { (30, Then::Fail) } else { (ALL, Then::End) },
+            Arc::new(Mutex::new(false)),
+        );
+        let (progress, _) = told();
+        HttpEngine::new()
+            .with_pull_bounds(quick())
+            .pull_ollama(&base, "qwen2.5:0.5b", &progress)
+            .unwrap();
+        assert_eq!(pulls.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn a_whole_stream_ends_the_pull_at_its_success() {

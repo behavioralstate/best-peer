@@ -272,8 +272,9 @@ new release upstream changes no deploy until a host has proven it; `BEST_PEER_OL
 name others, or a mirror. `BEST_PEER_READY_SECONDS` (default 900) is how long an engine may take to answer after its
 container started, `BEST_PEER_LOAD_SECONDS` (default 3600) how long a model may take to load, and a prompt is given
 ten minutes to be answered. A pull from Ollama's registry that says nothing for five minutes while the engine does not
-have the model fails the deploy as stalled, and one whose stream breaks is resumed, twice at most, so a deploy never
-waits the whole load on a pull that stopped. `BEST_PEER_ENGINE_HOST` (default `127.0.0.1`) is where the peer
+have the model (longer while it checks a large model's digests) fails the deploy as stalled, and one whose stream
+breaks, or that the engine gives up on, is resumed, twice at most, so a deploy never waits the whole load on a pull
+that stopped. `BEST_PEER_ENGINE_HOST` (default `127.0.0.1`) is where the peer
 itself reaches the engines' ports, which are bound there and nowhere else whatever the door listens on: on loopback
 when the container engine is on this host, on that host's interfaces when it is elsewhere, so a container engine
 on another host sits on a network you trust. The peer alone reaches them: a prompt is a command on the door, and
