@@ -1573,7 +1573,9 @@ mod tests {
         }
         // One approved is no longer waiting: the address has room again.
         let first = first.unwrap();
-        auth.approve(&first.user_code, "ok", Grant::default()).await.unwrap();
+        auth.approve(&first.user_code, "ok", Grant::default(), None)
+            .await
+            .unwrap();
         from("client-after", "203.0.113.9").unwrap();
     }
 
