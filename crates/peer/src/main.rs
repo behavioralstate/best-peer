@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use best_peer_door::{Auth, Door, EventLog, LocalApprover, Streams};
+use best_peer_door::{Auth, Door, EventLog, Limits, LocalApprover, Pace, Streams};
 use best_peer_engine::Engine;
 use best_peer_gpu::Gpu;
 use best_peer_runtime::Runtime;
@@ -129,19 +129,23 @@ pub fn door(peer: Arc<Peer>, workspaces: Arc<workspace::Workspaces>, auth: Arc<A
     )
     .with_tenants(&ctx.manifest_template())
     .with_partition(workspace::Workspaces::root_partition(peer.log.clone()))
-    .with_streams(ctx.streams.clone())
+    .with_limits(ctx.limits.clone())
 }
 
 /// What the workspaces of this door are built with: the root's endpoint and credentials, the data directory, the
 /// transport their clouds reach members through (HTTP with the trust `BEST_PEER_TRUST` adds, the PEM files of
-/// members' own certificates), the holdings every surface counts a share against, and the event streams every
-/// surface counts a credential's against.
+/// members' own certificates), the holdings every surface counts a share against, and the limits every surface holds
+/// a credential with a share to (`BEST_PEER_COMMANDS_PER_MINUTE`, `BEST_PEER_STREAMS_PER_CREDENTIAL`).
 fn context(
     endpoint: &str,
     dir: &std::path::Path,
     auth: Arc<Auth>,
     holdings: Arc<holdings::Holdings>,
 ) -> workspace::Context {
+    let per_minute = commands_per_minute(std::env::var("BEST_PEER_COMMANDS_PER_MINUTE").ok().as_deref())
+        .unwrap_or_else(|why| fail(&why));
+    let streams = streams_per_credential(std::env::var("BEST_PEER_STREAMS_PER_CREDENTIAL").ok().as_deref())
+        .unwrap_or_else(|why| fail(&why));
     let trust: Vec<PathBuf> = std::env::var("BEST_PEER_TRUST")
         .ok()
         .map(|t| {
@@ -159,7 +163,38 @@ fn context(
         auth,
         transport: Arc::new(transport::Http::new(&trust).unwrap_or_else(|why| fail(&why))),
         holdings,
-        streams: Arc::new(Streams::default()),
+        limits: Arc::new(Limits::new(
+            Pace::per_minute(per_minute),
+            Streams::per_credential(streams),
+        )),
+    }
+}
+
+/// How many commands a credential may send a minute, from `BEST_PEER_COMMANDS_PER_MINUTE`: the door's default
+/// unless the operator says more or less; nothing is not a pace.
+pub fn commands_per_minute(text: Option<&str>) -> Result<u32, String> {
+    match text.map(str::trim).filter(|t| !t.is_empty()) {
+        None => Ok(best_peer_door::pace::COMMANDS_PER_MINUTE),
+        Some(t) => match t.parse::<u32>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(format!(
+                "BEST_PEER_COMMANDS_PER_MINUTE is {t}: say how many commands a credential may send a minute, 1 or more"
+            )),
+        },
+    }
+}
+
+/// How many event streams a credential with a share may hold open at once, from `BEST_PEER_STREAMS_PER_CREDENTIAL`:
+/// the door's default unless the operator says more or less; a stream needs one at least.
+pub fn streams_per_credential(text: Option<&str>) -> Result<usize, String> {
+    match text.map(str::trim).filter(|t| !t.is_empty()) {
+        None => Ok(best_peer_door::streams::STREAMS_PER_CREDENTIAL),
+        Some(t) => match t.parse::<usize>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(format!(
+                "BEST_PEER_STREAMS_PER_CREDENTIAL is {t}: say how many event streams a credential with a share may hold open at once, 1 or more"
+            )),
+        },
     }
 }
 
@@ -661,7 +696,7 @@ mod tests {
                 auth: auth.clone(),
                 transport: Arc::new(Switchboard::default()),
                 holdings,
-                streams: Arc::new(Streams::default()),
+                limits: Arc::new(Limits::default()),
             }),
             log,
         );
@@ -892,11 +927,17 @@ mod tests {
 
     /// The members as `endpoint => bed`, the bed's own key being what its owner's approval would give the cloud.
     async fn site(members: Vec<(&str, Bed)>) -> Site {
+        site_pacing(members, Pace::default()).await
+    }
+
+    /// The same, the door taking commands at `pace`.
+    async fn site_pacing(members: Vec<(&str, Bed)>, pace: Pace) -> Site {
         site_over(
             members,
             Arc::new(tempfile::tempdir().unwrap()),
             Arc::new(EventLog::ephemeral()),
             None,
+            Arc::new(Limits::new(pace, Streams::default())),
         )
         .await
     }
@@ -906,6 +947,7 @@ mod tests {
         data: Arc<tempfile::TempDir>,
         log: Arc<EventLog>,
         auth: Option<Arc<Auth>>,
+        limits: Arc<Limits>,
     ) -> Site {
         let switchboard = Arc::new(Switchboard::default());
         let mut down = std::collections::HashMap::new();
@@ -943,7 +985,7 @@ mod tests {
                 auth: auth.clone(),
                 transport: switchboard.clone(),
                 holdings,
-                streams: Arc::new(Streams::default()),
+                limits,
             }),
             log.clone(),
         );
@@ -2292,7 +2334,14 @@ mod tests {
         let (key_a, key_b) = (a.key.clone(), b.key.clone());
         let data = Arc::new(tempfile::tempdir().unwrap());
         let log = Arc::new(EventLog::ephemeral());
-        let first = site_over(vec![(A, a), (B, b)], data.clone(), log.clone(), None).await;
+        let first = site_over(
+            vec![(A, a), (B, b)],
+            data.clone(),
+            log.clone(),
+            None,
+            Arc::new(Limits::default()),
+        )
+        .await;
         let ws = first.workspace("c1", "Research").await;
         first
             .cloud(&ws, "k1", "lab", &[("a", A, &key_a), ("b", B, &key_b)])
@@ -2328,7 +2377,7 @@ mod tests {
         // The door starts again over the same data directory, root log and credentials (on a host, all on disk):
         // the workspace, its members and invitations, its cloud with the members' credentials and the deployment it
         // placed are all back.
-        let again = site_over(Vec::new(), data.clone(), log, Some(auth)).await;
+        let again = site_over(Vec::new(), data.clone(), log, Some(auth), Arc::new(Limits::default())).await;
         for (endpoint, bed) in [(A, &members[0]), (B, &members[1])] {
             again.switchboard.connect(endpoint, bed.app.clone());
         }
@@ -2603,7 +2652,7 @@ mod tests {
                 auth: auth.clone(),
                 transport: Arc::new(Switchboard::default()),
                 holdings,
-                streams: Arc::new(Streams::default()),
+                limits: Arc::new(Limits::default()),
             }),
             log,
         );
@@ -3028,9 +3077,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_credential_holds_its_event_streams_across_the_root_and_every_workspace_together() {
+    async fn a_credential_with_a_share_holds_its_event_streams_across_the_root_and_every_workspace_together() {
         let site = site(Vec::new()).await;
-        let bob = key_with(&site.app, None, None).await;
+        let bob = key_with(&site.app, None, Some(GB)).await;
         let (s, b) = send_as(
             &site.app,
             "",
@@ -3049,33 +3098,111 @@ mod tests {
         let open = |prefix: String| {
             let (app, bob) = (site.app.clone(), bob.clone());
             async move {
-                app.oneshot(
-                    Request::get(format!("{prefix}/events/stream"))
-                        .header("X-Api-Key", &bob)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
+                let res = app
+                    .oneshot(
+                        Request::get(format!("{prefix}/events/stream"))
+                            .header("X-Api-Key", &bob)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(res.status(), StatusCode::OK);
+                res.into_body().into_data_stream()
             }
         };
         let mut held = Vec::new();
         for n in 0..best_peer_door::streams::STREAMS_PER_CREDENTIAL {
-            let prefix = if n % 2 == 0 {
-                String::new()
-            } else {
-                format!("/workspaces/{ws}")
-            };
-            let res = open(prefix).await;
-            assert_eq!(res.status(), StatusCode::OK);
-            held.push(res);
+            held.push(
+                open(if n % 2 == 0 {
+                    String::new()
+                } else {
+                    format!("/workspaces/{ws}")
+                })
+                .await,
+            );
         }
-        let refused = open(format!("/workspaces/{ws}")).await;
-        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(body(refused).await["error"]["code"], "TOO_MANY_STREAMS");
-        assert_eq!(open(String::new()).await.status(), StatusCode::TOO_MANY_REQUESTS);
-        drop(held.pop());
-        assert_eq!(open(String::new()).await.status(), StatusCode::OK);
+        let _newest = open(format!("/workspaces/{ws}")).await;
+        let oldest = &mut held[0];
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(frame) = oldest.next().await {
+                frame.unwrap();
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "the root's oldest gave way to the workspace's newest");
+        assert_eq!(streams_per_credential(None).unwrap(), 4);
+        assert_eq!(streams_per_credential(Some(" 8 ")).unwrap(), 8);
+        assert!(streams_per_credential(Some("0")).unwrap_err().contains("1 or more"));
+        assert!(streams_per_credential(Some("many")).unwrap_err().contains("many"));
+    }
+
+    #[tokio::test]
+    async fn a_credential_with_a_share_is_paced_across_the_root_and_every_workspace_together() {
+        let site = site_pacing(Vec::new(), Pace::per_minute(2)).await;
+        let bob = key_with(&site.app, None, Some(GB)).await;
+        let send = |prefix: String, id: &'static str, r#type: &'static str, schema: &'static str, data: Value| {
+            let (app, bob) = (site.app.clone(), bob.clone());
+            async move { send_as(&app, &prefix, &bob, id, r#type, schema, data).await }
+        };
+        let (s, b) = send(
+            "".into(),
+            "w1",
+            "CreateWorkspace",
+            "create-workspace",
+            json!({ "name": "Bob's" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let ws = events_as(&site.app, "", &bob, "w1", "WorkspaceCreatedV1").await[0]["data"]["workspace"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let at_ws = format!("/workspaces/{ws}");
+        // A command its admission refuses gives back what it took.
+        let (s, b) = send(
+            at_ws.clone(),
+            "c0",
+            "ArchiveCloud",
+            "archive-cloud",
+            json!({ "cloud": "lab" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        let (s, b) = send(
+            "".into(),
+            "w2",
+            "CreateWorkspace",
+            "create-workspace",
+            json!({ "name": "Bob's other" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let (s, b) = send(at_ws, "c1", "ArchiveCloud", "archive-cloud", json!({ "cloud": "lab" })).await;
+        assert_eq!(
+            s,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the workspace counts what the root took: {b}"
+        );
+        assert_eq!(b["error"]["code"], "TOO_MANY_COMMANDS");
+        // The owner's key, approved with nothing said, is not paced.
+        for id in ["o1", "o2", "o3"] {
+            let (s, b) = send_as(
+                &site.app,
+                "",
+                &site.key,
+                id,
+                "CreateWorkspace",
+                "create-workspace",
+                json!({ "name": id }),
+            )
+            .await;
+            assert_eq!(s, StatusCode::CREATED, "{b}");
+        }
+        assert_eq!(commands_per_minute(None).unwrap(), 60);
+        assert_eq!(commands_per_minute(Some(" 120 ")).unwrap(), 120);
+        assert!(commands_per_minute(Some("0")).unwrap_err().contains("1 or more"));
+        assert!(commands_per_minute(Some("fast")).unwrap_err().contains("fast"));
     }
 
     #[tokio::test]

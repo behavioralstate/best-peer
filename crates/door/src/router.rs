@@ -356,13 +356,39 @@ async fn ingest(
             key: key.clone(),
         }
     };
+    // Counted once it is new and whole, for a credential with a share: a retry of an accepted command, or one
+    // refused before this or by its admission, costs nothing.
+    let paced = match sender.grant.memory_bytes {
+        Some(_) => match door.limits.pace.take(&sender.hash, std::time::Instant::now()) {
+            Ok(when) => Some(when),
+            Err(wait) => {
+                let per_minute = door.limits.pace.limit();
+                let mut refused = BestError::new(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "TOO_MANY_COMMANDS",
+                    format!(
+                        "this credential sent {per_minute} commands within the last sixty seconds, the most this door takes from a credential with a share: this one was not accepted; send it again in {wait} s"
+                    ),
+                )
+                .with_details(json!({ "per_minute": per_minute, "retry_after_seconds": wait }))
+                .into_response();
+                refused.headers_mut().insert(header::RETRY_AFTER, wait.into());
+                return Ok(refused);
+            }
+        },
+        None => None,
+    };
     if let Some(admit) = &def.admit {
-        admit(
+        let admitted = admit(
             envelope.clone(),
             sender.clone(),
             command_key(&sender.hash, &envelope.id),
         )
-        .await?;
+        .await;
+        if let (Err(_), Some(when)) = (&admitted, paced) {
+            door.limits.pace.give_back(&sender.hash, when);
+        }
+        admitted?;
     }
     let accepted = door
         .log
@@ -537,7 +563,9 @@ async fn list_events(
 }
 
 /// Replays what came after `Last-Event-ID`, then follows live; the two never overlap. A client that falls behind
-/// the buffer is cut off, so it reconnects with its last id and misses nothing silently.
+/// the buffer is cut off, so it reconnects with its last id and misses nothing silently. A credential with a share
+/// holds so many streams open across the door; one more ends its oldest, which reconnects with its last id if it is
+/// still there.
 async fn stream_events(
     State(door): State<Shared>,
     Extension(sender): Extension<Credential>,
@@ -545,7 +573,14 @@ async fn stream_events(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, BestError> {
     let filter = filter_from(&q)?;
-    let slot = door.streams.take(&sender.hash)?;
+    // A credential with a share holds so many streams at once; past that its oldest gives way to this one.
+    let (slot, gave_way) = match sender.grant.memory_bytes {
+        Some(_) => {
+            let (slot, ends) = door.limits.streams.take(&sender.hash);
+            (Some(slot), ends.map(|_| ()).boxed())
+        }
+        None => (None, futures::future::pending().boxed()),
+    };
     let last = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
@@ -571,7 +606,7 @@ async fn stream_events(
                 .filter(|s| s.seq > seen_up_to && filter.matches(s) && door2.visible_to(&sender, s));
             async move { keep }
         });
-    let out = replayed.chain(live).map(move |s| {
+    let out = replayed.chain(live).take_until(gave_way).map(move |s| {
         let _held = &slot;
         Ok(SseEvent::default()
             .id(s.envelope.id.clone())
@@ -697,6 +732,11 @@ mod tests {
 
     /// A door over `log` with the credentials of a previous door, when it is that door restarted.
     fn door_over_with(log: Arc<EventLog>, auth: Option<Arc<Auth>>) -> Shared {
+        door_built(log, auth, crate::Limits::default())
+    }
+
+    /// The same, holding credentials with a share to `limits`.
+    fn door_built(log: Arc<EventLog>, auth: Option<Arc<Auth>>, limits: crate::Limits) -> Shared {
         let catalogue = Catalogue::new()
             .command(CommandDef {
                 schema: "pull-image".into(),
@@ -756,7 +796,7 @@ mod tests {
         let auth = auth.unwrap_or_else(|| {
             Arc::new(Auth::ephemeral(EP, Box::new(FakeApprover { proof: "ok".into() })).with_scopes(&["deploy"]))
         });
-        Arc::new(Door::new(EP, "io.best.agents", "A test peer.", catalogue, log, auth))
+        Arc::new(Door::new(EP, "io.best.agents", "A test peer.", catalogue, log, auth).with_limits(Arc::new(limits)))
     }
 
     async fn call(app: &Router, req: Request) -> (StatusCode, HeaderMap, Value) {
@@ -798,6 +838,17 @@ mod tests {
 
     /// The same, approved for the scopes `may` names when given.
     async fn sign_in_with(app: &Router, client: &str, connection: &str, may: Option<&str>) -> String {
+        sign_in_holding(app, client, connection, may, None).await
+    }
+
+    /// The same, with a share of `memory` bytes when given.
+    async fn sign_in_holding(
+        app: &Router,
+        client: &str,
+        connection: &str,
+        may: Option<&str>,
+        memory: Option<&str>,
+    ) -> String {
         let (s, _, a) = call(
             app,
             post_form("/auth/device", &[("client_id", client), ("connection", connection)]),
@@ -807,6 +858,9 @@ mod tests {
         let mut fields = vec![("user_code", a["user_code"].as_str().unwrap()), ("proof", "ok")];
         if let Some(m) = may {
             fields.push(("may", m));
+        }
+        if let Some(m) = memory {
+            fields.push(("memory_bytes", m));
         }
         let (s, _, ok) = call(app, post_form("/auth/approve", &fields)).await;
         assert_eq!(s, StatusCode::OK);
@@ -942,42 +996,108 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_credential_holds_so_many_event_streams_open_and_a_closed_one_gives_its_place_back() {
-        let d = door();
+    async fn a_credential_sends_so_many_new_commands_a_minute_and_is_told_when_to_send_again() {
+        let d = door_built(
+            Arc::new(EventLog::ephemeral()),
+            None,
+            crate::Limits::new(crate::Pace::per_minute(3), crate::Streams::default()),
+        );
         let app = router(d.clone());
-        let key = sign_in(&app, "test", "my-peer").await;
-        let other = sign_in(&app, "other", "other-peer").await;
+        let key = sign_in_holding(&app, "test", "my-peer", None, Some("1024")).await;
+        let other = sign_in_holding(&app, "other", "other-peer", None, Some("1024")).await;
+        let owner = sign_in(&app, "owner", "owner-peer").await;
+        let send = |key: &str, c: Value| call(&app, post_json("/commands", key, "application/json", c));
+        // A command refused before it is whole costs nothing.
+        for id in ["bad-1", "bad-2"] {
+            let (s, _, b) = send(&key, command(id, json!(5))).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        }
+        for id in ["p1", "p2", "p3"] {
+            let (s, _, b) = send(&key, command(id, json!("ollama/ollama:0.6"))).await;
+            assert_eq!(s, StatusCode::CREATED, "{b}");
+        }
+        let (s, h, b) = send(&key, command("p4", json!("ollama/ollama:0.6"))).await;
+        assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{b}");
+        assert_eq!(b["error"]["code"], "TOO_MANY_COMMANDS");
+        assert_eq!(b["error"]["details"]["per_minute"], 3);
+        let wait = b["error"]["details"]["retry_after_seconds"].as_u64().unwrap();
+        assert!((1..=60).contains(&wait), "{b}");
+        assert_eq!(h[header::RETRY_AFTER].to_str().unwrap(), wait.to_string());
+        let message = b["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("was not accepted") && message.contains(&format!("again in {wait} s")),
+            "{message}"
+        );
+        // A retry of an accepted command is answered as it was, full minute or not.
+        let (s, _, b) = send(&key, command("p1", json!("ollama/ollama:0.6"))).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let (s, _, b) = send(&other, command("o1", json!("ollama/ollama:0.6"))).await;
+        assert_eq!(s, StatusCode::CREATED, "another credential has its own minute: {b}");
+        for i in 0..5 {
+            let (s, _, b) = send(&owner, command(&format!("w{i}"), json!("ollama/ollama:0.6"))).await;
+            assert_eq!(s, StatusCode::CREATED, "a credential without a share is not paced: {b}");
+        }
+    }
+
+    #[tokio::test]
+    async fn past_its_streams_a_credential_with_a_share_ends_its_oldest_and_a_dropped_client_gives_its_place_back() {
+        let d = door_built(
+            Arc::new(EventLog::ephemeral()),
+            None,
+            crate::Limits::new(crate::Pace::default(), crate::Streams::per_credential(2)),
+        );
+        let app = router(d.clone());
+        let key = sign_in_holding(&app, "test", "my-peer", None, Some("1024")).await;
+        let other = sign_in_holding(&app, "other", "other-peer", None, Some("1024")).await;
+        let owner = sign_in(&app, "owner", "owner-peer").await;
+        let hash = |k: &str| d.auth.authenticate(k).unwrap().hash;
         let open = |key: String| {
             let app = app.clone();
             async move {
-                app.oneshot(
-                    Request::get("/events/stream")
-                        .header(AUTH_HEADER, &key)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
+                let res = app
+                    .oneshot(
+                        Request::get("/events/stream")
+                            .header(AUTH_HEADER, &key)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(res.status(), StatusCode::OK);
+                res.into_body().into_data_stream()
             }
         };
-        let mut held = Vec::new();
-        for _ in 0..crate::streams::STREAMS_PER_CREDENTIAL {
-            let res = open(key.clone()).await;
-            assert_eq!(res.status(), StatusCode::OK);
-            held.push(res);
-        }
-        let refused = open(key.clone()).await;
-        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
-        let b: Value = serde_json::from_slice(&refused.into_body().collect().await.unwrap().to_bytes()).unwrap();
-        assert_eq!(b["error"]["code"], "TOO_MANY_STREAMS");
-        assert_eq!(b["error"]["details"]["streams"], crate::streams::STREAMS_PER_CREDENTIAL);
+        let mut oldest = open(key.clone()).await;
+        let second = open(key.clone()).await;
+        assert_eq!(d.limits.streams.held(&hash(&key)), 2);
+        let third = open(key.clone()).await;
+        assert_eq!(d.limits.streams.held(&hash(&key)), 2, "never more than the figure");
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(frame) = oldest.next().await {
+                frame.unwrap();
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "the oldest gave way to the newest");
+        let _theirs = open(other.clone()).await;
         assert_eq!(
-            open(other.clone()).await.status(),
-            StatusCode::OK,
+            d.limits.streams.held(&hash(&other)),
+            1,
             "another credential's streams are its own"
         );
-        drop(held.pop());
-        assert_eq!(open(key.clone()).await.status(), StatusCode::OK);
+        let mut owners = Vec::new();
+        for _ in 0..3 {
+            owners.push(open(owner.clone()).await);
+        }
+        assert_eq!(
+            d.limits.streams.held(&hash(&owner)),
+            0,
+            "a credential without a share is not counted"
+        );
+        // A client that goes away gives its place back once its stream is dropped.
+        drop(second);
+        drop(third);
+        assert_eq!(d.limits.streams.held(&hash(&key)), 0);
     }
 
     #[tokio::test]

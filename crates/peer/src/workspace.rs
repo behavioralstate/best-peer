@@ -22,7 +22,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Json, Router};
 use best_peer_door::auth::Credential;
-use best_peer_door::{Auth, BestError, Door, Emitter, Envelope, EventLog, Partition, Stored, Streams};
+use best_peer_door::{Auth, BestError, Door, Emitter, Envelope, EventLog, Limits, Partition, Stored};
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -53,8 +53,8 @@ pub struct Context {
     pub transport: Arc<dyn Transport>,
     /// What a credential holds across the door, for its share.
     pub holdings: Arc<Holdings>,
-    /// The event streams each credential holds open, counted across the root and every workspace.
-    pub streams: Arc<Streams>,
+    /// What a credential with a share may do at once, counted across the root and every workspace.
+    pub limits: Arc<Limits>,
 }
 
 impl Context {
@@ -641,7 +641,7 @@ impl Workspace {
                 ctx.auth.clone(),
             )
             .with_partition(Workspaces::workspace_partition())
-            .with_streams(ctx.streams.clone()),
+            .with_limits(ctx.limits.clone()),
         );
         let router = best_peer_door::tenant_router(door.clone());
         let _ = me.door.set(door);
