@@ -206,6 +206,21 @@ fn accelerator(kind: Option<&str>) -> Result<Arc<dyn Gpu>, String> {
     }
 }
 
+/// The store of models every engine sees read-only, from `BEST_PEER_MODEL_STORE`: a directory on the container
+/// engine's host, in that host's own form, so the peer leaves the path to the engine, which refuses one that is not
+/// there. Only containers mount it: under `native` or `fake` the store would be ignored, so it is refused.
+pub fn model_store(text: Option<&str>, runtime: Option<&str>) -> Result<Option<String>, String> {
+    let Some(store) = text.map(str::trim).filter(|t| !t.is_empty()) else {
+        return Ok(None);
+    };
+    match runtime.map(str::trim) {
+        None | Some("docker") => Ok(Some(store.to_string())),
+        Some(other) => Err(format!(
+            "BEST_PEER_MODEL_STORE is set with BEST_PEER_RUNTIME={other}, which mounts nothing: the store serves engines in containers, so unset it or run with BEST_PEER_RUNTIME=docker"
+        )),
+    }
+}
+
 /// The container engine and the inference engine's client, by `BEST_PEER_RUNTIME`: `docker` (the default) talks to
 /// the Docker Engine on this host and refuses to start when it cannot; `native` deploys to engines already running
 /// on this host outside any container (an installed Ollama), with no jobs; `fake` serves the whole surface against
@@ -328,6 +343,11 @@ async fn peer_app(endpoint: &str, dir: &std::path::Path, log: Arc<EventLog>, aut
     let images = Images {
         ollama: std::env::var("BEST_PEER_OLLAMA_IMAGE").ok(),
         vllm: std::env::var("BEST_PEER_VLLM_IMAGE").ok(),
+        model_store: model_store(
+            std::env::var("BEST_PEER_MODEL_STORE").ok().as_deref(),
+            std::env::var("BEST_PEER_RUNTIME").ok().as_deref(),
+        )
+        .unwrap_or_else(|why| fail(&why)),
     };
     let seconds = |name: &str, default: u64| {
         Duration::from_secs(std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default))
@@ -625,6 +645,19 @@ mod tests {
         engine_host: &str,
         auth: Option<Arc<Auth>>,
     ) -> Bed {
+        bed_imaging(gpu, log, runtime, engine, engine_host, auth, Images::default()).await
+    }
+
+    /// The same, with the operator's say over the engines.
+    async fn bed_imaging(
+        gpu: Arc<best_peer_gpu::Fake>,
+        log: Arc<EventLog>,
+        runtime: Arc<best_peer_runtime::Fake>,
+        engine: Arc<best_peer_engine::Fake>,
+        engine_host: &str,
+        auth: Option<Arc<Auth>>,
+        images: Images,
+    ) -> Bed {
         for image in ["ollama/ollama", "vllm/vllm-openai", "busybox", "ollama/ollama:0.6"] {
             runtime.registry_has(best_peer_runtime::ImageRef(image.into()));
         }
@@ -636,7 +669,7 @@ mod tests {
             runtime.clone(),
             engine.clone(),
             log.clone(),
-            Images::default(),
+            images,
             Patience {
                 ready: Duration::from_secs(1),
                 load: Duration::from_secs(1),
@@ -3352,6 +3385,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_store_of_models_is_mounted_read_only_into_every_engine_and_nothing_is_pulled() {
+        let images = Images {
+            model_store: Some("/srv/models".into()),
+            ..Images::default()
+        };
+        let bed = bed_imaging(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+            Arc::new(best_peer_engine::Fake::new()),
+            "engines.local",
+            None,
+            images,
+        )
+        .await;
+        let dep = bed.deployed("d1", "llama3.2:3b", 8).await;
+        let spec = bed.runtime.spec_of(&bed.container_of(&dep)).unwrap();
+        assert_eq!(
+            spec.mounts,
+            vec![best_peer_runtime::Mount {
+                host: "/srv/models".into(),
+                container: best_peer_engine::STORE_PATH.into(),
+                read_only: true
+            }]
+        );
+        assert!(
+            spec.env
+                .contains(&("OLLAMA_MODELS".into(), best_peer_engine::STORE_PATH.into())),
+            "the engine is pointed at the store: {:?}",
+            spec.env
+        );
+        let ready = bed.events_of("d1", "DeploymentReady").await;
+        let port = ready.iter().find(|e| e.r#type == "DeploymentStarted").unwrap().data["port"]
+            .as_u64()
+            .unwrap();
+        let base = format!("http://engines.local:{port}");
+        assert_eq!(bed.engine.loaded_at(&base), vec!["llama3.2:3b"]);
+        assert!(bed.engine.pulled_at(&base).is_empty(), "a store is never pulled into");
+        // A vLLM engine is pointed at the store too, and kept off the network.
+        let (s, b) = bed
+            .send(
+                "v1",
+                "DeployModel",
+                "deploy-model",
+                json!({ "model": "Qwen/Qwen2.5-0.5B", "engine": "vllm", "memory_bytes": GB }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let v = bed.events_of("v1", "DeploymentReady").await;
+        let vdep = v.last().unwrap().data["deployment"].as_str().unwrap().to_string();
+        let vspec = bed.runtime.spec_of(&bed.container_of(&vdep)).unwrap();
+        assert!(
+            vspec.env.contains(&("HF_HUB_OFFLINE".into(), "1".into())),
+            "{:?}",
+            vspec.env
+        );
+        assert_eq!(vspec.mounts.len(), 1);
+        // A model the store lacks fails at once, and the fix says where it was looked for.
+        bed.engine.missing("nobody/none:1b");
+        let (s, _) = bed.deploy("d2", "nobody/none:1b", "ollama", 1).await;
+        assert_eq!(s, StatusCode::CREATED);
+        let failed = bed.events_of("d2", "DeploymentFailed").await;
+        let why = &failed.last().unwrap().data;
+        assert!(why["fix"].as_str().unwrap().contains("the store /srv/models"), "{why}");
+        // A job shares nothing of it.
+        let (s, _) = bed.send("j1", "RunJob", "run-job", json!({ "image": "busybox" })).await;
+        assert_eq!(s, StatusCode::CREATED);
+        let started = bed.events_of("j1", "JobStarted").await;
+        let container = ContainerId(started.last().unwrap().data["container"].as_str().unwrap().into());
+        assert!(bed.runtime.spec_of(&container).unwrap().mounts.is_empty());
+        // The path is the container engine's host's, in its own form: the peer does not judge it, on any OS.
+        assert_eq!(model_store(None, None).unwrap(), None);
+        assert_eq!(model_store(Some(" "), None).unwrap(), None);
+        for path in ["/srv/models", "D:\\models", "models"] {
+            assert_eq!(model_store(Some(path), Some("docker")).unwrap().as_deref(), Some(path));
+        }
+        for runtime in ["native", "fake"] {
+            let refused = model_store(Some("/srv/models"), Some(runtime)).unwrap_err();
+            assert!(refused.contains(&format!("BEST_PEER_RUNTIME={runtime}")), "{refused}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_deploy_that_fails_tells_why_and_what_to_do_and_leaves_nothing_running() {
         let bed = fresh().await;
         bed.engine.missing("nobody/none:1b");
@@ -3371,6 +3487,10 @@ mod tests {
         let failed = &events[4].data;
         assert!(failed["reason"].as_str().unwrap().contains("nobody/none:1b"));
         assert!(failed["fix"].as_str().unwrap().contains("check the name"));
+        assert!(
+            !failed["fix"].as_str().unwrap().contains("store"),
+            "a peer with no store says nothing of one"
+        );
         assert!(
             bed.runtime.running().await.unwrap().is_empty(),
             "the container is stopped"

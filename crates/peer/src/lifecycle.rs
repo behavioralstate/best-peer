@@ -13,9 +13,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use best_peer_door::auth::{holder_of_hash, Credential};
 use best_peer_door::{BestError, Emitter, Envelope, EventLog};
-use best_peer_engine::{Engine, EngineError, Kind, Message, Options};
+use best_peer_engine::{Engine, EngineError, Kind, Message, Options, Source};
 use best_peer_gpu::{Compute, DeviceId, Gpu, Host};
-use best_peer_runtime::{ContainerId, Event as RuntimeEvent, Runtime, RuntimeError, Spec};
+use best_peer_runtime::{ContainerId, Event as RuntimeEvent, Mount, Runtime, RuntimeError, Spec};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, Semaphore};
@@ -24,11 +24,14 @@ use crate::domain::Service;
 use crate::holdings::Holdings;
 use crate::state::{JobPhase, Owner, Phase, Reservation, State};
 
-/// The operator's overrides for the engines' images (a pinned tag, a mirror); none means the engine's default.
+/// The operator's say over the engines: their images (a pinned tag, a mirror; none means the engine's default), and
+/// a store of models on the container engine's host that every engine sees read-only (`BEST_PEER_MODEL_STORE`), so
+/// a model put there once serves every deployment and nothing is pulled.
 #[derive(Clone, Debug, Default)]
 pub struct Images {
     pub ollama: Option<String>,
     pub vllm: Option<String>,
+    pub model_store: Option<String>,
 }
 
 impl Images {
@@ -353,6 +356,14 @@ impl Peer {
             .map_err(|e| BestError::internal(format!("the accelerator library failed: {e}")))
     }
 
+    /// Where a model comes from: the store when the operator shares one, the engine's registry otherwise.
+    fn source(&self) -> Source {
+        match self.images.model_store {
+            Some(_) => Source::Store,
+            None => Source::Registry,
+        }
+    }
+
     /// The base URL the peer itself reaches an engine at.
     fn engine_base(&self, port: u16) -> String {
         format!("http://{}:{port}", self.engine_host)
@@ -420,7 +431,7 @@ impl Peer {
             Ok(Err(e)) => self.tell(
                 &em,
                 "PromptFailed",
-                json!({ "deployment": d.id, "reason": e.to_string(), "fix": fix_for_engine(&e) }),
+                json!({ "deployment": d.id, "reason": e.to_string(), "fix": fix_for_engine(&e, self.images.model_store.as_deref()) }),
             ),
             Err(_) => self.tell(
                 &em,
@@ -507,9 +518,18 @@ impl Peer {
             );
             return;
         };
-        let recipe = data
+        let mut recipe = data
             .engine
             .recipe(&data.model, &compute, self.images.for_engine(data.engine));
+        let mut mounts = Vec::new();
+        if let Some(store) = &self.images.model_store {
+            recipe.env.extend(recipe.store.env.iter().cloned());
+            mounts.push(Mount {
+                host: store.clone(),
+                container: recipe.store.path.clone(),
+                read_only: true,
+            });
+        }
         let image = recipe.image.clone();
         if let Err(e) = self.pull(&em, &image).await {
             self.fail_deployment(
@@ -534,6 +554,7 @@ impl Peer {
                 vec![device.clone()]
             },
             ports: vec![recipe.port],
+            mounts,
         };
         let started = match self.runtime.start(spec).await {
             Ok(s) => s,
@@ -597,7 +618,8 @@ impl Peer {
             self.engine.ready(data.engine, &base, self.patience.ready).await?;
             let loaded = tokio::time::timeout(
                 self.patience.load,
-                self.engine.load(data.engine, &base, &data.model, loading.clone()),
+                self.engine
+                    .load(data.engine, &base, &data.model, self.source(), loading.clone()),
             )
             .await
             .unwrap_or_else(|_| {
@@ -628,7 +650,7 @@ impl Peer {
                     &id,
                     &data.model,
                     &e.to_string(),
-                    fix_for_engine(&e),
+                    &fix_for_engine(&e, self.images.model_store.as_deref()),
                     Stage::AfterStart,
                 )
                 .await
@@ -861,6 +883,7 @@ impl Peer {
             env: vec![],
             devices,
             ports: vec![],
+            mounts: vec![],
         };
         match self.runtime.start(spec).await {
             Ok(started) => {
@@ -1434,11 +1457,22 @@ fn fix_for_runtime(e: &RuntimeError) -> &'static str {
     }
 }
 
-fn fix_for_engine(e: &EngineError) -> &'static str {
-    match e {
-        EngineError::NotReady { .. } => "the engine did not come up in time: read its container's logs on the host",
-        EngineError::ModelNotFound(_) => "the engine's library has no model by that name: check the name",
-        EngineError::Engine(_) => "read the engine's logs on the host",
+/// What to do about an engine's refusal; a peer serving from a store says where the model was looked for.
+fn fix_for_engine(e: &EngineError, store: Option<&str>) -> String {
+    match (e, store) {
+        (EngineError::NotReady { .. }, None) => {
+            "the engine did not come up in time: read its container's logs on the host".into()
+        }
+        (EngineError::NotReady { .. }, Some(_)) => {
+            "the engine did not come up in time: read its container's logs on the host; vLLM serving from the store stops at once when the model is not in it".into()
+        }
+        (EngineError::ModelNotFound(_), None) => {
+            "the engine's library has no model by that name: check the name".into()
+        }
+        (EngineError::ModelNotFound(_), Some(store)) => format!(
+            "this peer serves models from the store {store} and pulls none: check the name, or ask the operator to put the model in the store"
+        ),
+        (EngineError::Engine(_), _) => "read the engine's logs on the host".into(),
     }
 }
 

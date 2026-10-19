@@ -32,6 +32,17 @@ pub struct Spec {
     pub devices: Vec<DeviceId>,
     /// Container ports to publish; the adapter reports the host side in [`Event::Started`].
     pub ports: Vec<u16>,
+    /// Directories of the container engine's host the container sees, where the operator shares one.
+    pub mounts: Vec<Mount>,
+}
+
+/// A directory of the container engine's host at a path in the container. The path is the engine host's, in its
+/// own form; a directory that is not there is refused by the engine, never made.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mount {
+    pub host: String,
+    pub container: String,
+    pub read_only: bool,
 }
 
 /// A published port: the container's and the host's.
@@ -286,6 +297,7 @@ mod tests {
             env: vec![],
             devices: vec![device.into()],
             ports: vec![11434],
+            mounts: vec![],
         }
     }
 

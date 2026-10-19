@@ -1,13 +1,16 @@
 //! [`Runtime`] over the Docker Engine API through bollard. Every container this adapter creates carries the label
-//! `best-peer`, so `running` and the event feed see the peer's containers and nothing else. A device is handed over
-//! by the NVIDIA container toolkit when its id is an NVML UUID (`GPU-...`); other accelerators wait for their own
-//! adapter. Containers are removed by the engine when they exit. Thin; proven on a host by hand, never unit-tested.
+//! `best-peer`, so `running` and the event feed see the peer's containers and nothing else. A device is handed over by
+//! the NVIDIA container toolkit when its id is an NVML UUID (`GPU-...`); other accelerators wait for their own adapter.
+//! A mount is a bind the engine refuses when its source is not there. Containers are removed by the engine when they
+//! exit. Thin; proven on a host by hand, never unit-tested.
 
 use std::collections::HashMap;
 
 use async_trait::async_trait;
 use best_peer_runtime::{ContainerId, Event, ImageRef, Progress, Published, Runtime, RuntimeError, Spec, Started};
-use bollard::models::{ContainerCreateBody, DeviceRequest, EventMessageTypeEnum, HostConfig, PortBinding};
+use bollard::models::{
+    ContainerCreateBody, DeviceRequest, EventMessageTypeEnum, HostConfig, Mount, MountType, PortBinding,
+};
 use bollard::query_parameters::{
     CreateImageOptionsBuilder, EventsOptionsBuilder, ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
     StopContainerOptionsBuilder,
@@ -184,6 +187,20 @@ impl Runtime for DockerRuntime {
                 auto_remove: Some(true),
                 port_bindings: Some(port_bindings),
                 device_requests: (!device_requests.is_empty()).then_some(device_requests),
+                // A bind as a mount, not a `-v` string: the engine refuses a source that is not there instead of
+                // making an empty one, and reads the path as its own host's.
+                mounts: (!spec.mounts.is_empty()).then(|| {
+                    spec.mounts
+                        .iter()
+                        .map(|m| Mount {
+                            target: Some(m.container.clone()),
+                            source: Some(m.host.clone()),
+                            typ: Some(MountType::BIND),
+                            read_only: Some(m.read_only),
+                            ..Default::default()
+                        })
+                        .collect()
+                }),
                 ..Default::default()
             }),
             ..Default::default()
@@ -192,7 +209,16 @@ impl Runtime for DockerRuntime {
             bollard::errors::Error::DockerResponseServerError { status_code: 404, .. } => {
                 RuntimeError::ImageNotFound(spec.image.0.clone())
             }
-            other => RuntimeError::Engine(other.to_string()),
+            other => {
+                let said = other.to_string();
+                match spec.mounts.iter().find(|m| said.contains(&m.host)) {
+                    Some(m) => RuntimeError::Engine(format!(
+                        "the container engine cannot mount {} at {}: {said}; it must be a directory on the container engine's host",
+                        m.host, m.container
+                    )),
+                    None => RuntimeError::Engine(said),
+                }
+            }
         })?;
         let id = ContainerId(created.id);
         if let Err(e) = self.docker.start_container(&id.0, None).await {

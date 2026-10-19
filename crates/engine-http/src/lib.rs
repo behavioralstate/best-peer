@@ -1,5 +1,6 @@
 //! [`Engine`] over the engines' own HTTP APIs. Ollama: `GET /` says it is up, `POST /api/pull` streams a model into
-//! its library with progress. vLLM: `GET /health` answers once the model it was started with is loaded, and
+//! its library with progress, and a model in a store it sees is checked with `POST /api/show` and loaded with
+//! `POST /api/generate`. vLLM: `GET /health` answers once the model it was started with is loaded, and
 //! `GET /v1/models` lists it. Every call is blocking I/O on a worker thread, never on the door's workers. Thin;
 //! proven on a host by hand, never unit-tested.
 
@@ -7,7 +8,7 @@ use std::io::BufRead;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use best_peer_engine::{Answer, Engine, EngineError, Kind, Message, Options, Progress};
+use best_peer_engine::{Answer, Engine, EngineError, Kind, Message, Options, Progress, Source};
 
 #[derive(Clone)]
 pub struct HttpEngine {
@@ -86,6 +87,48 @@ impl HttpEngine {
         } else {
             Err(EngineError::Engine("the pull ended without success".into()))
         }
+    }
+
+    /// A model in a store Ollama sees is served without the registry: `POST /api/show` says whether it is there (404
+    /// says not), and `POST /api/generate` with no prompt loads it into memory. The load is given as long as the
+    /// caller waits for it, not the minute the shared agent gives a first byte, since a large model on a slow disk
+    /// answers only once it is in memory.
+    fn serve_ollama(&self, base: &str, model: &str, progress: &Progress) -> Result<(), EngineError> {
+        self.agent
+            .post(format!("{base}/api/show"))
+            .config()
+            .timeout_global(Some(Duration::from_secs(30)))
+            .build()
+            .send_json(serde_json::json!({ "model": model }))
+            .map_err(|e| match e {
+                ureq::Error::StatusCode(404) => EngineError::ModelNotFound(model.into()),
+                other => EngineError::Engine(other.to_string()),
+            })?;
+        progress(Some(0));
+        let config = ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_secs(5)))
+            .timeout_recv_response(None)
+            .timeout_global(None)
+            .http_status_as_error(false)
+            .build();
+        let mut res = ureq::Agent::new_with_config(config)
+            .post(format!("{base}/api/generate"))
+            .send_json(serde_json::json!({ "model": model, "stream": false }))
+            .map_err(|e| EngineError::Engine(format!("the model is in the store but did not load: {e}")))?;
+        if res.status().as_u16() != 200 {
+            let text = res.body_mut().read_to_string().unwrap_or_default();
+            let said = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| v["error"].as_str().map(str::to_string))
+                .unwrap_or(text);
+            return Err(EngineError::Engine(if said.contains("does not support generate") {
+                format!("{model} does not answer conversations (an embedding model?): a deployment is prompted with a conversation, so deploy a model that chats")
+            } else {
+                format!("the model is in the store but did not load: {said}")
+            }));
+        }
+        progress(Some(100));
+        Ok(())
     }
 
     /// `POST /api/generate` with `keep_alive: 0` makes Ollama drop the model from memory.
@@ -230,12 +273,20 @@ impl Engine for HttpEngine {
         }
     }
 
-    async fn load(&self, kind: Kind, base: &str, model: &str, progress: Progress) -> Result<(), EngineError> {
+    async fn load(
+        &self,
+        kind: Kind,
+        base: &str,
+        model: &str,
+        source: Source,
+        progress: Progress,
+    ) -> Result<(), EngineError> {
         let me = self.clone();
         let (base, model) = (base.to_string(), model.to_string());
-        tokio::task::spawn_blocking(move || match kind {
-            Kind::Ollama => me.pull_ollama(&base, &model, &progress),
-            Kind::Vllm => me.served_by_vllm(&base, &model),
+        tokio::task::spawn_blocking(move || match (kind, source) {
+            (Kind::Ollama, Source::Registry) => me.pull_ollama(&base, &model, &progress),
+            (Kind::Ollama, Source::Store) => me.serve_ollama(&base, &model, &progress),
+            (Kind::Vllm, _) => me.served_by_vllm(&base, &model),
         })
         .await
         .map_err(|e| EngineError::Engine(format!("the load did not complete: {e}")))?
