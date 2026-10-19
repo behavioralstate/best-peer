@@ -1,13 +1,20 @@
 //! [`Runtime`] over the Docker Engine API through bollard. Every container this adapter creates carries the label
 //! `best-peer`, so `running` and the event feed see the peer's containers and nothing else. A device is handed over
 //! by the NVIDIA container toolkit when its id is an NVML UUID (`GPU-...`); other accelerators wait for their own
-//! adapter. Containers are removed by the engine when they exit. Thin; proven on a host by hand, never unit-tested.
+//! adapter. A mount is a bind the engine refuses when its source is not there. A container is confined as its spec
+//! says, in the engine's own words: capabilities dropped, no new privileges, a read-only root with a private `/tmp`,
+//! ceilings on processes and on memory with swap counted in, and its network. Containers are removed by the engine
+//! when they exit. Thin; proven on a host by hand, never unit-tested.
 
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use best_peer_runtime::{ContainerId, Event, ImageRef, Progress, Published, Runtime, RuntimeError, Spec, Started};
-use bollard::models::{ContainerCreateBody, DeviceRequest, EventMessageTypeEnum, HostConfig, PortBinding};
+use best_peer_runtime::{
+    ContainerId, Event, ImageRef, Network, Progress, Published, Runtime, RuntimeError, Spec, Started,
+};
+use bollard::models::{
+    ContainerCreateBody, DeviceRequest, EventMessageTypeEnum, HostConfig, Mount, MountType, PortBinding,
+};
 use bollard::query_parameters::{
     CreateImageOptionsBuilder, EventsOptionsBuilder, ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
     StopContainerOptionsBuilder,
@@ -93,13 +100,20 @@ impl DockerRuntime {
 }
 
 /// `name:tag` as the engine wants them apart; a reference without a tag means `latest`. A port in the registry's
-/// host is not a tag.
-fn name_and_tag(image: &ImageRef) -> (String, String) {
+/// host is not a tag. A reference pinned by digest (`name:tag@sha256:...`) is handed over whole, with no tag: the
+/// digest is the name.
+fn name_and_tag(image: &ImageRef) -> (String, Option<String>) {
     let r = &image.0;
+    if r.contains('@') {
+        return (r.clone(), None);
+    }
     let after_slash = r.rfind('/').map(|i| i + 1).unwrap_or(0);
     match r[after_slash..].rfind(':') {
-        Some(i) => (r[..after_slash + i].to_string(), r[after_slash + i + 1..].to_string()),
-        None => (r.clone(), "latest".into()),
+        Some(i) => (
+            r[..after_slash + i].to_string(),
+            Some(r[after_slash + i + 1..].to_string()),
+        ),
+        None => (r.clone(), Some("latest".into())),
     }
 }
 
@@ -116,8 +130,11 @@ fn image_error(image: &ImageRef, message: &str) -> RuntimeError {
 impl Runtime for DockerRuntime {
     async fn pull(&self, image: &ImageRef, progress: Progress) -> Result<(), RuntimeError> {
         let (name, tag) = name_and_tag(image);
-        let options = CreateImageOptionsBuilder::new().from_image(&name).tag(&tag).build();
-        let mut stream = self.docker.create_image(Some(options), None, None);
+        let mut options = CreateImageOptionsBuilder::new().from_image(&name);
+        if let Some(tag) = &tag {
+            options = options.tag(tag);
+        }
+        let mut stream = self.docker.create_image(Some(options.build()), None, None);
         // Progress across every layer, not per layer: the engine reports each layer's own bytes.
         let mut layers: HashMap<String, (i64, i64)> = HashMap::new();
         let mut last: Option<u8> = None;
@@ -143,6 +160,17 @@ impl Runtime for DockerRuntime {
             }
         }
         Ok(())
+    }
+
+    async fn holds(&self, image: &ImageRef) -> Result<bool, RuntimeError> {
+        match self.docker.inspect_image(&image.0).await {
+            Ok(_) => Ok(true),
+            Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => Ok(false),
+            Err(e) => Err(RuntimeError::Engine(format!(
+                "the container engine cannot say whether it holds {}: {e}",
+                image.0
+            ))),
+        }
     }
 
     async fn start(&self, spec: Spec) -> Result<Started, RuntimeError> {
@@ -174,6 +202,7 @@ impl Runtime for DockerRuntime {
                 )
             })
             .collect();
+        let confinement = &spec.confinement;
         let body = ContainerCreateBody {
             image: Some(spec.image.0.clone()),
             cmd: (!spec.args.is_empty()).then(|| spec.args.clone()),
@@ -184,6 +213,36 @@ impl Runtime for DockerRuntime {
                 auto_remove: Some(true),
                 port_bindings: Some(port_bindings),
                 device_requests: (!device_requests.is_empty()).then_some(device_requests),
+                // A bind as a mount, not a `-v` string: the engine refuses a source that is not there instead of
+                // making an empty one, and reads the path as its own host's.
+                mounts: (!spec.mounts.is_empty()).then(|| {
+                    spec.mounts
+                        .iter()
+                        .map(|m| Mount {
+                            target: Some(m.container.clone()),
+                            source: Some(m.host.clone()),
+                            typ: Some(MountType::BIND),
+                            read_only: Some(m.read_only),
+                            ..Default::default()
+                        })
+                        .collect()
+                }),
+                cap_drop: confinement.drop_capabilities.then(|| vec!["ALL".into()]),
+                security_opt: confinement.no_new_privileges.then(|| vec!["no-new-privileges".into()]),
+                readonly_rootfs: Some(confinement.read_only_root),
+                tmpfs: confinement
+                    .read_only_root
+                    .then(|| HashMap::from([("/tmp".to_string(), "rw,nosuid,nodev,size=1g".to_string())])),
+                pids_limit: confinement.pids.map(|p| p as i64),
+                // One ceiling for memory and swap together: a ceiling that swap can exceed is none.
+                memory: confinement.memory_bytes.map(|m| m as i64),
+                memory_swap: confinement.memory_bytes.map(|m| m as i64),
+                network_mode: match &confinement.network {
+                    Network::None => Some("none".into()),
+                    Network::Default => None,
+                },
+                // An init as PID 1 reaps and forwards signals, so a stop reaches an image that did not expect to be it.
+                init: Some(true),
                 ..Default::default()
             }),
             ..Default::default()
@@ -192,7 +251,19 @@ impl Runtime for DockerRuntime {
             bollard::errors::Error::DockerResponseServerError { status_code: 404, .. } => {
                 RuntimeError::ImageNotFound(spec.image.0.clone())
             }
-            other => RuntimeError::Engine(other.to_string()),
+            other => {
+                let said = other.to_string();
+                match spec.mounts.iter().find(|m| said.contains(&m.host)) {
+                    Some(m) => {
+                        tracing::warn!(host = %m.host, container = %m.container, error = %said, "the container engine cannot mount a directory of this host");
+                        RuntimeError::Engine(format!(
+                            "the container engine cannot mount the operator's directory at {}: whoever runs the peer reads why in its log",
+                            m.container
+                        ))
+                    }
+                    None => RuntimeError::Engine(said),
+                }
+            }
         })?;
         let id = ContainerId(created.id);
         if let Err(e) = self.docker.start_container(&id.0, None).await {

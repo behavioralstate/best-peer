@@ -22,7 +22,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Json, Router};
 use best_peer_door::auth::Credential;
-use best_peer_door::{Auth, BestError, Door, Emitter, Envelope, EventLog, Partition, Stored};
+use best_peer_door::{Auth, BestError, Door, Emitter, Envelope, EventLog, Limits, Partition, Stored};
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -34,7 +34,7 @@ use crate::domain::{
 };
 use crate::holdings::Holdings;
 use crate::lifecycle::{list, new_id, require};
-use crate::transport::Transport;
+use crate::transport::{Cleartext, Transport};
 
 /// Where the workspaces' doors are under the root: `/workspaces/<id>`.
 pub const PREFIX: &str = "/workspaces/";
@@ -53,6 +53,10 @@ pub struct Context {
     pub transport: Arc<dyn Transport>,
     /// What a credential holds across the door, for its share.
     pub holdings: Arc<Holdings>,
+    /// Where a cloud may reach a member in cleartext: on loopback alone, unless the operator said a VPN carries it.
+    pub cleartext: Cleartext,
+    /// What a credential with a share may do at once, counted across the root and every workspace.
+    pub limits: Arc<Limits>,
 }
 
 impl Context {
@@ -142,6 +146,20 @@ impl Workspaces {
 
     pub fn get(&self, id: &str) -> Option<Arc<Workspace>> {
         self.live.lock().unwrap().get(id).cloned()
+    }
+
+    /// The members of a live cloud whose recorded endpoint this peer's cleartext rule refuses, as
+    /// `(workspace, cloud, peer, endpoint)`: recorded before the rule, or while `BEST_PEER_CLEARTEXT=vpn` was set.
+    pub fn cleartext_members(&self) -> Vec<(String, String, String, String)> {
+        let mut out = Vec::new();
+        for ws in self.all() {
+            for (cloud, r) in ws.clouds.lock().unwrap().iter().filter(|(_, r)| !r.archived) {
+                for (peer, endpoint) in r.members.iter().filter(|(_, e)| !self.ctx.cleartext.allows(e)) {
+                    out.push((ws.id.clone(), cloud.clone(), peer.clone(), endpoint.clone()));
+                }
+            }
+        }
+        out
     }
 
     /// Follows every cloud's members, and from here on a workspace or a cloud made later starts at once.
@@ -329,6 +347,7 @@ async fn dispatch(
     let Some(who) = (!key.is_empty()).then(|| reg.ctx.auth.authenticate(key)).flatten() else {
         return BestError::unauthorized().into_response();
     };
+    best_peer_door::router::Answered::record(&req, &who);
     let ws = reg.get(&id).filter(|ws| ws.is_member(&who.holder()));
     let Some(ws) = ws else {
         return BestError::not_found(
@@ -638,7 +657,8 @@ impl Workspace {
                 log,
                 ctx.auth.clone(),
             )
-            .with_partition(Workspaces::workspace_partition()),
+            .with_partition(Workspaces::workspace_partition())
+            .with_limits(ctx.limits.clone()),
         );
         let router = best_peer_door::tenant_router(door.clone());
         let _ = me.door.set(door);
@@ -902,6 +922,16 @@ impl Clouds for Workspace {
                     format!("peer {} is listed twice: give each member its own name", m.peer),
                 )
                 .with_details(json!({ "peer": m.peer })));
+            }
+            if !self.ctx.cleartext.allows(&endpoint) {
+                return Err(BestError::bad_request(
+                    "CLEARTEXT_MEMBER",
+                    format!(
+                        "endpoint {endpoint} is cleartext off loopback: the cloud's credential would travel unencrypted to peer {}; name it by its https:// endpoint, as its manifest advertises it, or have this door's operator set BEST_PEER_CLEARTEXT=vpn when a VPN carries it",
+                        m.peer
+                    ),
+                )
+                .with_details(json!({ "field": "members", "peer": m.peer, "endpoint": endpoint })));
             }
             if !seen_endpoints.insert(endpoint.clone()) {
                 return Err(BestError::bad_request(

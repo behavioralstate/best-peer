@@ -32,6 +32,76 @@ pub struct Spec {
     pub devices: Vec<DeviceId>,
     /// Container ports to publish; the adapter reports the host side in [`Event::Started`].
     pub ports: Vec<u16>,
+    /// Directories of the container engine's host the container sees, where the operator shares one.
+    pub mounts: Vec<Mount>,
+    /// What the container may not do on the host, and how much of the host it may take.
+    pub confinement: Confinement,
+}
+
+/// How a container is confined: what it may not do on the host, and how much of the host it may take. A peer runs
+/// code it did not write, so the default is a closed box, what a job gets; an engine serving a model gets
+/// [`Confinement::serving`]. The adapter maps each to the engine's own words.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Confinement {
+    /// No Linux capability: nothing inside may mount, trace, change ownership or bind a low port.
+    pub drop_capabilities: bool,
+    /// No setuid binary or file capability gains a privilege the container did not start with.
+    pub no_new_privileges: bool,
+    /// The image's filesystem is read-only, with a private `/tmp` of at most 1 GiB, counted in its memory.
+    pub read_only_root: bool,
+    /// The most tasks the container may hold, every thread counted as one; none for the engine's own default.
+    pub pids: Option<u64>,
+    /// The most host memory the container may hold, swap counted in; none for no ceiling. Not device memory.
+    pub memory_bytes: Option<u64>,
+    pub network: Network,
+}
+
+impl Confinement {
+    /// What an engine serving a model gets: the same rules on capabilities and privileges, but its network, which
+    /// it needs to pull models, and a writable filesystem, which it keeps them on, with a ceiling on processes alone.
+    pub fn serving() -> Self {
+        Self {
+            drop_capabilities: true,
+            no_new_privileges: true,
+            read_only_root: false,
+            pids: Some(4096),
+            memory_bytes: None,
+            network: Network::Default,
+        }
+    }
+}
+
+/// The closed box a job gets: no network, no capabilities, no new privileges, a read-only root, 4096 tasks and
+/// 4 GiB of host memory at most.
+impl Default for Confinement {
+    fn default() -> Self {
+        Self {
+            drop_capabilities: true,
+            no_new_privileges: true,
+            read_only_root: true,
+            pids: Some(4096),
+            memory_bytes: Some(4 << 30),
+            network: Network::None,
+        }
+    }
+}
+
+/// Where a container's network goes: nowhere, what a job gets, or the container engine's own default, what an
+/// engine gets to pull its models.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Network {
+    None,
+    Default,
+}
+
+/// A directory of the container engine's host at a path in the container. The path is the engine host's, in its
+/// own form; a directory that is not there is refused by the engine, never made.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mount {
+    pub host: String,
+    pub container: String,
+    pub read_only: bool,
 }
 
 /// A published port: the container's and the host's.
@@ -80,8 +150,13 @@ pub enum RuntimeError {
 /// What the door needs from a container engine.
 #[async_trait]
 pub trait Runtime: Send + Sync {
-    /// Makes the image present, telling `progress` as it goes.
+    /// Makes the image present, telling `progress` as it goes: from the registry, whether or not it is held.
     async fn pull(&self, image: &ImageRef, progress: Progress) -> Result<(), RuntimeError>;
+    /// Whether the engine holds the image now, so starting it needs no registry. An error is the engine's, never
+    /// "not held". An engine that cannot tell says no, and every image is pulled.
+    async fn holds(&self, _image: &ImageRef) -> Result<bool, RuntimeError> {
+        Ok(false)
+    }
     /// Creates and starts a container, answering its id and the published ports; emits `Started` too.
     async fn start(&self, spec: Spec) -> Result<Started, RuntimeError>;
     /// Stops and removes a container; emits `Exited`.
@@ -114,6 +189,8 @@ pub struct Fake {
     /// What a pull reports as it goes; a real engine reports every percent, often more.
     steps: Vec<Option<u8>>,
     containers: Mutex<BTreeMap<ContainerId, Spec>>,
+    /// Every image a pull was asked for, in order: what went to the registry.
+    pulled: Mutex<Vec<ImageRef>>,
     devices: Vec<DeviceId>,
     next: Mutex<u32>,
     tx: broadcast::Sender<Event>,
@@ -131,10 +208,16 @@ impl Fake {
             published: BTreeMap::new(),
             steps: vec![Some(50)],
             containers: Mutex::new(BTreeMap::new()),
+            pulled: Mutex::new(Vec::new()),
             devices,
             next: Mutex::new(0),
             tx,
         }
+    }
+
+    /// Every image a pull was asked for, in order: what went to the registry.
+    pub fn pulled(&self) -> Vec<ImageRef> {
+        self.pulled.lock().unwrap().clone()
     }
 
     /// Declares an image the registry serves, so a `pull` of it succeeds; it is not local until pulled.
@@ -200,6 +283,7 @@ impl Fake {
 #[async_trait]
 impl Runtime for Fake {
     async fn pull(&self, image: &ImageRef, progress: Progress) -> Result<(), RuntimeError> {
+        self.pulled.lock().unwrap().push(image.clone());
         if !self.open_registry && !self.registry.lock().unwrap().contains(image) {
             return Err(RuntimeError::ImageNotFound(image.0.clone()));
         }
@@ -211,6 +295,10 @@ impl Runtime for Fake {
             local.push(image.clone());
         }
         Ok(())
+    }
+
+    async fn holds(&self, image: &ImageRef) -> Result<bool, RuntimeError> {
+        Ok(self.local.lock().unwrap().contains(image))
     }
 
     async fn start(&self, spec: Spec) -> Result<Started, RuntimeError> {
@@ -286,6 +374,8 @@ mod tests {
             env: vec![],
             devices: vec![device.into()],
             ports: vec![11434],
+            mounts: vec![],
+            confinement: Confinement::default(),
         }
     }
 

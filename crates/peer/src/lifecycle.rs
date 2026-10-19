@@ -13,9 +13,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use best_peer_door::auth::{holder_of_hash, Credential};
 use best_peer_door::{BestError, Emitter, Envelope, EventLog};
-use best_peer_engine::{Engine, EngineError, Kind, Message, Options};
+use best_peer_engine::{Engine, EngineError, Kind, Message, Options, Source};
 use best_peer_gpu::{Compute, DeviceId, Gpu, Host};
-use best_peer_runtime::{ContainerId, Event as RuntimeEvent, Runtime, RuntimeError, Spec};
+use best_peer_runtime::{Confinement, ContainerId, Event as RuntimeEvent, Mount, Runtime, RuntimeError, Spec};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, Semaphore};
@@ -24,11 +24,24 @@ use crate::domain::Service;
 use crate::holdings::Holdings;
 use crate::state::{JobPhase, Owner, Phase, Reservation, State};
 
-/// The operator's overrides for the engines' images (a pinned tag, a mirror); none means the engine's default.
+/// The operator's say over the engines: their images (a pinned tag, a mirror; none means the engine's default), a
+/// store of models (`BEST_PEER_MODEL_STORE`) beside the registry: a model found in it is served from it, seen
+/// read-only, and nothing is pulled; one not found is pulled as before. And when a deploy or a job pulls its image.
 #[derive(Clone, Debug, Default)]
 pub struct Images {
     pub ollama: Option<String>,
     pub vllm: Option<String>,
+    pub model_store: Option<String>,
+    pub pull: Pull,
+}
+
+/// When a deploy or a job pulls its image: `Tags`, a reference by tag each time, since a tag may have moved, and one
+/// pinned by digest only when it is not held; `Missing`, any image only when it is not held.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Pull {
+    #[default]
+    Tags,
+    Missing,
 }
 
 impl Images {
@@ -38,6 +51,34 @@ impl Images {
             Kind::Vllm => self.vllm.as_deref(),
         }
     }
+}
+
+/// How the containers are confined, as the operator set it. A job of a credential with a share runs code from a
+/// tenant, so it gets the closed box: no network, no capabilities and a read-only filesystem, under ceilings on
+/// host memory and tasks the operator sets (`BEST_PEER_JOB_MEMORY`, `BEST_PEER_JOB_PIDS`). Any other job, the
+/// owner's or one whose credential was approved with `--open-jobs`, keeps the network, a writable filesystem and the
+/// host's memory, under the same capability and privilege rules and the same task ceiling. An engine is confined as
+/// an open job is, with its own ceilings (`BEST_PEER_ENGINE_MEMORY`, `BEST_PEER_ENGINE_PIDS`).
+#[derive(Clone, Debug)]
+pub struct Confine {
+    pub job: Confinement,
+    pub open_job: Confinement,
+    pub engine: Confinement,
+}
+
+impl Default for Confine {
+    fn default() -> Self {
+        Self {
+            job: Confinement::default(),
+            open_job: Confinement::serving(),
+            engine: Confinement::serving(),
+        }
+    }
+}
+
+/// Whether a job of `who` runs in the closed box: a credential with a share does, unless its approver opened it.
+pub fn boxed(who: &Credential) -> bool {
+    who.grant.memory_bytes.is_some() && !who.grant.open_jobs
 }
 
 /// How long the peer waits on an engine: to answer after its container started, to load a model, to unload one,
@@ -84,6 +125,7 @@ pub struct Peer {
     engine_host: String,
     images: Images,
     patience: Patience,
+    confine: Confine,
     pub state: Mutex<State>,
     /// Runtime events for containers the state did not know when they arrived, by container.
     unowned: Mutex<HashMap<ContainerId, RuntimeEvent>>,
@@ -158,6 +200,7 @@ impl Peer {
         log: Arc<EventLog>,
         images: Images,
         patience: Patience,
+        confine: Confine,
     ) -> Self {
         Self {
             gpu,
@@ -170,6 +213,7 @@ impl Peer {
             engine_host: engine_host.into(),
             images,
             patience,
+            confine,
             state: Mutex::new(State::default()),
             unowned: Mutex::new(HashMap::new()),
             tasks: Mutex::new(Vec::new()),
@@ -189,8 +233,8 @@ impl Peer {
         let weak = Arc::downgrade(self);
         self.holdings.add(move |holder| {
             weak.upgrade()
-                .map(|p| p.state.lock().unwrap().held_by(holder))
-                .unwrap_or(0)
+                .map(|p| p.state.lock().unwrap().holdings_of(holder))
+                .unwrap_or_default()
         });
     }
 
@@ -353,6 +397,15 @@ impl Peer {
             .map_err(|e| BestError::internal(format!("the accelerator library failed: {e}")))
     }
 
+    /// Where `model` comes from for `kind`: the operator's store when the engine reads one and the model is in it,
+    /// the engine's registry otherwise.
+    fn source(&self, kind: Kind, model: &str) -> Source {
+        match (&self.images.model_store, kind) {
+            (Some(store), Kind::Ollama) if in_store(std::path::Path::new(store), model) => Source::Store,
+            _ => Source::Registry,
+        }
+    }
+
     /// The base URL the peer itself reaches an engine at.
     fn engine_base(&self, port: u16) -> String {
         format!("http://{}:{port}", self.engine_host)
@@ -420,7 +473,7 @@ impl Peer {
             Ok(Err(e)) => self.tell(
                 &em,
                 "PromptFailed",
-                json!({ "deployment": d.id, "reason": e.to_string(), "fix": fix_for_engine(&e) }),
+                json!({ "deployment": d.id, "reason": e.to_string(), "fix": fix_for_engine(&e, Source::Registry) }),
             ),
             Err(_) => self.tell(
                 &em,
@@ -441,7 +494,7 @@ impl Peer {
         let image = best_peer_runtime::ImageRef(cmd.data["image"].as_str().unwrap_or_default().to_string());
         match self.pull(&em, &image).await {
             Ok(()) => {
-                self.tell(&em, "ImagePulled", json!({ "image": image.0 }));
+                self.tell(&em, "ImagePulled", json!({ "image": image.0, "held": false }));
             }
             Err(e) => {
                 self.tell(
@@ -462,9 +515,10 @@ impl Peer {
         // One admission at a time across the door, and what the credential holds is read before the state is
         // locked, since the door's holdings read this state too.
         let _admitting = self.holdings.admitting();
-        let held = self.holdings.held_by(&who.holder());
+        let held = self.holdings.of(&who.holder());
         let mut state = self.state.lock().unwrap();
-        within_share(held, &who, data.memory_bytes)?;
+        within_share(held.memory_bytes, &who, data.memory_bytes)?;
+        within_count("deployment", held.deployments, who.grant.deployments)?;
         let (device, compute) = place(
             &host,
             &state,
@@ -482,6 +536,7 @@ impl Peer {
                 compute: Some(compute),
                 memory_bytes: data.memory_bytes,
                 holder: who.holder(),
+                boxed: false,
             },
         );
         Ok(())
@@ -507,23 +562,36 @@ impl Peer {
             );
             return;
         };
-        let recipe = data
+        let mut recipe = data
             .engine
             .recipe(&data.model, &compute, self.images.for_engine(data.engine));
-        let image = recipe.image.clone();
-        if let Err(e) = self.pull(&em, &image).await {
-            self.fail_deployment(
-                &em,
-                &id,
-                &data.model,
-                &e.to_string(),
-                fix_for_runtime(&e),
-                Stage::BeforeStart(None),
-            )
-            .await;
-            return;
+        let source = self.source(data.engine, &data.model);
+        let mut mounts = Vec::new();
+        if let (Source::Store, Some(store), Some(at)) = (source, &self.images.model_store, &recipe.store) {
+            recipe.env.extend(at.env.iter().cloned());
+            mounts.push(Mount {
+                host: store.clone(),
+                container: at.path.clone(),
+                read_only: true,
+            });
         }
-        self.tell(&em, "ImagePulled", json!({ "image": image.0 }));
+        let image = recipe.image.clone();
+        let held = match self.ensure(&em, &image).await {
+            Ok(held) => held,
+            Err(e) => {
+                self.fail_deployment(
+                    &em,
+                    &id,
+                    &data.model,
+                    &e.to_string(),
+                    fix_for_runtime(&e),
+                    Stage::BeforeStart(None),
+                )
+                .await;
+                return;
+            }
+        };
+        self.tell(&em, "ImagePulled", json!({ "image": image.0, "held": held }));
         let spec = Spec {
             image,
             args: recipe.args,
@@ -534,6 +602,8 @@ impl Peer {
                 vec![device.clone()]
             },
             ports: vec![recipe.port],
+            mounts,
+            confinement: self.confine.engine.clone(),
         };
         let started = match self.runtime.start(spec).await {
             Ok(s) => s,
@@ -597,7 +667,8 @@ impl Peer {
             self.engine.ready(data.engine, &base, self.patience.ready).await?;
             let loaded = tokio::time::timeout(
                 self.patience.load,
-                self.engine.load(data.engine, &base, &data.model, loading.clone()),
+                self.engine
+                    .load(data.engine, &base, &data.model, source, loading.clone()),
             )
             .await
             .unwrap_or_else(|_| {
@@ -628,7 +699,7 @@ impl Peer {
                     &id,
                     &data.model,
                     &e.to_string(),
-                    fix_for_engine(&e),
+                    &fix_for_engine(&e, source),
                     Stage::AfterStart,
                 )
                 .await
@@ -636,7 +707,21 @@ impl Peer {
         }
     }
 
-    /// Pulls an image, telling its progress; a pull that completed is 100, whether or not the engine said so.
+    /// Makes an image present for a deploy or a job. A reference by tag is pulled each time unless the operator said
+    /// `missing`, since a tag may have moved; one pinned by digest, or any under `missing`, is not pulled when the
+    /// engine holds it, so a host with no way to a registry runs what it holds, told at 100 at once. Says whether it
+    /// was held.
+    async fn ensure(self: &Arc<Self>, em: &Emitter, image: &best_peer_runtime::ImageRef) -> Result<bool, RuntimeError> {
+        let pinned = image.0.contains('@');
+        if (pinned || self.images.pull == Pull::Missing) && self.runtime.holds(image).await? {
+            self.pulling(em, image)(Some(100));
+            return Ok(true);
+        }
+        self.pull(em, image).await.map(|()| false)
+    }
+
+    /// Pulls an image from the registry, held or not, telling its progress; a pull that completed is 100, whether or
+    /// not the engine said so. What pull-image does, so that is how a held image is refreshed.
     async fn pull(self: &Arc<Self>, em: &Emitter, image: &best_peer_runtime::ImageRef) -> Result<(), RuntimeError> {
         let progress = self.pulling(em, image);
         self.runtime.pull(image, progress.clone()).await?;
@@ -804,9 +889,10 @@ impl Peer {
             None => None,
         };
         let _admitting = self.holdings.admitting();
-        let held = self.holdings.held_by(&who.holder());
+        let held = self.holdings.of(&who.holder());
         let mut state = self.state.lock().unwrap();
-        within_share(held, &who, data.memory_bytes.unwrap_or(0))?;
+        within_share(held.memory_bytes, &who, data.memory_bytes.unwrap_or(0))?;
+        within_count("job", held.jobs, who.grant.jobs)?;
         let placement = match (data.memory_bytes, &host) {
             (Some(needed), Some(host)) => Some(place(
                 host,
@@ -827,6 +913,7 @@ impl Peer {
                 compute: placement.map(|(_, c)| c),
                 memory_bytes: data.memory_bytes.unwrap_or(0),
                 holder: who.holder(),
+                boxed: boxed(&who),
             },
         );
         Ok(())
@@ -853,11 +940,14 @@ impl Peer {
                 json!({ "job": id, "image": data.image, "reason": reason, "fix": fix }),
             );
         };
-        if let Err(e) = self.pull(&em, &image).await {
-            fail(e.to_string(), fix_for_runtime(&e));
-            return;
-        }
-        self.tell(&em, "ImagePulled", json!({ "image": image.0 }));
+        let held = match self.ensure(&em, &image).await {
+            Ok(held) => held,
+            Err(e) => {
+                fail(e.to_string(), fix_for_runtime(&e));
+                return;
+            }
+        };
+        self.tell(&em, "ImagePulled", json!({ "image": image.0, "held": held }));
         let devices = match (&reservation.device, &reservation.compute) {
             (Some(d), Some(c)) if *c != Compute::Cpu => vec![d.clone()],
             _ => vec![],
@@ -868,13 +958,22 @@ impl Peer {
             env: vec![],
             devices,
             ports: vec![],
+            mounts: vec![],
+            confinement: match reservation.boxed {
+                true => self.confine.job.clone(),
+                false => self.confine.open_job.clone(),
+            },
+        };
+        let host_memory_bytes = match reservation.boxed {
+            true => self.confine.job.memory_bytes,
+            false => self.confine.open_job.memory_bytes,
         };
         match self.runtime.start(spec).await {
             Ok(started) => {
                 self.tell(
                     &em,
                     "JobStarted",
-                    json!({ "job": id, "image": data.image, "device": reservation.device.as_ref().map(|d| d.0.clone()), "memory_bytes": reservation.memory_bytes, "container": started.id.0, "holder": reservation.holder }),
+                    json!({ "job": id, "image": data.image, "device": reservation.device.as_ref().map(|d| d.0.clone()), "memory_bytes": reservation.memory_bytes, "container": started.id.0, "holder": reservation.holder, "boxed": reservation.boxed, "host_memory_bytes": host_memory_bytes }),
                 );
                 em.bind_workload(&id);
                 self.replay_unowned(&started.id).await;
@@ -987,20 +1086,42 @@ impl Peer {
                     if let Err(e) = self.runtime.stop(&dep.container).await {
                         tracing::warn!(container = %dep.container.0, error = %e, "the out-of-memory container could not be stopped");
                     }
+                    let fix = match self.confine.engine.memory_bytes {
+                        Some(ceiling) => format!("deploy a smaller model, or ask for more memory_bytes so it is placed where it fits; an engine may also hold {ceiling} bytes of host memory at most, which whoever runs the peer sets"),
+                        None => "deploy a smaller model, or ask for more memory_bytes so it is placed where it fits".to_string(),
+                    };
                     self.tell(
                         &em,
                         "OutOfMemory",
-                        json!({ "deployment": dep.id, "model": dep.model, "device": dep.device.0, "memory_bytes": dep.memory_bytes, "fix": "deploy a smaller model, or ask for more memory_bytes so it is placed where it fits" }),
+                        json!({ "deployment": dep.id, "model": dep.model, "device": dep.device.0, "memory_bytes": dep.memory_bytes, "fix": fix }),
                     );
                 }
             }
             (RuntimeEvent::OutOfMemory { id }, Owner::Job(job)) => {
                 if self.job_running(&job) {
                     let _ = self.runtime.stop(&id).await;
+                    // The container's own memory ran out, the host's and not the device's: memory_bytes does not move it.
+                    let ceiling = self
+                        .state
+                        .lock()
+                        .unwrap()
+                        .jobs
+                        .get(&job)
+                        .and_then(|j| j.host_memory_bytes);
+                    let (reason, fix) = match ceiling {
+                        Some(ceiling) => (
+                            format!("out of host memory: a job holds {ceiling} bytes of host memory at most on this peer, device memory apart"),
+                            "hold less in host memory (fewer loader workers, smaller batches, weights streamed to the device), or ask whoever runs the peer to raise the ceiling".to_string(),
+                        ),
+                        None => (
+                            "out of host memory: the host had no more to give".to_string(),
+                            "hold less in host memory (fewer loader workers, smaller batches, weights streamed to the device)".to_string(),
+                        ),
+                    };
                     self.tell(
                         &em,
                         "JobFailed",
-                        json!({ "job": job, "reason": "out of memory", "fix": "run it with more memory_bytes so it is placed where it fits" }),
+                        json!({ "job": job, "reason": reason, "host_memory_bytes": ceiling, "fix": fix }),
                     );
                 }
             }
@@ -1258,6 +1379,28 @@ pub(crate) fn has_share(who: &Credential) -> bool {
     who.grant.memory_bytes.is_some()
 }
 
+/// A credential whose approver set a count runs `ceiling` workloads of `kind` at once across the door, `running` of
+/// them already, every workspace counted: one more is refused with what it runs and how to make room.
+pub(crate) fn within_count(kind: &str, running: usize, ceiling: Option<u32>) -> Result<(), BestError> {
+    let Some(ceiling) = ceiling.map(|c| c as usize) else {
+        return Ok(());
+    };
+    if running < ceiling {
+        return Ok(());
+    }
+    let (code, room) = match kind {
+        "job" => ("JOBS_EXCEEDED", "stop one or let one finish first"),
+        _ => ("DEPLOYMENTS_EXCEEDED", "undeploy one first"),
+    };
+    Err(BestError::bad_request(
+        code,
+        format!(
+            "this credential may run {ceiling} {kind}(s) at once and runs {running} across this door, every workspace counted: {room} (get-workloads on each door you use lists them), or ask whoever approved it for more"
+        ),
+    )
+    .with_details(json!({ "ceiling": ceiling, "running": running })))
+}
+
 /// Whether `who` sees and uses the accelerators alone, as its approver said (`approve --accelerators-only`): the
 /// host's CPU and memory stay the operator's.
 pub(crate) fn accelerators_only(who: &Credential) -> bool {
@@ -1504,12 +1647,45 @@ fn fix_for_runtime(e: &RuntimeError) -> &'static str {
     }
 }
 
-fn fix_for_engine(e: &EngineError) -> &'static str {
-    match e {
-        EngineError::NotReady { .. } => "the engine did not come up in time: read its container's logs on the host",
-        EngineError::ModelNotFound(_) => "the engine's library has no model by that name: check the name",
-        EngineError::Engine(_) => "read the engine's logs on the host",
+/// What to do about an engine's refusal; a peer serving from a store says where the model was looked for.
+fn fix_for_engine(e: &EngineError, source: Source) -> String {
+    match (e, source) {
+        (EngineError::NotReady { .. }, _) => {
+            "the engine did not come up in time: read its container's logs on the host".into()
+        }
+        (EngineError::ModelNotFound(_), Source::Registry) => {
+            "the engine's library has no model by that name: check the name".into()
+        }
+        (EngineError::ModelNotFound(_), Source::Store) => {
+            "the model is in the operator's model store only in part: ask whoever runs the peer to put it there again"
+                .into()
+        }
+        (EngineError::Engine(_), _) => "read the engine's logs on the host".into(),
     }
+}
+
+/// Whether Ollama's library at `store` holds `model`: its manifest, where `ollama pull` writes one. A name with no
+/// registry is Ollama's own, one with no namespace is in `library`, one with no tag is `latest`.
+pub(crate) fn in_store(store: &std::path::Path, model: &str) -> bool {
+    let after_slash = model.rfind('/').map(|i| i + 1).unwrap_or(0);
+    let (name, tag) = match model[after_slash..].rfind(':') {
+        Some(i) => (&model[..after_slash + i], &model[after_slash + i + 1..]),
+        None => (model, "latest"),
+    };
+    let parts: Vec<&str> = name.split('/').collect();
+    let path: Vec<&str> = match parts.as_slice() {
+        [name] => vec!["registry.ollama.ai", "library", name],
+        [namespace, name] => vec!["registry.ollama.ai", namespace, name],
+        _ => parts,
+    };
+    if tag.is_empty() || path.iter().any(|p| p.is_empty() || *p == "." || *p == "..") {
+        return false;
+    }
+    let mut manifest = store.join("manifests");
+    for p in path.iter().chain([&tag]) {
+        manifest.push(p);
+    }
+    manifest.is_file()
 }
 
 pub(crate) fn parse<T: serde::de::DeserializeOwned>(data: &Value) -> Result<T, BestError> {

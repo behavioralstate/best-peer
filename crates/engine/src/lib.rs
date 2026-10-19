@@ -41,7 +41,8 @@ impl Kind {
     }
 
     /// What to run to serve `model` on a device offering `compute`. The image may be overridden by the operator
-    /// (`image`), for a pinned tag or a mirror; the engine's port and arguments are not negotiable.
+    /// (`image`), for a pinned tag or a mirror; the engine's port and arguments are not negotiable. Where the engine
+    /// keeps its models, and what tells it so, is in the recipe for an operator who shares a store.
     pub fn recipe(self, model: &str, compute: &Compute, image: Option<&str>) -> Recipe {
         match self {
             Kind::Ollama => Recipe {
@@ -53,6 +54,10 @@ impl Kind {
                 env: vec![("OLLAMA_HOST".into(), "0.0.0.0".into())],
                 port: 11434,
                 openai_path: "/v1".into(),
+                store: Some(Store {
+                    path: STORE_PATH.into(),
+                    env: vec![("OLLAMA_MODELS".into(), STORE_PATH.into())],
+                }),
             },
             Kind::Vllm => Recipe {
                 image: ImageRef(image.unwrap_or("vllm/vllm-openai").into()),
@@ -60,6 +65,7 @@ impl Kind {
                 env: vec![],
                 port: 8000,
                 openai_path: "/v1".into(),
+                store: None,
             },
         }
     }
@@ -74,8 +80,8 @@ impl std::fmt::Display for Kind {
     }
 }
 
-/// What to run for one engine: the image, its arguments and environment, the container port it serves on, and the
-/// path under which the OpenAI-compatible API is reached.
+/// What to run for one engine: the image, its arguments and environment, the container port it serves on, the
+/// path under which the OpenAI-compatible API is reached, and where it keeps its models.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Recipe {
     pub image: ImageRef,
@@ -83,6 +89,27 @@ pub struct Recipe {
     pub env: Vec<(String, String)>,
     pub port: u16,
     pub openai_path: String,
+    /// Where it reads a store of models the operator shares, for an engine that can; none for one that cannot.
+    pub store: Option<Store>,
+}
+
+/// Where every engine sees a store of models the operator shares.
+pub const STORE_PATH: &str = "/models";
+
+/// Where an engine keeps its models in the container, and what points it there when they come from a store: Ollama's
+/// library (`OLLAMA_MODELS`). vLLM has none yet: it is not proven serving from one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Store {
+    pub path: String,
+    pub env: Vec<(String, String)>,
+}
+
+/// Where a model comes from when it is loaded: the engine's registry, over the network, or the store the operator
+/// mounted into the engine, which is never added to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    Registry,
+    Store,
 }
 
 /// What a load tells while it runs: progress in percent, where the engine says. Called in order, before the call
@@ -133,9 +160,16 @@ pub enum EngineError {
 pub trait Engine: Send + Sync {
     /// Waits until the engine at `base` answers, up to `within`.
     async fn ready(&self, kind: Kind, base: &str, within: Duration) -> Result<(), EngineError>;
-    /// Makes `model` present and loaded in the engine at `base`, telling `progress` as it goes. An engine that
-    /// loads its model at start answers once the model is served.
-    async fn load(&self, kind: Kind, base: &str, model: &str, progress: Progress) -> Result<(), EngineError>;
+    /// Makes `model` present and loaded in the engine at `base`, from `source`, telling `progress` as it goes. An
+    /// engine that loads its model at start answers once the model is served.
+    async fn load(
+        &self,
+        kind: Kind,
+        base: &str,
+        model: &str,
+        source: Source,
+        progress: Progress,
+    ) -> Result<(), EngineError>;
     /// Frees the memory `model` holds in the engine at `base`, where the engine can do that without stopping; an
     /// engine that cannot answers Ok and its container's stop does it.
     async fn unload(&self, kind: Kind, base: &str, model: &str) -> Result<(), EngineError>;
@@ -153,11 +187,13 @@ pub trait Engine: Send + Sync {
 }
 
 /// An in-memory [`Engine`] for tests: every base is up unless a test says it is down, every model exists unless a
-/// test says it does not, and a load tells progress the way a real pull would.
+/// test says it does not, a load tells progress the way a real pull would, and the loads that went to the registry
+/// are kept apart from those served from the store.
 pub struct Fake {
     down: Mutex<Vec<String>>,
     missing: Mutex<Vec<String>>,
     loaded: Mutex<BTreeMap<String, Vec<String>>>,
+    pulled: Mutex<BTreeMap<String, Vec<String>>>,
     unloaded: Mutex<BTreeMap<String, Vec<String>>>,
     /// What a load reports as it goes; a real engine reports every percent, often more.
     steps: Vec<Option<u8>>,
@@ -180,6 +216,7 @@ impl Fake {
             down: Mutex::new(vec![]),
             missing: Mutex::new(vec![]),
             loaded: Mutex::new(BTreeMap::new()),
+            pulled: Mutex::new(BTreeMap::new()),
             unloaded: Mutex::new(BTreeMap::new()),
             steps: vec![Some(25), Some(100)],
             prompted: Mutex::new(BTreeMap::new()),
@@ -212,6 +249,11 @@ impl Fake {
         self.loaded.lock().unwrap().get(base).cloned().unwrap_or_default()
     }
 
+    /// The models loaded at `base` from the registry, in order: what a store is meant to leave empty.
+    pub fn pulled_at(&self, base: &str) -> Vec<String> {
+        self.pulled.lock().unwrap().get(base).cloned().unwrap_or_default()
+    }
+
     /// The models unloaded at `base`, in order.
     pub fn unloaded_at(&self, base: &str) -> Vec<String> {
         self.unloaded.lock().unwrap().get(base).cloned().unwrap_or_default()
@@ -230,12 +272,30 @@ impl Engine for Fake {
         Ok(())
     }
 
-    async fn load(&self, _kind: Kind, base: &str, model: &str, progress: Progress) -> Result<(), EngineError> {
+    async fn load(
+        &self,
+        _kind: Kind,
+        base: &str,
+        model: &str,
+        source: Source,
+        progress: Progress,
+    ) -> Result<(), EngineError> {
         if self.missing.lock().unwrap().iter().any(|m| m == model) {
             return Err(EngineError::ModelNotFound(model.into()));
         }
-        for &step in &self.steps {
-            progress(step);
+        match source {
+            Source::Registry => {
+                for &step in &self.steps {
+                    progress(step);
+                }
+                self.pulled
+                    .lock()
+                    .unwrap()
+                    .entry(base.into())
+                    .or_default()
+                    .push(model.into());
+            }
+            Source::Store => progress(Some(100)),
         }
         self.loaded
             .lock()
@@ -318,6 +378,10 @@ mod tests {
         assert!(Kind::Vllm.runs_on().iter().all(|c| matches!(c, Compute::Cuda(_))));
         assert!(Kind::Ollama.runs_on().contains(&Compute::Cpu));
         assert_eq!(serde_json::to_value(Kind::Vllm).unwrap(), "vllm");
+        let store = o.store.unwrap();
+        assert_eq!(store.env, vec![("OLLAMA_MODELS".into(), STORE_PATH.into())]);
+        assert_eq!(store.path, STORE_PATH);
+        assert!(v.store.is_none(), "vLLM is not served from a store");
     }
 
     #[tokio::test]
@@ -332,12 +396,19 @@ mod tests {
             Kind::Ollama,
             "http://h:1",
             "m",
+            Source::Registry,
             Arc::new(move |pct| sink.lock().unwrap().push(pct)),
         )
         .await
         .unwrap();
         assert_eq!(*told.lock().unwrap(), vec![Some(25), Some(100)]);
         assert_eq!(e.loaded_at("http://h:1"), vec!["m"]);
+        assert_eq!(e.pulled_at("http://h:1"), vec!["m"]);
+        e.load(Kind::Ollama, "http://h:1", "s", Source::Store, Arc::new(|_| {}))
+            .await
+            .unwrap();
+        assert_eq!(e.loaded_at("http://h:1"), vec!["m", "s"]);
+        assert_eq!(e.pulled_at("http://h:1"), vec!["m"], "nothing is pulled from a store");
         e.down("http://h:2");
         assert!(matches!(
             e.ready(Kind::Ollama, "http://h:2", Duration::from_secs(1))
@@ -346,11 +417,13 @@ mod tests {
             EngineError::NotReady { .. }
         ));
         e.missing("nobody/none");
-        assert!(matches!(
-            e.load(Kind::Ollama, "http://h:1", "nobody/none", Arc::new(|_| {}))
-                .await
-                .unwrap_err(),
-            EngineError::ModelNotFound(m) if m == "nobody/none"
-        ));
+        for source in [Source::Registry, Source::Store] {
+            assert!(matches!(
+                e.load(Kind::Ollama, "http://h:1", "nobody/none", source, Arc::new(|_| {}))
+                    .await
+                    .unwrap_err(),
+                EngineError::ModelNotFound(m) if m == "nobody/none"
+            ));
+        }
     }
 }
