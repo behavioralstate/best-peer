@@ -202,7 +202,9 @@ where the door is that `best-peer approve` reads, so it reaches the peer over th
 certificate and no other. The event log is a file per UTC day, `events/2026-10-19.jsonl`, so a day can be copied,
 kept or removed on its own; an event goes to the day of its own time, or to the file being written when that time
 is older, so the files in name order are the log in its order. An `events.jsonl` left by an older peer is read before
-them and never written again, so an upgrade keeps the history with nothing to move. Each workspace keeps
+them and never written again, so an upgrade keeps the history with nothing to move. Going back to an older peer over
+the same folder is not: it reads `events.jsonl` alone and would number its events over the day files', so move
+`events/` aside first. Each workspace keeps
 its own log the same way under `workspaces/<id>/events/`. `accepted.jsonl`, the record of the commands the door
 accepted, stays one file.
 Every request to the door, a workspace's included, is one line in the peer's log at info: where it came from (the

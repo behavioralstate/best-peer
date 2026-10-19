@@ -132,7 +132,9 @@ struct Segments {
 }
 
 impl Segments {
-    /// Writes `stored` to its day's file, opening that file when it is not the one being written.
+    /// Writes `stored` to its day's file, opening that file when it is not the one being written. A day's file that
+    /// cannot be opened loses that event on disk, as any failed write does: it is in memory and was told, and after a
+    /// restart its `seq` is a gap. The file being written stays open, and the next event tries the day again.
     fn write(&mut self, stored: &Stored) {
         let current = self.open.as_ref().map(|(day, _)| *day);
         let day = segment_day(&stored.envelope.time, OffsetDateTime::now_utc().date(), current);
@@ -178,7 +180,7 @@ fn day_files(dir: &Path) -> std::io::Result<Vec<(Date, PathBuf)>> {
             .and_then(|n| n.to_str())
             .and_then(|n| n.strip_suffix(".jsonl"))
             .and_then(|stem| Date::parse(stem, format_description!("[year]-[month]-[day]")).ok());
-        match day {
+        match day.filter(|_| path.is_file()) {
             Some(day) => days.push((day, path)),
             None => {
                 tracing::warn!(file = %path.display(), "a file in the events folder is not a day's file and is not read")
@@ -220,7 +222,7 @@ impl EventLog {
                     Ok(s) => {
                         let mut events = log.events.lock().unwrap();
                         if events.last().is_some_and(|last| last.seq >= s.seq) {
-                            tracing::warn!(file = %path.display(), seq = s.seq, "an event is out of the log's order: its files were changed by hand");
+                            tracing::warn!(file = %path.display(), seq = s.seq, "an event is out of the log's order: an older peer wrote events.jsonl after this one wrote day files, or the files were changed by hand");
                         }
                         events.push(s);
                     }
@@ -904,6 +906,50 @@ mod tests {
         assert!(dir.path().join("events").join("2020-01-03.jsonl").exists());
         let again = EventLog::open(dir.path()).unwrap();
         assert_eq!(types(&again), vec!["Old1", "Old2", "New"]);
+    }
+
+    #[test]
+    fn a_day_file_that_cannot_be_opened_loses_that_event_on_disk_and_nothing_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = EventLog::open(dir.path()).unwrap();
+        first.append(ev_at("A", "2020-01-01T10:00:00Z"));
+        // A directory where the next day's file would go: the file cannot be opened.
+        let blocked = dir.path().join("events").join("2020-01-02.jsonl");
+        std::fs::create_dir(&blocked).unwrap();
+        assert_eq!(first.append(ev_at("Lost", "2020-01-02T10:00:00Z")).seq, 2);
+        assert_eq!(types(&first), vec!["A", "Lost"], "in memory and told");
+        assert_eq!(first.append(ev_at("Late", "2020-01-01T11:00:00Z")).seq, 3);
+        drop(first);
+        let again = EventLog::open(dir.path()).unwrap();
+        assert_eq!(
+            types(&again),
+            vec!["A", "Late"],
+            "what reached disk, in its order; the lost one is a gap"
+        );
+        assert_eq!(again.append(ev_at("B", "2020-01-01T12:00:00Z")).seq, 4);
+    }
+
+    #[test]
+    fn an_older_peer_writing_its_single_file_after_day_files_leaves_both_read_and_the_order_going_on() {
+        // A peer from before day files, started over a folder this one wrote, appends to events.jsonl with seq values
+        // the day files already hold. Both are read, the old file first, with a warning; nothing is lost or refused.
+        let dir = tempfile::tempdir().unwrap();
+        let first = EventLog::open(dir.path()).unwrap();
+        first.append(ev_at("New", "2020-01-02T10:00:00Z"));
+        drop(first);
+        let back = serde_json::to_string(&Stored {
+            seq: 1,
+            envelope: ev_at("FromOlderPeer", "2020-01-03T10:00:00Z"),
+        })
+        .unwrap();
+        std::fs::write(dir.path().join("events.jsonl"), back + "\n").unwrap();
+        let again = EventLog::open(dir.path()).unwrap();
+        assert_eq!(types(&again), vec!["FromOlderPeer", "New"]);
+        assert_eq!(
+            again.append(ev("Next", "c")).seq,
+            2,
+            "the order goes on from the last event read"
+        );
     }
 
     #[test]
