@@ -202,8 +202,8 @@ itself reaches the engines' ports, which are bound there and nowhere else whatev
 when the container engine is on this host, on that host's interfaces when it is elsewhere, so a container engine
 on another host sits on a network you trust. The peer alone reaches them: a prompt is a command on the door, and
 the peer carries it to the engine. Prompts are answered sixteen at a time per peer; the rest wait their turn,
-accepted, in order. `BEST_PEER_COMMANDS_PER_MINUTE` (default 60) is how many new commands one credential may send
-a minute across the door; a number below 1 is refused at start.
+accepted, in order. `BEST_PEER_COMMANDS_PER_MINUTE` (default 60) is how many new commands one credential with a
+share may send in any sixty seconds across the door; a number below 1 is refused at start.
 
 ## Deploy
 
@@ -270,12 +270,15 @@ Every command of this peer follows one pattern, and nothing else is needed to dr
    the end, and follows from there with `GET /events/stream` and `Last-Event-ID`. There is no other channel for
    progress or outcome, and nothing to poll.
 
-A credential sends 60 new commands a minute at most, counted across the door and every workspace on it
-(`BEST_PEER_COMMANDS_PER_MINUTE`): the one past that is refused with `TOO_MANY_COMMANDS`, 429 and `Retry-After`,
-and was not accepted. A retry of an accepted command is answered as it was and is not counted, nor is a command
-refused before it is whole. On a member, a cloud is one credential: every tenant of the cloud shares the member's
-minute, and a member that refuses the cloud's command is told on the cloud's stream as the command's failure, with
-the member's reason, so a member's owner who hosts a busy cloud raises the pace.
+A credential approved with a share (`--memory`), the tenant's kind, sends 60 new commands in any sixty seconds at
+most, counted across the door and every workspace on it (`BEST_PEER_COMMANDS_PER_MINUTE`): the one past that is
+refused with `TOO_MANY_COMMANDS`, 429 and `Retry-After`, and was not accepted. A credential without a share, the
+owner's own, is not paced, so an evaluation or a batch of prompts runs as fast as the peer answers. A retry of an
+accepted command is answered as it was and is not counted, nor is a command refused before it is whole or by its
+admission (no room, no such workload). On a member, a cloud is one credential: when the member's owner approved it
+with a share, every tenant of the cloud shares the member's pace, and a member that refuses the cloud's command is
+told on the cloud's stream as the command's failure, with the member's reason, so a member's owner who hosts a busy
+cloud raises the pace or approves the cloud without a share.
 
 ## Sign in
 

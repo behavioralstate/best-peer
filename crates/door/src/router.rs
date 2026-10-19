@@ -356,28 +356,39 @@ async fn ingest(
             key: key.clone(),
         }
     };
-    // Counted once it is new and whole: a retry of an accepted command, or one refused before this, costs nothing.
-    if let Err(wait) = door.pace.take(&sender.hash, std::time::Instant::now()) {
-        let per_minute = door.pace.limit();
-        let mut refused = BestError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "TOO_MANY_COMMANDS",
-            format!(
-                "this credential sent {per_minute} commands within the last minute, the most this door takes: this one was not accepted; send it again in {wait} s"
-            ),
-        )
-        .with_details(json!({ "per_minute": per_minute, "retry_after_seconds": wait }))
-        .into_response();
-        refused.headers_mut().insert(header::RETRY_AFTER, wait.into());
-        return Ok(refused);
-    }
+    // Counted once it is new and whole, for a credential with a share: a retry of an accepted command, or one
+    // refused before this or by its admission, costs nothing.
+    let paced = match sender.grant.memory_bytes {
+        Some(_) => match door.limits.pace.take(&sender.hash, std::time::Instant::now()) {
+            Ok(when) => Some(when),
+            Err(wait) => {
+                let per_minute = door.limits.pace.limit();
+                let mut refused = BestError::new(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "TOO_MANY_COMMANDS",
+                    format!(
+                        "this credential sent {per_minute} commands within the last sixty seconds, the most this door takes from a credential with a share: this one was not accepted; send it again in {wait} s"
+                    ),
+                )
+                .with_details(json!({ "per_minute": per_minute, "retry_after_seconds": wait }))
+                .into_response();
+                refused.headers_mut().insert(header::RETRY_AFTER, wait.into());
+                return Ok(refused);
+            }
+        },
+        None => None,
+    };
     if let Some(admit) = &def.admit {
-        admit(
+        let admitted = admit(
             envelope.clone(),
             sender.clone(),
             command_key(&sender.hash, &envelope.id),
         )
-        .await?;
+        .await;
+        if let (Err(_), Some(when)) = (&admitted, paced) {
+            door.limits.pace.give_back(&sender.hash, when);
+        }
+        admitted?;
     }
     let accepted = door
         .log
@@ -774,7 +785,10 @@ mod tests {
         let auth = auth.unwrap_or_else(|| {
             Arc::new(Auth::ephemeral(EP, Box::new(FakeApprover { proof: "ok".into() })).with_scopes(&["deploy"]))
         });
-        Arc::new(Door::new(EP, "io.best.agents", "A test peer.", catalogue, log, auth).with_pace(Arc::new(pace)))
+        Arc::new(
+            Door::new(EP, "io.best.agents", "A test peer.", catalogue, log, auth)
+                .with_limits(Arc::new(crate::Limits::new(pace))),
+        )
     }
 
     async fn call(app: &Router, req: Request) -> (StatusCode, HeaderMap, Value) {
@@ -816,6 +830,17 @@ mod tests {
 
     /// The same, approved for the scopes `may` names when given.
     async fn sign_in_with(app: &Router, client: &str, connection: &str, may: Option<&str>) -> String {
+        sign_in_holding(app, client, connection, may, None).await
+    }
+
+    /// The same, with a share of `memory` bytes when given.
+    async fn sign_in_holding(
+        app: &Router,
+        client: &str,
+        connection: &str,
+        may: Option<&str>,
+        memory: Option<&str>,
+    ) -> String {
         let (s, _, a) = call(
             app,
             post_form("/auth/device", &[("client_id", client), ("connection", connection)]),
@@ -825,6 +850,9 @@ mod tests {
         let mut fields = vec![("user_code", a["user_code"].as_str().unwrap()), ("proof", "ok")];
         if let Some(m) = may {
             fields.push(("may", m));
+        }
+        if let Some(m) = memory {
+            fields.push(("memory_bytes", m));
         }
         let (s, _, ok) = call(app, post_form("/auth/approve", &fields)).await;
         assert_eq!(s, StatusCode::OK);
@@ -963,8 +991,9 @@ mod tests {
     async fn a_credential_sends_so_many_new_commands_a_minute_and_is_told_when_to_send_again() {
         let d = door_built(Arc::new(EventLog::ephemeral()), None, crate::Pace::per_minute(3));
         let app = router(d.clone());
-        let key = sign_in(&app, "test", "my-peer").await;
-        let other = sign_in(&app, "other", "other-peer").await;
+        let key = sign_in_holding(&app, "test", "my-peer", None, Some("1024")).await;
+        let other = sign_in_holding(&app, "other", "other-peer", None, Some("1024")).await;
+        let owner = sign_in(&app, "owner", "owner-peer").await;
         let send = |key: &str, c: Value| call(&app, post_json("/commands", key, "application/json", c));
         // A command refused before it is whole costs nothing.
         for id in ["bad-1", "bad-2"] {
@@ -992,6 +1021,10 @@ mod tests {
         assert_eq!(s, StatusCode::CREATED, "{b}");
         let (s, _, b) = send(&other, command("o1", json!("ollama/ollama:0.6"))).await;
         assert_eq!(s, StatusCode::CREATED, "another credential has its own minute: {b}");
+        for i in 0..5 {
+            let (s, _, b) = send(&owner, command(&format!("w{i}"), json!("ollama/ollama:0.6"))).await;
+            assert_eq!(s, StatusCode::CREATED, "a credential without a share is not paced: {b}");
+        }
     }
 
     #[tokio::test]

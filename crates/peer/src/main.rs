@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use best_peer_door::{Auth, Door, EventLog, LocalApprover, Pace};
+use best_peer_door::{Auth, Door, EventLog, Limits, LocalApprover, Pace};
 use best_peer_engine::Engine;
 use best_peer_gpu::Gpu;
 use best_peer_runtime::Runtime;
@@ -129,7 +129,7 @@ pub fn door(peer: Arc<Peer>, workspaces: Arc<workspace::Workspaces>, auth: Arc<A
     )
     .with_tenants(&ctx.manifest_template())
     .with_partition(workspace::Workspaces::root_partition(peer.log.clone()))
-    .with_pace(ctx.pace.clone())
+    .with_limits(ctx.limits.clone())
 }
 
 /// What the workspaces of this door are built with: the root's endpoint and credentials, the data directory, the
@@ -161,7 +161,7 @@ fn context(
         auth,
         transport: Arc::new(transport::Http::new(&trust).unwrap_or_else(|why| fail(&why))),
         holdings,
-        pace: Arc::new(Pace::per_minute(per_minute)),
+        limits: Arc::new(Limits::new(Pace::per_minute(per_minute))),
     }
 }
 
@@ -677,7 +677,7 @@ mod tests {
                 auth: auth.clone(),
                 transport: Arc::new(Switchboard::default()),
                 holdings,
-                pace: Arc::new(Pace::default()),
+                limits: Arc::new(Limits::default()),
             }),
             log,
         );
@@ -918,7 +918,7 @@ mod tests {
             Arc::new(tempfile::tempdir().unwrap()),
             Arc::new(EventLog::ephemeral()),
             None,
-            Arc::new(pace),
+            Arc::new(Limits::new(pace)),
         )
         .await
     }
@@ -928,7 +928,7 @@ mod tests {
         data: Arc<tempfile::TempDir>,
         log: Arc<EventLog>,
         auth: Option<Arc<Auth>>,
-        pace: Arc<Pace>,
+        limits: Arc<Limits>,
     ) -> Site {
         let switchboard = Arc::new(Switchboard::default());
         let mut down = std::collections::HashMap::new();
@@ -966,7 +966,7 @@ mod tests {
                 auth: auth.clone(),
                 transport: switchboard.clone(),
                 holdings,
-                pace,
+                limits,
             }),
             log.clone(),
         );
@@ -2320,7 +2320,7 @@ mod tests {
             data.clone(),
             log.clone(),
             None,
-            Arc::new(Pace::default()),
+            Arc::new(Limits::default()),
         )
         .await;
         let ws = first.workspace("c1", "Research").await;
@@ -2358,7 +2358,7 @@ mod tests {
         // The door starts again over the same data directory, root log and credentials (on a host, all on disk):
         // the workspace, its members and invitations, its cloud with the members' credentials and the deployment it
         // placed are all back.
-        let again = site_over(Vec::new(), data.clone(), log, Some(auth), Arc::new(Pace::default())).await;
+        let again = site_over(Vec::new(), data.clone(), log, Some(auth), Arc::new(Limits::default())).await;
         for (endpoint, bed) in [(A, &members[0]), (B, &members[1])] {
             again.switchboard.connect(endpoint, bed.app.clone());
         }
@@ -2633,7 +2633,7 @@ mod tests {
                 auth: auth.clone(),
                 transport: Arc::new(Switchboard::default()),
                 holdings,
-                pace: Arc::new(Pace::default()),
+                limits: Arc::new(Limits::default()),
             }),
             log,
         );
@@ -3058,13 +3058,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_credential_is_paced_across_the_root_and_every_workspace_together() {
+    async fn a_credential_with_a_share_is_paced_across_the_root_and_every_workspace_together() {
         let site = site_pacing(Vec::new(), Pace::per_minute(2)).await;
-        let bob = key_with(&site.app, None, None).await;
-        let (s, b) = send_as(
-            &site.app,
-            "",
-            &bob,
+        let bob = key_with(&site.app, None, Some(GB)).await;
+        let send = |prefix: String, id: &'static str, r#type: &'static str, schema: &'static str, data: Value| {
+            let (app, bob) = (site.app.clone(), bob.clone());
+            async move { send_as(&app, &prefix, &bob, id, r#type, schema, data).await }
+        };
+        let (s, b) = send(
+            "".into(),
             "w1",
             "CreateWorkspace",
             "create-workspace",
@@ -3076,10 +3078,19 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        let (s, b) = send_as(
-            &site.app,
-            "",
-            &bob,
+        let at_ws = format!("/workspaces/{ws}");
+        // A command its admission refuses gives back what it took.
+        let (s, b) = send(
+            at_ws.clone(),
+            "c0",
+            "ArchiveCloud",
+            "archive-cloud",
+            json!({ "cloud": "lab" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        let (s, b) = send(
+            "".into(),
             "w2",
             "CreateWorkspace",
             "create-workspace",
@@ -3087,22 +3098,27 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::CREATED, "{b}");
-        let (s, b) = send_as(
-            &site.app,
-            &format!("/workspaces/{ws}"),
-            &bob,
-            "c1",
-            "ArchiveCloud",
-            "archive-cloud",
-            json!({ "cloud": "lab" }),
-        )
-        .await;
+        let (s, b) = send(at_ws, "c1", "ArchiveCloud", "archive-cloud", json!({ "cloud": "lab" })).await;
         assert_eq!(
             s,
             StatusCode::TOO_MANY_REQUESTS,
             "the workspace counts what the root took: {b}"
         );
         assert_eq!(b["error"]["code"], "TOO_MANY_COMMANDS");
+        // The owner's key, approved with nothing said, is not paced.
+        for id in ["o1", "o2", "o3"] {
+            let (s, b) = send_as(
+                &site.app,
+                "",
+                &site.key,
+                id,
+                "CreateWorkspace",
+                "create-workspace",
+                json!({ "name": id }),
+            )
+            .await;
+            assert_eq!(s, StatusCode::CREATED, "{b}");
+        }
         assert_eq!(commands_per_minute(None).unwrap(), 60);
         assert_eq!(commands_per_minute(Some(" 120 ")).unwrap(), 120);
         assert!(commands_per_minute(Some("0")).unwrap_err().contains("1 or more"));

@@ -18,6 +18,7 @@ pub mod catalogue;
 pub mod envelope;
 pub mod error;
 pub mod guidance;
+pub mod limits;
 pub mod log;
 pub mod manifest;
 pub mod pace;
@@ -27,6 +28,7 @@ pub use auth::{Approver, Auth, FakeApprover, LocalApprover};
 pub use catalogue::{AdmitHook, Catalogue, CommandDef, Emitter, EventDef, QueryDef};
 pub use envelope::Envelope;
 pub use error::BestError;
+pub use limits::Limits;
 pub use log::{Accept, EventLog, Filter, Stored, Unfinished};
 pub use pace::Pace;
 
@@ -67,8 +69,8 @@ pub struct Door {
     pub tenants: Option<String>,
     /// What a credential may read of this log's events, when the door's own rule is not the whole answer.
     pub partition: Option<Partition>,
-    /// How many commands a credential may send a minute, counted with every door that shares it.
-    pub pace: Arc<Pace>,
+    /// What a credential with a share may do at once, counted with every door that shares it.
+    pub limits: Arc<Limits>,
 }
 
 impl Door {
@@ -95,13 +97,13 @@ impl Door {
             completions,
             tenants: None,
             partition: None,
-            pace: Arc::new(Pace::default()),
+            limits: Arc::new(Limits::default()),
         }
     }
 
-    /// The same door, counting commands against `pace`, which other doors may share.
-    pub fn with_pace(mut self, pace: Arc<Pace>) -> Self {
-        self.pace = pace;
+    /// The same door, holding credentials with a share to `limits`, which other doors may share.
+    pub fn with_limits(mut self, limits: Arc<Limits>) -> Self {
+        self.limits = limits;
         self
     }
 
