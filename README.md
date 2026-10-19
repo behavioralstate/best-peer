@@ -72,11 +72,14 @@ The peer makes itself a certificate at first start, keeps it in its data folder 
 (`NODE_EXTRA_CA_CERTS=<file>` for a Node client, `SSL_CERT_FILE=<file>` for a Python one, `--cacert <file>` for
 curl). A certificate of your own, from your CA or a public one for a name you hold, is
 `BEST_PEER_TLS_CERT=<chain.pem> BEST_PEER_TLS_KEY=<key.pem>`; the peer checks nothing about it beyond that it
-loads. An `http://` endpoint still works, with a warning at start: the credential then travels in the clear, so keep
-that to a VPN. There is no relay in the peer, so across the internet the address is one you make reachable (a static
-IP with a port forward, a Tailscale IP), and the firewall lets in 7777 and nothing else: a prompt is a command on
-the door like any other, on that port, with the door's credential. The engines' own ports stay on loopback whatever
-the door listens on, and nothing of them is on the door.
+loads. An `http://` endpoint is served on loopback alone: off it the credential would travel in the clear, and the
+peer refuses to start, saying what to set. A hop that a VPN already encrypts (a WireGuard or Tailscale address) is
+the one exception, and you say so: `BEST_PEER_CLEARTEXT=vpn` serves `http://` off loopback, with a warning at start,
+and lets this door's clouds reach members over `http://`. Behind a proxy, let it pass TLS through, or re-encrypt to
+the peer's own certificate. There is no relay in the peer, so across the internet the address is one you make
+reachable (a static IP with a port forward, a Tailscale IP), and the firewall lets in 7777 and nothing else: a prompt
+is a command on the door like any other, on that port, with the door's credential. The engines' own ports stay on
+loopback whatever the door listens on, and nothing of them is on the door.
 
 **3. Admit the agent.** The person connecting says to their client "sign me in `<name>`, start from
 `https://<address>:7777/.well-known/best`"; their client shows them a code like `8BB9-CB44`, and they send it to you.
@@ -152,7 +155,10 @@ and a build provenance attestation (`gh attestation verify <archive> --repo beha
 `best-peer --version` says which it is.
 
 `BEST_PEER_LISTEN` (default `127.0.0.1:7777`) is where it listens; `BEST_PEER_ENDPOINT` is the consumer-facing base URL
-the manifest advertises, required when the peer listens on every interface. An `https://` endpoint is served by the
+the manifest advertises, required when the peer listens on every interface. An `http://` endpoint is served only
+when both the listen address and the endpoint's host are loopback (`127.0.0.0/8`, `::1`, `localhost`); otherwise the
+peer refuses to start, naming which is off, unless `BEST_PEER_CLEARTEXT=vpn` says a VPN already encrypts every hop to
+and from it, which also lets its clouds reach members over `http://`. An `https://` endpoint is served by the
 peer itself, with rustls: `BEST_PEER_TLS_CERT` and `BEST_PEER_TLS_KEY` name the operator's certificate chain and
 private key (PEM files, checked for nothing beyond loading); without them the peer makes a certificate at first
 start, `tls/cert.pem` under its data folder, named at start for clients to pin, and made again when the endpoint's
@@ -182,7 +188,11 @@ are placed by the peer's own rule across its members and sent there as the cloud
 comes back on the workspace's stream under the caller's correlation id with `cloud` and `peer` named; a prompt is
 placed on the member that holds the deployment, as the cloud's own command there, and its answer relayed the same
 way. `BEST_PEER_TRUST` lists PEM files to trust beyond the public roots, for members serving their own
-certificates. Every thirty seconds each cloud squares its state with its members: one that does not answer within
+certificates. A member named by an `http://` endpoint off loopback is refused at `configure-cloud`
+(`CLEARTEXT_MEMBER`), and nothing is sent to one, since the cloud's credential would travel in the clear, unless this
+door's operator set `BEST_PEER_CLEARTEXT=vpn`. A cloud recorded with such a member before (under an older peer, or
+while `vpn` was set) stops the peer at start, naming the workspace, the cloud, the peer and its endpoint, and how to
+name it by `https://` instead. Every thirty seconds each cloud squares its state with its members: one that does not answer within
 fifteen seconds is told as `PeerLost`, with its workloads told as ended and its commands in flight failed;
 `PeerJoined` when it answers again, and what it still runs of the cloud's by then is ended there, so the two agree;
 a workload a member no longer lists at two ticks running is told as ended. A credential's share is counted across

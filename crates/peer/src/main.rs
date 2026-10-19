@@ -30,22 +30,28 @@ use best_peer_gpu::Gpu;
 use best_peer_runtime::{Confinement, Runtime};
 use lifecycle::{Confine, Images, Patience, Peer};
 use tls::Tls;
+use transport::{is_loopback, Cleartext};
 
 /// Where to listen, what to advertise and whether TLS serves it, from `BEST_PEER_LISTEN` (ip:port, default
 /// loopback), `BEST_PEER_ENDPOINT` (the consumer-facing base URL) and `BEST_PEER_TLS_CERT` with `BEST_PEER_TLS_KEY`
 /// (the operator's certificate; an `https://` endpoint without them is served with one the peer makes). The endpoint
 /// defaults to the listen address only when that address is one a consumer can use: a peer listening on every
-/// interface has no address of its own to advertise, so it refuses to start until told what it is called.
+/// interface has no address of its own to advertise, so it refuses to start until told what it is called. A
+/// cleartext endpoint is served on loopback alone, both where the peer listens and what it advertises: off it the
+/// credential would travel in the clear, so the peer refuses to start and says what to set, unless the operator said
+/// a VPN carries the hop (`BEST_PEER_CLEARTEXT=vpn`).
 pub fn config(
     listen: Option<&str>,
     endpoint: Option<&str>,
     cert: Option<&str>,
     key: Option<&str>,
+    cleartext: Cleartext,
 ) -> Result<(SocketAddr, String, Tls), String> {
     let listen_text = listen.unwrap_or("127.0.0.1:7777");
     let listen: SocketAddr = listen_text
         .parse()
         .map_err(|_| format!("BEST_PEER_LISTEN must be ip:port, not {listen_text:?}"))?;
+    let said = endpoint.is_some();
     let endpoint = match endpoint {
         Some(e) if e.starts_with("http://") || e.starts_with("https://") => e.trim_end_matches('/').to_string(),
         Some(e) => {
@@ -62,6 +68,24 @@ pub fn config(
         None => format!("http://{listen}"),
     };
     let tls = Tls::decide(&endpoint, cert, key)?;
+    let listen_off = !listen.ip().to_canonical().is_loopback();
+    let host = transport::url_host(&endpoint);
+    let endpoint_off = said && !is_loopback(host);
+    if tls == Tls::Off && cleartext == Cleartext::Loopback && (listen_off || endpoint_off) {
+        let named = if said {
+            "BEST_PEER_ENDPOINT is"
+        } else {
+            "the endpoint, from BEST_PEER_LISTEN, is"
+        };
+        let off = match (listen_off, endpoint_off) {
+            (true, true) => format!("BEST_PEER_LISTEN is {listen} and the endpoint's host is {host}, neither loopback"),
+            (true, false) => format!("BEST_PEER_LISTEN is {listen}, not loopback"),
+            _ => format!("the endpoint's host is {host}, not loopback"),
+        };
+        return Err(format!(
+            "{named} {endpoint}, cleartext, and {off}: a credential would travel unencrypted. Make BEST_PEER_ENDPOINT https:// (the peer makes its own certificate, or serves BEST_PEER_TLS_CERT and BEST_PEER_TLS_KEY), keep both on loopback, or set BEST_PEER_CLEARTEXT=vpn when a VPN already encrypts the hop"
+        ));
+    }
     Ok((listen, endpoint, tls))
 }
 
@@ -186,12 +210,14 @@ pub fn door(peer: Arc<Peer>, workspaces: Arc<workspace::Workspaces>, auth: Arc<A
 
 /// What the workspaces of this door are built with: the root's endpoint and credentials, the data directory, the
 /// transport their clouds reach members through (HTTP with the trust `BEST_PEER_TRUST` adds, the PEM files of
-/// members' own certificates), and the holdings every surface counts a share against.
+/// members' own certificates, and cleartext only where the peer's own rule allows it), and the holdings every
+/// surface counts a share against.
 fn context(
     endpoint: &str,
     dir: &std::path::Path,
     auth: Arc<Auth>,
     holdings: Arc<holdings::Holdings>,
+    cleartext: Cleartext,
 ) -> workspace::Context {
     let trust: Vec<PathBuf> = std::env::var("BEST_PEER_TRUST")
         .ok()
@@ -208,8 +234,9 @@ fn context(
         service: SERVICE.into(),
         dir: dir.into(),
         auth,
-        transport: Arc::new(transport::Http::new(&trust).unwrap_or_else(|why| fail(&why))),
+        transport: Arc::new(transport::Http::new(&trust, cleartext).unwrap_or_else(|why| fail(&why))),
         holdings,
+        cleartext,
     }
 }
 
@@ -226,11 +253,6 @@ fn main() {
             std::process::exit(2);
         }
     }
-}
-
-/// Whether a host name or address is this machine's loopback.
-fn is_loopback(host: &str) -> bool {
-    host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// The hardware the peer places workloads on, by `BEST_PEER_GPU`: `nvml` (the default) reads the NVIDIA cards
@@ -297,11 +319,16 @@ async fn serve() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
+    let cleartext = Cleartext::parse(std::env::var("BEST_PEER_CLEARTEXT").ok().as_deref()).unwrap_or_else(|why| {
+        eprintln!("{why}");
+        std::process::exit(2);
+    });
     let (listen, endpoint, tls) = match config(
         std::env::var("BEST_PEER_LISTEN").ok().as_deref(),
         std::env::var("BEST_PEER_ENDPOINT").ok().as_deref(),
         std::env::var("BEST_PEER_TLS_CERT").ok().as_deref(),
         std::env::var("BEST_PEER_TLS_KEY").ok().as_deref(),
+        cleartext,
     ) {
         Ok(c) => c,
         Err(why) => {
@@ -323,7 +350,7 @@ async fn serve() {
     if let Ok(members) = std::env::var("BEST_PEER_MEMBERS") {
         fail(&workspace::members_variable_replaced(&members));
     }
-    let app = peer_app(&endpoint, &dir, log, auth).await;
+    let app = peer_app(&endpoint, &dir, log, auth, cleartext).await;
     let serving = tls::serving(&tls, &dir, &tls::names_for(&endpoint, &listen)).unwrap_or_else(|why| fail(&why));
     let listener = std::net::TcpListener::bind(listen)
         .and_then(|l| l.set_nonblocking(true).map(|()| l))
@@ -344,8 +371,8 @@ async fn serve() {
             tracing::info!(certificate = %s.file.display(), "https with a certificate this peer made: a client that pins it reads this file")
         }
         Some(s) => tracing::info!(certificate = %s.file.display(), "https with the operator's certificate"),
-        None if !listen.ip().is_loopback() => {
-            tracing::warn!(%endpoint, "the endpoint is cleartext and not loopback: credentials will travel unencrypted; make BEST_PEER_ENDPOINT https:// before anyone but you uses it")
+        None if cleartext == Cleartext::Vpn => {
+            tracing::warn!(%endpoint, "cleartext, as BEST_PEER_CLEARTEXT=vpn says: credentials travel unencrypted to and from this peer, and only the VPN protects them")
         }
         None => {}
     }
@@ -363,9 +390,31 @@ async fn serve() {
         .unwrap_or_else(|e| fail(&format!("serving failed: {e}")));
 }
 
+/// Why the peer will not start when a cloud it hosts has a member recorded at a cleartext endpoint off loopback:
+/// the cloud would send its credential there in the clear. Each is named, with the way out.
+fn cleartext_members_refused(members: &[(String, String, String, String)]) -> Option<String> {
+    if members.is_empty() {
+        return None;
+    }
+    let named: Vec<String> = members
+        .iter()
+        .map(|(ws, cloud, peer, endpoint)| format!("workspace {ws}, cloud {cloud}, peer {peer} at {endpoint}"))
+        .collect();
+    Some(format!(
+        "a cloud here has a member recorded at a cleartext endpoint off loopback, where its credential would travel unencrypted: {}. Send configure-cloud in that workspace naming the member by its https:// endpoint, or archive the cloud; to start meanwhile, set BEST_PEER_CLEARTEXT=vpn, which is what the cloud ran under, and only when a VPN carries the hop",
+        named.join("; ")
+    ))
+}
+
 /// The peer over this host's hardware and engines, its door and its endpoints, and the workspaces it hosts under
 /// `/workspaces`.
-async fn peer_app(endpoint: &str, dir: &std::path::Path, log: Arc<EventLog>, auth: Arc<Auth>) -> axum::Router {
+async fn peer_app(
+    endpoint: &str,
+    dir: &std::path::Path,
+    log: Arc<EventLog>,
+    auth: Arc<Auth>,
+    cleartext: Cleartext,
+) -> axum::Router {
     let gpu = accelerator(std::env::var("BEST_PEER_GPU").ok().as_deref()).unwrap_or_else(|why| fail(&why));
     // The engines' ports are bound where the peer reaches them, whatever the door listens on: a prompt reaches an
     // engine through the door, with the door's credential. On this machine that is loopback; a container engine on
@@ -418,8 +467,11 @@ async fn peer_app(endpoint: &str, dir: &std::path::Path, log: Arc<EventLog>, aut
         confine,
     )
     .await;
-    let ctx = Arc::new(context(endpoint, dir, auth.clone(), holdings));
+    let ctx = Arc::new(context(endpoint, dir, auth.clone(), holdings, cleartext));
     let workspaces = workspace::Workspaces::open(ctx, log);
+    if let Some(why) = cleartext_members_refused(&workspaces.cleartext_members()) {
+        fail(&why);
+    }
     let door = Arc::new(door(peer.clone(), workspaces.clone(), auth.clone()));
     // What the last run accepted and never completed is run now, before anyone can send more: at the root, then in
     // every workspace, whose clouds then start following their members.
@@ -758,6 +810,7 @@ mod tests {
                 auth: auth.clone(),
                 transport: Arc::new(Switchboard::default()),
                 holdings,
+                cleartext: Cleartext::Loopback,
             }),
             log,
         );
@@ -1041,6 +1094,17 @@ mod tests {
         log: Arc<EventLog>,
         auth: Option<Arc<Auth>>,
     ) -> Site {
+        site_under(members, data, log, auth, Cleartext::Loopback).await
+    }
+
+    /// The same, under the cleartext rule given.
+    async fn site_under(
+        members: Vec<(&str, Bed)>,
+        data: Arc<tempfile::TempDir>,
+        log: Arc<EventLog>,
+        auth: Option<Arc<Auth>>,
+        cleartext: Cleartext,
+    ) -> Site {
         let switchboard = Arc::new(Switchboard::default());
         let mut down = std::collections::HashMap::new();
         let mut beds = Vec::new();
@@ -1078,6 +1142,7 @@ mod tests {
                 auth: auth.clone(),
                 transport: switchboard.clone(),
                 holdings,
+                cleartext,
             }),
             log.clone(),
         );
@@ -1235,8 +1300,8 @@ mod tests {
         (a, b)
     }
 
-    const A: &str = "http://a.test";
-    const B: &str = "http://b.test";
+    const A: &str = "https://a.test";
+    const B: &str = "https://b.test";
 
     #[tokio::test]
     async fn two_workspaces_on_one_door_each_hold_a_cloud_one_machine_serves_both_and_each_sees_places_on_and_hears_only_its_own(
@@ -2283,6 +2348,26 @@ mod tests {
         let (s, e) = configure("k0", json!({ "cloud": "lab", "members": [{ "peer": "a", "endpoint": A }, { "peer": "a2", "endpoint": format!("{A}/") }] })).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert_eq!(e["error"]["code"], "DUPLICATE_MEMBER");
+        // A member in cleartext off loopback would be sent the cloud's credential unencrypted: refused, naming it.
+        for endpoint in [
+            "http://203.0.113.5:7777",
+            "http://a.test",
+            "http://[::ffff:203.0.113.5]:7777",
+        ] {
+            let (s, e) = configure(
+                "k0",
+                json!({ "cloud": "lab", "members": [{ "peer": "a", "endpoint": endpoint }] }),
+            )
+            .await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{endpoint}: {e}");
+            assert_eq!(e["error"]["code"], "CLEARTEXT_MEMBER");
+            assert_eq!(e["error"]["details"]["field"], "members");
+            let message = e["error"]["message"].as_str().unwrap();
+            assert!(
+                message.contains("https://") && message.contains("BEST_PEER_CLEARTEXT=vpn"),
+                "{message}"
+            );
+        }
         let (_, all) = get_as(&site.app, &format!("/workspaces/{ws}"), &site.key, "/events").await;
         assert_eq!(
             type_names(all["events"].as_array().unwrap()),
@@ -2667,34 +2752,210 @@ mod tests {
 
     #[test]
     fn the_endpoint_defaults_to_the_listen_address_only_when_a_consumer_can_reach_it() {
-        let (listen, endpoint, tls) = config(None, None, None, None).unwrap();
+        let (listen, endpoint, tls) = config(None, None, None, None, Cleartext::Loopback).unwrap();
         assert_eq!(listen.to_string(), "127.0.0.1:7777");
         assert_eq!(endpoint, "http://127.0.0.1:7777");
         assert_eq!(tls, Tls::Off);
-        let (_, endpoint, tls) = config(Some("0.0.0.0:7777"), Some("https://peer.example.com/"), None, None).unwrap();
+        let (_, endpoint, tls) = config(
+            Some("0.0.0.0:7777"),
+            Some("https://peer.example.com/"),
+            None,
+            None,
+            Cleartext::Loopback,
+        )
+        .unwrap();
         assert_eq!(endpoint, "https://peer.example.com");
         assert_eq!(tls, Tls::Own);
-        assert!(config(Some("0.0.0.0:7777"), None, None, None)
+        assert!(config(Some("0.0.0.0:7777"), None, None, None, Cleartext::Loopback)
             .unwrap_err()
             .contains("BEST_PEER_ENDPOINT"));
-        assert!(config(Some("[::]:7777"), None, None, None)
+        assert!(config(Some("[::]:7777"), None, None, None, Cleartext::Loopback)
             .unwrap_err()
             .contains("BEST_PEER_ENDPOINT"));
-        assert!(config(Some("localhost:7777"), None, None, None)
+        assert!(config(Some("localhost:7777"), None, None, None, Cleartext::Loopback)
             .unwrap_err()
             .contains("ip:port"));
-        assert!(config(None, Some("peer.example.com"), None, None)
+        assert!(config(None, Some("peer.example.com"), None, None, Cleartext::Loopback)
             .unwrap_err()
             .contains("https://"));
+        // Cleartext off loopback is refused, whether the endpoint was said or defaulted, whether the listen address
+        // or the endpoint's host is what is off; each refusal names what is off, the variables and the ways through.
+        for (listen, endpoint, off) in [
+            (
+                Some("192.168.1.9:7777"),
+                Some("http://192.168.1.9:7777"),
+                "neither loopback",
+            ),
+            (
+                Some("192.168.1.9:7777"),
+                None,
+                "BEST_PEER_LISTEN is 192.168.1.9:7777, not loopback",
+            ),
+            (
+                Some("0.0.0.0:7777"),
+                Some("http://peer.example.com:7777"),
+                "neither loopback",
+            ),
+            (
+                None,
+                Some("http://peer.example.com:7777"),
+                "host is peer.example.com, not loopback",
+            ),
+            (
+                Some("[::]:7777"),
+                Some("http://[::1]:7777"),
+                "BEST_PEER_LISTEN is [::]:7777, not loopback",
+            ),
+            (None, Some("http://user@203.0.113.5:7777/door"), "host is 203.0.113.5"),
+        ] {
+            let why = config(listen, endpoint, None, None, Cleartext::Loopback).unwrap_err();
+            assert!(why.contains(off), "{why}");
+            for named in ["cleartext", "https://", "BEST_PEER_TLS_CERT", "BEST_PEER_CLEARTEXT=vpn"] {
+                assert!(why.contains(named), "{named} in {why}");
+            }
+            let opens = if endpoint.is_some() {
+                "BEST_PEER_ENDPOINT is"
+            } else {
+                "from BEST_PEER_LISTEN"
+            };
+            assert!(why.contains(opens), "{why}");
+        }
+        // Loopback is loopback in every spelling, and a VPN the operator names lets cleartext through.
+        for (listen, endpoint) in [
+            (Some("127.0.0.1:7781"), Some("http://127.0.0.1:7781")),
+            (Some("127.0.0.2:7781"), Some("http://localhost:7781")),
+            (Some("[::1]:7781"), Some("http://[::1]:7781")),
+            (Some("[::ffff:127.0.0.1]:7781"), Some("http://[::ffff:127.0.0.1]:7781")),
+        ] {
+            let (_, _, tls) = config(listen, endpoint, None, None, Cleartext::Loopback).unwrap();
+            assert_eq!(tls, Tls::Off, "{listen:?} {endpoint:?}");
+        }
+        let (_, endpoint, tls) = config(Some("100.64.0.7:7777"), None, None, None, Cleartext::Vpn).unwrap();
+        assert_eq!((endpoint.as_str(), tls), ("http://100.64.0.7:7777", Tls::Off));
+        let (_, endpoint, tls) = config(
+            Some("192.168.1.9:7777"),
+            Some("https://192.168.1.9:7777"),
+            None,
+            None,
+            Cleartext::Loopback,
+        )
+        .unwrap();
+        assert_eq!((endpoint.as_str(), tls), ("https://192.168.1.9:7777", Tls::Own));
+    }
+
+    #[test]
+    fn cleartext_goes_to_loopback_alone_unless_the_operator_names_a_vpn() {
+        assert_eq!(Cleartext::parse(None).unwrap(), Cleartext::Loopback);
+        assert_eq!(Cleartext::parse(Some("vpn")).unwrap(), Cleartext::Vpn);
+        assert!(Cleartext::parse(Some("yes"))
+            .unwrap_err()
+            .contains("BEST_PEER_CLEARTEXT"));
+        for (url, host) in [
+            ("http://127.0.0.1:7777/x", "127.0.0.1"),
+            ("http://[::1]:7777", "[::1]"),
+            ("http://user:pw@localhost", "localhost"),
+            ("https://peer.example.com?x=1", "peer.example.com"),
+        ] {
+            assert_eq!(transport::url_host(url), host);
+        }
+        for url in [
+            "http://127.0.0.1:7777",
+            "http://127.9.9.9",
+            "http://localhost:7777",
+            "http://LOCALHOST",
+            "http://[::1]:7777",
+            "http://[::ffff:127.0.0.1]:7777",
+            "https://203.0.113.5:7777",
+        ] {
+            assert!(Cleartext::Loopback.allows(url), "{url}");
+        }
+        for url in [
+            "http://203.0.113.5:7777",
+            "http://[::ffff:203.0.113.5]:7777",
+            "http://127.0.0.1.example.com",
+            "http://localhost@203.0.113.5",
+            "ftp://127.0.0.1",
+        ] {
+            assert!(!Cleartext::Loopback.allows(url), "{url}");
+        }
+        assert!(Cleartext::Vpn.allows("http://100.64.0.7:7777"));
+    }
+
+    #[tokio::test]
+    async fn a_door_with_a_cloud_member_recorded_in_cleartext_off_loopback_names_it_at_start() {
+        const OFF: &str = "http://203.0.113.5:7777";
+        let (a, _) = two_members().await;
+        let key_a = a.key.clone();
+        let data = Arc::new(tempfile::tempdir().unwrap());
+        let log = Arc::new(EventLog::ephemeral());
+        let first = site_under(vec![(OFF, a)], data.clone(), log.clone(), None, Cleartext::Vpn).await;
+        let ws = first.workspace("c1", "Research").await;
+        first.cloud(&ws, "k1", "lab", &[("a", OFF, &key_a)]).await;
+        let auth = first.auth.clone();
+        first.workspaces.get(&ws).unwrap().cloud_for_test("lab").halt();
+        drop(first.app);
+        drop(first.workspaces);
+
+        let again = site_over(Vec::new(), data.clone(), log, Some(auth)).await;
+        let found = again.workspaces.cleartext_members();
+        assert_eq!(found, vec![(ws.clone(), "lab".into(), "a".into(), OFF.into())]);
+        let why = cleartext_members_refused(&found).unwrap();
+        for named in [
+            ws.as_str(),
+            "cloud lab",
+            "peer a",
+            OFF,
+            "configure-cloud",
+            "https://",
+            "BEST_PEER_CLEARTEXT=vpn",
+        ] {
+            assert!(why.contains(named), "{named} in {why}");
+        }
+        assert!(cleartext_members_refused(&[]).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_transport_sends_nothing_in_cleartext_off_loopback() {
+        use transport::Transport;
+        let http = transport::Http::new(&[], Cleartext::Loopback).unwrap();
+        let req = Request::builder()
+            .uri("http://203.0.113.5:7777/.well-known/best")
+            .header("X-Api-Key", "secret")
+            .body(Body::empty())
+            .unwrap();
+        let why = http.call(req).await.unwrap_err();
+        assert!(
+            why.contains("cleartext") && why.contains("BEST_PEER_CLEARTEXT=vpn"),
+            "{why}"
+        );
     }
 
     #[test]
     fn a_certificate_makes_the_default_endpoint_https() {
-        let (_, endpoint, tls) = config(None, None, Some("c.pem"), Some("k.pem")).unwrap();
+        let (_, endpoint, tls) = config(None, None, Some("c.pem"), Some("k.pem"), Cleartext::Loopback).unwrap();
         assert_eq!(endpoint, "https://127.0.0.1:7777");
         assert!(matches!(tls, Tls::Given { .. }));
-        let why = config(None, Some("http://127.0.0.1:7777"), Some("c.pem"), Some("k.pem")).unwrap_err();
-        assert!(why.contains("https://"), "{why}");
+        let why = config(
+            None,
+            Some("http://127.0.0.1:7777"),
+            Some("c.pem"),
+            Some("k.pem"),
+            Cleartext::Loopback,
+        )
+        .unwrap_err();
+        assert!(why.contains("a certificate is set"), "{why}");
+        let why = config(
+            Some("192.168.1.9:7777"),
+            Some("http://192.168.1.9:7777"),
+            Some("c.pem"),
+            Some("k.pem"),
+            Cleartext::Loopback,
+        )
+        .unwrap_err();
+        assert!(
+            why.contains("a certificate is set"),
+            "cleartext with a certificate is the certificate's refusal: {why}"
+        );
     }
 
     /// The door served over https from a loopback port, with the certificate the peer makes for itself: the manifest
@@ -2738,6 +2999,7 @@ mod tests {
                 auth: auth.clone(),
                 transport: Arc::new(Switchboard::default()),
                 holdings,
+                cleartext: Cleartext::Loopback,
             }),
             log,
         );
