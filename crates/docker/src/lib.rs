@@ -203,6 +203,7 @@ impl Runtime for DockerRuntime {
                 network_mode: match &confinement.network {
                     Network::None => Some("none".into()),
                     Network::Default => None,
+                    Network::Named(name) => Some(name.clone()),
                 },
                 // An init as PID 1 reaps and forwards signals, so a stop reaches an image that did not expect to be it.
                 init: Some(true),
@@ -210,11 +211,18 @@ impl Runtime for DockerRuntime {
             }),
             ..Default::default()
         };
-        let created = self.docker.create_container(None, body).await.map_err(|e| match e {
-            bollard::errors::Error::DockerResponseServerError { status_code: 404, .. } => {
+        let created = self.docker.create_container(None, body).await.map_err(|e| match (e, &spec.confinement.network) {
+            (bollard::errors::Error::DockerResponseServerError { status_code: 404, message }, Network::Named(name))
+                if message.contains(name.as_str()) =>
+            {
+                RuntimeError::Engine(format!(
+                    "the container engine has no network {name}: create it (docker network create {name}) or unset BEST_PEER_NETWORK ({message})"
+                ))
+            }
+            (bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }, _) => {
                 RuntimeError::ImageNotFound(spec.image.0.clone())
             }
-            other => RuntimeError::Engine(other.to_string()),
+            (other, _) => RuntimeError::Engine(other.to_string()),
         })?;
         let id = ContainerId(created.id);
         if let Err(e) = self.docker.start_container(&id.0, None).await {

@@ -84,13 +84,14 @@ impl Default for Confinement {
     }
 }
 
-/// Where a container's network goes: nowhere, what a job gets, or the container engine's own default, what an
-/// engine gets to pull its models.
+/// Where a container's network goes: nowhere, what a job gets; the container engine's own default, what an engine
+/// gets to pull its models; or a network the operator made for the engines and named.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Network {
     None,
     Default,
+    Named(String),
 }
 
 /// A published port: the container's and the host's.

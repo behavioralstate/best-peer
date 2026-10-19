@@ -27,7 +27,7 @@ use std::time::Duration;
 use best_peer_door::{Auth, Door, EventLog, LocalApprover};
 use best_peer_engine::Engine;
 use best_peer_gpu::Gpu;
-use best_peer_runtime::{Confinement, Runtime};
+use best_peer_runtime::{Confinement, Network, Runtime};
 use lifecycle::{Confine, Images, Patience, Peer};
 use tls::Tls;
 
@@ -72,6 +72,32 @@ const MIN_CONTAINER_MEMORY: u64 = 6 << 20;
 /// 4096) for a job, `BEST_PEER_ENGINE_MEMORY` (default none) and `BEST_PEER_ENGINE_PIDS` (default 4096) for an
 /// engine; `none` for a ceiling is no ceiling. These are ceilings and nothing else: a job never has a network, and
 /// capabilities, privileges and a job's filesystem are never opened by a variable.
+/// The network the engines' containers join, from `BEST_PEER_NETWORK`: the container engine's default unless the
+/// operator made one for them, so they reach what that network lets them and nothing the default one would. An
+/// engine serves on a published port, so `none` cannot serve it, and `host` would put the engine's own wide bind on
+/// the host's interfaces: both are refused, as is another container's network. Only containers join a network:
+/// under `native` or `fake` it is refused too, since it would do nothing.
+pub fn engine_network(text: Option<&str>, runtime: Option<&str>) -> Result<Network, String> {
+    let Some(name) = text.map(str::trim).filter(|t| !t.is_empty()) else {
+        return Ok(Network::Default);
+    };
+    if let Some(other) = runtime.map(str::trim).filter(|r| *r != "docker") {
+        return Err(format!(
+            "BEST_PEER_NETWORK is set with BEST_PEER_RUNTIME={other}, which starts no container: unset it or run with BEST_PEER_RUNTIME=docker"
+        ));
+    }
+    match name {
+        "default" | "bridge" => Ok(Network::Default),
+        "none" | "host" => Err(format!(
+            "BEST_PEER_NETWORK is {name}: an engine serves on a published port, which {name} does not give it safely; name a network made for the engines (docker network create <name>), or unset it for the default"
+        )),
+        _ if name.starts_with("container:") => Err(format!(
+            "BEST_PEER_NETWORK is {name}: an engine joins a network of its own, never another container's; name a network made for the engines, or unset it"
+        )),
+        _ => Ok(Network::Named(name.to_string())),
+    }
+}
+
 pub fn confine(
     job_memory: Option<&str>,
     job_pids: Option<&str>,
@@ -389,11 +415,16 @@ async fn peer_app(endpoint: &str, dir: &std::path::Path, log: Arc<EventLog>, aut
         ..Patience::default()
     };
     let holdings = Arc::new(holdings::Holdings::default());
-    let confine = confine(
+    let mut confine = confine(
         std::env::var("BEST_PEER_JOB_MEMORY").ok().as_deref(),
         std::env::var("BEST_PEER_JOB_PIDS").ok().as_deref(),
         std::env::var("BEST_PEER_ENGINE_MEMORY").ok().as_deref(),
         std::env::var("BEST_PEER_ENGINE_PIDS").ok().as_deref(),
+    )
+    .unwrap_or_else(|why| fail(&why));
+    confine.engine.network = engine_network(
+        std::env::var("BEST_PEER_NETWORK").ok().as_deref(),
+        std::env::var("BEST_PEER_RUNTIME").ok().as_deref(),
     )
     .unwrap_or_else(|why| fail(&why));
     let peer = peer(
@@ -577,7 +608,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{header, Request, StatusCode};
     use best_peer_door::{Envelope, FakeApprover, Filter};
-    use best_peer_runtime::{ContainerId, Network};
+    use best_peer_runtime::ContainerId;
     use futures::StreamExt;
     use http_body_util::BodyExt;
 
@@ -684,6 +715,19 @@ mod tests {
         engine_host: &str,
         auth: Option<Arc<Auth>>,
     ) -> Bed {
+        bed_confining(gpu, log, runtime, engine, engine_host, auth, Confine::default()).await
+    }
+
+    /// The same, with the containers confined as `confine` says.
+    async fn bed_confining(
+        gpu: Arc<best_peer_gpu::Fake>,
+        log: Arc<EventLog>,
+        runtime: Arc<best_peer_runtime::Fake>,
+        engine: Arc<best_peer_engine::Fake>,
+        engine_host: &str,
+        auth: Option<Arc<Auth>>,
+        confine: Confine,
+    ) -> Bed {
         for image in ["ollama/ollama", "vllm/vllm-openai", "busybox", "ollama/ollama:0.6"] {
             runtime.registry_has(best_peer_runtime::ImageRef(image.into()));
         }
@@ -703,7 +747,7 @@ mod tests {
                 prompt: Duration::from_secs(1),
             },
             holdings.clone(),
-            Confine::default(),
+            confine,
         )
         .await;
         let auth = auth.unwrap_or_else(|| {
@@ -3088,6 +3132,45 @@ mod tests {
         assert_eq!(parse_memory("1073741824").unwrap(), 1 << 30);
         assert!(parse_memory("lots").unwrap_err().contains("40G"));
         assert!(parse_memory("4X").unwrap_err().contains("unit"));
+    }
+
+    #[tokio::test]
+    async fn the_engines_join_the_network_the_operator_named_and_a_job_joins_none() {
+        let mut confined = confine(None, None, None, None).unwrap();
+        confined.engine.network = engine_network(Some("best-peer-engines"), Some("docker")).unwrap();
+        let bed = bed_confining(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+            Arc::new(best_peer_engine::Fake::new()),
+            "engines.local",
+            None,
+            confined,
+        )
+        .await;
+        let dep = bed.deployed("d1", "llama3.2:3b", 8).await;
+        let spec = bed.runtime.spec_of(&bed.container_of(&dep)).unwrap();
+        assert_eq!(spec.confinement.network, Network::Named("best-peer-engines".into()));
+        let (s, _) = bed.send("j1", "RunJob", "run-job", json!({ "image": "busybox" })).await;
+        assert_eq!(s, StatusCode::CREATED);
+        let started = bed.events_of("j1", "JobStarted").await;
+        let container = ContainerId(started.last().unwrap().data["container"].as_str().unwrap().into());
+        assert_eq!(
+            bed.runtime.spec_of(&container).unwrap().confinement.network,
+            Network::None,
+            "a job never joins the engines' network"
+        );
+        assert_eq!(engine_network(None, None).unwrap(), Network::Default);
+        assert_eq!(engine_network(Some(" "), Some("docker")).unwrap(), Network::Default);
+        assert_eq!(engine_network(Some("bridge"), None).unwrap(), Network::Default);
+        for refused in ["none", "host", "container:abc"] {
+            let why = engine_network(Some(refused), None).unwrap_err();
+            assert!(why.contains("BEST_PEER_NETWORK") && why.contains(refused), "{why}");
+        }
+        for runtime in ["native", "fake"] {
+            let why = engine_network(Some("best-peer-engines"), Some(runtime)).unwrap_err();
+            assert!(why.contains(&format!("BEST_PEER_RUNTIME={runtime}")), "{why}");
+        }
     }
 
     #[test]

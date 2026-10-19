@@ -211,9 +211,15 @@ memory, no network, ever, and a ceiling on host memory with swap counted in. `BE
 and `BEST_PEER_JOB_PIDS` (default 4096) are a job's ceilings, `BEST_PEER_ENGINE_MEMORY` (default none) and
 `BEST_PEER_ENGINE_PIDS` (default 4096) an engine's; `none` is no ceiling, and a memory ceiling under the 6M a
 container starts with is refused at start. Host memory is not device memory: a job that reaches its ceiling ends in
-`JobFailed` naming it, whatever `memory_bytes` it asked for. The engines keep their network, which they need to pull
-models, and a writable filesystem, which they keep the models on. Capabilities, privileges, a job's network and a
-job's filesystem are never opened by a variable.
+`JobFailed` naming it, whatever `memory_bytes` it asked for. The engines keep a network, which they need to pull
+models, and a writable filesystem, which they keep the models on. Their network is the container engine's default
+unless `BEST_PEER_NETWORK` names one the operator made for them (`docker network create <name>`), so the host's
+firewall, or the network's own rules, decide what they reach, apart from the default network's other containers; a
+job never joins it. The engines' ports are published from it as from the default, so an `--internal` network, from
+which Docker publishes nothing, cannot serve. `none`, `host` and another container's network are refused at start,
+as is the variable under `BEST_PEER_RUNTIME=native` or `fake`, which start no container; a name the container engine
+does not know fails the deploy with the command that makes it. Capabilities, privileges, a job's network and a job's
+filesystem are never opened by a variable.
 
 ## Deploy
 
