@@ -91,8 +91,11 @@ decides who is in, as with SSH keys, and what they may do: approved with nothing
 `--may deploy,prompt --memory 40G` makes one that may deploy models and prompt them but run no job, and hold 40 GiB
 of device memory at most across its workloads, which it alone sees, prompts and ends. A code waits ten minutes for
 you; the door holds at most five waiting from one client, sixteen from one address and 64 in all, and past that
-answers 503 with how long until the oldest expires. Loopback is not counted as an address: it is this machine, or a
-proxy in front of the door that every caller shares.
+answers 503 with how long until the oldest expires. An IPv6 address is counted by its /64, which one client holds
+whole, and a connection whose address is not known is counted with every other such one. Loopback is not counted at
+all: it is this machine, so a proxy on this machine in front of the door takes the per-address ceiling away, and a
+proxy on another machine puts every caller behind it under one count of sixteen. The door reads no forwarded
+address, since any client can write one; with a proxy, set the ceiling per address there.
 
 **4. More than one machine.** Run a peer on each, and one more `best-peer` anywhere as the door your team enters
 by: a laptop will do, with `BEST_PEER_GPU=none` and the runtime it has (`BEST_PEER_RUNTIME=fake` when it has none:

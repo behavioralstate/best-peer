@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -169,7 +169,7 @@ pub struct Pending {
     pub connection: Option<String>,
     pub agent_label: Option<String>,
     pub lifetime: Lifetime,
-    /// The address it came from, when the transport said and it was not loopback.
+    /// Where it is counted: what `counted_as` made of the address it came from.
     from: Option<IpAddr>,
     created: Instant,
     last_poll: Option<Instant>,
@@ -349,6 +349,18 @@ pub struct Auth {
     scopes: Vec<String>,
 }
 
+/// Where a registration from `from` is counted: an IPv4 address alone, an IPv6 address by its /64 (one client holds
+/// a whole /64), every registration whose address the transport did not name in one place together, and loopback,
+/// this machine or a proxy on it, nowhere.
+fn counted_as(from: Option<IpAddr>) -> Option<IpAddr> {
+    match from.map(|a| a.to_canonical()) {
+        None => Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+        Some(a) if a.is_loopback() => None,
+        Some(IpAddr::V6(a)) => Some(IpAddr::V6(Ipv6Addr::from(u128::from(a) & !(u128::MAX >> 64)))),
+        Some(a) => Some(a),
+    }
+}
+
 impl Auth {
     /// Credentials kept only in memory; for tests and for a peer run without a data directory.
     pub fn ephemeral(endpoint: &str, approver: Box<dyn Approver>) -> Self {
@@ -450,7 +462,7 @@ impl Auth {
     /// The same, from the address the transport named: one address has its own ceiling on registrations pending at
     /// once, whatever clients it names (SPEC.md security: rate-limited per client). Loopback is not counted.
     pub fn start_device_from(&self, req: DeviceRequest, from: Option<IpAddr>) -> Result<DeviceAnswer, OAuthError> {
-        let from = from.map(|a| a.to_canonical()).filter(|a| !a.is_loopback());
+        let from = counted_as(from);
         let client_id = match req.client_id.as_deref().map(str::trim) {
             Some(c) if !c.is_empty() && c.len() <= MAX_CLIENT_ID => c.to_string(),
             Some(_) => {
@@ -1133,6 +1145,47 @@ mod tests {
         let first = first.unwrap();
         auth.approve(&first.user_code, "ok", Grant::default()).await.unwrap();
         from("client-after", "203.0.113.9").unwrap();
+    }
+
+    #[test]
+    fn an_ipv6_client_is_counted_by_its_64_and_an_address_not_named_is_counted_too() {
+        let auth = auth();
+        let from = |client: &str, ip: &str| {
+            auth.start_device_from(
+                DeviceRequest {
+                    client_id: Some(client.into()),
+                    ..Default::default()
+                },
+                Some(ip.parse().unwrap()),
+            )
+        };
+        // An IPv6 client is counted by its /64, which it holds whole.
+        for i in 0..MAX_PENDING_PER_ADDRESS {
+            from(&format!("v6-{i}"), &format!("2001:db8:1:2::{:x}", i + 1)).unwrap();
+        }
+        assert!(from("v6-new", "2001:db8:1:2:ffff::1").is_err(), "the same /64");
+        from("v6-new", "2001:db8:1:3::1").unwrap();
+        // Registrations whose address the transport did not name are counted together, not let through.
+        for i in 0..MAX_PENDING_PER_ADDRESS {
+            auth.start_device_from(
+                DeviceRequest {
+                    client_id: Some(format!("nameless-{i}")),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        }
+        let nameless = auth
+            .start_device_from(
+                DeviceRequest {
+                    client_id: Some("nameless-new".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(nameless.error, "temporarily_unavailable");
     }
 
     #[tokio::test]
