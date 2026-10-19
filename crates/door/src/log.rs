@@ -1,16 +1,24 @@
 //! The event log: every fact the door has told, in order, kept on disk and streamed live. `GET /events` reads it,
 //! `GET /events/stream` follows it, and a reconnecting client replays from `Last-Event-ID`. The log also keeps the
 //! commands it accepted, per sender, so an envelope `id` is an idempotency key across restarts.
+//!
+//! On disk the events are a file per UTC day, `events/<YYYY-MM-DD>.jsonl`, so a day can be copied, kept or forgotten
+//! on its own. An event goes to the file of its own `time`, except that the log never goes back to an earlier file
+//! (a fact told late with an old time, as a workspace hears a root fact again at start, joins the file being
+//! written) and never opens a file for a day that has not come (a time ahead of the clock joins today's): so the
+//! files in name order, each line by line, are the log in its order. An `events.jsonl` left by an older peer is read
+//! before them and never written again.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
-use time::OffsetDateTime;
+use time::macros::format_description;
+use time::{Date, OffsetDateTime, UtcOffset};
 use tokio::sync::broadcast;
 
 use crate::envelope::Envelope;
@@ -111,9 +119,74 @@ pub struct EventLog {
     owners: Mutex<HashMap<String, (u64, String)>>,
     /// How many commands were ever accepted: the next one's order.
     accepted_count: Mutex<u64>,
-    events_file: Mutex<Option<File>>,
+    /// Where events are written, for a log kept on disk.
+    segments: Mutex<Option<Segments>>,
     accepted_file: Mutex<Option<File>>,
     tx: broadcast::Sender<Stored>,
+}
+
+/// The day files of a log on disk, and the one being written.
+struct Segments {
+    dir: PathBuf,
+    open: Option<(Date, File)>,
+}
+
+impl Segments {
+    /// Writes `stored` to its day's file, opening that file when it is not the one being written.
+    fn write(&mut self, stored: &Stored) {
+        let current = self.open.as_ref().map(|(day, _)| *day);
+        let day = segment_day(&stored.envelope.time, OffsetDateTime::now_utc().date(), current);
+        if current != Some(day) {
+            let path = self.dir.join(segment_name(day));
+            match append_to(&path) {
+                Ok(file) => self.open = Some((day, file)),
+                Err(e) => {
+                    tracing::error!(error = %e, file = %path.display(), "the day's event file could not be opened; the event lasts until restart");
+                    return;
+                }
+            }
+        }
+        if let Some((_, file)) = self.open.as_mut() {
+            write_record(file, stored, "event");
+        }
+    }
+}
+
+/// The day an event with `time` is written under: its own UTC day, never after `today` and never before the file
+/// being written (`current`), so the files in name order keep the log's order whatever the clocks did. A time that
+/// does not parse joins the file being written, or today's.
+fn segment_day(time: &str, today: Date, current: Option<Date>) -> Date {
+    let told = OffsetDateTime::parse(time, &Rfc3339)
+        .map(|t| t.to_offset(UtcOffset::UTC).date())
+        .unwrap_or(current.unwrap_or(today));
+    let day = told.min(today);
+    current.map_or(day, |c| day.max(c))
+}
+
+/// `2026-10-19.jsonl`: the date first, its fields widest first at a fixed width, so the names sort as the days do.
+fn segment_name(day: Date) -> String {
+    format!("{:04}-{:02}-{:02}.jsonl", day.year(), u8::from(day.month()), day.day())
+}
+
+/// The day files under `dir`, oldest first. A file whose name is not a day is left alone, and said so.
+fn day_files(dir: &Path) -> std::io::Result<Vec<(Date, PathBuf)>> {
+    let mut days = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let day = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".jsonl"))
+            .and_then(|stem| Date::parse(stem, format_description!("[year]-[month]-[day]")).ok());
+        match day {
+            Some(day) => days.push((day, path)),
+            None => {
+                tracing::warn!(file = %path.display(), "a file in the events folder is not a day's file and is not read")
+            }
+        }
+    }
+    days.sort_by_key(|(day, _)| *day);
+    Ok(days)
 }
 
 impl EventLog {
@@ -125,23 +198,36 @@ impl EventLog {
             accepted: Mutex::new(HashMap::new()),
             owners: Mutex::new(HashMap::new()),
             accepted_count: Mutex::new(0),
-            events_file: Mutex::new(None),
+            segments: Mutex::new(None),
             accepted_file: Mutex::new(None),
             tx,
         }
     }
 
-    /// A log kept in `dir` (`events.jsonl`, `accepted.jsonl`), loaded now and appended to from here on. A line that
-    /// cannot be read (a torn write) is skipped and logged, never fatal.
+    /// A log kept in `dir` (the day files under `events/`, `accepted.jsonl`), loaded now and appended to from here
+    /// on. An `events.jsonl` an older peer left is read first and never written again. A line that cannot be read (a
+    /// torn write) is skipped and logged, never fatal.
     pub fn open(dir: &Path) -> std::io::Result<Self> {
-        std::fs::create_dir_all(dir)?;
+        let events_dir = dir.join("events");
+        std::fs::create_dir_all(&events_dir)?;
         let log = Self::ephemeral();
-        let events_path = dir.join("events.jsonl");
         let accepted_path = dir.join("accepted.jsonl");
-        for line in read_lines(&events_path)? {
-            match serde_json::from_str::<Stored>(&line) {
-                Ok(s) => log.events.lock().unwrap().push(s),
-                Err(e) => tracing::warn!(error = %e, "an event line could not be read and is skipped"),
+        let days = day_files(&events_dir)?;
+        let files = std::iter::once(dir.join("events.jsonl")).chain(days.iter().map(|(_, p)| p.clone()));
+        for path in files {
+            for line in read_lines(&path)? {
+                match serde_json::from_str::<Stored>(&line) {
+                    Ok(s) => {
+                        let mut events = log.events.lock().unwrap();
+                        if events.last().is_some_and(|last| last.seq >= s.seq) {
+                            tracing::warn!(file = %path.display(), seq = s.seq, "an event is out of the log's order: its files were changed by hand");
+                        }
+                        events.push(s);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, file = %path.display(), "an event line could not be read and is skipped")
+                    }
+                }
             }
         }
         for line in read_lines(&accepted_path)? {
@@ -182,7 +268,12 @@ impl EventLog {
                 }
             }
         }
-        *log.events_file.lock().unwrap() = Some(append_to(&events_path)?);
+        // The last day's file is the one being written: reopened, its torn line ended, so a restart appends to it.
+        let open = match days.last() {
+            Some((day, path)) => Some((*day, append_to(path)?)),
+            None => None,
+        };
+        *log.segments.lock().unwrap() = Some(Segments { dir: events_dir, open });
         *log.accepted_file.lock().unwrap() = Some(append_to(&accepted_path)?);
         Ok(log)
     }
@@ -194,7 +285,9 @@ impl EventLog {
         let mut events = self.events.lock().unwrap();
         let seq = events.last().map(|s| s.seq + 1).unwrap_or(1);
         let stored = Stored { seq, envelope };
-        write_line(&self.events_file, &stored, "event");
+        if let Some(segments) = self.segments.lock().unwrap().as_mut() {
+            segments.write(&stored);
+        }
         events.push(stored.clone());
         let _ = self.tx.send(stored.clone());
         drop(events);
@@ -477,11 +570,15 @@ impl EventLog {
 /// One record, one line, one write; a failure is logged, never a panic that would poison the log for everyone.
 fn write_line<T: Serialize>(file: &Mutex<Option<File>>, record: &T, what: &str) {
     if let Some(f) = file.lock().unwrap().as_mut() {
-        let mut line = serde_json::to_string(record).expect("a record serialises");
-        line.push('\n');
-        if let Err(e) = f.write_all(line.as_bytes()).and_then(|_| f.flush()) {
-            tracing::error!(error = %e, "{what} could not be written to disk; it lasts until restart");
-        }
+        write_record(f, record, what);
+    }
+}
+
+fn write_record<T: Serialize>(f: &mut File, record: &T, what: &str) {
+    let mut line = serde_json::to_string(record).expect("a record serialises");
+    line.push('\n');
+    if let Err(e) = f.write_all(line.as_bytes()).and_then(|_| f.flush()) {
+        tracing::error!(error = %e, "{what} could not be written to disk; it lasts until restart");
     }
 }
 
@@ -516,6 +613,32 @@ mod tests {
 
     fn ev(r#type: &str, corr: &str) -> Envelope {
         Envelope::event("io.best.agents", r#type, json!({}), Some(corr.into()), None)
+    }
+
+    /// An event told at `time`, as a fact relayed or heard again keeps the time it was first told.
+    fn ev_at(r#type: &str, time: &str) -> Envelope {
+        let mut e = ev(r#type, "c");
+        e.time = time.into();
+        e
+    }
+
+    fn types(log: &EventLog) -> Vec<String> {
+        log.list(&Filter {
+            limit: Some(MAX_PAGE),
+            ..Default::default()
+        })
+        .0
+        .into_iter()
+        .map(|e| e.r#type)
+        .collect()
+    }
+
+    fn lines(path: &Path) -> usize {
+        read_lines(path).unwrap().len()
+    }
+
+    fn day(text: &str) -> Date {
+        Date::parse(text, format_description!("[year]-[month]-[day]")).unwrap()
     }
 
     #[test]
@@ -642,23 +765,19 @@ mod tests {
     fn the_log_survives_a_restart_with_its_order_and_its_accepted_ids_and_skips_a_torn_line() {
         let dir = tempfile::tempdir().unwrap();
         let first = EventLog::open(dir.path()).unwrap();
-        first.append(ev("A", "c"));
-        first.append(ev("B", "c"));
+        first.append(ev_at("A", "2020-01-01T10:00:00Z"));
+        first.append(ev_at("B", "2020-01-01T11:00:00Z"));
         let cmd = ev("PullImage", "c");
         assert_eq!(first.accept_command("alice", "cmd-1", "h", "c", &cmd), Accept::New);
         assert_eq!(first.accept_command("alice", "cmd-2", "h", "c", &cmd), Accept::New);
         first.finish_command("alice", "cmd-2");
         drop(first);
-        let path = dir.path().join("events.jsonl");
+        let path = dir.path().join("events").join("2020-01-01.jsonl");
         let mut torn = std::fs::read_to_string(&path).unwrap();
         torn.push_str("{\"seq\":3,\"envelope\":{\"specversion");
         std::fs::write(&path, torn).unwrap();
         let again = EventLog::open(dir.path()).unwrap();
-        let (events, _) = again.list(&Filter::default());
-        assert_eq!(
-            events.iter().map(|e| e.r#type.as_str()).collect::<Vec<_>>(),
-            vec!["A", "B"]
-        );
+        assert_eq!(types(&again), vec!["A", "B"]);
         assert_eq!(
             again.accept_command("alice", "cmd-1", "h", "c", &cmd),
             Accept::Duplicate {
@@ -668,16 +787,139 @@ mod tests {
         let owed = again.unfinished();
         assert_eq!(owed.len(), 1, "the finished one is not owed after the restart");
         assert_eq!(owed[0].envelope.id, cmd.id);
-        let c = again.append(ev("C", "c"));
+        let c = again.append(ev_at("C", "2020-01-01T12:00:00Z"));
         assert_eq!(c.seq, 3);
-        // The record written after the torn line starts on its own line: a third open reads A, B and C.
+        // The restart reopened the day's file and appended to it, the record after the torn line on its own line:
+        // a third open reads A, B and C, and the day is still one file.
         drop(again);
         let third = EventLog::open(dir.path()).unwrap();
-        let (events, _) = third.list(&Filter::default());
+        assert_eq!(types(&third), vec!["A", "B", "C"]);
+        assert_eq!(std::fs::read_dir(dir.path().join("events")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn events_go_to_the_file_of_their_own_day_and_read_back_in_order_across_days() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = EventLog::open(dir.path()).unwrap();
+        let a = first.append(ev_at("A", "2020-01-01T23:59:59Z"));
+        first.append(ev_at("B", "2020-01-02T00:00:01Z"));
+        // A time with an offset is a UTC day: 01:00 at +02:00 is the 2nd at 23:00 UTC.
+        first.append(ev_at("C", "2020-01-03T01:00:00+02:00"));
+        let events = dir.path().join("events");
+        assert_eq!(lines(&events.join("2020-01-01.jsonl")), 1);
+        assert_eq!(lines(&events.join("2020-01-02.jsonl")), 2);
+        assert!(!events.join("2020-01-03.jsonl").exists());
+        assert!(!dir.path().join("events.jsonl").exists(), "no single file is made");
+        drop(first);
+        let again = EventLog::open(dir.path()).unwrap();
+        assert_eq!(types(&again), vec!["A", "B", "C"]);
         assert_eq!(
-            events.iter().map(|e| e.r#type.as_str()).collect::<Vec<_>>(),
-            vec!["A", "B", "C"]
+            again
+                .since_id(&a.envelope.id)
+                .iter()
+                .map(|s| (s.seq, s.envelope.r#type.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(2, "B"), (3, "C")],
+            "a reconnect replays across the day's boundary"
         );
+        assert_eq!(again.subscribe().1, 3);
+        assert_eq!(
+            again.append(ev("D", "c")).seq,
+            4,
+            "the order goes on from the last day's file"
+        );
+    }
+
+    #[test]
+    fn a_fact_told_late_with_an_old_time_joins_the_file_being_written() {
+        // As a workspace hears a root fact again at start, keeping the time it was first told.
+        let dir = tempfile::tempdir().unwrap();
+        let first = EventLog::open(dir.path()).unwrap();
+        first.append(ev_at("A", "2020-01-02T10:00:00Z"));
+        first.append(ev_at("Heard", "2020-01-01T09:00:00Z"));
+        let events = dir.path().join("events");
+        assert!(
+            !events.join("2020-01-01.jsonl").exists(),
+            "the log never goes back to an earlier day"
+        );
+        assert_eq!(lines(&events.join("2020-01-02.jsonl")), 2);
+        drop(first);
+        let again = EventLog::open(dir.path()).unwrap();
+        assert_eq!(types(&again), vec!["A", "Heard"], "replayed in the order it was told");
+    }
+
+    #[test]
+    fn the_day_is_the_events_own_bounded_by_today_and_by_the_file_being_written() {
+        let today = day("2026-10-19");
+        assert_eq!(segment_day("2026-10-18T12:00:00Z", today, None), day("2026-10-18"));
+        assert_eq!(
+            segment_day("2026-10-18T12:00:00Z", today, Some(day("2026-10-19"))),
+            day("2026-10-19"),
+            "never back to an earlier file"
+        );
+        assert_eq!(
+            segment_day("2031-01-01T00:00:00Z", today, Some(day("2026-10-18"))),
+            today,
+            "never a day that has not come"
+        );
+        assert_eq!(
+            segment_day("not a time", today, Some(day("2026-10-17"))),
+            day("2026-10-17"),
+            "a time that does not parse joins the file being written"
+        );
+        assert_eq!(segment_day("not a time", today, None), today);
+        assert_eq!(segment_name(day("2026-01-09")), "2026-01-09.jsonl");
+    }
+
+    #[test]
+    fn the_single_file_an_older_peer_left_is_read_first_and_never_written_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let old: String = [
+            ev_at("Old1", "2020-01-01T10:00:00Z"),
+            ev_at("Old2", "2020-01-05T10:00:00Z"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, envelope)| {
+            serde_json::to_string(&Stored {
+                seq: i as u64 + 1,
+                envelope,
+            })
+            .unwrap()
+                + "\n"
+        })
+        .collect();
+        let legacy = dir.path().join("events.jsonl");
+        std::fs::write(&legacy, &old).unwrap();
+        let first = EventLog::open(dir.path()).unwrap();
+        assert_eq!(types(&first), vec!["Old1", "Old2"]);
+        // An earlier day than the old file's last: it still comes after, since the old file is read first.
+        assert_eq!(first.append(ev_at("New", "2020-01-03T10:00:00Z")).seq, 3);
+        drop(first);
+        assert_eq!(
+            std::fs::read_to_string(&legacy).unwrap(),
+            old,
+            "the old file is not written"
+        );
+        assert!(dir.path().join("events").join("2020-01-03.jsonl").exists());
+        let again = EventLog::open(dir.path()).unwrap();
+        assert_eq!(types(&again), vec!["Old1", "Old2", "New"]);
+    }
+
+    #[test]
+    fn a_file_in_the_events_folder_that_is_not_a_day_is_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = EventLog::open(dir.path()).unwrap();
+        first.append(ev_at("A", "2020-01-01T10:00:00Z"));
+        drop(first);
+        let stray = serde_json::to_string(&Stored {
+            seq: 9,
+            envelope: ev_at("Stray", "2020-01-01T10:00:00Z"),
+        })
+        .unwrap();
+        std::fs::write(dir.path().join("events").join("notes.jsonl"), stray).unwrap();
+        let again = EventLog::open(dir.path()).unwrap();
+        assert_eq!(types(&again), vec!["A"]);
     }
 
     #[test]

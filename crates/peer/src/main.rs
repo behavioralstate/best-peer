@@ -2773,6 +2773,20 @@ mod tests {
         let (_, w) = get_as(&again.app, "", &owner_key, "/queries/get-workspaces").await;
         assert_eq!(w["workspaces"][0]["workspace"], ws);
         assert_eq!(w["workspaces"][0]["name"], "Research");
+        // The workspace's own log is kept by day, as the root's is: day files under its `events/`, no single file.
+        let ws_dir = data.path().join("workspaces").join(&ws);
+        assert!(!ws_dir.join("events.jsonl").exists());
+        let days: Vec<String> = std::fs::read_dir(ws_dir.join("events"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !days.is_empty()
+                && days
+                    .iter()
+                    .all(|d| d.len() == "YYYY-MM-DD.jsonl".len() && d.ends_with(".jsonl") && d.as_bytes()[4] == b'-'),
+            "{days:?}"
+        );
         let (_, w) = get_as(&again.app, "", &bob, "/queries/get-workspaces").await;
         assert_eq!(w["invitations"][0]["workspace"], ws, "the invitation stands");
         let (s, c) = get_as(

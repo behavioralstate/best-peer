@@ -199,7 +199,12 @@ start, `tls/cert.pem` under its data folder, named at start for clients to pin, 
 host changes or fewer than thirty days of it remain, which the start-up line says. `BEST_PEER_DATA` (default
 `~/.best-peer`) holds the event log, the credentials as hashes, the admin token, that certificate, and the record of
 where the door is that `best-peer approve` reads, so it reaches the peer over the same TLS, pinned to that
-certificate and no other.
+certificate and no other. The event log is a file per UTC day, `events/2026-10-19.jsonl`, so a day can be copied,
+kept or removed on its own; an event goes to the day of its own time, or to the file being written when that time
+is older, so the files in name order are the log in its order. An `events.jsonl` left by an older peer is read before
+them and never written again, so an upgrade keeps the history with nothing to move. Each workspace keeps
+its own log the same way under `workspaces/<id>/events/`. `accepted.jsonl`, the record of the commands the door
+accepted, stays one file.
 Every request to the door, a workspace's included, is one line in the peer's log at info: where it came from (the
 client's address and port, so the log holds the addresses of everyone who reached the door), the method and the
 path as it arrived (never the query string), the status, the holder when a credential opened it, refused or not,
