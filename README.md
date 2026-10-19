@@ -72,11 +72,14 @@ The peer makes itself a certificate at first start, keeps it in its data folder 
 (`NODE_EXTRA_CA_CERTS=<file>` for a Node client, `SSL_CERT_FILE=<file>` for a Python one, `--cacert <file>` for
 curl). A certificate of your own, from your CA or a public one for a name you hold, is
 `BEST_PEER_TLS_CERT=<chain.pem> BEST_PEER_TLS_KEY=<key.pem>`; the peer checks nothing about it beyond that it
-loads. An `http://` endpoint still works, with a warning at start: the credential then travels in the clear, so keep
-that to a VPN. There is no relay in the peer, so across the internet the address is one you make reachable (a static
-IP with a port forward, a Tailscale IP), and the firewall lets in 7777 and nothing else: a prompt is a command on
-the door like any other, on that port, with the door's credential. The engines' own ports stay on loopback whatever
-the door listens on, and nothing of them is on the door.
+loads. An `http://` endpoint is served on loopback alone: off it the credential would travel in the clear, and the
+peer refuses to start, saying what to set. A hop that a VPN already encrypts (a WireGuard or Tailscale address) is
+the one exception, and you say so: `BEST_PEER_CLEARTEXT=vpn` serves `http://` off loopback, with a warning at start,
+and lets this door's clouds reach members over `http://`. Behind a proxy, let it pass TLS through, or re-encrypt to
+the peer's own certificate. There is no relay in the peer, so across the internet the address is one you make
+reachable (a static IP with a port forward, a Tailscale IP), and the firewall lets in 7777 and nothing else: a prompt
+is a command on the door like any other, on that port, with the door's credential. The engines' own ports stay on
+loopback whatever the door listens on, and nothing of them is on the door.
 
 **3. Admit the agent.** The person connecting says to their client "sign me in `<name>`, start from
 `https://<address>:7777/.well-known/best`"; their client shows them a code like `8BB9-CB44`, and they send it to you.
@@ -89,7 +92,24 @@ At your machine:
 Their client's next poll receives a key under that name. No accounts, no passwords: whoever controls the machine
 decides who is in, as with SSH keys, and what they may do: approved with nothing more said, a key may do everything;
 `--may deploy,prompt --memory 40G` makes one that may deploy models and prompt them but run no job, and hold 40 GiB
-of device memory at most across its workloads, which it alone sees, prompts and ends.
+of device memory at most across its workloads, which it alone sees, prompts and ends. `--deployments 2 --jobs 2` lets it
+run two of each at once at most. A key with a share runs its jobs in a closed box (no network, a ceiling on host
+memory) unless you add `--open-jobs`. `--expires 8h` ends the key after eight hours, so access lent for an afternoon
+ends without anyone remembering to take it back. To take a key back sooner, at your machine:
+
+```bash
+./best-peer revoke <name>
+```
+
+with the name it was approved under: every request carrying it is refused from then on, and an event stream it holds
+open ends within seconds. The agent can also give its key back itself, with the `revoke-agent` command.
+
+A code waits ten minutes for you; the door holds at most five waiting from one client, sixteen from one address and 64 in all, and past that
+answers 503 with how long until the oldest expires. An IPv6 address is counted by its /64, which one client holds
+whole, and a connection whose address is not known is counted with every other such one. Loopback is not counted at
+all: it is this machine, so a proxy on this machine in front of the door takes the per-address ceiling away, and a
+proxy on another machine puts every caller behind it under one count of sixteen. The door reads no forwarded
+address, since any client can write one; with a proxy, set the ceiling per address there.
 
 **4. More than one machine.** Run a peer on each, and one more `best-peer` anywhere as the door your team enters
 by: a laptop will do, with `BEST_PEER_GPU=none` and the runtime it has (`BEST_PEER_RUNTIME=fake` when it has none:
@@ -125,7 +145,7 @@ notes say what is proven and what is not yet.
 | `crates/gpu` | The accelerator abstraction: a vendor-neutral snapshot of the host's devices (`Gpu`), each naming the compute APIs it offers (CUDA, ROCm, oneAPI, Metal, Vulkan, CPU) so a workload asks for an API and memory, never for a vendor. Ships the `Fake` tests run against. |
 | `crates/runtime` | The container runtime abstraction (`Runtime`): pull with progress, start with devices handed over by id and the ports published, stop, observe, and what the engine does on its own told as events. Ships the `Fake`. |
 | `crates/engine` | The inference engine abstraction (`Engine`): which engines serve a model (Ollama, vLLM), what to run for each, how a served model is made ready, with progress, and how it is asked to answer a conversation. Ships the `Fake`. |
-| `crates/peer` | The `best-peer` binary: the door over the three abstractions, with the peer's own commands, queries and events, its state folded from the events it told; the workspaces it hosts, each a tenant door with its clouds of peers, folded from their own logs; and `best-peer approve`, the operator's side of sign-in. |
+| `crates/peer` | The `best-peer` binary: the door over the three abstractions, with the peer's own commands, queries and events, its state folded from the events it told; the workspaces it hosts, each a tenant door with its clouds of peers, folded from their own logs; and `best-peer approve` and `best-peer revoke`, the operator's side of sign-in. |
 | `crates/host` | The host itself as a device: a `Gpu` adapter reporting the CPU and system memory, so a peer with no accelerator serves the whole lifecycle. |
 | `crates/nvml` | The `Gpu` adapter for NVIDIA cards through NVML: memory, temperature, power, utilisation and the CUDA version, read live; the peer refuses to start without the driver unless told the host has none. |
 | `crates/docker` | The `Runtime` adapter over the Docker Engine API: NVIDIA devices handed over through the container toolkit by their NVML UUID. |
@@ -150,7 +170,10 @@ and a build provenance attestation (`gh attestation verify <archive> --repo beha
 `best-peer --version` says which it is.
 
 `BEST_PEER_LISTEN` (default `127.0.0.1:7777`) is where it listens; `BEST_PEER_ENDPOINT` is the consumer-facing base URL
-the manifest advertises, required when the peer listens on every interface. An `https://` endpoint is served by the
+the manifest advertises, required when the peer listens on every interface. An `http://` endpoint is served only
+when both the listen address and the endpoint's host are loopback (`127.0.0.0/8`, `::1`, `localhost`); otherwise the
+peer refuses to start, naming which is off, unless `BEST_PEER_CLEARTEXT=vpn` says a VPN already encrypts every hop to
+and from it, which also lets its clouds reach members over `http://`. An `https://` endpoint is served by the
 peer itself, with rustls: `BEST_PEER_TLS_CERT` and `BEST_PEER_TLS_KEY` name the operator's certificate chain and
 private key (PEM files, checked for nothing beyond loading); without them the peer makes a certificate at first
 start, `tls/cert.pem` under its data folder, named at start for clients to pin, and made again when the endpoint's
@@ -158,6 +181,16 @@ host changes or fewer than thirty days of it remain, which the start-up line say
 `~/.best-peer`) holds the event log, the credentials as hashes, the admin token, that certificate, and the record of
 where the door is that `best-peer approve` reads, so it reaches the peer over the same TLS, pinned to that
 certificate and no other.
+Every request to the door, a workspace's included, is one line in the peer's log at info: where it came from (the
+client's address and port, so the log holds the addresses of everyone who reached the door), the method and the
+path as it arrived (never the query string), the status, the holder when a credential opened it, refused or not,
+and how long the answer took. The key is never in it. A request the client gave up on before its answer is a line
+too, `request abandoned` with the status `-`; an event stream's line is written when it opens, and its `ms` is the
+time to the headers, not how long it stayed open. The log is loud by design: an agent's polls, a cloud's ticks and
+every stream reconnect are lines. The lines are under the target `best_peer_door::router`, so
+`RUST_LOG=info,best_peer_door::router=warn` quiets them and keeps everything else. The peer writes its log to
+stderr and keeps no file of its own: the record lasts as long as whatever runs the peer keeps stderr (journald under
+systemd, by its own size and age limits), so an operator who counts on it as an audit trail sets that retention.
 
 Every door hosts **workspaces**, the BEST tenants. The root manifest declares their template
 (`/.well-known/best/{tenantId}`), and a workspace's own door is at `/workspaces/<id>` under the root, with its own
@@ -180,7 +213,11 @@ are placed by the peer's own rule across its members and sent there as the cloud
 comes back on the workspace's stream under the caller's correlation id with `cloud` and `peer` named; a prompt is
 placed on the member that holds the deployment, as the cloud's own command there, and its answer relayed the same
 way. `BEST_PEER_TRUST` lists PEM files to trust beyond the public roots, for members serving their own
-certificates. Every thirty seconds each cloud squares its state with its members: one that does not answer within
+certificates. A member named by an `http://` endpoint off loopback is refused at `configure-cloud`
+(`CLEARTEXT_MEMBER`), and nothing is sent to one, since the cloud's credential would travel in the clear, unless this
+door's operator set `BEST_PEER_CLEARTEXT=vpn`. A cloud recorded with such a member before (under an older peer, or
+while `vpn` was set) stops the peer at start, naming the workspace, the cloud, the peer and its endpoint, and how to
+name it by `https://` instead. Every thirty seconds each cloud squares its state with its members: one that does not answer within
 fifteen seconds is told as `PeerLost`, with its workloads told as ended and its commands in flight failed;
 `PeerJoined` when it answers again, and what it still runs of the cloud's by then is ended there, so the two agree;
 a workload a member no longer lists at two ticks running is told as ended. A credential's share is counted across
@@ -195,6 +232,12 @@ The container engine is Docker on the same host, reached through its socket or n
 without it unless `BEST_PEER_RUNTIME` says otherwise: `native` deploys to an engine already running on the host
 outside any container (an installed Ollama; no jobs), `fake` serves the whole surface against the in-memory fakes
 (what CI runs).
+A deploy or a job pulls an image named by tag each time, since a tag may have moved, as before; one pinned by digest
+(`name@sha256:...`, handed to Docker whole) names one image for good and is pulled only when Docker does not hold it.
+`BEST_PEER_PULL=missing` pulls any image only when Docker does not hold it: for a host with no way to a registry,
+whose images were put there by hand, a held image then runs as it is and is refreshed only by `pull-image`, which
+always pulls. Either way a credential may run any image Docker holds, the operator's own and locally built ones
+included, by naming it: a host shared with a tenant keeps in Docker only the images it would let that tenant run.
 `BEST_PEER_OLLAMA_IMAGE` and `BEST_PEER_VLLM_IMAGE` pin or mirror the engines' images; `BEST_PEER_READY_SECONDS`
 (default 900) is how long an engine may take to answer after its container started, `BEST_PEER_LOAD_SECONDS`
 (default 3600) how long a model may take to load, and a prompt is given ten minutes to be answered. `BEST_PEER_ENGINE_HOST` (default `127.0.0.1`) is where the peer
@@ -202,8 +245,26 @@ itself reaches the engines' ports, which are bound there and nowhere else whatev
 when the container engine is on this host, on that host's interfaces when it is elsewhere, so a container engine
 on another host sits on a network you trust. The peer alone reaches them: a prompt is a command on the door, and
 the peer carries it to the engine. Prompts are answered sixteen at a time per peer; the rest wait their turn,
-accepted, in order. `BEST_PEER_COMMANDS_PER_MINUTE` (default 60) is how many new commands one credential with a
-share may send in any sixty seconds across the door; a number below 1 is refused at start.
+accepted, in order. How many deployments and jobs a key runs at once is set when it is approved
+(`--deployments`, `--jobs`); a peer started with the old `BEST_PEER_DEPLOYMENTS_PER_HOLDER` or
+`BEST_PEER_JOBS_PER_HOLDER` refuses to start and says so. `BEST_PEER_COMMANDS_PER_MINUTE` (default 60) is how many new commands one
+credential with a share may send in any sixty seconds across the door; a number below 1 is refused at start.
+
+A container runs confined: no capabilities, no new privileges, a ceiling on tasks (every thread counts as one), and
+a small init as its first process, which reaps what the image leaves behind and passes a stop on to it. The job of a
+credential approved with a share, a tenant's, runs code the owner did not write, so it also gets a closed box: a
+read-only filesystem with a private `/tmp` of 1 GiB, which counts in its memory, no network, and a ceiling on host
+memory with swap counted in. The owner's own jobs, from a credential with no share, keep the network, a writable
+filesystem and the host's memory, as before; so do a tenant's whose approver said `best-peer approve --open-jobs`,
+which only the approver can say, never the credential or the job. `JobStarted` says `boxed`.
+`BEST_PEER_JOB_MEMORY` (default `4G`) is the box's host memory ceiling and `BEST_PEER_JOB_PIDS` (default 4096) every
+job's task ceiling, `BEST_PEER_ENGINE_MEMORY` (default none) and `BEST_PEER_ENGINE_PIDS` (default 4096) an
+engine's; `none` is no ceiling, and a memory ceiling under the 6M a container starts with is refused at start. Host
+memory is not device memory: a boxed job that reaches its ceiling ends in `JobFailed` naming it, whatever
+`memory_bytes` it asked for. The engines keep their network, which they need to pull models, and a writable
+filesystem, which they keep the models on. Capabilities, privileges and the box are never opened by a variable. On a
+workspace's cloud, a job runs on the member as the cloud's credential: boxed when the member's owner approved the
+cloud with a share and did not open its jobs.
 
 ## Deploy
 
@@ -213,12 +274,13 @@ CUDA, ROCm or CPU; `vllm` on CUDA) and the device memory it needs; the peer plac
 engine runs on with that much room after what is already promised, or refuses at once with the reason and what to do.
 On a workspace's door the same commands take the `cloud` to place in (or a `device` as `cloud/peer/device`, which
 names it), the devices are every cloud's peers', and every row and event carries `cloud` and `peer`.
-The facts follow on the event stream under the command's correlation id, in order: `ImagePulling`, `ImagePulled`,
+The facts follow on the event stream under the command's correlation id, in order: `ImagePulling`, `ImagePulled`
+(`held: true` when the image was already here and not pulled, `ImagePulling` then told once, at 100),
 `DeploymentStarted`, `WeightsLoading`, then `DeploymentReady`, or `DeploymentFailed`. What the engine does on its own
 later (`OutOfMemory`, `DeploymentEnded`) is told under the same correlation id. `prompt` names a ready deployment and
 the conversation so far, and `PromptAnswered` follows under its own correlation id with the answer whole, or
-`PromptFailed` with the reason and the fix. `run-job` runs an image once and tells `JobStarted` and `JobFinished`
-with the exit code; `undeploy-model` and `stop-job` end them.
+`PromptFailed` with the reason and the fix. `run-job` runs an image once, a tenant's in a closed box, and tells
+`JobStarted` and `JobFinished` with the exit code; `undeploy-model` and `stop-job` end them.
 
 The peer's state is the fold of the events it told. After a restart it is rebuilt from the log and squared with what
 the engine still runs; a workload that ended while the peer was down is told so then.
@@ -256,7 +318,9 @@ Every command of this peer follows one pattern, and nothing else is needed to dr
    reads is the facts under its own correlations. A chain of commands under one correlation is one credential's. From that moment the
    command ends in a completing event, through a restart if need be: a command accepted and not yet run when the
    peer stops is run when it starts again, through the same state check, or failed with a `CommandFailed` that
-   says why; one whose workload had already started and did not survive the restart is failed with the fix.
+   says why; one whose workload had already started and did not survive the restart is failed with the fix. The
+   door keeps the command whole until it completes, then only its id, hash and correlation, which still answer a
+   retry as before, in memory and after a restart alike.
 2. Everything that happens is an event carrying that correlation id, in the order it happened. The command's
    schema document lists what it `produces` and, among those, what `completes` it: the events after which the
    command's outcome is known (`DeploymentReady` for a deploy, or `DeploymentFailed`, `DeploymentEnded` or
@@ -280,6 +344,11 @@ with a share, every tenant of the cloud shares the member's pace, and a member t
 told on the cloud's stream as the command's failure, with the member's reason, so a member's owner who hosts a busy
 cloud raises the pace or approves the cloud without a share.
 
+Every string and list a command carries has a bound its schema document states (`maxLength`, `maxItems`), refused
+past it with `SCHEMA_VALIDATION` naming the field. A request body weighs 256 KiB at most on the door and 4 KiB less
+on a workspace's, refused with `PAYLOAD_TOO_LARGE` and `limit_bytes`: a cloud passes a command on to a member's door
+in an envelope of its own, so whatever the cloud took, the member takes.
+
 ## Sign in
 
 An agent signs a person in the way every BEST service is signed in to: it reads the manifest, posts to
@@ -293,8 +362,11 @@ best-peer approve ABCD-EFGH
 ```
 
 That presents the machine's admin token, which only its owner can read, and the agent's next poll gets its credential:
-a key shown once, kept hashed, bound to the connection name the person gave. An operator who wants an identity
-provider instead plugs one in behind the `Approver` trait; the door never knows which stands behind it.
+a key shown once, kept hashed, bound to the connection name the person gave. The token is checked before anything
+else, so without it an approval learns neither whether a code is pending nor which scopes the door has. An operator
+who wants an identity provider instead plugs one in behind the `Approver` trait, which says whether a proof is the
+authority's (`attest`, asked first, and for a revoke) and admits a registration (`admit`); the door never knows which
+stands behind it.
 
 **Where a credential belongs** is the workspaces it created or accepted an invitation into, on this door, and
 `get-workspaces` says which, with the identity the credential is known by there, an opaque id another workspace's
@@ -306,12 +378,29 @@ lists the scopes: `deploy` (pull-image, deploy-model, undeploy-model), `jobs` (r
 (prompt); `all` is every scope and every holder's workloads, and what a key approved with nothing said is, so the owner's own box changes
 nothing. Reading is every key's: the hardware state, and its own workloads and events. `best-peer approve <code>
 --may deploy` grants scopes; `--memory 40G` sets the most device memory the key's workloads may hold together,
-counted across its deployments, jobs and commands admitted but not yet started. Every command document says which
+counted across its deployments, jobs and commands admitted but not yet started; `--expires 8h` ends the key after
+that long (`8h`, `30m`, `2d`, or seconds; 366 days at most, and 8 hours at most for a session credential, which an
+agent asks for when it cannot keep a secret: more is refused, never cut). `best-peer revoke <name>` takes a key back
+at once, by the connection name the agent signed in under or the holder id the events show, with the peer running
+and the same admin token; an agent takes back its own with the `revoke-agent` command, sent under it. Either way the
+key opens nothing from then on, on this door and every workspace door here, an event stream open under it ends
+within seconds, as one does when a key runs out, and what the key left running is the owner's to end. A revoke the
+disk did not keep says so: the key is closed until the peer restarts, and running the revoke again writes it. Every command document says which
 scope it needs. A command the key may not send is refused at ingest with `FORBIDDEN` and what it was approved for;
 a deploy or a job past the share with `SHARE_EXCEEDED`, what is held and the room left; a workload another key
 started, by name, whether a command, a prompt or the events are asked for, and a refusal names only what the key may
 see. `get-workloads` shows a key its own, with `held_bytes` against `share_bytes`; `DeploymentStarted` and
-`JobStarted` name the `holder`, an opaque id of the credential, never the key. Another sign-in is another holder,
-as the spec has it: what a key that expired or was replaced left running is the owner's to end with a key approved
-for all. The spec has no per-command scope field yet, so the requirement is in the description text; that is an
-entry on the spec follow-ups.
+`JobStarted` name the `holder`, an opaque id of the credential, never the key. A key with a share runs its jobs on
+a device, where its share counts them: a job without `memory_bytes`, which would run on the host with no device and
+hold the host's memory and processors outside the share, is refused with `JOB_NEEDS_DEVICE`; a key with scopes and
+no share is not held to it. In a workspace the rule holds for the cloud's jobs, and a member's owner who approved the
+cloud with a share holds every tenant of the cloud to it on that member. A key approved with `--deployments N` or
+`--jobs N` runs that many deployments or jobs at once at most, counted across the door like the share, every
+workspace's included, and the one past that is refused with `DEPLOYMENTS_EXCEEDED` or `JOBS_EXCEEDED`: what a
+workload claims in `memory_bytes` is its client's own word, so the share bounds what is promised and the counts how
+many, while neither bounds what a workload uses on a card that cannot be partitioned. A key approved without them is
+not counted. On a member the cloud's own credential is one holder, so a member's owner who approved the cloud with a
+count counts every tenant of the cloud together, and a deploy the cloud accepted can then be refused by the member,
+told on the workspace's stream as `DeploymentFailed` with the member's reason. Another sign-in is another holder, as the spec has it: what a key that expired or was
+replaced left running is the owner's to end with a key approved for all. The spec has no per-command scope field
+yet, so the requirement is in the description text; that is an entry on the spec follow-ups.
