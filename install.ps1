@@ -1,8 +1,9 @@
 # Installs the newest release of best-peer on Windows: the archive is taken from GitHub, checked against the release's
-# SHA256SUMS, and the binary put in $env:LOCALAPPDATA\Programs\best-peer with its LICENSE and README
-# ($env:BEST_PEER_INSTALL_DIR chooses another place), which is added to the user's PATH. Run it again to upgrade: the
-# data folder (~\.best-peer: the event log, the credentials, the certificate) is not touched, and a peer still running
-# from the folder is named, not overwritten.
+# SHA256SUMS, and the binary put, with its LICENSE and README, where a best-peer.exe already is on the PATH, else in
+# $env:LOCALAPPDATA\Programs\best-peer, which is added to the user's PATH ($env:BEST_PEER_INSTALL_DIR chooses another
+# place over both). Run it again to upgrade: the binary is replaced where it is, the data folder (~\.best-peer: the
+# event log, the credentials, the certificate) is not touched, and a peer still running from the folder is named,
+# with the command that stops it, not overwritten.
 #
 #   irm https://raw.githubusercontent.com/behavioralstate/best-peer/main/install.ps1 | iex
 #
@@ -14,11 +15,15 @@
 $ErrorActionPreference = "Stop"
 
 $repo = "behavioralstate/best-peer"
-$dir = if ($env:BEST_PEER_INSTALL_DIR) { $env:BEST_PEER_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA "Programs\best-peer" }
+$found = (Get-Command best-peer.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+if ($env:BEST_PEER_INSTALL_DIR) { $dir = $env:BEST_PEER_INSTALL_DIR; $why = "BEST_PEER_INSTALL_DIR" }
+elseif ($found) { $dir = Split-Path -Parent $found; $why = "where best-peer already is, on the PATH" }
+else { $dir = Join-Path $env:LOCALAPPDATA "Programs\best-peer"; $why = "the default" }
 # A full path, so a relative folder is not written into the PATH and the running-peer check below compares like
 # with like.
 if (-not [System.IO.Path]::IsPathRooted($dir)) { $dir = Join-Path (Get-Location).Path $dir }
 $dir = [System.IO.Path]::GetFullPath($dir)
+Write-Host "Installing into $dir ($why)"
 $arch = if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq "Arm64") { "aarch64" } else { "x86_64" }
 if ($arch -ne "x86_64") { throw "best-peer: no release for Windows on $arch yet; build it with: cargo install --git https://github.com/$repo best-peer" }
 $target = "$arch-pc-windows-msvc"
@@ -33,7 +38,7 @@ if ($env:BEST_PEER_VERSION) {
 
 $exe = Join-Path $dir "best-peer.exe"
 $running = Get-Process best-peer -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe }
-if ($running) { throw "best-peer: a peer is running from $exe (process $($running.Id -join ', ')); stop it, then run this again" }
+if ($running) { $ids = $running.Id -join ', '; throw "best-peer: a peer is running from $exe (process $ids); stop it (Stop-Process -Id $ids), then run this again" }
 
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("best-peer-install-" + [System.IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Path $tmp | Out-Null

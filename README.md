@@ -47,9 +47,10 @@ variable has a default that fits these two ways; [Run](#run) lists them for a se
 curl -fsSL https://raw.githubusercontent.com/behavioralstate/best-peer/main/install.sh | sh
 ```
 
-It takes the release's archive for your machine, checks it against `SHA256SUMS`, and puts `best-peer` in
-`~/.local/bin` (`BEST_PEER_INSTALL_DIR` chooses another place; `BEST_PEER_VERSION=0.0.12` pins a release). On Windows,
-in PowerShell, the same into `%LOCALAPPDATA%\Programs\best-peer`, added to your PATH:
+It takes the release's archive for your machine, checks it against `SHA256SUMS`, and puts `best-peer` where one
+already is on your PATH, so a rerun upgrades in place, else in `~/.local/bin` (`BEST_PEER_INSTALL_DIR` chooses another
+place over both; `BEST_PEER_VERSION=0.0.12` pins a release). On Windows, in PowerShell, the same, the first time into
+`%LOCALAPPDATA%\Programs\best-peer`, added to your PATH:
 
 ```powershell
 irm https://raw.githubusercontent.com/behavioralstate/best-peer/main/install.ps1 | iex
