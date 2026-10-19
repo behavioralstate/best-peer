@@ -566,6 +566,8 @@ mod tests {
         Hold,
         /// Says it gave up, as Ollama does when the registry dropped it past its own retries, and ends.
         Fail,
+        /// Names a blob of 10 GiB, all of it come, says it is verifying the digests, and breaks.
+        VerifyThenBreak,
     }
 
     type Answer = Arc<dyn Fn(usize) -> (usize, Then) + Send + Sync>;
@@ -613,6 +615,24 @@ mod tests {
                         }
                         Then::Break => {}
                         Then::Hold => std::thread::sleep(Duration::from_secs(120)),
+                        Then::VerifyThenBreak => {
+                            for line in [
+                                format!(
+                                    r#"{{"status":"pulling big","digest":"sha256:big","total":{0},"completed":{0}}}"#,
+                                    10u64 << 30
+                                ),
+                                r#"{"status":"verifying sha256 digest"}"#.to_string(),
+                            ] {
+                                let _ = write!(
+                                    conn,
+                                    "{:x}
+{line}
+
+",
+                                    line.len() + 1
+                                );
+                            }
+                        }
                         Then::Fail => {
                             let line = "{\"error\":\"max retries exceeded: EOF\"}";
                             let _ = write!(conn, "{:x}\r\n{line}\n\r\n0\r\n\r\n", line.len() + 1);
@@ -707,6 +727,30 @@ mod tests {
                 .unwrap();
             assert_eq!(pulls.load(Ordering::SeqCst), 1);
         }
+    }
+
+    #[test]
+    fn a_resumed_attempt_that_says_nothing_is_held_to_the_download_bound_not_the_digest_allowance() {
+        // The first attempt verifies 10 GiB, which would allow minutes of silence, and breaks; the second says nothing.
+        let (base, pulls) = engine(
+            |n| {
+                if n == 1 {
+                    (0, Then::VerifyThenBreak)
+                } else {
+                    (0, Then::Hold)
+                }
+            },
+            Arc::new(Mutex::new(false)),
+        );
+        let (progress, _) = told();
+        let started = Instant::now();
+        let err = HttpEngine::new()
+            .with_pull_bounds(quick())
+            .pull_ollama(&base, "big:70b", &progress)
+            .unwrap_err();
+        assert_eq!(pulls.load(Ordering::SeqCst), 2);
+        assert!(matches!(&err, EngineError::Engine(m) if m.contains("stalled")), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     }
 
     #[test]
