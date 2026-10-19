@@ -1,14 +1,17 @@
 //! The HTTP routes the spec names (SPEC.md, HTTP Transport and the four capabilities), over a [`Door`]. The manifest
-//! and the two OAuth endpoints are public; everything else needs the credential in the `X-Api-Key` header. Every
-//! error the door answers, the framework's included, is in the BEST error format. A tenant's door has the protected
-//! routes alone ([`tenant_router`]): its manifest is the root's to serve, and sign-in is the root's.
+//! and the two OAuth endpoints are public, as are the two the person at the machine uses with the admin token
+//! (approve, revoke); everything else needs the credential in the `X-Api-Key` header. Every error the door answers,
+//! the framework's included, is in the BEST error format. A tenant's door has the protected routes alone
+//! ([`tenant_router`]): its manifest is the root's to serve, and sign-in is the root's.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -23,17 +26,21 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::auth::{Credential, DeviceRequest, Grant, OAuthError, TokenRequest, AUTH_HEADER};
+use crate::auth::{holder_of_hash, Credential, DeviceRequest, Grant, OAuthError, TokenRequest, AUTH_HEADER};
 use crate::catalogue::{CommandDef, Emitter};
 use crate::envelope::Envelope;
 use crate::error::BestError;
-use crate::log::{Accept, Filter, MAX_PAGE};
+use crate::log::{Accept, Filter, Stored, MAX_PAGE};
 use crate::{manifest, Door};
 
 type Shared = Arc<Door>;
 
-/// The most a request body may carry: a command is a few kilobytes, a form a few hundred bytes.
-const MAX_BODY: usize = 256 * 1024;
+/// The most a request body may carry: a command is a few kilobytes, a prompt's conversation more, a form a few
+/// hundred bytes.
+pub const MAX_BODY: usize = 256 * 1024;
+/// What a tenant's door keeps below [`MAX_BODY`]: a workspace's cloud passes a command on to a member's door in an
+/// envelope of its own, and whatever the cloud took, the member takes.
+pub const TENANT_ROOM: usize = 4 * 1024;
 
 pub fn router(door: Shared) -> Router {
     let public = Router::new()
@@ -41,14 +48,15 @@ pub fn router(door: Shared) -> Router {
         .route("/auth/device", post(device))
         .route("/auth/token", post(token))
         .route("/auth/verify", get(verify))
-        .route("/auth/approve", post(approve));
-    shaped(public.merge(protected(&door)), door)
+        .route("/auth/approve", post(approve))
+        .route("/auth/revoke", post(revoke));
+    shaped(public.merge(protected(&door)), door, MAX_BODY)
 }
 
 /// The routes of a tenant's door: the four capabilities behind the credential, and nothing public. The host mounts
 /// it under the tenant's endpoint, with the path below that endpoint, and serves the tenant's manifest itself.
 pub fn tenant_router(door: Shared) -> Router {
-    shaped(protected(&door), door)
+    shaped(protected(&door), door, MAX_BODY - TENANT_ROOM)
 }
 
 fn protected(door: &Shared) -> Router<Shared> {
@@ -66,13 +74,73 @@ fn protected(door: &Shared) -> Router<Shared> {
         .layer(middleware::from_fn_with_state(door.clone(), require_key))
 }
 
-/// Every refusal in the BEST shape, the body bounded, an unknown route named.
-fn shaped(routes: Router<Shared>, door: Shared) -> Router {
+/// Every refusal in the BEST shape, the body bounded at `limit` bytes, an unknown route named.
+fn shaped(routes: Router<Shared>, door: Shared, limit: usize) -> Router {
     routes
         .fallback(unknown_route)
-        .layer(middleware::map_response(best_shaped))
-        .layer(DefaultBodyLimit::max(MAX_BODY))
+        .layer(middleware::map_response(move |res: Response| best_shaped(res, limit)))
+        .layer(DefaultBodyLimit::max(limit))
         .with_state(door)
+}
+
+/// Who a request was answered for, set by whichever check opened it to a credential, for the access log: the holder
+/// id, never the key. A request no credential opened has none.
+#[derive(Clone, Debug, Default)]
+pub struct Answered(Arc<OnceLock<String>>);
+
+impl Answered {
+    /// Records the holder a credential opened the request for, on the request's own record when it has one.
+    pub fn record(req: &Request, credential: &Credential) {
+        if let Some(a) = req.extensions().get::<Answered>() {
+            let _ = a.0.set(credential.holder());
+        }
+    }
+}
+
+/// One line per request, at info, once it is answered: where it came from when the transport said, what it asked
+/// (the method and the path as it arrived, without the query string), what it got, the holder when a credential
+/// opened it, refused or not, and how long the answer took. A request the client gave up on before its answer is
+/// still a line, with the status `-` and `abandoned`. For an event stream the line is written when the stream
+/// opens, and `ms` is the time to its headers, not how long it stayed open. The headers and the body are never in
+/// it: a key travels in a header, and the line never carries one. Layered once, around everything a door serves,
+/// workspaces included.
+pub async fn access_log(from: Option<ConnectInfo<SocketAddr>>, mut req: Request, next: Next) -> Response {
+    let answered = Answered::default();
+    req.extensions_mut().insert(answered.clone());
+    let mut line = Line {
+        from: from.map(|c| c.0.to_string()).unwrap_or_else(|| "-".into()),
+        method: req.method().to_string(),
+        path: req.uri().path().to_string(),
+        answered,
+        started: Instant::now(),
+        status: None,
+    };
+    let res = next.run(req).await;
+    line.status = Some(res.status().as_u16());
+    res
+}
+
+/// The access log's line for one request, written when it is dropped: after the answer, or when the client went
+/// away before one.
+struct Line {
+    from: String,
+    method: String,
+    path: String,
+    answered: Answered,
+    started: Instant,
+    status: Option<u16>,
+}
+
+impl Drop for Line {
+    fn drop(&mut self) {
+        let holder = self.answered.0.get().map(String::as_str).unwrap_or("-");
+        let ms = self.started.elapsed().as_millis() as u64;
+        let (from, method, path) = (&self.from, &self.method, &self.path);
+        match self.status {
+            Some(status) => tracing::info!(%from, %method, %path, status, %holder, ms, "request"),
+            None => tracing::info!(%from, %method, %path, status = %"-", %holder, ms, "request abandoned"),
+        }
+    }
 }
 
 async fn require_key(State(door): State<Shared>, mut req: Request, next: Next) -> Response {
@@ -85,6 +153,7 @@ async fn require_key(State(door): State<Shared>, mut req: Request, next: Next) -
     let Some(credential) = (!key.is_empty()).then(|| door.auth.authenticate(key)).flatten() else {
         return BestError::unauthorized().into_response();
     };
+    Answered::record(&req, &credential);
     req.extensions_mut().insert(credential);
     next.run(req).await
 }
@@ -102,7 +171,7 @@ async fn unknown_route(req: Request) -> BestError {
 
 /// The framework answers some refusals on its own (a method the route lacks, a body over the limit, a query string
 /// it cannot read) in plain text; the spec wants every error in one shape, so those are rewritten here.
-async fn best_shaped(res: Response) -> Response {
+async fn best_shaped(res: Response, limit: usize) -> Response {
     let status = res.status();
     if !(status.is_client_error() || status.is_server_error()) {
         return res;
@@ -128,7 +197,7 @@ async fn best_shaped(res: Response) -> Response {
         StatusCode::PAYLOAD_TOO_LARGE => (
             "PAYLOAD_TOO_LARGE",
             format!(
-                "the body exceeds {MAX_BODY} bytes: send less in one command; for a prompt, fewer or shorter messages"
+                "the body exceeds {limit} bytes, the most this door takes: send less in one command; for a prompt, fewer or shorter messages"
             ),
         ),
         StatusCode::BAD_REQUEST => (
@@ -151,7 +220,11 @@ async fn best_shaped(res: Response) -> Response {
         s if s.is_server_error() => ("INTERNAL", "the door failed; try again".into()),
         _ => ("REFUSED", if text.is_empty() { status.to_string() } else { text }),
     };
-    let mut out = BestError::new(status, code, message).into_response();
+    let mut refusal = BestError::new(status, code, message);
+    if status == StatusCode::PAYLOAD_TOO_LARGE {
+        refusal = refusal.with_details(json!({ "limit_bytes": limit }));
+    }
+    let mut out = refusal.into_response();
     for (name, value) in parts
         .headers
         .iter()
@@ -192,9 +265,14 @@ fn form<T: serde::de::DeserializeOwned>(headers: &HeaderMap, body: &Bytes) -> Re
         .map_err(|e| OAuthError::invalid_request(format!("the form could not be read: {e}")))
 }
 
-async fn device(State(door): State<Shared>, headers: HeaderMap, body: Bytes) -> Result<Response, OAuthError> {
+async fn device(
+    State(door): State<Shared>,
+    from: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, OAuthError> {
     let req: DeviceRequest = form(&headers, &body)?;
-    let answer = door.auth.start_device(req)?;
+    let answer = door.auth.start_device_from(req, from.map(|c| c.0.ip()))?;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(answer)).into_response())
 }
 
@@ -216,6 +294,14 @@ struct ApproveForm {
     may: Option<String>,
     /// The most device memory the credential's workloads may hold together; absent for no share.
     memory_bytes: Option<u64>,
+    /// The most deployments the credential may run at once; absent for no count.
+    deployments: Option<u32>,
+    /// The most jobs the credential may run at once; absent for no count.
+    jobs: Option<u32>,
+    /// Whether a credential with a share runs its jobs outside the closed box; absent for no.
+    open_jobs: Option<bool>,
+    /// Seconds until the credential ends, whatever lifetime the agent asked for; absent for the agent's choice.
+    expires_in: Option<u64>,
 }
 
 async fn approve(State(door): State<Shared>, headers: HeaderMap, body: Bytes) -> Result<Response, OAuthError> {
@@ -228,9 +314,44 @@ async fn approve(State(door): State<Shared>, headers: HeaderMap, body: Bytes) ->
                 .collect()
         }),
         memory_bytes: f.memory_bytes,
+        deployments: f.deployments,
+        jobs: f.jobs,
+        open_jobs: f.open_jobs.unwrap_or(false),
     };
-    let admitted = door.auth.approve(f.user_code.trim(), f.proof.trim(), grant).await?;
+    let admitted = door
+        .auth
+        .approve(
+            f.user_code.trim(),
+            f.proof.trim(),
+            grant,
+            f.expires_in.map(Duration::from_secs),
+        )
+        .await?;
     Ok(Json(json!({ "approved": true, "admitted": admitted })).into_response())
+}
+
+#[derive(serde::Deserialize)]
+struct RevokeForm {
+    /// The connection name or the holder id of the credential to take back.
+    name: String,
+    proof: String,
+}
+
+/// The person at the machine takes a credential back, with the same proof the approval takes: every live credential
+/// by that name is taken at once, and the answer says which.
+async fn revoke(State(door): State<Shared>, headers: HeaderMap, body: Bytes) -> Result<Response, OAuthError> {
+    let f: RevokeForm = form(&headers, &body)?;
+    let taken = door.auth.revoke(&f.name, f.proof.trim()).await?;
+    let revoked: Vec<Value> = taken
+        .iter()
+        .map(|c| {
+            json!({
+                "name": c.name, "holder": c.holder(), "client_id": c.client_id, "agent_label": c.agent_label,
+                "issued_at": c.issued_at, "revoked_at": c.revoked_at
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "revoked": revoked })).into_response())
 }
 
 // ----- commands ----------------------------------------------------------------------------------------------------
@@ -562,10 +683,16 @@ async fn list_events(
     Ok(Json(body))
 }
 
+/// How often an open event stream looks at its credential again when no event comes.
+const CREDENTIAL_RECHECK: Duration = Duration::from_secs(5);
+
 /// Replays what came after `Last-Event-ID`, then follows live; the two never overlap. A client that falls behind
-/// the buffer is cut off, so it reconnects with its last id and misses nothing silently. A credential with a share
-/// holds so many streams open across the door; one more ends its oldest, which reconnects with its last id if it is
-/// still there.
+/// the buffer is cut off, so it reconnects with its last id and misses nothing silently. A credential taken back or
+/// run out ends the stream with it, within seconds whether or not events flow: its end is looked at on every event
+/// and every few seconds between, and the credential itself whenever one was taken back since. A credential taken
+/// back still reads its own AgentRevokedV1, the outcome of the revoke-agent it sent, and the stream ends after it.
+/// A credential with a share holds so many streams open across the door; one more ends its oldest, which
+/// reconnects with its last id if it is still there.
 async fn stream_events(
     State(door): State<Shared>,
     Extension(sender): Extension<Credential>,
@@ -598,20 +725,60 @@ async fn stream_events(
             .filter(move |s| f1.matches(s) && door1.visible_to(&who1, s)),
     );
     let door2 = door.clone();
-    let live = BroadcastStream::new(rx)
+    let ends = sender
+        .expires_at
+        .as_deref()
+        .and_then(|e| OffsetDateTime::parse(e, &Rfc3339).ok());
+    let (auth, hash) = (door.auth.clone(), sender.hash.clone());
+    let mut seen = auth.revocations();
+    let recheck = stream::unfold(tokio::time::interval(CREDENTIAL_RECHECK), |mut every| async move {
+        every.tick().await;
+        Some((Ok(None), every))
+    });
+    let live = stream::select(BroadcastStream::new(rx).map(|r| r.map(Some)), recheck)
         .take_while(|r| futures::future::ready(r.is_ok()))
         .filter_map(move |r| {
             let keep = r
                 .ok()
+                .flatten()
                 .filter(|s| s.seq > seen_up_to && filter.matches(s) && door2.visible_to(&sender, s));
-            async move { keep }
+            async move { Some(keep) }
         });
-    let out = replayed.chain(live).take_until(gave_way).map(move |s| {
-        let _held = &slot;
-        Ok(SseEvent::default()
-            .id(s.envelope.id.clone())
-            .data(serde_json::to_string(&s.envelope).unwrap_or_default()))
-    });
+    let holder = holder_of_hash(&hash);
+    let mut closing: Option<tokio::time::Instant> = None;
+    let mut told = false;
+    let mut step = move |item: Option<Stored>| {
+        if told || ends.is_some_and(|e| OffsetDateTime::now_utc() >= e) {
+            return futures::future::ready(None);
+        }
+        if closing.is_none() && auth.revocations() != seen && auth.credential_by_hash(&hash).is_none() {
+            closing = Some(tokio::time::Instant::now());
+        }
+        seen = auth.revocations();
+        let Some(since) = closing else {
+            return futures::future::ready(Some(item));
+        };
+        if item
+            .as_ref()
+            .is_some_and(|s| s.envelope.r#type == "AgentRevokedV1" && s.envelope.data["holder"] == holder)
+        {
+            told = true;
+            return futures::future::ready(Some(item));
+        }
+        futures::future::ready((since.elapsed() < CREDENTIAL_RECHECK).then_some(None))
+    };
+    let out = replayed
+        .map(Some)
+        .chain(live)
+        .scan((), move |_, item| step(item))
+        .filter_map(futures::future::ready)
+        .take_until(gave_way)
+        .map(move |s| {
+            let _held = &slot;
+            Ok(SseEvent::default()
+                .id(s.envelope.id.clone())
+                .data(serde_json::to_string(&s.envelope).unwrap_or_default()))
+        });
     Ok(Sse::new(out).keep_alive(KeepAlive::default().text("keepalive")))
 }
 
@@ -838,7 +1005,8 @@ mod tests {
 
     /// The same, approved for the scopes `may` names when given.
     async fn sign_in_with(app: &Router, client: &str, connection: &str, may: Option<&str>) -> String {
-        sign_in_holding(app, client, connection, may, None).await
+        let extra: Vec<(&str, &str)> = may.map(|m| ("may", m)).into_iter().collect();
+        sign_in_approved(app, client, connection, &extra).await
     }
 
     /// The same, with a share of `memory` bytes when given.
@@ -849,6 +1017,16 @@ mod tests {
         may: Option<&str>,
         memory: Option<&str>,
     ) -> String {
+        let extra: Vec<(&str, &str)> = may
+            .map(|m| ("may", m))
+            .into_iter()
+            .chain(memory.map(|m| ("memory_bytes", m)))
+            .collect();
+        sign_in_approved(app, client, connection, &extra).await
+    }
+
+    /// The same, approved with the `extra` fields of the approval form.
+    async fn sign_in_approved(app: &Router, client: &str, connection: &str, extra: &[(&str, &str)]) -> String {
         let (s, _, a) = call(
             app,
             post_form("/auth/device", &[("client_id", client), ("connection", connection)]),
@@ -856,12 +1034,7 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::OK, "{a}");
         let mut fields = vec![("user_code", a["user_code"].as_str().unwrap()), ("proof", "ok")];
-        if let Some(m) = may {
-            fields.push(("may", m));
-        }
-        if let Some(m) = memory {
-            fields.push(("memory_bytes", m));
-        }
+        fields.extend_from_slice(extra);
         let (s, _, ok) = call(app, post_form("/auth/approve", &fields)).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(ok["admitted"]["connection"], connection);
@@ -1102,7 +1275,8 @@ mod tests {
 
     #[tokio::test]
     async fn every_error_the_framework_answers_is_in_the_best_shape() {
-        let app = router(door());
+        let d = door();
+        let app = router(d.clone());
         let key = sign_in(&app, "test", "my-peer").await;
         let (s, _, b) = call(&app, get("/nothing/here", Some(&key))).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
@@ -1126,12 +1300,179 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(b["error"]["code"], "PAYLOAD_TOO_LARGE");
+        assert_eq!(b["error"]["details"]["limit_bytes"], MAX_BODY);
+        // A tenant's door takes a little less, so what a cloud took a member's door takes too.
+        let tenant = tenant_router(d.clone());
+        let near = "x".repeat(MAX_BODY - TENANT_ROOM);
+        let (s, _, b) = call(
+            &tenant,
+            post_json("/commands", &key, "application/json", json!({ "pad": near })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE, "{b}");
+        assert_eq!(b["error"]["details"]["limit_bytes"], MAX_BODY - TENANT_ROOM);
         let (s, _, b) = call(&app, get("/events?limit=0", Some(&key))).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert_eq!(b["error"]["details"]["parameter"], "limit");
         let (s, _, b) = call(&app, get("/events?limit=5000", Some(&key))).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert!(b["error"]["message"].as_str().unwrap().contains("200"));
+    }
+
+    #[tokio::test]
+    async fn sign_in_counts_registrations_by_the_address_the_connection_came_from() {
+        let at = |ip: &str| {
+            router(door()).layer(axum::extract::connect_info::MockConnectInfo(SocketAddr::new(
+                ip.parse().unwrap(),
+                40000,
+            )))
+        };
+        let app = at("203.0.113.9");
+        for i in 0..16 {
+            let client = format!("client-{i}");
+            let (s, _, b) = call(&app, post_form("/auth/device", &[("client_id", client.as_str())])).await;
+            assert_eq!(s, StatusCode::OK, "{b}");
+        }
+        let (s, h, b) = call(&app, post_form("/auth/device", &[("client_id", "client-new")])).await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{b}");
+        assert_eq!(h[header::CACHE_CONTROL], "no-store");
+        assert!(
+            b["error_description"].as_str().unwrap().contains("from your address"),
+            "{b}"
+        );
+        let local = at("127.0.0.1");
+        for i in 0..20 {
+            let client = format!("client-{i}");
+            let (s, _, b) = call(&local, post_form("/auth/device", &[("client_id", client.as_str())])).await;
+            assert_eq!(s, StatusCode::OK, "loopback is not counted: {b}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_person_takes_a_credential_back_with_the_proof() {
+        let d = door();
+        let app = router(d.clone());
+        let key = sign_in(&app, "test", "my-peer").await;
+        let res = app.clone().oneshot(get("/commands", Some(&key))).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let holder = d.auth.authenticate(&key).unwrap().holder();
+        // The wrong proof takes nothing; the right one takes it, and the door closes to it at once.
+        let (s, _, b) = call(&app, post_form("/auth/revoke", &[("name", "my-peer"), ("proof", "no")])).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+        let (s, _, b) = call(&app, post_form("/auth/revoke", &[("name", "my-peer"), ("proof", "ok")])).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["revoked"][0]["holder"], holder);
+        assert_eq!(b["revoked"][0]["name"], "my-peer");
+        assert!(b["revoked"][0]["revoked_at"].is_string());
+        assert!(!b.to_string().contains(&key));
+        let (s, _, b) = call(&app, get("/commands", Some(&key))).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        assert_eq!(b["error"]["code"], "UNAUTHORIZED");
+        let (s, _, b) = call(&app, post_form("/auth/revoke", &[("name", "my-peer"), ("proof", "ok")])).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(b["error_description"].as_str().unwrap().contains("none"), "{b}");
+        // An approval bounded in time: the token answer says so.
+        let (_, _, a) = call(
+            &app,
+            post_form("/auth/device", &[("client_id", "test"), ("connection", "bounded")]),
+        )
+        .await;
+        let (s, _, ok) = call(
+            &app,
+            post_form(
+                "/auth/approve",
+                &[
+                    ("user_code", a["user_code"].as_str().unwrap()),
+                    ("proof", "ok"),
+                    ("expires_in", "120"),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{ok}");
+        assert_eq!(ok["admitted"]["expires_in"], 120);
+        let (_, _, t) = call(
+            &app,
+            post_form(
+                "/auth/token",
+                &[
+                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                    ("device_code", a["device_code"].as_str().unwrap()),
+                    ("client_id", "test"),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(t["expires_in"], 120);
+        assert!(t["expires_at"].is_string());
+    }
+
+    /// Opens an event stream under `key` and gives its body, frame by frame.
+    async fn open_stream(app: &Router, key: &str) -> axum::body::BodyDataStream {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::get("/events/stream")
+                    .header(AUTH_HEADER, key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        res.into_body().into_data_stream()
+    }
+
+    /// Whether a quiet stream ends within `within`, with nothing but keep-alives before it does.
+    async fn ends_within(body: &mut axum::body::BodyDataStream, within: Duration) -> bool {
+        tokio::time::timeout(within, async {
+            while let Some(frame) = body.next().await {
+                let frame = frame.unwrap();
+                assert!(
+                    String::from_utf8_lossy(&frame).contains("keepalive"),
+                    "no event reaches a credential taken back or run out"
+                );
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_stream_ends_within_seconds_of_its_credential_being_taken_back() {
+        let d = door();
+        let app = router(d.clone());
+        let key = sign_in(&app, "test", "my-peer").await;
+        let other = sign_in(&app, "test", "other").await;
+        let mut body = open_stream(&app, &key).await;
+        let mut others = open_stream(&app, &other).await;
+        assert!(
+            !ends_within(&mut body, Duration::from_secs(30)).await,
+            "a live key's quiet stream stays open"
+        );
+        let (s, _, b) = call(&app, post_form("/auth/revoke", &[("name", "my-peer"), ("proof", "ok")])).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert!(
+            ends_within(&mut body, CREDENTIAL_RECHECK * 2).await,
+            "the stream outlived its credential"
+        );
+        assert!(
+            !ends_within(&mut others, CREDENTIAL_RECHECK * 3).await,
+            "another credential's stream is its own"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_stream_ends_within_seconds_of_its_credential_running_out() {
+        let app = router(door());
+        let key = sign_in_approved(&app, "test", "brief", &[("expires_in", "1")]).await;
+        let mut body = open_stream(&app, &key).await;
+        assert!(!ends_within(&mut body, Duration::from_millis(500)).await);
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(
+            ends_within(&mut body, CREDENTIAL_RECHECK * 2).await,
+            "the stream outlived its credential"
+        );
     }
 
     #[tokio::test]

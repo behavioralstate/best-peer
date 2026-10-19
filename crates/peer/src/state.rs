@@ -59,6 +59,8 @@ pub struct Job {
     pub holder: String,
     /// On a cloud, the member peer it was placed on, as `peer` in JobStarted.
     pub peer: Option<String>,
+    /// The most host memory its container may hold, as JobStarted told it; none for no ceiling.
+    pub host_memory_bytes: Option<u64>,
 }
 
 /// What an admitted command was given before its handler told the first fact: its id, and the device and memory
@@ -71,6 +73,8 @@ pub struct Reservation {
     pub memory_bytes: u64,
     /// The credential the command came from: what the started event will name as `holder`.
     pub holder: String,
+    /// For a job, whether it runs in the closed box, as its credential's grant decided at admission.
+    pub boxed: bool,
 }
 
 /// What a container belongs to.
@@ -90,6 +94,22 @@ pub struct State {
 }
 
 impl State {
+    /// What `holder` holds here, for the door's holdings: device memory, and the deployments and jobs running or
+    /// admitted.
+    pub fn holdings_of(&self, holder: &str) -> crate::holdings::Held {
+        let admitted = |kind: &str| {
+            self.reserved
+                .values()
+                .filter(|r| r.holder == holder && r.id.starts_with(kind))
+                .count()
+        };
+        crate::holdings::Held {
+            memory_bytes: self.held_by(holder),
+            deployments: self.deployments.values().filter(|d| d.holder == holder).count() + admitted("dep-"),
+            jobs: self.jobs.values().filter(|j| j.holder == holder).count() + admitted("job-"),
+        }
+    }
+
     /// The device memory promised to one holder's workloads, admitted ones included: what a share is measured
     /// against.
     pub fn held_by(&self, holder: &str) -> u64 {
@@ -224,6 +244,7 @@ impl State {
                         phase: JobPhase::Running,
                         holder: text("holder"),
                         peer: data["peer"].as_str().map(str::to_string),
+                        host_memory_bytes: data["host_memory_bytes"].as_u64(),
                     },
                 );
             }
@@ -255,6 +276,7 @@ mod tests {
                 compute: Some(Compute::Cuda("12".into())),
                 memory_bytes: bytes,
                 holder: "h".into(),
+                boxed: false,
             },
         );
     }
