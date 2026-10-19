@@ -14,98 +14,12 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
-      - run: cargo build --release -p best-peer
-
       - uses: actions/setup-node@v4
         with:
           node-version: 22
 
-      # The validator is a gate from the first commit: a manifest the spec refuses fails the build. The data
-      # directory is shared with the later steps through the job environment, so `best-peer approve` finds the same
-      # admin token the server wrote. The peer runs on the fakes: CI never needs an engine or a GPU.
-      - name: best-validate, anonymous
-        run: |
-          data="$(mktemp -d)"
-          echo "BEST_PEER_DATA=$data" >> "$GITHUB_ENV"
-          echo "BEST_PEER_RUNTIME=fake" >> "$GITHUB_ENV"
-          echo "BEST_PEER_GPU=none" >> "$GITHUB_ENV"
-          BEST_PEER_DATA="$data" BEST_PEER_RUNTIME=fake BEST_PEER_GPU=none ./target/release/best-peer &
-          for i in $(seq 1 30); do curl -sf http://127.0.0.1:7777/.well-known/best >/dev/null && break; sleep 1; done
-          npx -y @behavioralstate/best-validate@0.4.2 http://127.0.0.1:7777
-
-      # Then as an admitted agent, over https: a second peer with an https endpoint and no certificate given makes
-      # its own, and every call here is pinned to that file (curl --cacert, the validator through NODE_EXTRA_CA_CERTS):
-      # the device flow, approval with this machine's admin token through the real `best-peer approve`, the credential
-      # redeemed, and the validator probing every active capability with it. Nothing here prints the credential.
-      - name: best-validate, signed in over https, with the registration probe
-        run: |
-          set -euo pipefail
-          data="$(mktemp -d)"
-          base=https://127.0.0.1:7778
-          cert="$data/tls/cert.pem"
-          BEST_PEER_DATA="$data" BEST_PEER_LISTEN=127.0.0.1:7778 BEST_PEER_ENDPOINT="$base" ./target/release/best-peer &
-          for i in $(seq 1 30); do curl -sf --cacert "$cert" "$base/.well-known/best" >/dev/null 2>&1 && break; sleep 1; done
-          device=$(curl -sf --cacert "$cert" -X POST "$base/auth/device" -d client_id=ci -d connection=ci-peer -d agent_label=ci)
-          user_code=$(echo "$device" | python3 -c 'import json,sys; print(json.load(sys.stdin)["user_code"])')
-          device_code=$(echo "$device" | python3 -c 'import json,sys; print(json.load(sys.stdin)["device_code"])')
-          echo "$device" | python3 -c 'import json,sys; assert json.load(sys.stdin)["verification_uri"].startswith("https://"), "the verification URI is not https"'
-          BEST_PEER_DATA="$data" ./target/release/best-peer approve "$user_code"
-          token=$(curl -sf --cacert "$cert" -X POST "$base/auth/token" -d grant_type=urn:ietf:params:oauth:grant-type:device_code -d "device_code=$device_code" -d client_id=ci)
-          key=$(echo "$token" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
-          echo "$token" | python3 -c 'import json,sys; t=json.load(sys.stdin); assert t["name"]=="ci-peer" and t["auth_header"]=="X-Api-Key" and t["note"].startswith("The credential is a secret."), "the token answer lacks a BEST member"'
-          NODE_EXTRA_CA_CERTS="$cert" npx -y @behavioralstate/best-validate@0.4.2 "$base" --api-key "$key" --auth-type apikey --auth-header X-Api-Key --probe-registration
-
-      # Then a workspace and a cloud: the same binary as the door, over two member peers on the fakes. The agent creates
-      # the workspace and configures the cloud through the surface, each member admits the cloud through the real
-      # `best-peer approve` with the code the door logs, and the validator probes the root and the workspace's own
-      # manifest (--tenant), anonymous and signed in.
-      - name: best-validate, a workspace with a cloud over two members
-        run: |
-          set -euo pipefail
-          data_a="$(mktemp -d)"; data_b="$(mktemp -d)"
-          BEST_PEER_DATA="$data_a" BEST_PEER_LISTEN=127.0.0.1:7781 BEST_PEER_ENDPOINT=http://127.0.0.1:7781 ./target/release/best-peer &
-          BEST_PEER_DATA="$data_b" BEST_PEER_LISTEN=127.0.0.1:7782 BEST_PEER_ENDPOINT=http://127.0.0.1:7782 ./target/release/best-peer &
-          for p in 7781 7782; do for i in $(seq 1 30); do curl -sf http://127.0.0.1:$p/.well-known/best >/dev/null && break; sleep 1; done; done
-          door="$(mktemp -d)"
-          BEST_PEER_DATA="$door" BEST_PEER_LISTEN=127.0.0.1:7783 BEST_PEER_ENDPOINT=http://127.0.0.1:7783 ./target/release/best-peer > "$door/log" 2>&1 &
-          base=http://127.0.0.1:7783
-          for i in $(seq 1 30); do curl -sf "$base/.well-known/best" >/dev/null && break; sleep 1; done
-          curl -sf "$base/.well-known/best" | python3 -c 'import json,sys; m=json.load(sys.stdin)["best"]; assert m["tenants"]["manifest"].endswith("/.well-known/best/{tenantId}"), m'
-          device=$(curl -sf -X POST "$base/auth/device" -d client_id=ci -d connection=ci-door -d agent_label=ci)
-          user_code=$(echo "$device" | python3 -c 'import json,sys; print(json.load(sys.stdin)["user_code"])')
-          device_code=$(echo "$device" | python3 -c 'import json,sys; print(json.load(sys.stdin)["device_code"])')
-          BEST_PEER_DATA="$door" ./target/release/best-peer approve "$user_code"
-          token=$(curl -sf -X POST "$base/auth/token" -d grant_type=urn:ietf:params:oauth:grant-type:device_code -d "device_code=$device_code" -d client_id=ci)
-          key=$(echo "$token" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
-          command() {  # base id type schema data -> POST /commands, fails on anything but 201
-            local body
-            body=$(python3 -c 'import json,sys,datetime; print(json.dumps({"specversion":"1.0","id":sys.argv[2],"source":"https://ci.test/agent","type":sys.argv[3],"datacontenttype":"application/json","dataschema":sys.argv[1]+"/commands/"+sys.argv[4]+"/1.0","time":datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),"data":json.loads(sys.argv[5])}))' "$@")
-            curl -sf -H "X-Api-Key: $key" -H "Content-Type: application/cloudevents+json" -d "$body" "$1/commands" >/dev/null
-          }
-          command "$base" ci-ws CreateWorkspace create-workspace '{"name":"CI"}'
-          for i in $(seq 1 30); do
-            ws=$(curl -sf -H "X-Api-Key: $key" "$base/queries/get-workspaces" | python3 -c 'import json,sys; w=json.load(sys.stdin)["workspaces"]; print(w[0]["workspace"] if w else "")')
-            [ -n "$ws" ] && break; sleep 0.5
-          done
-          [ -n "$ws" ] || { echo "::error::no workspace after create-workspace"; cat "$door/log"; exit 1; }
-          tenant="$base/workspaces/$ws"
-          command "$tenant" ci-cloud ConfigureCloud configure-cloud '{"cloud":"lab","members":[{"peer":"a","endpoint":"http://127.0.0.1:7781"},{"peer":"b","endpoint":"http://127.0.0.1:7782"}]}'
-          for m in a b; do
-            for i in $(seq 1 40); do grep -q "on $m, run on that machine" "$door/log" && break; sleep 0.5; done
-            code=$(grep -o "on $m, run on that machine: best-peer approve [A-Z0-9-]*" "$door/log" | head -1 | awk '{print $NF}')
-            d="data_$m"; BEST_PEER_DATA="${!d}" ./target/release/best-peer approve "$code"
-          done
-          for i in $(seq 1 60); do
-            up=$(curl -sf -H "X-Api-Key: $key" "$tenant/queries/get-clouds" | python3 -c 'import json,sys; c=json.load(sys.stdin)["clouds"][0]; print(sum(1 for p in c["peers"] if p["state"]=="up"))')
-            [ "$up" = 2 ] && break; sleep 0.5
-          done
-          [ "$up" = 2 ] || { echo "::error::the cloud sees $up of 2 members up"; cat "$door/log"; exit 1; }
-          curl -sf -H "X-Api-Key: $key" "$tenant/queries/get-hardware-state" | python3 -c 'import json,sys; ids=[d["id"] for d in json.load(sys.stdin)["devices"]]; assert ids==["lab/a/cpu-0","lab/b/cpu-0"], ids'
-          npx -y @behavioralstate/best-validate@0.4.2 "$base" --tenant "$ws"
-          npx -y @behavioralstate/best-validate@0.4.2 "$base" --tenant "$ws" --api-key "$key" --auth-type apikey --auth-header X-Api-Key --probe-registration
-          # BEST_PEER_MEMBERS is refused at start, with the commands that configure a cloud.
-          if BEST_PEER_DATA="$(mktemp -d)" BEST_PEER_LISTEN=127.0.0.1:7784 BEST_PEER_MEMBERS=a=http://127.0.0.1:7781 ./target/release/best-peer 2> "$door/refused"; then echo "::error::BEST_PEER_MEMBERS was accepted"; exit 1; fi
-          grep -q "configure-cloud" "$door/refused"
+      # The gate is the script every maintainer runs before the push (SDLC.md section 3): fmt, clippy, the tests, a
+      # release build, then best-validate against the built peer on the fakes, anonymous, signed in over https
+      # through the real device flow and `best-peer approve`, and on a workspace's cloud over two members. A manifest
+      # the spec refuses fails the build. CI never needs an engine or a GPU.
+      - run: scripts/gate.sh all

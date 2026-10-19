@@ -36,8 +36,10 @@
 - Tests first where one applies, against the fakes: the lifecycle, the refusals, the events, the manifest.
 - `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`; then the served
   manifest through `best-validate`, anonymous and then signed in: an agent registered through the device flow,
-  admitted with the real `best-peer approve`, and the validator probing every active capability with that credential.
-  CI runs the same, and a surface the spec refuses fails the build.
+  admitted with the real `best-peer approve`, and the validator probing every active capability with that credential;
+  then a workspace with a cloud over two member peers, validated on the root and the workspace's manifest.
+  `scripts/gate.sh all` (`pwsh scripts/gate.ps1 all` on Windows) runs all of it and ends in `GATE GREEN` or
+  `GATE RED`; CI runs the same script, and a surface the spec refuses fails the build.
 
 ## 4. Ship
 
@@ -46,13 +48,16 @@
   the owner's bypass of the protection lets through. A piece of work is a branch, and lands as one commit on `main`
   (a squash merge), the subject saying what changed and why, ending with the assistant's attribution line.
 - **Three gates, in this order; nothing moves on while one is open.**
-  1. **The local proof**, before the branch is pushed: section 3 on the maintainer's machine, every step green (the
-     owner wraps them in a script that ends in `GATE GREEN`; any maintainer runs the same commands); a change that
-     touches a host is proven on that host by hand, with the proof on the issue.
-  2. **CI** on the pull request: section 3 again, on the fakes; a red check blocks the merge.
-  3. **The review**: `/best-review` on the branch, the owner-run review of everything the pull request holds that
-     `main` does not. Every finding is answered on its thread with a fix and a test, or set aside with its reason;
-     nothing is dropped silently. The owner merges.
+  1. **The local proof**, before the branch is pushed: section 3 on the maintainer's machine, `scripts/gate.sh all`
+     (`pwsh scripts/gate.ps1 all` on Windows) ending in `GATE GREEN`; a change that touches a host is proven on that
+     host by hand, with the proof on the issue.
+  2. **CI** on the pull request: the same script, on the fakes; a red check blocks the merge.
+  3. **The review**: `/best-review` on the branch, run by the author's assistant once the pull request is open. It is
+     the repository's own skill (`.claude/skills/best-review`, in every checkout): a reviewer that has not seen the
+     conversation, on a separate worker with the model `.claude/skills/best-reviewer` pins (Sonnet 5.5, high effort),
+     reads the pull request and posts its findings as a comment-only review; the author's session verifies each one
+     and answers it on its thread with a fix and a test, or the reason it stands; nothing is dropped silently. A push
+     after that is reviewed again, for what is new. The owner merges.
 - **The merge is what runs.** A host run by the owner builds `main` and runs it; the sha is its version.
 - **A release is a tag.** `scripts/release.sh <version> -m "<what it is>"` runs only on a clean `main` level with
   origin, so everything it releases has passed the gates; it bumps the one version in `Cargo.toml` (every crate
