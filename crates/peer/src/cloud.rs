@@ -855,26 +855,40 @@ impl Cloud {
             if let Some(device) = data["device"].as_str().filter(|d| !d.is_empty() && !d.contains('/')) {
                 data["device"] = json!(format!("{}/{}/{device}", self.name, member.name));
             }
-            // The holder of the order, while it is one; an order no longer there was stopped before it started.
+            // The holder of the order and whether it started, while it is one; an order no longer there was stopped
+            // before it started.
             let ordered = order.as_ref().map(|o| {
                 let s = self.state.lock().unwrap();
-                (o.clone(), s.orders.get(o).map(|x| x.holder.clone()))
+                (o.clone(), s.orders.get(o).map(|x| (x.holder.clone(), x.job.is_some())))
             });
+            let mut r#type = e.r#type.clone();
+            if let Some((o, Some((_, false)))) = &ordered {
+                // The member ended the order before it started: under the member's own id for its job, which the
+                // caller never saw. It is the order that ended, told by the order's id, and a refusal is its failure.
+                if TERMINAL.contains(&r#type.as_str()) {
+                    data["job"] = json!(o);
+                    if r#type == "CommandFailed" {
+                        r#type = "JobFailed".into();
+                        data["fix"] = json!("read the peer's refusal in the reason, then order it again");
+                    }
+                }
+            }
             if let Some(key) = pull {
                 self.on_pull_fact(member, &key, &em, &e.r#type, data);
-            } else if let Some((_, None)) = &ordered {
-                // Stopped before it started, and the member started it all the same: it is stopped there, and
-                // nothing more is told about it.
-                if let Some(mc) = e.correlationid.as_deref() {
-                    self.issued
-                        .lock()
-                        .unwrap()
-                        .remove(&(member.name.clone(), mc.to_string()));
-                }
-                if let Some((o, _)) = &ordered {
+            } else if let Some((o, None)) = &ordered {
+                // Stopped before it started: the member's facts about it are not told. When the member starts it all
+                // the same, it is stopped there; when the member ends it first, nothing is left to do.
+                let started = r#type == "JobStarted";
+                if started || TERMINAL.contains(&r#type.as_str()) {
+                    if let Some(mc) = e.correlationid.as_deref() {
+                        self.issued
+                            .lock()
+                            .unwrap()
+                            .remove(&(member.name.clone(), mc.to_string()));
+                    }
                     self.stopped_unstarted.lock().unwrap().remove(o);
                 }
-                if let (true, Some(job)) = (e.r#type == "JobStarted", data["job"].as_str()) {
+                if let (true, Some(job)) = (started, data["job"].as_str()) {
                     tracing::info!(cloud = %self.name, peer = %member.name, %job, "a job stopped before it started was started on the member; stopping it there");
                     self.stop_stray(&member.name, job);
                 }
@@ -882,13 +896,13 @@ impl Cloud {
                 let key = em.command_key().to_string();
                 let (sender, _) = Self::sender_of(&key);
                 // The promise made at admission is kept until the member starts the workload, or fails to.
-                if !matches!(e.r#type.as_str(), "ImagePulling" | "ImagePulled") && !key.is_empty() {
+                if !matches!(r#type.as_str(), "ImagePulling" | "ImagePulled") && !key.is_empty() {
                     self.state.lock().unwrap().reserved.remove(&key);
                 }
-                match e.r#type.as_str() {
+                match r#type.as_str() {
                     "DeploymentStarted" | "JobStarted" => {
                         match &ordered {
-                            Some((o, Some(holder))) => {
+                            Some((o, Some((holder, _)))) => {
                                 data["order"] = json!(o);
                                 data["holder"] = json!(holder);
                             }
@@ -906,8 +920,8 @@ impl Cloud {
                         data[k] = v.clone();
                     }
                 }
-                self.tell(&em, &e.r#type, data);
-                if TERMINAL.contains(&e.r#type.as_str()) {
+                self.tell(&em, &r#type, data);
+                if TERMINAL.contains(&r#type.as_str()) {
                     if let Some(mc) = e.correlationid.as_deref() {
                         self.issued
                             .lock()
@@ -2051,6 +2065,9 @@ impl Service for Cloud {
 
     async fn stop_job(self: Arc<Self>, cmd: Envelope, em: Emitter) {
         let named = cmd.data["job"].as_str().unwrap_or_default().to_string();
+        // Not between a placement step's choice and its JobPlaced: the order is stopped either before it is sent,
+        // or as one sent.
+        let _no_step = self.steps.lock().await;
         let order = self.state.lock().unwrap().orders.get(&named).cloned();
         // An order not started ends before it started: under its own correlation, which completes it, and under
         // the stop's. A member it was sent to that starts it all the same is told to stop it when it says so.

@@ -1704,6 +1704,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_order_its_member_fails_before_it_started_ends_by_the_orders_id() {
+        let (a, b) = two_members().await;
+        let key_a = a.key.clone();
+        let site = site(vec![(A, a), (B, b)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a)]).await;
+        // The member cannot pull the image: it fails the job under its own id, which the caller never saw.
+        let order = site.order(&ws, "j1", 4, json!({ "image": "nobody/nothing:1" })).await;
+        let events = site.events(&ws, "j1", "JobFailed").await;
+        assert_eq!(facts(&events), ["JobQueued", "JobPlaced", "JobFailed"]);
+        let failed = &events.last().unwrap()["data"];
+        assert_eq!(failed["job"], order["job"], "the order ended, by its own id");
+        assert_eq!(failed["peer"], "a");
+        let w = site.query(&ws, "get-workloads").await;
+        assert_eq!(w["queued"], json!([]), "it no longer waits, nor is it held");
+        assert_eq!(w["held_bytes"], 0);
+        let door = site.workspaces.get(&ws).unwrap().door().clone();
+        assert!(door.log.unfinished().iter().all(|u| u.envelope.id != "j1"));
+    }
+
+    #[tokio::test]
+    async fn an_order_stopped_after_it_was_sent_is_stopped_on_the_member_when_it_starts_there() {
+        let (a, b) = two_members().await;
+        let key_a = a.key.clone();
+        let site = site(vec![(A, a), (B, b)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a)]).await;
+        // The member holds the pull, so the order is sent and not started when the stop comes.
+        let gate = site.members[0].runtime.hold_pulls();
+        let order = site.order(&ws, "j1", 4, json!({})).await;
+        site.events(&ws, "j1", "JobPlaced").await;
+        let (s, b) = site
+            .send(&ws, "s1", "StopJob", "stop-job", json!({ "job": order["job"] }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "s1", "JobStopped").await;
+        // The member pulls on and starts it all the same, telling the pull first: the cloud stops it there.
+        gate.add_permits(1);
+        let member = &site.members[0];
+        for _ in 0..400 {
+            let stopped = member.door.log.list(&Filter {
+                r#type: Some("JobStopped".into()),
+                ..Default::default()
+            });
+            if !stopped.0.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            member.runtime.running().await.unwrap().is_empty(),
+            "nothing of it runs on the member"
+        );
+        assert_eq!(
+            facts(&site.events(&ws, "j1", "JobStopped").await),
+            ["JobQueued", "JobPlaced", "JobStopped"],
+            "the member's facts about it are not told"
+        );
+        assert_eq!(site.query(&ws, "get-workloads").await["jobs"], json!([]));
+    }
+
+    #[tokio::test]
     async fn a_member_lost_under_an_order_queues_it_again_once_and_the_second_time_it_fails() {
         let (a, b) = two_members().await;
         let (key_a, key_b) = (a.key.clone(), b.key.clone());

@@ -194,6 +194,8 @@ pub struct Fake {
     devices: Vec<DeviceId>,
     next: Mutex<u32>,
     tx: broadcast::Sender<Event>,
+    /// When set, a pull waits for a permit: a test holds a workload between its pull and its start.
+    gate: Mutex<Option<std::sync::Arc<tokio::sync::Semaphore>>>,
 }
 
 impl Fake {
@@ -212,7 +214,15 @@ impl Fake {
             devices,
             next: Mutex::new(0),
             tx,
+            gate: Mutex::new(None),
         }
+    }
+
+    /// Holds every pull from now on until the gate answered gives it a permit (`add_permits`).
+    pub fn hold_pulls(&self) -> std::sync::Arc<tokio::sync::Semaphore> {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        *self.gate.lock().unwrap() = Some(gate.clone());
+        gate
     }
 
     /// Every image a pull was asked for, in order: what went to the registry.
@@ -284,6 +294,12 @@ impl Fake {
 impl Runtime for Fake {
     async fn pull(&self, image: &ImageRef, progress: Progress) -> Result<(), RuntimeError> {
         self.pulled.lock().unwrap().push(image.clone());
+        let gate = self.gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            if let Ok(permit) = gate.acquire().await {
+                permit.forget();
+            }
+        }
         if !self.open_registry && !self.registry.lock().unwrap().contains(image) {
             return Err(RuntimeError::ImageNotFound(image.0.clone()));
         }

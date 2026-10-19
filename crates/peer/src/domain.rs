@@ -299,21 +299,46 @@ fn workloads_query(peer: Arc<dyn Service>, at: Where) -> QueryDef {
         required_deployment.extend(["cloud", "peer"]);
         required_job.extend(["cloud", "peer"]);
     }
+    let mut response = json!({
+        "type": "object",
+        "required": ["deployments", "jobs"],
+        "properties": {
+            "deployments": { "type": "array", "items": { "type": "object", "required": required_deployment, "properties": deployment } },
+            "jobs": { "type": "array", "items": { "type": "object", "required": required_job, "properties": job } },
+            "held_bytes": { "type": "integer", "description": "The device memory your workloads hold together on this door, admitted ones included" },
+            "share_bytes": { "type": ["integer", "null"], "description": "The most your credential may hold; null when no share was set" }
+        }
+    });
+    if at == Where::Workspace {
+        response["required"] = json!(["deployments", "jobs", "queued"]);
+        response["properties"]["queued"] = json!({
+            "type": "array",
+            "description": "The orders not started yet, oldest first",
+            "items": {
+                "type": "object",
+                "required": ["job", "cloud", "image", "attempt", "queued_at", "waiting"],
+                "properties": {
+                    "job": { "type": "string", "description": "The order's id, what stop-job names" },
+                    "cloud": { "type": "string", "description": "The cloud that took it" },
+                    "image": { "type": "string" },
+                    "memory_bytes": { "type": ["integer", "null"] },
+                    "device": { "type": ["string", "null"], "description": "The device it pinned, cloud/peer/device" },
+                    "holder": { "type": "string", "description": "The credential that ordered it, an opaque id" },
+                    "attempt": { "type": "integer", "description": "1; 2 once queued again after a member peer was lost under it" },
+                    "queued_at": { "type": "string", "description": "When this attempt was queued, as JobQueued told it" },
+                    "queue_seconds": { "type": ["integer", "null"], "description": "How long it may wait from then" },
+                    "waiting": { "type": "boolean", "description": "True while no member peer has taken it; false once sent to the peer named" },
+                    "peer": { "type": ["string", "null"], "description": "The member peer it was sent to, once sent" }
+                }
+            }
+        });
+    }
     QueryDef {
         schema: "get-workloads".into(),
         version: "1.0".into(),
         description: description.into(),
         parameters: None,
-        response: json!({
-            "type": "object",
-            "required": ["deployments", "jobs"],
-            "properties": {
-                "deployments": { "type": "array", "items": { "type": "object", "required": required_deployment, "properties": deployment } },
-                "jobs": { "type": "array", "items": { "type": "object", "required": required_job, "properties": job } },
-                "held_bytes": { "type": "integer", "description": "The device memory your workloads hold together on this door, admitted ones included" },
-                "share_bytes": { "type": ["integer", "null"], "description": "The most your credential may hold; null when no share was set" }
-            }
-        }),
+        response,
         handler: Arc::new(move |who, _params| {
             let peer = peer.clone();
             Box::pin(async move { peer.workloads(&who) })
