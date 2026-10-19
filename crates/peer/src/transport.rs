@@ -20,14 +20,70 @@ pub trait Transport: Send + Sync + 'static {
     fn call(&self, req: Request<Body>) -> BoxFuture<'static, Result<Response<Body>, String>>;
 }
 
+/// Where this peer carries a credential in cleartext, from `BEST_PEER_CLEARTEXT`: on loopback alone, unless the
+/// operator says a VPN already encrypts the hop (`vpn`). The door it serves and the members its clouds reach are held
+/// to the same rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cleartext {
+    Loopback,
+    Vpn,
+}
+
+impl Cleartext {
+    pub fn parse(text: Option<&str>) -> Result<Self, String> {
+        match text.map(str::trim) {
+            None | Some("") => Ok(Cleartext::Loopback),
+            Some("vpn") => Ok(Cleartext::Vpn),
+            Some(t) => Err(format!(
+                "BEST_PEER_CLEARTEXT must be vpn, when a VPN already encrypts every hop to and from this peer, or unset, not {t:?}"
+            )),
+        }
+    }
+
+    /// Whether a credential may go to or come from `url`: always over `https://`, over `http://` only to this
+    /// machine's loopback or where a VPN carries it.
+    pub fn allows(self, url: &str) -> bool {
+        match url.split_once("://") {
+            Some((scheme, _)) if scheme.eq_ignore_ascii_case("https") => true,
+            Some((scheme, _)) if scheme.eq_ignore_ascii_case("http") => {
+                self == Cleartext::Vpn || is_loopback(url_host(url))
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The host of an absolute URL, an IPv6 address with its brackets.
+pub fn url_host(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if host_port.starts_with('[') {
+        return host_port.split_inclusive(']').next().unwrap_or(host_port);
+    }
+    host_port.rsplit_once(':').map_or(host_port, |(h, _)| h)
+}
+
+/// Whether a host name or address is this machine's loopback, an IPv4 address mapped into IPv6 included.
+pub fn is_loopback(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    bare.eq_ignore_ascii_case("localhost")
+        || bare
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.to_canonical().is_loopback())
+}
+
 /// HTTP and HTTPS over TCP. HTTPS trusts the public roots and the PEM files given, which is how a member's own
-/// certificate is pinned: the file the member names at start, handed to the cloud as `BEST_PEER_TRUST`.
+/// certificate is pinned: the file the member names at start, handed to the cloud as `BEST_PEER_TRUST`. A request
+/// in cleartext off loopback is refused before it is sent, unless the operator said a VPN carries it, so a cloud's
+/// credential never travels in the clear to a member.
 pub struct Http {
     client: Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>,
+    cleartext: Cleartext,
 }
 
 impl Http {
-    pub fn new(trust: &[PathBuf]) -> Result<Self, String> {
+    pub fn new(trust: &[PathBuf], cleartext: Cleartext) -> Result<Self, String> {
         let mut roots = rustls::RootCertStore {
             roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
         };
@@ -56,6 +112,7 @@ impl Http {
             .build();
         Ok(Self {
             client: Client::builder(TokioExecutor::new()).build(connector),
+            cleartext,
         })
     }
 }
@@ -63,6 +120,14 @@ impl Http {
 impl Transport for Http {
     fn call(&self, req: Request<Body>) -> BoxFuture<'static, Result<Response<Body>, String>> {
         let client = self.client.clone();
+        let url = req.uri().to_string();
+        if !self.cleartext.allows(&url) {
+            return Box::pin(async move {
+                Err(format!(
+                    "{url} is cleartext off loopback, and the credential would travel unencrypted: name the member by its https:// endpoint, or set BEST_PEER_CLEARTEXT=vpn on this peer when a VPN carries it"
+                ))
+            });
+        }
         Box::pin(async move {
             let res = client.request(req).await.map_err(|e| e.to_string())?;
             let (parts, body) = res.into_parts();
