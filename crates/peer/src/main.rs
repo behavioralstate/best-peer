@@ -4245,6 +4245,14 @@ mod tests {
             b["error"]["message"].as_str().unwrap().contains("another credential"),
             "{b}"
         );
+        // The answer is its holder's: another credential reading the prompt's correlation sees nothing of it.
+        let (s, seen) = get_as(&bed.app, "", &prompts, "/events?correlationId=p1").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(seen["events"], json!([]), "{seen}");
+        // A prompt over the door's body ceiling is refused at ingest, 413, and the fix names the messages.
+        let (s, b) = bed.send("p7", "Prompt", "prompt", ask(&"x".repeat(2 << 20))).await;
+        assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE, "{b}");
+        assert!(b["error"]["message"].as_str().unwrap().contains("messages"), "{b}");
         // Once the deployment is gone, so is the thing to prompt.
         let (s, _) = bed
             .send("u1", "UndeployModel", "undeploy-model", json!({ "deployment": dep }))
