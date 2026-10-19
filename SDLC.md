@@ -10,8 +10,13 @@
   agent's side, numbered decisions, and a "Done when" list. A spec gap met while implementing is an entry on the
   spec follow-ups issue, never a silent patch and never a spec change up front.
 - Ambiguity is resolved by reading the spec and the running code, never by guessing.
-- Work on an issue starts by moving it to In progress on the board (its Status), before the first change, so the
-  board says what is being worked on.
+- The board's Status says where each issue is:
+  - **In progress** from the first change, before it is made, while the work is built and its pull requests are
+    open.
+  - **In review** once its code is merged and released, when all that is left is the proof on a host or the owner's
+    acceptance.
+  - **Done** when the issue closes, every "Done when" ticked.
+  - An epic moves to **Ready** as soon as any of its issues has started.
 
 ## 2. Design rules every change is held to
 
