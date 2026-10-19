@@ -41,7 +41,22 @@ the CPU is the one device. Then one of two ways to run models, each with what it
 `BEST_PEER_RUNTIME=fake` is a third way for a machine with neither: the surface answers, nothing runs. Every other
 variable has a default that fits these two ways; [Run](#run) lists them for a setup that differs.
 
-**1. Download and run.** Take the newest release's archive for your machine, unpack it, and start the peer:
+**1. Download and run.** One line installs the newest release, or upgrades the one you have:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/behavioralstate/best-peer/main/install.sh | sh
+```
+
+It takes the release's archive for your machine, checks it against `SHA256SUMS`, and puts `best-peer` in
+`~/.local/bin` (`BEST_PEER_INSTALL_DIR` chooses another place; `BEST_PEER_VERSION=0.0.12` pins a release). On Windows,
+in PowerShell, the same into `%LOCALAPPDATA%\Programs\best-peer`, added to your PATH:
+
+```powershell
+irm https://raw.githubusercontent.com/behavioralstate/best-peer/main/install.ps1 | iex
+```
+
+Neither touches the data folder, so an upgrade keeps the credentials and the certificate. Or take the archive by
+hand, unpack it, and start the peer from its folder:
 
 ```bash
 curl -fLO https://github.com/behavioralstate/best-peer/releases/latest/download/best-peer-x86_64-unknown-linux-gnu.tar.gz
@@ -165,9 +180,10 @@ curl http://127.0.0.1:7777/.well-known/best
 npx -y @behavioralstate/best-validate http://127.0.0.1:7777
 ```
 
-Or take a [release](https://github.com/behavioralstate/best-peer/releases), as in [Try it on your machine](#try-it-on-your-machine):
-one binary per machine (Linux x86_64 on glibc 2.35 or newer; Windows x86_64; macOS Apple silicon), with `SHA256SUMS`
-and a build provenance attestation (`gh attestation verify <archive> --repo behavioralstate/best-peer`).
+Or take a [release](https://github.com/behavioralstate/best-peer/releases), as in [Try it on your machine](#try-it-on-your-machine),
+with `install.sh` or `install.ps1` or by hand: one binary per machine (Linux x86_64 on glibc 2.35 or newer; Windows
+x86_64; macOS Apple silicon), with `SHA256SUMS` and a build provenance attestation
+(`gh attestation verify <archive> --repo behavioralstate/best-peer`).
 `best-peer --version` says which it is.
 
 `BEST_PEER_LISTEN` (default `127.0.0.1:7777`) is where it listens; `BEST_PEER_ENDPOINT` is the consumer-facing base URL
