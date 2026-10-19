@@ -961,7 +961,12 @@ mod tests {
         auth: Option<Arc<Auth>>,
         images: Images,
     ) -> Bed {
-        for image in ["ollama/ollama", "vllm/vllm-openai", "busybox", "ollama/ollama:0.6"] {
+        for image in [
+            best_peer_engine::OLLAMA_IMAGE,
+            best_peer_engine::VLLM_IMAGE,
+            "busybox",
+            "ollama/ollama:0.6",
+        ] {
             runtime.registry_has(best_peer_runtime::ImageRef(image.into()));
         }
         let holdings = Arc::new(holdings::Holdings::default());
@@ -4032,7 +4037,7 @@ mod tests {
         // The container runs the recipe on the device, and the engine loaded the model at the base the event names.
         let container = ContainerId(started["container"].as_str().unwrap().into());
         let spec = bed.runtime.spec_of(&container).unwrap();
-        assert_eq!(spec.image.0, "ollama/ollama");
+        assert_eq!(spec.image.0, best_peer_engine::OLLAMA_IMAGE);
         assert_eq!(spec.devices, vec!["gpu-0".into()]);
         assert_eq!(spec.ports, vec![11434]);
         assert_eq!(
@@ -4321,6 +4326,45 @@ mod tests {
         }
         // Eleven of each, with ImagePulled, DeploymentStarted and DeploymentReady between: tens, not hundreds.
         assert_eq!(events.len(), 11 + 1 + 1 + 11 + 1, "{:?}", types(&events));
+    }
+
+    #[tokio::test]
+    async fn a_load_that_stalls_ends_in_deployment_failed_within_the_load_patience_and_frees_the_device() {
+        let bed = bed_with(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+            Arc::new(best_peer_engine::Fake::new().stalling()),
+            "engines.local",
+            None,
+        )
+        .await;
+        let (s, b) = bed.deploy("d1", "llama3.2:3b", "ollama", 8).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        // The bed's load patience is a second: the stalled load is failed then, not left to wait.
+        let events = bed.events_of("d1", "DeploymentFailed").await;
+        assert_eq!(
+            types(&events),
+            vec![
+                "ImagePulling",
+                "ImagePulling",
+                "ImagePulled",
+                "DeploymentStarted",
+                "WeightsLoading",
+                "DeploymentFailed"
+            ]
+        );
+        let failed = &events.last().unwrap().data;
+        assert!(
+            failed["reason"].as_str().unwrap().contains("was not loaded within"),
+            "{failed}"
+        );
+        assert!(
+            bed.runtime.running().await.unwrap().is_empty(),
+            "its container was stopped"
+        );
+        let w = bed.query("get-workloads").await;
+        assert_eq!(w["deployments"], json!([]), "{w}");
     }
 
     #[test]
@@ -5943,7 +5987,10 @@ mod tests {
         let held = best_peer_runtime::ImageRef("held/trainer:1".into());
         let runtime = Arc::new(best_peer_runtime::Fake::new(
             vec!["gpu-0".into()],
-            vec![held.clone(), best_peer_runtime::ImageRef("ollama/ollama".into())],
+            vec![
+                held.clone(),
+                best_peer_runtime::ImageRef(best_peer_engine::OLLAMA_IMAGE.into()),
+            ],
         ));
         let bed = bed_imaging(
             card(),
@@ -5976,7 +6023,7 @@ mod tests {
         // The engine's image, held, is not pulled for a deploy either.
         bed.deployed("h2", "llama3.2:3b", 4).await;
         assert_eq!(bed.log_of("h2")[1].data["held"], true);
-        assert!(!runtime.pulled().iter().any(|i| i.0 == "ollama/ollama"));
+        assert!(!runtime.pulled().iter().any(|i| i.0 == best_peer_engine::OLLAMA_IMAGE));
         // Neither held nor in a registry: the job fails with the fix, after one pull.
         let (s, _) = bed
             .send("h3", "RunJob", "run-job", json!({ "image": "nobody/nothing:1" }))

@@ -47,8 +47,8 @@ impl Kind {
         match self {
             Kind::Ollama => Recipe {
                 image: ImageRef(image.map(str::to_string).unwrap_or_else(|| match compute {
-                    Compute::Rocm(_) => "ollama/ollama:rocm".into(),
-                    _ => "ollama/ollama".into(),
+                    Compute::Rocm(_) => OLLAMA_ROCM_IMAGE.into(),
+                    _ => OLLAMA_IMAGE.into(),
                 })),
                 args: vec![],
                 env: vec![("OLLAMA_HOST".into(), "0.0.0.0".into())],
@@ -60,7 +60,7 @@ impl Kind {
                 }),
             },
             Kind::Vllm => Recipe {
-                image: ImageRef(image.unwrap_or("vllm/vllm-openai").into()),
+                image: ImageRef(image.unwrap_or(VLLM_IMAGE).into()),
                 args: vec!["--model".into(), model.into()],
                 env: vec![],
                 port: 8000,
@@ -79,6 +79,15 @@ impl std::fmt::Display for Kind {
         })
     }
 }
+
+/// The engines' images the peer starts when its operator names none (`BEST_PEER_OLLAMA_IMAGE`, `BEST_PEER_VLLM_IMAGE`),
+/// each pinned to a version, so that a new release upstream cannot change a deploy unseen. Moving one is a change of
+/// its own, proven by a deploy to ready on a host before it is released, with the proof on its issue.
+pub const OLLAMA_IMAGE: &str = "ollama/ollama:0.40.6";
+/// Ollama's build for ROCm, of the same version; no ROCm host has proven a deploy yet.
+pub const OLLAMA_ROCM_IMAGE: &str = "ollama/ollama:0.40.6-rocm";
+/// vLLM's OpenAI-compatible server.
+pub const VLLM_IMAGE: &str = "vllm/vllm-openai:v0.32.0";
 
 /// What to run for one engine: the image, its arguments and environment, the container port it serves on, the
 /// path under which the OpenAI-compatible API is reached, and where it keeps its models.
@@ -197,6 +206,8 @@ pub struct Fake {
     unloaded: Mutex<BTreeMap<String, Vec<String>>>,
     /// What a load reports as it goes; a real engine reports every percent, often more.
     steps: Vec<Option<u8>>,
+    /// Whether a load from the registry stops after its first report and never returns, as a pull that stalled.
+    stalls: bool,
     /// The prompts each base was asked, as they came.
     prompted: Mutex<BTreeMap<String, Vec<Prompted>>>,
 }
@@ -219,6 +230,7 @@ impl Fake {
             pulled: Mutex::new(BTreeMap::new()),
             unloaded: Mutex::new(BTreeMap::new()),
             steps: vec![Some(25), Some(100)],
+            stalls: false,
             prompted: Mutex::new(BTreeMap::new()),
         }
     }
@@ -231,6 +243,12 @@ impl Fake {
     /// A fake whose load reports every percent from 0 to 100, as a real engine does.
     pub fn reporting_every_percent(mut self) -> Self {
         self.steps = (0..=100).map(Some).collect();
+        self
+    }
+
+    /// A fake whose load from the registry tells its first step and then never returns, as a pull that stalled.
+    pub fn stalling(mut self) -> Self {
+        self.stalls = true;
         self
     }
 
@@ -285,6 +303,10 @@ impl Engine for Fake {
         }
         match source {
             Source::Registry => {
+                if self.stalls {
+                    progress(self.steps.first().copied().flatten());
+                    return std::future::pending().await;
+                }
                 for &step in &self.steps {
                     progress(step);
                 }
@@ -364,11 +386,11 @@ mod tests {
     #[test]
     fn each_engine_says_what_to_run_and_where_its_api_is() {
         let o = Kind::Ollama.recipe("llama3.2:3b", &Compute::Cuda("12.4".into()), None);
-        assert_eq!(o.image, ImageRef("ollama/ollama".into()));
+        assert_eq!(o.image, ImageRef(OLLAMA_IMAGE.into()));
         assert_eq!(o.port, 11434);
         assert!(o.env.contains(&("OLLAMA_HOST".into(), "0.0.0.0".into())));
         let r = Kind::Ollama.recipe("llama3.2:3b", &Compute::Rocm("6.2".into()), None);
-        assert_eq!(r.image, ImageRef("ollama/ollama:rocm".into()));
+        assert_eq!(r.image, ImageRef(OLLAMA_ROCM_IMAGE.into()));
         let pinned = Kind::Ollama.recipe("x", &Compute::Cpu, Some("mirror.local/ollama:0.12"));
         assert_eq!(pinned.image, ImageRef("mirror.local/ollama:0.12".into()));
         let v = Kind::Vllm.recipe("Qwen/Qwen2.5-0.5B", &Compute::Cuda("12.4".into()), None);

@@ -2,9 +2,11 @@
 //! its library with progress, and a model in a store it sees is checked with `POST /api/show` and loaded with
 //! `POST /api/generate`. vLLM: `GET /health` answers once the model it was started with is loaded, and
 //! `GET /v1/models` lists it. Every call is blocking I/O on a worker thread, never on the door's workers. Thin;
-//! proven on a host by hand, never unit-tested.
+//! proven on a host by hand. The reading of a pull, which decides when a pull has ended, is tested over Ollama's
+//! own stream, recorded, and over a stream that breaks or goes quiet.
 
 use std::io::BufRead;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -13,6 +15,31 @@ use best_peer_engine::{Answer, Engine, EngineError, Kind, Message, Options, Prog
 #[derive(Clone)]
 pub struct HttpEngine {
     agent: ureq::Agent,
+    pull: PullBounds,
+}
+
+/// How a pull from the registry is watched. The engine's stream says how the pull goes, but its end is not the only
+/// way to know the model arrived: when the stream says nothing for `check_after`, the engine is asked whether it has
+/// the model, and a stream that says nothing for `quiet_limit` while the engine does not have it ends the pull as
+/// stalled. A stream that breaks or ends without success is resumed, the engine going on from what it has, up to
+/// `attempts` times in all.
+#[derive(Clone, Copy, Debug)]
+pub struct PullBounds {
+    pub check_after: Duration,
+    pub quiet_limit: Duration,
+    pub attempts: u32,
+}
+
+impl Default for PullBounds {
+    /// Five minutes of silence is longer than the engine takes to check the digest of a model of tens of gigabytes
+    /// on a slow disk, the one step of a pull that says nothing while it runs.
+    fn default() -> Self {
+        Self {
+            check_after: Duration::from_secs(15),
+            quiet_limit: Duration::from_secs(300),
+            attempts: 3,
+        }
+    }
 }
 
 impl Default for HttpEngine {
@@ -32,61 +59,126 @@ impl HttpEngine {
             .build();
         Self {
             agent: ureq::Agent::new_with_config(config),
+            pull: PullBounds::default(),
         }
     }
 
-    /// `POST /api/pull` on Ollama, one JSON line per progress step: `{ status, total?, completed? }`, the last one
-    /// `{ status: "success" }`; an error line names the fault.
+    /// The same adapter, watching a pull within `bounds`.
+    pub fn with_pull_bounds(mut self, bounds: PullBounds) -> Self {
+        self.pull = bounds;
+        self
+    }
+
+    /// `POST /api/pull` on Ollama: the model from the registry into the engine's library, its progress told as the
+    /// stream says it. The pull has ended when the stream says `success`, or when the engine has the model whatever
+    /// the stream says; a stream that breaks or ends short is resumed; one quiet for longer than the bounds allow while
+    /// the engine does not have the model ends the pull as stalled, so a deploy never waits its whole load patience
+    /// on a pull that stopped.
     fn pull_ollama(&self, base: &str, model: &str, progress: &Progress) -> Result<(), EngineError> {
-        let mut res = self
-            .agent
+        let mut stream = PullStream::default();
+        let mut broke = String::new();
+        let attempts = self.pull.attempts.max(1);
+        for attempt in 1..=attempts {
+            tracing::info!(%base, %model, attempt, "pulling the model into the engine");
+            match self.pull_once(base, model, progress, &mut stream)? {
+                Pulled::Ended => {
+                    tracing::info!(%base, %model, "the engine has the model");
+                    return Ok(());
+                }
+                Pulled::Broke(why) => {
+                    if self.holds(base, model) {
+                        tracing::info!(%base, %model, why = %why, "the engine has the model, though its pull did not say so");
+                        return Ok(());
+                    }
+                    tracing::warn!(%base, %model, attempt, why = %why, "the pull did not complete");
+                    broke = why;
+                }
+            }
+        }
+        Err(EngineError::Engine(format!(
+            "the pull did not complete in {attempts} attempts: {broke}"
+        )))
+    }
+
+    /// One `POST /api/pull`, its stream read on a thread of its own, so that a stream that stops saying anything is
+    /// noticed whatever its connection does.
+    fn pull_once(
+        &self,
+        base: &str,
+        model: &str,
+        progress: &Progress,
+        stream: &mut PullStream,
+    ) -> Result<Pulled, EngineError> {
+        // An agent of its own: no connection kept from another call is reused for a stream that runs for minutes.
+        let config = ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_secs(5)))
+            .timeout_recv_response(Some(Duration::from_secs(60)))
+            .timeout_global(None)
+            .build();
+        let res = match ureq::Agent::new_with_config(config)
             .post(format!("{base}/api/pull"))
             .send_json(serde_json::json!({ "name": model, "stream": true }))
-            .map_err(|e| match e {
-                ureq::Error::StatusCode(404) => EngineError::ModelNotFound(model.into()),
-                other => EngineError::Engine(other.to_string()),
-            })?;
-        let reader = std::io::BufReader::new(res.body_mut().as_reader());
-        // Progress across every blob, not per blob: the engine reports each digest's own bytes.
-        let mut blobs: std::collections::HashMap<String, (u64, u64)> = std::collections::HashMap::new();
-        let mut last_pct: Option<u8> = None;
-        let mut done = false;
-        for line in reader.lines() {
-            let line = line.map_err(|e| EngineError::Engine(format!("the pull stream broke: {e}")))?;
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
-                continue;
-            };
-            if let Some(err) = v["error"].as_str() {
-                return Err(if err.contains("not found") || err.contains("pull model manifest") {
-                    EngineError::ModelNotFound(model.into())
-                } else {
-                    EngineError::Engine(err.into())
-                });
+        {
+            Ok(res) => res,
+            Err(ureq::Error::StatusCode(404)) => return Err(EngineError::ModelNotFound(model.into())),
+            Err(ureq::Error::StatusCode(status)) => {
+                return Err(EngineError::Engine(format!("the engine refused the pull: {status}")))
             }
-            if let (Some(digest), Some(c), Some(t)) =
-                (v["digest"].as_str(), v["completed"].as_u64(), v["total"].as_u64())
-            {
-                if t > 0 {
-                    blobs.insert(digest.to_string(), (c.min(t), t));
+            Err(other) => return Ok(Pulled::Broke(format!("the pull could not be asked: {other}"))),
+        };
+        let (tx, rx) = mpsc::channel();
+        let body = res.into_body();
+        std::thread::Builder::new()
+            .name("ollama-pull".into())
+            .spawn(move || {
+                for line in std::io::BufReader::new(body.into_reader()).lines() {
+                    let end = line.is_err();
+                    if tx.send(line).is_err() || end {
+                        return;
+                    }
+                }
+            })
+            .map_err(|e| EngineError::Engine(format!("the pull could not be read: {e}")))?;
+        let mut said_last = Instant::now();
+        loop {
+            match rx.recv_timeout(self.pull.check_after) {
+                Ok(Ok(line)) => {
+                    said_last = Instant::now();
+                    match stream.line(&line, model)? {
+                        Said::Progress(pct) => progress(Some(pct)),
+                        Said::Success => return Ok(Pulled::Ended),
+                        Said::Nothing => {}
+                    }
+                }
+                Ok(Err(e)) => return Ok(Pulled::Broke(format!("the pull stream broke: {e}"))),
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Ok(Pulled::Broke("the pull stream ended without success".into()))
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    if self.holds(base, model) {
+                        tracing::warn!(%base, %model, "the pull stream went quiet with the model in the engine: the pull has ended");
+                        return Ok(Pulled::Ended);
+                    }
+                    if said_last.elapsed() >= self.pull.quiet_limit {
+                        return Err(EngineError::Engine(format!(
+                            "the engine said nothing of the pull for {} s and does not have the model: the registry or the engine stalled",
+                            said_last.elapsed().as_secs()
+                        )));
+                    }
                 }
             }
-            let (done_bytes, total) = blobs.values().fold((0u64, 0u64), |(d, t), (c, bt)| (d + c, t + bt));
-            if let Some(share) = (done_bytes * 100).checked_div(total) {
-                let pct = Some(share.min(100) as u8);
-                if pct != last_pct {
-                    last_pct = pct;
-                    progress(pct);
-                }
-            }
-            if v["status"] == "success" {
-                done = true;
-            }
         }
-        if done {
-            Ok(())
-        } else {
-            Err(EngineError::Engine("the pull ended without success".into()))
-        }
+    }
+
+    /// Whether the engine has `model` in its library: `POST /api/show` answers, or says not with a 404.
+    fn holds(&self, base: &str, model: &str) -> bool {
+        self.agent
+            .post(format!("{base}/api/show"))
+            .config()
+            .timeout_global(Some(Duration::from_secs(10)))
+            .build()
+            .send_json(serde_json::json!({ "model": model }))
+            .is_ok()
     }
 
     /// A model in a store Ollama sees is served without the registry: `POST /api/show` says whether it is there (404
@@ -235,6 +327,67 @@ impl HttpEngine {
     }
 }
 
+/// How one attempt of a pull ended: the engine has the model, or the stream broke or ended short of it.
+enum Pulled {
+    Ended,
+    Broke(String),
+}
+
+/// What one line of Ollama's pull stream says.
+#[derive(Debug, PartialEq, Eq)]
+enum Said {
+    Progress(u8),
+    Success,
+    Nothing,
+}
+
+/// The reading of Ollama's pull stream, one JSON object a line: `{ status, digest?, total?, completed? }` per step,
+/// the last `{ status: "success" }`, or `{ error }`. The share is across every blob, not per blob, since the engine
+/// reports each digest's own bytes, and a blob's first line names its size before any byte of it came. Kept across
+/// the attempts of one pull, so a resumed stream goes on from what was told.
+#[derive(Default)]
+struct PullStream {
+    blobs: std::collections::HashMap<String, (u64, u64)>,
+    last: Option<u8>,
+}
+
+impl PullStream {
+    fn line(&mut self, line: &str, model: &str) -> Result<Said, EngineError> {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            return Ok(Said::Nothing);
+        };
+        if let Some(err) = v["error"].as_str() {
+            return Err(if err.contains("not found") || err.contains("pull model manifest") {
+                EngineError::ModelNotFound(model.into())
+            } else {
+                EngineError::Engine(err.into())
+            });
+        }
+        if v["status"] == "success" {
+            return Ok(Said::Success);
+        }
+        if let (Some(digest), Some(total)) = (v["digest"].as_str(), v["total"].as_u64()) {
+            if total > 0 {
+                // A resumed stream names each blob again from its start; what came of it before is still there.
+                let completed = v["completed"].as_u64().unwrap_or(0);
+                let blob = self.blobs.entry(digest.to_string()).or_insert((0, total));
+                *blob = (blob.0.max(completed).min(total), total);
+            }
+        }
+        let (done, total) = self
+            .blobs
+            .values()
+            .fold((0u64, 0u64), |(d, t), (c, bt)| (d + c, t + bt));
+        match (done * 100).checked_div(total).map(|p| p.min(100) as u8) {
+            Some(pct) if Some(pct) != self.last => {
+                self.last = Some(pct);
+                Ok(Said::Progress(pct))
+            }
+            _ => Ok(Said::Nothing),
+        }
+    }
+}
+
 /// Whether `url` answers at all, within a few seconds.
 fn probe(agent: &ureq::Agent, url: &str) -> bool {
     agent
@@ -318,5 +471,235 @@ impl Engine for HttpEngine {
         tokio::task::spawn_blocking(move || me.chat(&base, &model, &messages, &options, within))
             .await
             .map_err(|e| EngineError::Engine(format!("the prompt did not complete: {e}")))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// Ollama 0.40.6's own stream for `POST /api/pull` of qwen2.5:0.5b, one line per chunk as it sent it.
+    const RECORDED: &str = include_str!("../testdata/ollama-0.40.6-pull.ndjson");
+
+    fn told() -> (Progress, Arc<Mutex<Vec<u8>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        (
+            Arc::new(move |p: Option<u8>| sink.lock().unwrap().push(p.unwrap())),
+            seen,
+        )
+    }
+
+    #[test]
+    fn ollamas_recorded_stream_is_read_to_its_success_with_the_share_across_every_blob() {
+        let mut stream = PullStream::default();
+        let mut shares = Vec::new();
+        let mut ended = false;
+        for line in RECORDED.lines() {
+            match stream.line(line, "qwen2.5:0.5b").unwrap() {
+                Said::Progress(p) => shares.push(p),
+                Said::Success => ended = true,
+                Said::Nothing => {}
+            }
+        }
+        assert!(ended);
+        assert_eq!(
+            shares.first(),
+            Some(&0),
+            "a blob's first line names its size before any byte came"
+        );
+        // The engine's last progress line leaves a sliver of its last blob unsaid: 100 is the lifecycle's to tell, once
+        // the load returned.
+        assert_eq!(shares.last(), Some(&99));
+        assert!(shares.windows(2).all(|w| w[0] < w[1]), "{shares:?}");
+    }
+
+    #[test]
+    fn an_error_line_ends_the_pull_with_what_the_engine_said() {
+        let mut stream = PullStream::default();
+        let missing = stream.line(r#"{"error":"pull model manifest: file does not exist"}"#, "nope:1b");
+        assert!(matches!(missing, Err(EngineError::ModelNotFound(m)) if m == "nope:1b"));
+        let full = stream.line(r#"{"error":"no space left on device"}"#, "a:1b");
+        assert!(matches!(full, Err(EngineError::Engine(m)) if m == "no space left on device"));
+    }
+
+    /// What the fake engine does after the recorded lines it sends of a pull's stream: ends the stream, breaks the
+    /// connection, or holds it open saying nothing.
+    #[derive(Clone, Copy)]
+    enum Then {
+        End,
+        Break,
+        Hold,
+    }
+
+    type Answer = Arc<dyn Fn(usize) -> (usize, Then) + Send + Sync>;
+
+    /// A fake Ollama on loopback: its n-th `POST /api/pull` (from 1) sends what `pull(n)` says; `POST /api/show`
+    /// answers 200 once `has` says the model is in the library, 404 before.
+    fn engine(
+        pull: impl Fn(usize) -> (usize, Then) + Send + Sync + 'static,
+        has: Arc<Mutex<bool>>,
+    ) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let count = pulls.clone();
+        let pull: Answer = Arc::new(pull);
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let (mut conn, pull, count, has) = (conn.unwrap(), pull.clone(), count.clone(), has.clone());
+                std::thread::spawn(move || {
+                    if request(&mut conn) == "/api/show" {
+                        let ok = *has.lock().unwrap();
+                        let (status, body) = if ok {
+                            ("200 OK", "{}")
+                        } else {
+                            ("404 Not Found", "{\"error\":\"not found\"}")
+                        };
+                        let _ = write!(
+                            conn,
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        return;
+                    }
+                    let (lines, then) = pull(count.fetch_add(1, Ordering::SeqCst) + 1);
+                    let _ = write!(
+                        conn,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    );
+                    for line in RECORDED.lines().take(lines) {
+                        let _ = write!(conn, "{:x}\r\n{line}\n\r\n", line.len() + 1);
+                    }
+                    match then {
+                        Then::End => {
+                            let _ = write!(conn, "0\r\n\r\n");
+                        }
+                        Then::Break => {}
+                        Then::Hold => std::thread::sleep(Duration::from_secs(120)),
+                    }
+                });
+            }
+        });
+        (base, pulls)
+    }
+
+    /// Reads one request's head and body, and says its path.
+    fn request(conn: &mut TcpStream) -> String {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") && conn.read(&mut byte).unwrap_or(0) == 1 {
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8_lossy(&head).to_string();
+        let length = head
+            .lines()
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+            })
+            .unwrap_or(0);
+        let mut body = vec![0u8; length];
+        let _ = conn.read_exact(&mut body);
+        head.split_whitespace().nth(1).unwrap_or_default().to_string()
+    }
+
+    fn quick() -> PullBounds {
+        PullBounds {
+            check_after: Duration::from_millis(200),
+            quiet_limit: Duration::from_secs(1),
+            attempts: 3,
+        }
+    }
+
+    const ALL: usize = usize::MAX;
+
+    #[test]
+    fn a_whole_stream_ends_the_pull_at_its_success() {
+        let (base, pulls) = engine(|_| (ALL, Then::End), Arc::new(Mutex::new(false)));
+        let (progress, seen) = told();
+        HttpEngine::new()
+            .with_pull_bounds(quick())
+            .pull_ollama(&base, "qwen2.5:0.5b", &progress)
+            .unwrap();
+        assert_eq!(pulls.load(Ordering::SeqCst), 1);
+        assert_eq!(seen.lock().unwrap().last(), Some(&99));
+    }
+
+    #[test]
+    fn a_stream_that_goes_quiet_with_the_model_in_the_engine_has_ended() {
+        // The engine finished, but the end of its stream never came: the host run of 2026-10-19 waited on that.
+        let has = Arc::new(Mutex::new(false));
+        let (base, pulls) = engine(|_| (100, Then::Hold), has.clone());
+        let flip = has.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            *flip.lock().unwrap() = true;
+        });
+        let (progress, _) = told();
+        let started = Instant::now();
+        HttpEngine::new()
+            .with_pull_bounds(quick())
+            .pull_ollama(&base, "qwen2.5:0.5b", &progress)
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(pulls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_stream_quiet_past_the_bound_without_the_model_fails_and_says_it_stalled() {
+        let (base, _) = engine(|_| (40, Then::Hold), Arc::new(Mutex::new(false)));
+        let (progress, _) = told();
+        let started = Instant::now();
+        let err = HttpEngine::new()
+            .with_pull_bounds(quick())
+            .pull_ollama(&base, "qwen2.5:0.5b", &progress)
+            .unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Engine(m) if m.contains("said nothing of the pull") && m.contains("stalled")),
+            "{err}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_stream_that_breaks_is_resumed_and_the_share_goes_on_from_what_was_told() {
+        let (base, pulls) = engine(
+            |n| if n == 1 { (60, Then::Break) } else { (ALL, Then::End) },
+            Arc::new(Mutex::new(false)),
+        );
+        let (progress, seen) = told();
+        HttpEngine::new()
+            .with_pull_bounds(quick())
+            .pull_ollama(&base, "qwen2.5:0.5b", &progress)
+            .unwrap();
+        assert_eq!(pulls.load(Ordering::SeqCst), 2);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.last(), Some(&99));
+        assert_eq!(
+            seen.iter().filter(|p| **p == 0).count(),
+            1,
+            "the resumed stream is not told from 0 again: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn a_stream_that_keeps_breaking_fails_after_its_attempts_with_the_reason() {
+        let (base, pulls) = engine(|_| (20, Then::Break), Arc::new(Mutex::new(false)));
+        let (progress, _) = told();
+        let err = HttpEngine::new()
+            .with_pull_bounds(quick())
+            .pull_ollama(&base, "qwen2.5:0.5b", &progress)
+            .unwrap_err();
+        assert_eq!(pulls.load(Ordering::SeqCst), 3);
+        assert!(
+            matches!(&err, EngineError::Engine(m) if m.contains("did not complete in 3 attempts")),
+            "{err}"
+        );
     }
 }

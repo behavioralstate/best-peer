@@ -267,9 +267,13 @@ A deploy or a job pulls an image named by tag each time, since a tag may have mo
 whose images were put there by hand, a held image then runs as it is and is refreshed only by `pull-image`, which
 always pulls. Either way a credential may run any image Docker holds, the operator's own and locally built ones
 included, by naming it: a host shared with a tenant keeps in Docker only the images it would let that tenant run.
-`BEST_PEER_OLLAMA_IMAGE` and `BEST_PEER_VLLM_IMAGE` pin or mirror the engines' images; `BEST_PEER_READY_SECONDS`
-(default 900) is how long an engine may take to answer after its container started, `BEST_PEER_LOAD_SECONDS`
-(default 3600) how long a model may take to load, and a prompt is given ten minutes to be answered. `BEST_PEER_ENGINE_HOST` (default `127.0.0.1`) is where the peer
+The engines' images are pinned: `ollama/ollama:0.40.6` (`0.40.6-rocm` on ROCm) and `vllm/vllm-openai:v0.32.0`, so a
+new release upstream changes no deploy until a host has proven it; `BEST_PEER_OLLAMA_IMAGE` and `BEST_PEER_VLLM_IMAGE`
+name others, or a mirror. `BEST_PEER_READY_SECONDS` (default 900) is how long an engine may take to answer after its
+container started, `BEST_PEER_LOAD_SECONDS` (default 3600) how long a model may take to load, and a prompt is given
+ten minutes to be answered. A pull from Ollama's registry that says nothing for five minutes while the engine does not
+have the model fails the deploy as stalled, and one whose stream breaks is resumed, twice at most, so a deploy never
+waits the whole load on a pull that stopped. `BEST_PEER_ENGINE_HOST` (default `127.0.0.1`) is where the peer
 itself reaches the engines' ports, which are bound there and nowhere else whatever the door listens on: on loopback
 when the container engine is on this host, on that host's interfaces when it is elsewhere, so a container engine
 on another host sits on a network you trust. The peer alone reaches them: a prompt is a command on the door, and
