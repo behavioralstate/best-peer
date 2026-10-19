@@ -623,14 +623,7 @@ mod tests {
                                 ),
                                 r#"{"status":"verifying sha256 digest"}"#.to_string(),
                             ] {
-                                let _ = write!(
-                                    conn,
-                                    "{:x}
-{line}
-
-",
-                                    line.len() + 1
-                                );
+                                let _ = write!(conn, "{:x}\r\n{line}\n\r\n", line.len() + 1);
                             }
                         }
                         Then::Fail => {
