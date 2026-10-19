@@ -55,8 +55,9 @@ in PowerShell, the same into `%LOCALAPPDATA%\Programs\best-peer`, added to your 
 irm https://raw.githubusercontent.com/behavioralstate/best-peer/main/install.ps1 | iex
 ```
 
-Neither touches the data folder, so an upgrade keeps the credentials and the certificate. Or take the archive by
-hand, unpack it, and start the peer from its folder:
+Neither touches the data folder, so an upgrade keeps the credentials and the certificate. From then on the peer is
+`best-peer` in any terminal (a new one, on Windows), and the steps below run it so: `best-peer --version`, then
+`best-peer` to start it. Or take the archive by hand, unpack it, and run it from its folder as `./best-peer`:
 
 ```bash
 curl -fLO https://github.com/behavioralstate/best-peer/releases/latest/download/best-peer-x86_64-unknown-linux-gnu.tar.gz
@@ -79,7 +80,7 @@ the manifest, the one document an agent needs.
 For a person elsewhere, listen on every interface and say the address they will reach, as `https://`:
 
 ```bash
-BEST_PEER_LISTEN=0.0.0.0:7777 BEST_PEER_ENDPOINT=https://<address they reach>:7777 ./best-peer
+BEST_PEER_LISTEN=0.0.0.0:7777 BEST_PEER_ENDPOINT=https://<address they reach>:7777 best-peer
 ```
 
 The peer makes itself a certificate at first start, keeps it in its data folder and names the file in the line
@@ -101,7 +102,7 @@ loopback whatever the door listens on, and nothing of them is on the door.
 At your machine:
 
 ```bash
-./best-peer approve 8BB9-CB44
+best-peer approve 8BB9-CB44
 ```
 
 Their client's next poll receives a key under that name. No accounts, no passwords: whoever controls the machine
@@ -113,7 +114,7 @@ memory) unless you add `--open-jobs`. `--expires 8h` ends the key after eight ho
 ends without anyone remembering to take it back. To take a key back sooner, at your machine:
 
 ```bash
-./best-peer revoke <name>
+best-peer revoke <name>
 ```
 
 with the name it was approved under: every request carrying it is refused from then on, and an event stream it holds
