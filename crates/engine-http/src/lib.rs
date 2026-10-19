@@ -132,6 +132,7 @@ impl HttpEngine {
             }
             Err(other) => return Ok(Pulled::Broke(format!("the pull could not be asked: {other}"))),
         };
+        stream.begin_attempt();
         let (tx, rx) = mpsc::channel();
         let body = res.into_body();
         std::thread::Builder::new()
@@ -398,6 +399,11 @@ impl PullStream {
             }
             _ => Ok(Said::Nothing),
         }
+    }
+
+    /// A new attempt says nothing of verifying until it says so: until then it is held to the download's bound.
+    fn begin_attempt(&mut self) {
+        self.verifying = false;
     }
 
     /// How long the stream may say nothing: `quiet` while the model downloads, and while the engine checks its
@@ -678,6 +684,16 @@ mod tests {
             .line(r#"{"status":"verifying sha256 digest"}"#, "small:1b")
             .unwrap();
         assert_eq!(small.quiet_allowed(quiet), quiet, "a small model keeps the bound");
+        // An attempt that ended while verifying does not lend its allowance to the next.
+        stream
+            .line(r#"{"status":"verifying sha256 digest"}"#, "big:70b")
+            .unwrap();
+        stream.begin_attempt();
+        assert_eq!(
+            stream.quiet_allowed(quiet),
+            quiet,
+            "a resumed attempt is held to the bound until it verifies"
+        );
     }
 
     #[test]
