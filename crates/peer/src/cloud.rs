@@ -1187,6 +1187,7 @@ impl Service for Cloud {
                 compute: Some(compute),
                 memory_bytes: data.memory_bytes,
                 holder: who.holder(),
+                boxed: false,
             },
         );
         Ok(())
@@ -1358,6 +1359,7 @@ impl Service for Cloud {
                 compute: Some(placement.1),
                 memory_bytes: data.memory_bytes.unwrap_or(0),
                 holder: who.holder(),
+                boxed: crate::lifecycle::boxed(&who),
             },
         );
         Ok(())

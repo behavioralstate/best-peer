@@ -40,14 +40,16 @@ impl Images {
     }
 }
 
-/// How the containers are confined, as the operator set it. A job runs code the peer did not write, so it gets no
-/// network, no capabilities and a read-only filesystem, always, under ceilings on host memory and tasks the
-/// operator sets (`BEST_PEER_JOB_MEMORY`, `BEST_PEER_JOB_PIDS`); an engine keeps its network and a writable
-/// filesystem, which it needs for the models, under the same capability and privilege rules and its own ceilings
-/// (`BEST_PEER_ENGINE_MEMORY`, `BEST_PEER_ENGINE_PIDS`).
+/// How the containers are confined, as the operator set it. A job of a credential with a share runs code from a
+/// tenant, so it gets the closed box: no network, no capabilities and a read-only filesystem, under ceilings on
+/// host memory and tasks the operator sets (`BEST_PEER_JOB_MEMORY`, `BEST_PEER_JOB_PIDS`). Any other job, the
+/// owner's or one whose credential was approved with `--open-jobs`, keeps the network, a writable filesystem and the
+/// host's memory, under the same capability and privilege rules and the same task ceiling. An engine is confined as
+/// an open job is, with its own ceilings (`BEST_PEER_ENGINE_MEMORY`, `BEST_PEER_ENGINE_PIDS`).
 #[derive(Clone, Debug)]
 pub struct Confine {
     pub job: Confinement,
+    pub open_job: Confinement,
     pub engine: Confinement,
 }
 
@@ -55,9 +57,15 @@ impl Default for Confine {
     fn default() -> Self {
         Self {
             job: Confinement::default(),
+            open_job: Confinement::serving(),
             engine: Confinement::serving(),
         }
     }
+}
+
+/// Whether a job of `who` runs in the closed box: a credential with a share does, unless its approver opened it.
+pub fn boxed(who: &Credential) -> bool {
+    who.grant.memory_bytes.is_some() && !who.grant.open_jobs
 }
 
 /// How long the peer waits on an engine: to answer after its container started, to load a model, to unload one,
@@ -505,6 +513,7 @@ impl Peer {
                 compute: Some(compute),
                 memory_bytes: data.memory_bytes,
                 holder: who.holder(),
+                boxed: false,
             },
         );
         Ok(())
@@ -844,6 +853,7 @@ impl Peer {
                 compute: placement.map(|(_, c)| c),
                 memory_bytes: data.memory_bytes.unwrap_or(0),
                 holder: who.holder(),
+                boxed: boxed(&who),
             },
         );
         Ok(())
@@ -885,14 +895,21 @@ impl Peer {
             env: vec![],
             devices,
             ports: vec![],
-            confinement: self.confine.job.clone(),
+            confinement: match reservation.boxed {
+                true => self.confine.job.clone(),
+                false => self.confine.open_job.clone(),
+            },
+        };
+        let host_memory_bytes = match reservation.boxed {
+            true => self.confine.job.memory_bytes,
+            false => self.confine.open_job.memory_bytes,
         };
         match self.runtime.start(spec).await {
             Ok(started) => {
                 self.tell(
                     &em,
                     "JobStarted",
-                    json!({ "job": id, "image": data.image, "device": reservation.device.as_ref().map(|d| d.0.clone()), "memory_bytes": reservation.memory_bytes, "container": started.id.0, "holder": reservation.holder }),
+                    json!({ "job": id, "image": data.image, "device": reservation.device.as_ref().map(|d| d.0.clone()), "memory_bytes": reservation.memory_bytes, "container": started.id.0, "holder": reservation.holder, "boxed": reservation.boxed, "host_memory_bytes": host_memory_bytes }),
                 );
                 em.bind_workload(&id);
                 self.replay_unowned(&started.id).await;
@@ -1020,7 +1037,14 @@ impl Peer {
                 if self.job_running(&job) {
                     let _ = self.runtime.stop(&id).await;
                     // The container's own memory ran out, the host's and not the device's: memory_bytes does not move it.
-                    let (reason, fix) = match self.confine.job.memory_bytes {
+                    let ceiling = self
+                        .state
+                        .lock()
+                        .unwrap()
+                        .jobs
+                        .get(&job)
+                        .and_then(|j| j.host_memory_bytes);
+                    let (reason, fix) = match ceiling {
                         Some(ceiling) => (
                             format!("out of host memory: a job holds {ceiling} bytes of host memory at most on this peer, device memory apart"),
                             "hold less in host memory (fewer loader workers, smaller batches, weights streamed to the device), or ask whoever runs the peer to raise the ceiling".to_string(),
@@ -1033,7 +1057,7 @@ impl Peer {
                     self.tell(
                         &em,
                         "JobFailed",
-                        json!({ "job": job, "reason": reason, "host_memory_bytes": self.confine.job.memory_bytes, "fix": fix }),
+                        json!({ "job": job, "reason": reason, "host_memory_bytes": ceiling, "fix": fix }),
                     );
                 }
             }

@@ -89,7 +89,8 @@ At your machine:
 Their client's next poll receives a key under that name. No accounts, no passwords: whoever controls the machine
 decides who is in, as with SSH keys, and what they may do: approved with nothing more said, a key may do everything;
 `--may deploy,prompt --memory 40G` makes one that may deploy models and prompt them but run no job, and hold 40 GiB
-of device memory at most across its workloads, which it alone sees, prompts and ends.
+of device memory at most across its workloads, which it alone sees, prompts and ends. A key with a share runs its jobs
+in a closed box (no network, a ceiling on host memory) unless you add `--open-jobs`.
 
 **4. More than one machine.** Run a peer on each, and one more `best-peer` anywhere as the door your team enters
 by: a laptop will do, with `BEST_PEER_GPU=none` and the runtime it has (`BEST_PEER_RUNTIME=fake` when it has none:
@@ -204,16 +205,21 @@ on another host sits on a network you trust. The peer alone reaches them: a prom
 the peer carries it to the engine. Prompts are answered sixteen at a time per peer; the rest wait their turn,
 accepted, in order.
 
-A container runs confined, since a peer runs code it did not write: no capabilities, no new privileges, a ceiling on
-tasks (every thread counts as one), and a small init as its first process, which reaps what the image leaves behind
-and passes a stop on to it. A job also gets a read-only filesystem with a private `/tmp` of 1 GiB, which counts in its
-memory, no network, ever, and a ceiling on host memory with swap counted in. `BEST_PEER_JOB_MEMORY` (default `4G`)
-and `BEST_PEER_JOB_PIDS` (default 4096) are a job's ceilings, `BEST_PEER_ENGINE_MEMORY` (default none) and
-`BEST_PEER_ENGINE_PIDS` (default 4096) an engine's; `none` is no ceiling, and a memory ceiling under the 6M a
-container starts with is refused at start. Host memory is not device memory: a job that reaches its ceiling ends in
-`JobFailed` naming it, whatever `memory_bytes` it asked for. The engines keep their network, which they need to pull
-models, and a writable filesystem, which they keep the models on. Capabilities, privileges, a job's network and a
-job's filesystem are never opened by a variable.
+A container runs confined: no capabilities, no new privileges, a ceiling on tasks (every thread counts as one), and
+a small init as its first process, which reaps what the image leaves behind and passes a stop on to it. The job of a
+credential approved with a share, a tenant's, runs code the owner did not write, so it also gets a closed box: a
+read-only filesystem with a private `/tmp` of 1 GiB, which counts in its memory, no network, and a ceiling on host
+memory with swap counted in. The owner's own jobs, from a credential with no share, keep the network, a writable
+filesystem and the host's memory, as before; so do a tenant's whose approver said `best-peer approve --open-jobs`,
+which only the approver can say, never the credential or the job. `JobStarted` says `boxed`.
+`BEST_PEER_JOB_MEMORY` (default `4G`) is the box's host memory ceiling and `BEST_PEER_JOB_PIDS` (default 4096) every
+job's task ceiling, `BEST_PEER_ENGINE_MEMORY` (default none) and `BEST_PEER_ENGINE_PIDS` (default 4096) an
+engine's; `none` is no ceiling, and a memory ceiling under the 6M a container starts with is refused at start. Host
+memory is not device memory: a boxed job that reaches its ceiling ends in `JobFailed` naming it, whatever
+`memory_bytes` it asked for. The engines keep their network, which they need to pull models, and a writable
+filesystem, which they keep the models on. Capabilities, privileges and the box are never opened by a variable. On a
+workspace's cloud, a job runs on the member as the cloud's credential: boxed when the member's owner approved the
+cloud with a share and did not open its jobs.
 
 ## Deploy
 
@@ -227,8 +233,8 @@ The facts follow on the event stream under the command's correlation id, in orde
 `DeploymentStarted`, `WeightsLoading`, then `DeploymentReady`, or `DeploymentFailed`. What the engine does on its own
 later (`OutOfMemory`, `DeploymentEnded`) is told under the same correlation id. `prompt` names a ready deployment and
 the conversation so far, and `PromptAnswered` follows under its own correlation id with the answer whole, or
-`PromptFailed` with the reason and the fix. `run-job` runs an image once, in a closed box, and tells `JobStarted` and
-`JobFinished` with the exit code; `undeploy-model` and `stop-job` end them.
+`PromptFailed` with the reason and the fix. `run-job` runs an image once, a tenant's in a closed box, and tells
+`JobStarted` and `JobFinished` with the exit code; `undeploy-model` and `stop-job` end them.
 
 The peer's state is the fold of the events it told. After a restart it is rebuilt from the log and squared with what
 the engine still runs; a workload that ended while the peer was down is told so then.

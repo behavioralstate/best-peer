@@ -59,6 +59,8 @@ pub struct Job {
     pub holder: String,
     /// On a cloud, the member peer it was placed on, as `peer` in JobStarted.
     pub peer: Option<String>,
+    /// The most host memory its container may hold, as JobStarted told it; none for no ceiling.
+    pub host_memory_bytes: Option<u64>,
 }
 
 /// What an admitted command was given before its handler told the first fact: its id, and the device and memory
@@ -71,6 +73,8 @@ pub struct Reservation {
     pub memory_bytes: u64,
     /// The credential the command came from: what the started event will name as `holder`.
     pub holder: String,
+    /// For a job, whether it runs in the closed box, as its credential's grant decided at admission.
+    pub boxed: bool,
 }
 
 /// What a container belongs to.
@@ -224,6 +228,7 @@ impl State {
                         phase: JobPhase::Running,
                         holder: text("holder"),
                         peer: data["peer"].as_str().map(str::to_string),
+                        host_memory_bytes: data["host_memory_bytes"].as_u64(),
                     },
                 );
             }
@@ -255,6 +260,7 @@ mod tests {
                 compute: Some(Compute::Cuda("12".into())),
                 memory_bytes: bytes,
                 holder: "h".into(),
+                boxed: false,
             },
         );
     }

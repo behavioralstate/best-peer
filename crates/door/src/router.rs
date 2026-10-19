@@ -216,6 +216,8 @@ struct ApproveForm {
     may: Option<String>,
     /// The most device memory the credential's workloads may hold together; absent for no share.
     memory_bytes: Option<u64>,
+    /// Whether a credential with a share runs its jobs outside the closed box; absent for no.
+    open_jobs: Option<bool>,
 }
 
 async fn approve(State(door): State<Shared>, headers: HeaderMap, body: Bytes) -> Result<Response, OAuthError> {
@@ -228,6 +230,7 @@ async fn approve(State(door): State<Shared>, headers: HeaderMap, body: Bytes) ->
                 .collect()
         }),
         memory_bytes: f.memory_bytes,
+        open_jobs: f.open_jobs.unwrap_or(false),
     };
     let admitted = door.auth.approve(f.user_code.trim(), f.proof.trim(), grant).await?;
     Ok(Json(json!({ "approved": true, "admitted": admitted })).into_response())
