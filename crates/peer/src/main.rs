@@ -28,25 +28,31 @@ use std::time::Duration;
 use best_peer_door::{Auth, Door, EventLog, LocalApprover};
 use best_peer_engine::Engine;
 use best_peer_gpu::Gpu;
-use best_peer_runtime::Runtime;
-use lifecycle::{Images, Patience, Peer};
+use best_peer_runtime::{Confinement, Runtime};
+use lifecycle::{Confine, Images, Patience, Peer};
 use tls::Tls;
+use transport::{is_loopback, Cleartext};
 
 /// Where to listen, what to advertise and whether TLS serves it, from `BEST_PEER_LISTEN` (ip:port, default
 /// loopback), `BEST_PEER_ENDPOINT` (the consumer-facing base URL) and `BEST_PEER_TLS_CERT` with `BEST_PEER_TLS_KEY`
 /// (the operator's certificate; an `https://` endpoint without them is served with one the peer makes). The endpoint
 /// defaults to the listen address only when that address is one a consumer can use: a peer listening on every
-/// interface has no address of its own to advertise, so it refuses to start until told what it is called.
+/// interface has no address of its own to advertise, so it refuses to start until told what it is called. A
+/// cleartext endpoint is served on loopback alone, both where the peer listens and what it advertises: off it the
+/// credential would travel in the clear, so the peer refuses to start and says what to set, unless the operator said
+/// a VPN carries the hop (`BEST_PEER_CLEARTEXT=vpn`).
 pub fn config(
     listen: Option<&str>,
     endpoint: Option<&str>,
     cert: Option<&str>,
     key: Option<&str>,
+    cleartext: Cleartext,
 ) -> Result<(SocketAddr, String, Tls), String> {
     let listen_text = listen.unwrap_or("127.0.0.1:7777");
     let listen: SocketAddr = listen_text
         .parse()
         .map_err(|_| format!("BEST_PEER_LISTEN must be ip:port, not {listen_text:?}"))?;
+    let said = endpoint.is_some();
     let endpoint = match endpoint {
         Some(e) if e.starts_with("http://") || e.starts_with("https://") => e.trim_end_matches('/').to_string(),
         Some(e) => {
@@ -63,7 +69,76 @@ pub fn config(
         None => format!("http://{listen}"),
     };
     let tls = Tls::decide(&endpoint, cert, key)?;
+    let listen_off = !listen.ip().to_canonical().is_loopback();
+    let host = transport::url_host(&endpoint);
+    let endpoint_off = said && !is_loopback(host);
+    if tls == Tls::Off && cleartext == Cleartext::Loopback && (listen_off || endpoint_off) {
+        let named = if said {
+            "BEST_PEER_ENDPOINT is"
+        } else {
+            "the endpoint, from BEST_PEER_LISTEN, is"
+        };
+        let off = match (listen_off, endpoint_off) {
+            (true, true) => format!("BEST_PEER_LISTEN is {listen} and the endpoint's host is {host}, neither loopback"),
+            (true, false) => format!("BEST_PEER_LISTEN is {listen}, not loopback"),
+            _ => format!("the endpoint's host is {host}, not loopback"),
+        };
+        return Err(format!(
+            "{named} {endpoint}, cleartext, and {off}: a credential would travel unencrypted. Make BEST_PEER_ENDPOINT https:// (the peer makes its own certificate, or serves BEST_PEER_TLS_CERT and BEST_PEER_TLS_KEY), keep both on loopback, or set BEST_PEER_CLEARTEXT=vpn when a VPN already encrypts the hop"
+        ));
+    }
     Ok((listen, endpoint, tls))
+}
+
+/// The least host memory a container starts with: the container engine refuses less.
+const MIN_CONTAINER_MEMORY: u64 = 6 << 20;
+
+/// How the containers are confined, from `BEST_PEER_JOB_MEMORY` (default `4G`) and `BEST_PEER_JOB_PIDS` (default
+/// 4096) for a job, `BEST_PEER_ENGINE_MEMORY` (default none) and `BEST_PEER_ENGINE_PIDS` (default 4096) for an
+/// engine; `none` for a ceiling is no ceiling. These are ceilings and nothing else: a job never has a network, and
+/// capabilities, privileges and a job's filesystem are never opened by a variable.
+pub fn confine(
+    job_memory: Option<&str>,
+    job_pids: Option<&str>,
+    engine_memory: Option<&str>,
+    engine_pids: Option<&str>,
+) -> Result<Confine, String> {
+    let memory = |name: &str, text: Option<&str>, default: Option<u64>| -> Result<Option<u64>, String> {
+        match text.map(str::trim) {
+            None => Ok(default),
+            Some("none") => Ok(None),
+            Some(t) => match parse_memory(t) {
+                Ok(m) if m < MIN_CONTAINER_MEMORY => Err(format!(
+                    "{name}: {t:?} is less than the 6M a container starts with: write 4G, 512M or a number of bytes \
+                     from 6M up, or none for no ceiling"
+                )),
+                Ok(m) if m > i64::MAX as u64 => Err(format!("{name}: {t:?} is more memory than exists, or none")),
+                Ok(m) => Ok(Some(m)),
+                Err(why) => Err(format!("{name}: {why}, or none")),
+            },
+        }
+    };
+    let pids = |name: &str, text: Option<&str>, default: u64| -> Result<Option<u64>, String> {
+        match text.map(str::trim) {
+            None => Ok(Some(default)),
+            Some("none") => Ok(None),
+            Some(t) => match t.parse::<u64>() {
+                Ok(n) if n > 0 => Ok(Some(n)),
+                _ => Err(format!(
+                    "{name} must be a number of tasks above zero (every thread counts as one), or none, not {t:?}"
+                )),
+            },
+        }
+    };
+    let mut job = Confinement::default();
+    job.memory_bytes = memory("BEST_PEER_JOB_MEMORY", job_memory, job.memory_bytes)?;
+    job.pids = pids("BEST_PEER_JOB_PIDS", job_pids, 4096)?;
+    let mut engine = Confinement::serving();
+    engine.memory_bytes = memory("BEST_PEER_ENGINE_MEMORY", engine_memory, None)?;
+    engine.pids = pids("BEST_PEER_ENGINE_PIDS", engine_pids, 4096)?;
+    let mut open_job = Confinement::serving();
+    open_job.pids = job.pids;
+    Ok(Confine { job, open_job, engine })
 }
 
 /// The peer's data directory: `BEST_PEER_DATA`, else `.best-peer` in the home directory. Never a relative path:
@@ -94,6 +169,7 @@ pub async fn peer(
     images: Images,
     patience: Patience,
     holdings: Arc<holdings::Holdings>,
+    confine: Confine,
 ) -> Arc<Peer> {
     // Subscribed before the rebuild, so an exit told while the state is being rebuilt is not lost.
     let events = runtime.events();
@@ -108,6 +184,7 @@ pub async fn peer(
             log,
             images,
             patience,
+            confine,
         )
         .with_holdings(holdings),
     );
@@ -134,12 +211,14 @@ pub fn door(peer: Arc<Peer>, workspaces: Arc<workspace::Workspaces>, auth: Arc<A
 
 /// What the workspaces of this door are built with: the root's endpoint and credentials, the data directory, the
 /// transport their clouds reach members through (HTTP with the trust `BEST_PEER_TRUST` adds, the PEM files of
-/// members' own certificates), and the holdings every surface counts a share against.
+/// members' own certificates, and cleartext only where the peer's own rule allows it), and the holdings every
+/// surface counts a share against.
 fn context(
     endpoint: &str,
     dir: &std::path::Path,
     auth: Arc<Auth>,
     holdings: Arc<holdings::Holdings>,
+    cleartext: Cleartext,
 ) -> workspace::Context {
     let trust: Vec<PathBuf> = std::env::var("BEST_PEER_TRUST")
         .ok()
@@ -156,8 +235,9 @@ fn context(
         service: SERVICE.into(),
         dir: dir.into(),
         auth,
-        transport: Arc::new(transport::Http::new(&trust).unwrap_or_else(|why| fail(&why))),
+        transport: Arc::new(transport::Http::new(&trust, cleartext).unwrap_or_else(|why| fail(&why))),
         holdings,
+        cleartext,
     }
 }
 
@@ -175,11 +255,6 @@ fn main() {
             std::process::exit(2);
         }
     }
-}
-
-/// Whether a host name or address is this machine's loopback.
-fn is_loopback(host: &str) -> bool {
-    host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// The hardware the peer places workloads on, by `BEST_PEER_GPU`: `nvml` (the default) reads the NVIDIA cards
@@ -246,11 +321,16 @@ async fn serve() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
+    let cleartext = Cleartext::parse(std::env::var("BEST_PEER_CLEARTEXT").ok().as_deref()).unwrap_or_else(|why| {
+        eprintln!("{why}");
+        std::process::exit(2);
+    });
     let (listen, endpoint, tls) = match config(
         std::env::var("BEST_PEER_LISTEN").ok().as_deref(),
         std::env::var("BEST_PEER_ENDPOINT").ok().as_deref(),
         std::env::var("BEST_PEER_TLS_CERT").ok().as_deref(),
         std::env::var("BEST_PEER_TLS_KEY").ok().as_deref(),
+        cleartext,
     ) {
         Ok(c) => c,
         Err(why) => {
@@ -272,7 +352,7 @@ async fn serve() {
     if let Ok(members) = std::env::var("BEST_PEER_MEMBERS") {
         fail(&workspace::members_variable_replaced(&members));
     }
-    let app = peer_app(&endpoint, &dir, log, auth).await;
+    let app = peer_app(&endpoint, &dir, log, auth, cleartext).await;
     let serving = tls::serving(&tls, &dir, &tls::names_for(&endpoint, &listen)).unwrap_or_else(|why| fail(&why));
     let listener = std::net::TcpListener::bind(listen)
         .and_then(|l| l.set_nonblocking(true).map(|()| l))
@@ -293,8 +373,8 @@ async fn serve() {
             tracing::info!(certificate = %s.file.display(), "https with a certificate this peer made: a client that pins it reads this file")
         }
         Some(s) => tracing::info!(certificate = %s.file.display(), "https with the operator's certificate"),
-        None if !listen.ip().is_loopback() => {
-            tracing::warn!(%endpoint, "the endpoint is cleartext and not loopback: credentials will travel unencrypted; make BEST_PEER_ENDPOINT https:// before anyone but you uses it")
+        None if cleartext == Cleartext::Vpn => {
+            tracing::warn!(%endpoint, "cleartext, as BEST_PEER_CLEARTEXT=vpn says: credentials travel unencrypted to and from this peer, and only the VPN protects them")
         }
         None => {}
     }
@@ -312,9 +392,31 @@ async fn serve() {
         .unwrap_or_else(|e| fail(&format!("serving failed: {e}")));
 }
 
+/// Why the peer will not start when a cloud it hosts has a member recorded at a cleartext endpoint off loopback:
+/// the cloud would send its credential there in the clear. Each is named, with the way out.
+fn cleartext_members_refused(members: &[(String, String, String, String)]) -> Option<String> {
+    if members.is_empty() {
+        return None;
+    }
+    let named: Vec<String> = members
+        .iter()
+        .map(|(ws, cloud, peer, endpoint)| format!("workspace {ws}, cloud {cloud}, peer {peer} at {endpoint}"))
+        .collect();
+    Some(format!(
+        "a cloud here has a member recorded at a cleartext endpoint off loopback, where its credential would travel unencrypted: {}. Send configure-cloud in that workspace naming the member by its https:// endpoint, or archive the cloud; to start meanwhile, set BEST_PEER_CLEARTEXT=vpn, which is what the cloud ran under, and only when a VPN carries the hop",
+        named.join("; ")
+    ))
+}
+
 /// The peer over this host's hardware and engines, its door and its endpoints, and the workspaces it hosts under
 /// `/workspaces`.
-async fn peer_app(endpoint: &str, dir: &std::path::Path, log: Arc<EventLog>, auth: Arc<Auth>) -> axum::Router {
+async fn peer_app(
+    endpoint: &str,
+    dir: &std::path::Path,
+    log: Arc<EventLog>,
+    auth: Arc<Auth>,
+    cleartext: Cleartext,
+) -> axum::Router {
     let gpu = accelerator(std::env::var("BEST_PEER_GPU").ok().as_deref()).unwrap_or_else(|why| fail(&why));
     // The engines' ports are bound where the peer reaches them, whatever the door listens on: a prompt reaches an
     // engine through the door, with the door's credential. On this machine that is loopback; a container engine on
@@ -339,7 +441,21 @@ async fn peer_app(endpoint: &str, dir: &std::path::Path, log: Arc<EventLog>, aut
         load: seconds("BEST_PEER_LOAD_SECONDS", 3600),
         ..Patience::default()
     };
+    for gone in ["BEST_PEER_DEPLOYMENTS_PER_HOLDER", "BEST_PEER_JOBS_PER_HOLDER"] {
+        if std::env::var_os(gone).is_some() {
+            fail(&format!(
+                "{gone} is gone: how many deployments and jobs a credential runs at once is set when it is approved, best-peer approve <code> --deployments N --jobs N"
+            ));
+        }
+    }
     let holdings = Arc::new(holdings::Holdings::default());
+    let confine = confine(
+        std::env::var("BEST_PEER_JOB_MEMORY").ok().as_deref(),
+        std::env::var("BEST_PEER_JOB_PIDS").ok().as_deref(),
+        std::env::var("BEST_PEER_ENGINE_MEMORY").ok().as_deref(),
+        std::env::var("BEST_PEER_ENGINE_PIDS").ok().as_deref(),
+    )
+    .unwrap_or_else(|why| fail(&why));
     let peer = peer(
         endpoint,
         &engine_host,
@@ -350,10 +466,14 @@ async fn peer_app(endpoint: &str, dir: &std::path::Path, log: Arc<EventLog>, aut
         images,
         patience,
         holdings.clone(),
+        confine,
     )
     .await;
-    let ctx = Arc::new(context(endpoint, dir, auth.clone(), holdings));
+    let ctx = Arc::new(context(endpoint, dir, auth.clone(), holdings, cleartext));
     let workspaces = workspace::Workspaces::open(ctx, log);
+    if let Some(why) = cleartext_members_refused(&workspaces.cleartext_members()) {
+        fail(&why);
+    }
     let door = Arc::new(door(peer.clone(), workspaces.clone(), auth.clone()));
     // What the last run accepted and never completed is run now, before anyone can send more: at the root, then in
     // every workspace, whose clouds then start following their members.
@@ -511,9 +631,17 @@ fn revoke(args: &[String]) {
 /// person was shown. The token goes to the listen address only, never to the public endpoint, and over TLS to the
 /// certificate the peer serves and no other, when it serves one.
 fn approve(args: &[String]) {
-    const USAGE: &str = "usage: best-peer approve <code> [--may deploy,jobs,prompt | all] [--memory 40G] [--expires 8h]: the code the agent showed the person; what the credential may do (all when not said); the most device memory its workloads may hold together (no share when not said); how long the credential lasts, 366d at most, and 8h at most for a session credential (the agent's choice when not said)";
+    const USAGE: &str = "usage: best-peer approve <code> [--may deploy,jobs,prompt | all] [--memory 40G] [--deployments N] [--jobs N] [--open-jobs] [--expires 8h]: the code the agent showed the person; what the credential may do (all when not said); the most device memory its workloads may hold together (no share when not said); how many deployments and jobs it may run at once across the door (no count when not said); with a share, whether its jobs leave the closed box (no network, a ceiling on host memory) a tenant's job gets; how long the credential lasts, 366d at most, and 8h at most for a session credential (the agent's choice when not said)";
     let Some(code) = args.first() else { fail(USAGE) };
-    let (mut may, mut memory, mut expires) = (None::<String>, None::<u64>, None::<Duration>);
+    let (mut may, mut memory, mut open_jobs) = (None::<String>, None::<u64>, false);
+    let mut expires = None::<Duration>;
+    let (mut deployments, mut jobs) = (None::<u32>, None::<u32>);
+    let count = |flag: &str, text: Option<&String>| -> u32 {
+        match text.map(|t| t.trim().parse::<u32>()) {
+            Some(Ok(n)) if n > 0 => n,
+            _ => fail(&format!("{flag} needs how many at once, 1 or more")),
+        }
+    };
     let mut rest = args[1..].iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -536,6 +664,9 @@ fn approve(args: &[String]) {
                 });
                 expires = Some(parse_duration(span).unwrap_or_else(|why| fail(&why)));
             }
+            "--open-jobs" => open_jobs = true,
+            "--deployments" => deployments = Some(count("--deployments", rest.next())),
+            "--jobs" => jobs = Some(count("--jobs", rest.next())),
             other => fail(&format!("unknown argument {other:?}. {USAGE}")),
         }
     }
@@ -545,6 +676,18 @@ fn approve(args: &[String]) {
     }
     if let Some(b) = memory {
         form.push(("memory_bytes", b.to_string()));
+    }
+    if open_jobs {
+        if memory.is_none() {
+            fail("--open-jobs opens the jobs of a credential with a share, and this one has none: a credential without --memory runs its jobs open already");
+        }
+        form.push(("open_jobs", "true".into()));
+    }
+    if let Some(n) = deployments {
+        form.push(("deployments", n.to_string()));
+    }
+    if let Some(n) = jobs {
+        form.push(("jobs", n.to_string()));
     }
     if let Some(d) = expires {
         form.push(("expires_in", d.as_secs().to_string()));
@@ -568,10 +711,19 @@ fn approve(args: &[String]) {
         Some(s) => s.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(","),
         None => "all".into(),
     };
-    let share = match a["grant"]["memory_bytes"].as_u64() {
-        Some(b) => format!("{b} bytes of device memory at most"),
-        None => "no share set".into(),
+    let mut share = match (
+        a["grant"]["memory_bytes"].as_u64(),
+        a["grant"]["open_jobs"].as_bool() == Some(true),
+    ) {
+        (Some(b), false) => format!("{b} bytes of device memory at most, its jobs in the closed box"),
+        (Some(b), true) => format!("{b} bytes of device memory at most, its jobs open"),
+        (None, _) => "no share set".into(),
     };
+    for kind in ["deployments", "jobs"] {
+        if let Some(n) = a["grant"][kind].as_u64() {
+            share.push_str(&format!(", {n} {kind} at once at most"));
+        }
+    }
     let lasts = match a["expires_in"].as_u64() {
         Some(s) => format!("ending in {s} s"),
         None => "never ending".into(),
@@ -594,7 +746,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{header, Request, StatusCode};
     use best_peer_door::{Envelope, FakeApprover, Filter};
-    use best_peer_runtime::ContainerId;
+    use best_peer_runtime::{ContainerId, Network};
     use futures::StreamExt;
     use http_body_util::BodyExt;
 
@@ -720,6 +872,7 @@ mod tests {
                 prompt: Duration::from_secs(1),
             },
             holdings.clone(),
+            Confine::default(),
         )
         .await;
         let auth = auth.unwrap_or_else(|| {
@@ -734,6 +887,7 @@ mod tests {
                 auth: auth.clone(),
                 transport: Arc::new(Switchboard::default()),
                 holdings,
+                cleartext: Cleartext::Loopback,
             }),
             log,
         );
@@ -772,6 +926,34 @@ mod tests {
 
     /// A credential approved with `may` and `memory`, as `best-peer approve --may --memory` would.
     async fn key_with(app: &axum::Router, may: Option<&str>, memory: Option<u64>) -> String {
+        key_full(app, may, memory, None, None, false).await
+    }
+
+    /// The same, its jobs opened by the approver when `open_jobs`, as `best-peer approve --open-jobs` would.
+    async fn key_opened(app: &axum::Router, may: Option<&str>, memory: Option<u64>, open_jobs: bool) -> String {
+        key_full(app, may, memory, None, None, open_jobs).await
+    }
+
+    /// The same, allowed so many deployments and jobs at once when given, as `approve --deployments --jobs` would.
+    async fn key_counted(
+        app: &axum::Router,
+        may: Option<&str>,
+        memory: Option<u64>,
+        deployments: Option<u32>,
+        jobs: Option<u32>,
+    ) -> String {
+        key_full(app, may, memory, deployments, jobs, false).await
+    }
+
+    /// A credential approved with all of `best-peer approve`'s words: `may`, `memory`, the counts and `open_jobs`.
+    async fn key_full(
+        app: &axum::Router,
+        may: Option<&str>,
+        memory: Option<u64>,
+        deployments: Option<u32>,
+        jobs: Option<u32>,
+        open_jobs: bool,
+    ) -> String {
         let form = |f: &[(&str, &str)]| {
             Request::post("/auth/device")
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
@@ -786,6 +968,16 @@ mod tests {
         }
         if let Some(m) = &memory {
             fields.push(("memory_bytes", m));
+        }
+        if open_jobs {
+            fields.push(("open_jobs", "true"));
+        }
+        let (deployments, jobs) = (deployments.map(|n| n.to_string()), jobs.map(|n| n.to_string()));
+        if let Some(n) = &deployments {
+            fields.push(("deployments", n));
+        }
+        if let Some(n) = &jobs {
+            fields.push(("jobs", n));
         }
         let approve = Request::post("/auth/approve")
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
@@ -979,6 +1171,17 @@ mod tests {
         log: Arc<EventLog>,
         auth: Option<Arc<Auth>>,
     ) -> Site {
+        site_under(members, data, log, auth, Cleartext::Loopback).await
+    }
+
+    /// The same, under the cleartext rule given.
+    async fn site_under(
+        members: Vec<(&str, Bed)>,
+        data: Arc<tempfile::TempDir>,
+        log: Arc<EventLog>,
+        auth: Option<Arc<Auth>>,
+        cleartext: Cleartext,
+    ) -> Site {
         let switchboard = Arc::new(Switchboard::default());
         let mut down = std::collections::HashMap::new();
         let mut beds = Vec::new();
@@ -1002,6 +1205,7 @@ mod tests {
             Images::default(),
             Patience::default(),
             holdings.clone(),
+            Confine::default(),
         )
         .await;
         let auth = auth.unwrap_or_else(|| {
@@ -1015,6 +1219,7 @@ mod tests {
                 auth: auth.clone(),
                 transport: switchboard.clone(),
                 holdings,
+                cleartext,
             }),
             log.clone(),
         );
@@ -1172,8 +1377,8 @@ mod tests {
         (a, b)
     }
 
-    const A: &str = "http://a.test";
-    const B: &str = "http://b.test";
+    const A: &str = "https://a.test";
+    const B: &str = "https://b.test";
 
     #[tokio::test]
     async fn two_workspaces_on_one_door_each_hold_a_cloud_one_machine_serves_both_and_each_sees_places_on_and_hears_only_its_own(
@@ -2220,6 +2425,26 @@ mod tests {
         let (s, e) = configure("k0", json!({ "cloud": "lab", "members": [{ "peer": "a", "endpoint": A }, { "peer": "a2", "endpoint": format!("{A}/") }] })).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert_eq!(e["error"]["code"], "DUPLICATE_MEMBER");
+        // A member in cleartext off loopback would be sent the cloud's credential unencrypted: refused, naming it.
+        for endpoint in [
+            "http://203.0.113.5:7777",
+            "http://a.test",
+            "http://[::ffff:203.0.113.5]:7777",
+        ] {
+            let (s, e) = configure(
+                "k0",
+                json!({ "cloud": "lab", "members": [{ "peer": "a", "endpoint": endpoint }] }),
+            )
+            .await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{endpoint}: {e}");
+            assert_eq!(e["error"]["code"], "CLEARTEXT_MEMBER");
+            assert_eq!(e["error"]["details"]["field"], "members");
+            let message = e["error"]["message"].as_str().unwrap();
+            assert!(
+                message.contains("https://") && message.contains("BEST_PEER_CLEARTEXT=vpn"),
+                "{message}"
+            );
+        }
         let (_, all) = get_as(&site.app, &format!("/workspaces/{ws}"), &site.key, "/events").await;
         assert_eq!(
             type_names(all["events"].as_array().unwrap()),
@@ -2604,34 +2829,210 @@ mod tests {
 
     #[test]
     fn the_endpoint_defaults_to_the_listen_address_only_when_a_consumer_can_reach_it() {
-        let (listen, endpoint, tls) = config(None, None, None, None).unwrap();
+        let (listen, endpoint, tls) = config(None, None, None, None, Cleartext::Loopback).unwrap();
         assert_eq!(listen.to_string(), "127.0.0.1:7777");
         assert_eq!(endpoint, "http://127.0.0.1:7777");
         assert_eq!(tls, Tls::Off);
-        let (_, endpoint, tls) = config(Some("0.0.0.0:7777"), Some("https://peer.example.com/"), None, None).unwrap();
+        let (_, endpoint, tls) = config(
+            Some("0.0.0.0:7777"),
+            Some("https://peer.example.com/"),
+            None,
+            None,
+            Cleartext::Loopback,
+        )
+        .unwrap();
         assert_eq!(endpoint, "https://peer.example.com");
         assert_eq!(tls, Tls::Own);
-        assert!(config(Some("0.0.0.0:7777"), None, None, None)
+        assert!(config(Some("0.0.0.0:7777"), None, None, None, Cleartext::Loopback)
             .unwrap_err()
             .contains("BEST_PEER_ENDPOINT"));
-        assert!(config(Some("[::]:7777"), None, None, None)
+        assert!(config(Some("[::]:7777"), None, None, None, Cleartext::Loopback)
             .unwrap_err()
             .contains("BEST_PEER_ENDPOINT"));
-        assert!(config(Some("localhost:7777"), None, None, None)
+        assert!(config(Some("localhost:7777"), None, None, None, Cleartext::Loopback)
             .unwrap_err()
             .contains("ip:port"));
-        assert!(config(None, Some("peer.example.com"), None, None)
+        assert!(config(None, Some("peer.example.com"), None, None, Cleartext::Loopback)
             .unwrap_err()
             .contains("https://"));
+        // Cleartext off loopback is refused, whether the endpoint was said or defaulted, whether the listen address
+        // or the endpoint's host is what is off; each refusal names what is off, the variables and the ways through.
+        for (listen, endpoint, off) in [
+            (
+                Some("192.168.1.9:7777"),
+                Some("http://192.168.1.9:7777"),
+                "neither loopback",
+            ),
+            (
+                Some("192.168.1.9:7777"),
+                None,
+                "BEST_PEER_LISTEN is 192.168.1.9:7777, not loopback",
+            ),
+            (
+                Some("0.0.0.0:7777"),
+                Some("http://peer.example.com:7777"),
+                "neither loopback",
+            ),
+            (
+                None,
+                Some("http://peer.example.com:7777"),
+                "host is peer.example.com, not loopback",
+            ),
+            (
+                Some("[::]:7777"),
+                Some("http://[::1]:7777"),
+                "BEST_PEER_LISTEN is [::]:7777, not loopback",
+            ),
+            (None, Some("http://user@203.0.113.5:7777/door"), "host is 203.0.113.5"),
+        ] {
+            let why = config(listen, endpoint, None, None, Cleartext::Loopback).unwrap_err();
+            assert!(why.contains(off), "{why}");
+            for named in ["cleartext", "https://", "BEST_PEER_TLS_CERT", "BEST_PEER_CLEARTEXT=vpn"] {
+                assert!(why.contains(named), "{named} in {why}");
+            }
+            let opens = if endpoint.is_some() {
+                "BEST_PEER_ENDPOINT is"
+            } else {
+                "from BEST_PEER_LISTEN"
+            };
+            assert!(why.contains(opens), "{why}");
+        }
+        // Loopback is loopback in every spelling, and a VPN the operator names lets cleartext through.
+        for (listen, endpoint) in [
+            (Some("127.0.0.1:7781"), Some("http://127.0.0.1:7781")),
+            (Some("127.0.0.2:7781"), Some("http://localhost:7781")),
+            (Some("[::1]:7781"), Some("http://[::1]:7781")),
+            (Some("[::ffff:127.0.0.1]:7781"), Some("http://[::ffff:127.0.0.1]:7781")),
+        ] {
+            let (_, _, tls) = config(listen, endpoint, None, None, Cleartext::Loopback).unwrap();
+            assert_eq!(tls, Tls::Off, "{listen:?} {endpoint:?}");
+        }
+        let (_, endpoint, tls) = config(Some("100.64.0.7:7777"), None, None, None, Cleartext::Vpn).unwrap();
+        assert_eq!((endpoint.as_str(), tls), ("http://100.64.0.7:7777", Tls::Off));
+        let (_, endpoint, tls) = config(
+            Some("192.168.1.9:7777"),
+            Some("https://192.168.1.9:7777"),
+            None,
+            None,
+            Cleartext::Loopback,
+        )
+        .unwrap();
+        assert_eq!((endpoint.as_str(), tls), ("https://192.168.1.9:7777", Tls::Own));
+    }
+
+    #[test]
+    fn cleartext_goes_to_loopback_alone_unless_the_operator_names_a_vpn() {
+        assert_eq!(Cleartext::parse(None).unwrap(), Cleartext::Loopback);
+        assert_eq!(Cleartext::parse(Some("vpn")).unwrap(), Cleartext::Vpn);
+        assert!(Cleartext::parse(Some("yes"))
+            .unwrap_err()
+            .contains("BEST_PEER_CLEARTEXT"));
+        for (url, host) in [
+            ("http://127.0.0.1:7777/x", "127.0.0.1"),
+            ("http://[::1]:7777", "[::1]"),
+            ("http://user:pw@localhost", "localhost"),
+            ("https://peer.example.com?x=1", "peer.example.com"),
+        ] {
+            assert_eq!(transport::url_host(url), host);
+        }
+        for url in [
+            "http://127.0.0.1:7777",
+            "http://127.9.9.9",
+            "http://localhost:7777",
+            "http://LOCALHOST",
+            "http://[::1]:7777",
+            "http://[::ffff:127.0.0.1]:7777",
+            "https://203.0.113.5:7777",
+        ] {
+            assert!(Cleartext::Loopback.allows(url), "{url}");
+        }
+        for url in [
+            "http://203.0.113.5:7777",
+            "http://[::ffff:203.0.113.5]:7777",
+            "http://127.0.0.1.example.com",
+            "http://localhost@203.0.113.5",
+            "ftp://127.0.0.1",
+        ] {
+            assert!(!Cleartext::Loopback.allows(url), "{url}");
+        }
+        assert!(Cleartext::Vpn.allows("http://100.64.0.7:7777"));
+    }
+
+    #[tokio::test]
+    async fn a_door_with_a_cloud_member_recorded_in_cleartext_off_loopback_names_it_at_start() {
+        const OFF: &str = "http://203.0.113.5:7777";
+        let (a, _) = two_members().await;
+        let key_a = a.key.clone();
+        let data = Arc::new(tempfile::tempdir().unwrap());
+        let log = Arc::new(EventLog::ephemeral());
+        let first = site_under(vec![(OFF, a)], data.clone(), log.clone(), None, Cleartext::Vpn).await;
+        let ws = first.workspace("c1", "Research").await;
+        first.cloud(&ws, "k1", "lab", &[("a", OFF, &key_a)]).await;
+        let auth = first.auth.clone();
+        first.workspaces.get(&ws).unwrap().cloud_for_test("lab").halt();
+        drop(first.app);
+        drop(first.workspaces);
+
+        let again = site_over(Vec::new(), data.clone(), log, Some(auth)).await;
+        let found = again.workspaces.cleartext_members();
+        assert_eq!(found, vec![(ws.clone(), "lab".into(), "a".into(), OFF.into())]);
+        let why = cleartext_members_refused(&found).unwrap();
+        for named in [
+            ws.as_str(),
+            "cloud lab",
+            "peer a",
+            OFF,
+            "configure-cloud",
+            "https://",
+            "BEST_PEER_CLEARTEXT=vpn",
+        ] {
+            assert!(why.contains(named), "{named} in {why}");
+        }
+        assert!(cleartext_members_refused(&[]).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_transport_sends_nothing_in_cleartext_off_loopback() {
+        use transport::Transport;
+        let http = transport::Http::new(&[], Cleartext::Loopback).unwrap();
+        let req = Request::builder()
+            .uri("http://203.0.113.5:7777/.well-known/best")
+            .header("X-Api-Key", "secret")
+            .body(Body::empty())
+            .unwrap();
+        let why = http.call(req).await.unwrap_err();
+        assert!(
+            why.contains("cleartext") && why.contains("BEST_PEER_CLEARTEXT=vpn"),
+            "{why}"
+        );
     }
 
     #[test]
     fn a_certificate_makes_the_default_endpoint_https() {
-        let (_, endpoint, tls) = config(None, None, Some("c.pem"), Some("k.pem")).unwrap();
+        let (_, endpoint, tls) = config(None, None, Some("c.pem"), Some("k.pem"), Cleartext::Loopback).unwrap();
         assert_eq!(endpoint, "https://127.0.0.1:7777");
         assert!(matches!(tls, Tls::Given { .. }));
-        let why = config(None, Some("http://127.0.0.1:7777"), Some("c.pem"), Some("k.pem")).unwrap_err();
-        assert!(why.contains("https://"), "{why}");
+        let why = config(
+            None,
+            Some("http://127.0.0.1:7777"),
+            Some("c.pem"),
+            Some("k.pem"),
+            Cleartext::Loopback,
+        )
+        .unwrap_err();
+        assert!(why.contains("a certificate is set"), "{why}");
+        let why = config(
+            Some("192.168.1.9:7777"),
+            Some("http://192.168.1.9:7777"),
+            Some("c.pem"),
+            Some("k.pem"),
+            Cleartext::Loopback,
+        )
+        .unwrap_err();
+        assert!(
+            why.contains("a certificate is set"),
+            "cleartext with a certificate is the certificate's refusal: {why}"
+        );
     }
 
     /// The door served over https from a loopback port, with the certificate the peer makes for itself: the manifest
@@ -2659,6 +3060,7 @@ mod tests {
             Images::default(),
             Patience::default(),
             holdings.clone(),
+            Confine::default(),
         )
         .await;
         let auth = Arc::new(Auth::ephemeral(
@@ -2674,6 +3076,7 @@ mod tests {
                 auth: auth.clone(),
                 transport: Arc::new(Switchboard::default()),
                 holdings,
+                cleartext: Cleartext::Loopback,
             }),
             log,
         );
@@ -2805,6 +3208,13 @@ mod tests {
         assert_eq!(spec.image.0, "ollama/ollama");
         assert_eq!(spec.devices, vec!["gpu-0".into()]);
         assert_eq!(spec.ports, vec![11434]);
+        assert_eq!(
+            spec.confinement,
+            Confinement::serving(),
+            "an engine keeps its network and a writable root, with no capabilities and no new privileges"
+        );
+        assert_eq!(spec.confinement.network, Network::Default);
+        assert!(spec.confinement.drop_capabilities && !spec.confinement.read_only_root);
         assert_eq!(
             bed.engine.loaded_at("http://engines.local:41434"),
             vec!["llama3.2:3b"],
@@ -3110,6 +3520,466 @@ mod tests {
         assert_eq!(parse_memory("1073741824").unwrap(), 1 << 30);
         assert!(parse_memory("lots").unwrap_err().contains("40G"));
         assert!(parse_memory("4X").unwrap_err().contains("unit"));
+    }
+
+    #[test]
+    fn the_confinement_is_closed_and_the_operator_sets_only_its_ceilings() {
+        let c = confine(None, None, None, None).unwrap();
+        assert_eq!(c.job, Confinement::default());
+        assert_eq!(c.engine, Confinement::serving());
+        assert_eq!(c.job.network, Network::None);
+        assert_eq!(c.job.memory_bytes, Some(4 << 30));
+        assert_eq!(c.job.pids, Some(4096), "a training job's threads fit under the default");
+        assert_eq!(c.engine.memory_bytes, None);
+        assert_eq!(c.engine.pids, Some(4096));
+        let c = confine(Some("8G"), Some("none"), Some("16G"), Some("100")).unwrap();
+        assert_eq!(c.job.memory_bytes, Some(8 << 30));
+        assert_eq!(c.job.pids, None);
+        assert_eq!(c.engine.memory_bytes, Some(16 << 30));
+        assert_eq!(c.engine.pids, Some(100));
+        assert!(
+            c.job.drop_capabilities
+                && c.job.no_new_privileges
+                && c.job.read_only_root
+                && c.job.network == Network::None,
+            "what is not a ceiling stays closed"
+        );
+        let c = confine(Some("none"), None, None, None).unwrap();
+        assert_eq!(c.job.memory_bytes, None, "none is the one way to no ceiling");
+        assert_eq!(
+            confine(Some("6M"), None, None, None).unwrap().job.memory_bytes,
+            Some(6 << 20)
+        );
+        for (why, args) in [
+            ("BEST_PEER_JOB_MEMORY", (Some("lots"), None, None, None)),
+            ("BEST_PEER_JOB_MEMORY", (Some("0"), None, None, None)),
+            ("BEST_PEER_JOB_MEMORY", (Some("5M"), None, None, None)),
+            ("BEST_PEER_JOB_MEMORY", (Some("9000000T"), None, None, None)),
+            ("BEST_PEER_JOB_PIDS", (None, Some("0"), None, None)),
+            ("BEST_PEER_ENGINE_MEMORY", (None, None, Some("4X"), None)),
+            ("BEST_PEER_ENGINE_MEMORY", (None, None, Some("0"), None)),
+            ("BEST_PEER_ENGINE_PIDS", (None, None, None, Some("many"))),
+        ] {
+            let err = confine(args.0, args.1, args.2, args.3).unwrap_err();
+            assert!(err.contains(why), "{err}");
+            assert!(err.contains("none"), "the refusal names the way to no ceiling: {err}");
+        }
+    }
+
+    /// The strings and arrays in `schema` with no bound on their length, by path.
+    fn unbounded(schema: &Value, at: &str, found: &mut Vec<String>) {
+        match schema["type"].as_str() {
+            Some("string") if schema.get("maxLength").is_none() && schema.get("enum").is_none() => {
+                found.push(at.to_string())
+            }
+            Some("array") if schema.get("maxItems").is_none() => found.push(at.to_string()),
+            _ => {}
+        }
+        if let Some(properties) = schema["properties"].as_object() {
+            for (name, p) in properties {
+                unbounded(p, &format!("{at}.{name}"), found);
+            }
+        }
+        if schema.get("items").is_some() {
+            unbounded(&schema["items"], &format!("{at}[]"), found);
+        }
+    }
+
+    #[tokio::test]
+    async fn every_string_and_collection_a_command_carries_is_bounded() {
+        let (a, _) = two_members().await;
+        let key_a = a.key.clone();
+        let site = site(vec![(A, a)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a)]).await;
+        let mut found = Vec::new();
+        for prefix in [String::new(), format!("/workspaces/{ws}")] {
+            let (_, c) = get_as(&site.app, &prefix, &site.key, "/commands").await;
+            for entry in c["commands"].as_array().unwrap() {
+                let path = format!(
+                    "/commands/{}/{}",
+                    entry["schema"].as_str().unwrap(),
+                    entry["version"].as_str().unwrap()
+                );
+                let (s, doc) = get_as(&site.app, &prefix, &site.key, &path).await;
+                assert_eq!(s, StatusCode::OK, "{doc}");
+                unbounded(&doc, &format!("{prefix}{path}"), &mut found);
+            }
+        }
+        assert!(found.is_empty(), "unbounded: {found:#?}");
+        // A workspace's door takes a little less than the root's, so what its cloud took a member's door takes.
+        let limit = best_peer_door::router::MAX_BODY - best_peer_door::router::TENANT_ROOM;
+        let req = Request::post(format!("/workspaces/{ws}/commands"))
+            .header("X-Api-Key", &site.key)
+            .header(header::CONTENT_TYPE, "application/cloudevents+json")
+            .body(Body::from("x".repeat(limit + 1)))
+            .unwrap();
+        let res = site.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body(res).await["error"]["details"]["limit_bytes"], limit);
+    }
+
+    #[tokio::test]
+    async fn a_credential_with_a_share_runs_its_jobs_on_a_device_where_its_share_counts_them() {
+        let bed = fresh().await;
+        let team = key_with(&bed.app, Some("jobs"), Some(8 * GB)).await;
+        let scoped = key_with(&bed.app, Some("jobs"), None).await;
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &team,
+            "t0",
+            "RunJob",
+            "run-job",
+            json!({ "image": "busybox" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "JOB_NEEDS_DEVICE");
+        assert_eq!(b["error"]["details"]["field"], "memory_bytes");
+        assert!(
+            b["error"]["message"].as_str().unwrap().contains("send memory_bytes"),
+            "{b}"
+        );
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &team,
+            "t1",
+            "RunJob",
+            "run-job",
+            json!({ "image": "busybox", "memory_bytes": GB }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        // A key with no share is not held to a device, whatever its scopes.
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &scoped,
+            "s0",
+            "RunJob",
+            "run-job",
+            json!({ "image": "busybox" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+    }
+
+    #[tokio::test]
+    async fn a_credential_with_a_share_runs_its_jobs_on_a_device_in_a_cloud_too() {
+        let (a, b) = two_members().await;
+        let (key_a, key_b) = (a.key.clone(), b.key.clone());
+        let site = site(vec![(A, a), (B, b)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a), ("b", B, &key_b)])
+            .await;
+        let bob = key_with(&site.app, Some("jobs"), Some(4 * GB)).await;
+        let (_, w) = get_as(&site.app, "", &bob, "/queries/get-workspaces").await;
+        let bob_id = w["identity"].as_str().unwrap().to_string();
+        let (s, _) = send_as(
+            &site.app,
+            "",
+            &site.key,
+            "i0",
+            "InviteMember",
+            "invite-member",
+            json!({ "workspace": ws, "identity": bob_id }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        events_as(&site.app, "", &site.key, "i0", "MemberInvitedV1").await;
+        let (s, _) = send_as(
+            &site.app,
+            "",
+            &bob,
+            "a0",
+            "AcceptInvitation",
+            "accept-invitation",
+            json!({ "workspace": ws }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        events_as(&site.app, "", &bob, "a0", "MemberJoinedV1").await;
+        let prefix = format!("/workspaces/{ws}");
+        let (s, e) = send_as(
+            &site.app,
+            &prefix,
+            &bob,
+            "bj0",
+            "RunJob",
+            "run-job",
+            json!({ "image": "busybox", "cloud": "lab" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "JOB_NEEDS_DEVICE");
+        let (s, e) = send_as(
+            &site.app,
+            &prefix,
+            &bob,
+            "bj1",
+            "RunJob",
+            "run-job",
+            json!({ "image": "busybox", "cloud": "lab", "memory_bytes": GB }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{e}");
+    }
+
+    /// The data of the last event of `until` with `correlation`, as `key` reads it at the root.
+    async fn last_of(app: &axum::Router, key: &str, correlation: &str, until: &str) -> Value {
+        let events = events_as(app, "", key, correlation, until).await;
+        events.iter().rev().find(|e| e["type"] == until).unwrap()["data"].clone()
+    }
+
+    #[tokio::test]
+    async fn a_credential_runs_as_many_workloads_at_once_as_its_approver_allows() {
+        let log = Arc::new(EventLog::ephemeral());
+        let runtime = Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![]));
+        let engine = Arc::new(best_peer_engine::Fake::new());
+        let bed = bed_with(
+            card(),
+            log.clone(),
+            runtime.clone(),
+            engine.clone(),
+            "engines.local",
+            None,
+        )
+        .await;
+        let team = key_counted(&bed.app, Some("deploy,jobs"), Some(8 * GB), Some(1), Some(1)).await;
+        let deploy = |id: &'static str, model: &'static str| {
+            let (app, team) = (bed.app.clone(), team.clone());
+            async move {
+                send_as(
+                    &app,
+                    "",
+                    &team,
+                    id,
+                    "DeployModel",
+                    "deploy-model",
+                    json!({ "model": model, "engine": "ollama", "memory_bytes": 1 }),
+                )
+                .await
+            }
+        };
+        let run = |id: &'static str| {
+            let (app, team) = (bed.app.clone(), team.clone());
+            async move {
+                send_as(
+                    &app,
+                    "",
+                    &team,
+                    id,
+                    "RunJob",
+                    "run-job",
+                    json!({ "image": "busybox", "memory_bytes": 1 }),
+                )
+                .await
+            }
+        };
+        // One deployment at a time, however small each claims to be; the owner, approved with no count, is not counted.
+        let (s, b) = deploy("d1", "a:7b").await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let first = last_of(&bed.app, &team, "d1", "DeploymentReady").await["deployment"].clone();
+        let (s, b) = deploy("d2", "b:7b").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "DEPLOYMENTS_EXCEEDED");
+        assert_eq!(b["error"]["details"], json!({ "ceiling": 1, "running": 1 }));
+        assert!(b["error"]["message"].as_str().unwrap().contains("undeploy one first"));
+        bed.deployed("o1", "owner-a:7b", 1).await;
+        bed.deployed("o2", "owner-b:7b", 1).await;
+        // Room comes back when the deployment is undeployed, and when one fails.
+        let (s, _) = send_as(
+            &bed.app,
+            "",
+            &team,
+            "u1",
+            "UndeployModel",
+            "undeploy-model",
+            json!({ "deployment": first }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        events_as(&bed.app, "", &team, "u1", "Undeployed").await;
+        engine.missing("gone:7b");
+        let (s, b) = deploy("d3", "gone:7b").await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        last_of(&bed.app, &team, "d3", "DeploymentFailed").await;
+        let (s, b) = deploy("d4", "b:7b").await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        last_of(&bed.app, &team, "d4", "DeploymentReady").await;
+        // One job at a time: room comes back when it finishes and when it is stopped.
+        let (s, b) = run("j1").await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let started = last_of(&bed.app, &team, "j1", "JobStarted").await;
+        let (s, b) = run("j2").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "JOBS_EXCEEDED");
+        assert_eq!(b["error"]["details"], json!({ "ceiling": 1, "running": 1 }));
+        assert!(b["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("stop one or let one finish first"));
+        runtime
+            .stop(&ContainerId(started["container"].as_str().unwrap().into()))
+            .await
+            .unwrap();
+        last_of(&bed.app, &team, "j1", "JobFinished").await;
+        let (s, b) = run("j3").await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let started = last_of(&bed.app, &team, "j3", "JobStarted").await;
+        let (s, _) = send_as(
+            &bed.app,
+            "",
+            &team,
+            "s3",
+            "StopJob",
+            "stop-job",
+            json!({ "job": started["job"] }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED);
+        events_as(&bed.app, "", &team, "s3", "JobStopped").await;
+        let (s, b) = run("j4").await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        last_of(&bed.app, &team, "j4", "JobStarted").await;
+        // A restart counts again what still runs, from the log.
+        bed.peer.halt();
+        let credentials = bed.door.auth.clone();
+        drop(bed);
+        let again = bed_with(card(), log, runtime, engine, "engines.local", Some(credentials)).await;
+        let (s, b) = send_as(
+            &again.app,
+            "",
+            &team,
+            "d5",
+            "DeployModel",
+            "deploy-model",
+            json!({ "model": "c:7b", "engine": "ollama", "memory_bytes": 1 }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "DEPLOYMENTS_EXCEEDED");
+        let (s, b) = send_as(
+            &again.app,
+            "",
+            &team,
+            "j5",
+            "RunJob",
+            "run-job",
+            json!({ "image": "busybox", "memory_bytes": 1 }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "JOBS_EXCEEDED");
+        // A share with no count runs as many as fit in it: the counts are the approver's word, never a default.
+        let shared = key_with(&again.app, Some("deploy"), Some(8 * GB)).await;
+        for (id, model) in [("x1", "x:7b"), ("x2", "y:7b"), ("x3", "z:7b")] {
+            let (s, b) = send_as(
+                &again.app,
+                "",
+                &shared,
+                id,
+                "DeployModel",
+                "deploy-model",
+                json!({ "model": model, "engine": "ollama", "memory_bytes": 1 }),
+            )
+            .await;
+            assert_eq!(s, StatusCode::CREATED, "{b}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_credential_with_a_share_is_counted_across_the_door_every_workspace_included() {
+        let (a, b) = two_members().await;
+        let (key_a, key_b) = (a.key.clone(), b.key.clone());
+        let site = site(vec![(A, a), (B, b)]).await;
+        let ws1 = site.workspace("c1", "Research").await;
+        let ws2 = site.workspace("c2", "Ops").await;
+        site.cloud(&ws1, "k1", "lab", &[("a", A, &key_a)]).await;
+        site.cloud(&ws2, "k2", "ops-pool", &[("b", B, &key_b)]).await;
+        let bob = key_counted(&site.app, Some("deploy"), Some(4 * GB), Some(1), None).await;
+        let (_, w) = get_as(&site.app, "", &bob, "/queries/get-workspaces").await;
+        let bob_id = w["identity"].as_str().unwrap().to_string();
+        for (n, ws) in [&ws1, &ws2].into_iter().enumerate() {
+            let (s, _) = send_as(
+                &site.app,
+                "",
+                &site.key,
+                &format!("i{n}"),
+                "InviteMember",
+                "invite-member",
+                json!({ "workspace": ws, "identity": bob_id }),
+            )
+            .await;
+            assert_eq!(s, StatusCode::CREATED);
+            events_as(&site.app, "", &site.key, &format!("i{n}"), "MemberInvitedV1").await;
+            let (s, _) = send_as(
+                &site.app,
+                "",
+                &bob,
+                &format!("a{n}"),
+                "AcceptInvitation",
+                "accept-invitation",
+                json!({ "workspace": ws }),
+            )
+            .await;
+            assert_eq!(s, StatusCode::CREATED);
+            events_as(&site.app, "", &bob, &format!("a{n}"), "MemberJoinedV1").await;
+        }
+        let (s, b) = send_as(
+            &site.app,
+            &format!("/workspaces/{ws1}"),
+            &bob,
+            "bd1",
+            "DeployModel",
+            "deploy-model",
+            json!({ "model": "m", "engine": "ollama", "memory_bytes": GB, "cloud": "lab" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let (s, e) = send_as(
+            &site.app,
+            &format!("/workspaces/{ws2}"),
+            &bob,
+            "bd2",
+            "DeployModel",
+            "deploy-model",
+            json!({ "model": "m", "engine": "ollama", "memory_bytes": GB, "cloud": "ops-pool" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "DEPLOYMENTS_EXCEEDED");
+        assert_eq!(e["error"]["details"]["running"], 1);
+        assert!(e["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("every workspace counted"));
+    }
+
+    #[tokio::test]
+    async fn a_member_that_gave_the_cloud_a_count_counts_the_whole_cloud_as_one() {
+        let (a, _) = two_members().await;
+        let cloud_key = key_counted(&a.app, Some("deploy,jobs"), Some(16 * GB), Some(1), None).await;
+        let site = site(vec![(A, a)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &cloud_key)]).await;
+        let (s, b) = site.deploy(&ws, "d1", Some("lab"), 4, None).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "d1", "DeploymentReady").await;
+        // The owner of the workspace is not counted by the cloud, but the member counts the cloud as one holder.
+        let (s, b) = site.deploy(&ws, "d2", Some("lab"), 4, None).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let events = site.events(&ws, "d2", "DeploymentFailed").await;
+        let failed = &events.last().unwrap()["data"];
+        assert!(
+            failed["reason"]
+                .as_str()
+                .unwrap()
+                .contains("may run 1 deployment(s) at once"),
+            "{failed}"
+        );
     }
 
     #[tokio::test]
@@ -3620,8 +4490,77 @@ mod tests {
         let job = started["job"].as_str().unwrap().to_string();
         assert!(job.starts_with("job-"));
         let container = ContainerId(started["container"].as_str().unwrap().into());
-        assert_eq!(bed.runtime.spec_of(&container).unwrap().args, vec!["echo", "hi"]);
+        let spec = bed.runtime.spec_of(&container).unwrap();
+        assert_eq!(spec.args, vec!["echo", "hi"]);
+        // The owner's job, from a credential with no share, keeps the network, a writable filesystem and the host's
+        // memory, as on 0.0.11, under the capability, privilege and task rules every container gets.
+        assert_eq!(spec.confinement.network, Network::Default);
+        assert!(
+            spec.confinement.drop_capabilities
+                && spec.confinement.no_new_privileges
+                && !spec.confinement.read_only_root
+                && spec.confinement.pids.is_some()
+                && spec.confinement.memory_bytes.is_none()
+        );
+        assert_eq!(started["boxed"], false);
         assert_eq!(bed.query("get-workloads").await["jobs"][0]["phase"], "running");
+        // A tenant's job, from a credential with a share, runs in the closed box, whatever the operator set.
+        let tenant = key_with(&bed.app, Some("jobs"), Some(8 * GB)).await;
+        let opened = key_opened(&bed.app, Some("jobs"), Some(8 * GB), true).await;
+        let started_by = |key: String, id: &'static str| {
+            let bed = &bed;
+            async move {
+                let (s, b) = send_as(
+                    &bed.app,
+                    "",
+                    &key,
+                    id,
+                    "RunJob",
+                    "run-job",
+                    json!({ "image": "busybox", "memory_bytes": GB }),
+                )
+                .await;
+                assert_eq!(s, StatusCode::CREATED, "{b}");
+                bed.events_of(id, "JobStarted").await.last().unwrap().data.clone()
+            }
+        };
+        let boxed = started_by(tenant.clone(), "b3").await;
+        assert_eq!(boxed["boxed"], true);
+        assert_eq!(boxed["host_memory_bytes"], 4u64 << 30);
+        let spec = bed
+            .runtime
+            .spec_of(&ContainerId(boxed["container"].as_str().unwrap().into()))
+            .unwrap();
+        assert_eq!(spec.confinement, Confinement::default());
+        assert_eq!(spec.confinement.network, Network::None);
+        assert!(spec.confinement.read_only_root && spec.confinement.memory_bytes.is_some());
+        // One approved with --open-jobs runs open: the approver's word, never the credential's.
+        let open = started_by(opened, "b4").await;
+        assert_eq!(open["boxed"], false);
+        let spec = bed
+            .runtime
+            .spec_of(&ContainerId(open["container"].as_str().unwrap().into()))
+            .unwrap();
+        assert_eq!(spec.confinement.network, Network::Default);
+        assert!(!spec.confinement.read_only_root && spec.confinement.memory_bytes.is_none());
+        // The boxed job's host memory runs out: the fix is the host's ceiling, not the device memory it asked for.
+        bed.runtime
+            .out_of_memory(&ContainerId(boxed["container"].as_str().unwrap().into()))
+            .unwrap();
+        let events = bed.events_of("b3", "JobFailed").await;
+        let failed = &events.last().unwrap().data;
+        assert_eq!(failed["host_memory_bytes"], 4u64 << 30);
+        assert!(failed["reason"].as_str().unwrap().contains("host memory"), "{failed}");
+        assert!(failed["fix"].as_str().unwrap().contains("ceiling"), "{failed}");
+        assert!(!failed["fix"].as_str().unwrap().contains("memory_bytes"), "{failed}");
+        // An open job's runs out with the host's own memory, and no ceiling is named.
+        bed.runtime
+            .out_of_memory(&ContainerId(open["container"].as_str().unwrap().into()))
+            .unwrap();
+        let events = bed.events_of("b4", "JobFailed").await;
+        let failed = &events.last().unwrap().data;
+        assert!(failed["host_memory_bytes"].is_null(), "{failed}");
+        assert!(!failed["fix"].as_str().unwrap().contains("ceiling"), "{failed}");
         // The engine ends it: the exit is told, and the memory is free.
         bed.runtime.stop(&container).await.unwrap();
         let events = bed.events_of("j1", "JobFinished").await;

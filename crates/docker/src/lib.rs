@@ -1,12 +1,17 @@
 //! [`Runtime`] over the Docker Engine API through bollard. Every container this adapter creates carries the label
 //! `best-peer`, so `running` and the event feed see the peer's containers and nothing else. A device is handed over
 //! by the NVIDIA container toolkit when its id is an NVML UUID (`GPU-...`); other accelerators wait for their own
-//! adapter. Containers are removed by the engine when they exit. Thin; proven on a host by hand, never unit-tested.
+//! adapter. A container is confined as its spec says, in the engine's own words: capabilities dropped, no new
+//! privileges, a read-only root with a private `/tmp`, ceilings on processes and on memory with swap counted in,
+//! and its network. Containers are removed by the engine when they exit. Thin; proven on a host by hand, never
+//! unit-tested.
 
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use best_peer_runtime::{ContainerId, Event, ImageRef, Progress, Published, Runtime, RuntimeError, Spec, Started};
+use best_peer_runtime::{
+    ContainerId, Event, ImageRef, Network, Progress, Published, Runtime, RuntimeError, Spec, Started,
+};
 use bollard::models::{ContainerCreateBody, DeviceRequest, EventMessageTypeEnum, HostConfig, PortBinding};
 use bollard::query_parameters::{
     CreateImageOptionsBuilder, EventsOptionsBuilder, ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
@@ -174,6 +179,7 @@ impl Runtime for DockerRuntime {
                 )
             })
             .collect();
+        let confinement = &spec.confinement;
         let body = ContainerCreateBody {
             image: Some(spec.image.0.clone()),
             cmd: (!spec.args.is_empty()).then(|| spec.args.clone()),
@@ -184,6 +190,22 @@ impl Runtime for DockerRuntime {
                 auto_remove: Some(true),
                 port_bindings: Some(port_bindings),
                 device_requests: (!device_requests.is_empty()).then_some(device_requests),
+                cap_drop: confinement.drop_capabilities.then(|| vec!["ALL".into()]),
+                security_opt: confinement.no_new_privileges.then(|| vec!["no-new-privileges".into()]),
+                readonly_rootfs: Some(confinement.read_only_root),
+                tmpfs: confinement
+                    .read_only_root
+                    .then(|| HashMap::from([("/tmp".to_string(), "rw,nosuid,nodev,size=1g".to_string())])),
+                pids_limit: confinement.pids.map(|p| p as i64),
+                // One ceiling for memory and swap together: a ceiling that swap can exceed is none.
+                memory: confinement.memory_bytes.map(|m| m as i64),
+                memory_swap: confinement.memory_bytes.map(|m| m as i64),
+                network_mode: match &confinement.network {
+                    Network::None => Some("none".into()),
+                    Network::Default => None,
+                },
+                // An init as PID 1 reaps and forwards signals, so a stop reaches an image that did not expect to be it.
+                init: Some(true),
                 ..Default::default()
             }),
             ..Default::default()
