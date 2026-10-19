@@ -12,7 +12,8 @@ behaves; this page is only the comparison. Where a gap has an issue, it is named
 - Its facts, under the caller's correlation id: `JobQueued` (the order whole, `waiting` when it waits), `JobPlaced`
   (the member peer), then the member's `ImagePulling`, `ImagePulled`, `JobStarted` (naming the order), and
   `JobFinished` with the exit code, `JobFailed` or `JobStopped`.
-- `queue_seconds` bounds the wait and `deadline_seconds` the run, both from the facts' own times.
+- `queue_seconds` bounds the wait, a day when the order names none, and `deadline_seconds` the run, both from the
+  facts' own times.
 - `stop-job` ends a waiting order, or a running job by its job id or its order's.
 - A member lost under an order queues it again once (`attempt: 2`), then fails it.
 - The queue is folded from those facts, so it survives a restart of the door, and a job that ends after one is told
@@ -27,7 +28,7 @@ behaves; this page is only the comparison. Where a gap has an issue, it is named
 | Status of a job | a status path | `/status` | the stream, `get-workloads` (`queued`, `jobs`) |
 | The job's output | a result path | `output` in `/status`, kept for a while | no: the exit code only; inputs and outputs are behavioralstate/spec#66 |
 | A bound on the run | `deadline_seconds` | `executionTimeout` | `deadline_seconds` |
-| A bound on the wait | `queue_message_ttl_seconds` | `ttl`, from submission, covering the wait and the run | `queue_seconds`, the wait alone |
+| A bound on the wait | `queue_message_ttl_seconds` | `ttl`, from submission, covering the wait and the run | `queue_seconds`, the wait alone, a day by default |
 | Cancel a queued or running job | not documented | `/cancel` | `stop-job` |
 | Retry a failed job under the same id | not documented | `/retry` | no: order it again |
 | Clear the queue | not documented | `/purge-queue` | no: `stop-job` each order |

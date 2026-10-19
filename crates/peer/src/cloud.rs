@@ -198,6 +198,9 @@ pub struct Cloud {
     stopped_unstarted: Mutex<HashSet<String>>,
 }
 
+/// How long an order may wait for room when it names no `queue_seconds`: a day, as RunPod's default time-to-live.
+pub const DEFAULT_QUEUE_SECONDS: u64 = 24 * 60 * 60;
+
 /// An order's id: the command's key hashed, so the command run again after a restart finds its order.
 fn order_id(key: &str) -> String {
     format!("job-{}", &hash_key(key)[..12])
@@ -1997,7 +2000,7 @@ impl Service for Cloud {
             args: data.args.clone(),
             memory_bytes: data.memory_bytes,
             device: data.device.clone(),
-            queue_seconds: data.queue_seconds,
+            queue_seconds: Some(data.queue_seconds.unwrap_or(DEFAULT_QUEUE_SECONDS)),
             deadline_seconds: data.deadline_seconds,
             accelerators_only: self.held_to_accelerators.lock().unwrap().remove(&key),
             attempt: 1,

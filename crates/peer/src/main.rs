@@ -1664,6 +1664,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_order_that_names_no_wait_waits_a_day_at_most() {
+        let (a, b) = two_members().await;
+        let key_a = a.key.clone();
+        let site = site(vec![(A, a), (B, b)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a)]).await;
+        let lab = site.live_cloud(&ws, "lab");
+        site.order(&ws, "j1", 20, json!({})).await;
+        site.events(&ws, "j1", "JobStarted").await;
+        let waits = site.order(&ws, "j2", 10, json!({})).await;
+        assert_eq!(waits["waiting"], true);
+        assert_eq!(waits["queue_seconds"], 86400, "a day, told on the order");
+
+        lab.step(later(86400 - 60)).await;
+        assert_eq!(facts(&site.events(&ws, "j2", "JobQueued").await), ["JobQueued"]);
+        lab.step(later(86400 + 60)).await;
+        let failed = site.events(&ws, "j2", "JobFailed").await;
+        let failed = &failed.last().unwrap()["data"];
+        assert_eq!(failed["job"], waits["job"]);
+        assert!(failed["reason"].as_str().unwrap().contains("(86400 s)"), "{failed}");
+        assert_eq!(site.query(&ws, "get-workloads").await["queued"], json!([]));
+    }
+
+    #[tokio::test]
     async fn stop_job_ends_an_order_that_waits_before_it_started_and_a_running_one_by_its_order_id() {
         let (a, b) = two_members().await;
         let key_a = a.key.clone();

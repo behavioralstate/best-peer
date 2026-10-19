@@ -530,7 +530,7 @@ fn run_job(peer: Arc<dyn Service>, at: Where) -> CommandDef {
             json!({
                 "cloud": cloud_property("to run in; may be left out when device names it"),
                 "device": { "type": "string", "maxLength": 256, "description": "A device id from this workspace's get-hardware-state, cloud/peer/device, to pin the placement; refused without memory_bytes" },
-                "queue_seconds": { "type": "integer", "minimum": 1, "maximum": 604800, "description": "How long the order may wait for room before it ends unplaced, counted from JobQueued; at most seven days; without it the order waits until it is placed or stopped" },
+                "queue_seconds": { "type": "integer", "minimum": 1, "maximum": 604800, "description": "How long the order may wait for room before it ends unplaced, counted from JobQueued; at most seven days; without it, a day (86400)" },
                 "deadline_seconds": { "type": "integer", "minimum": 1, "maximum": 2592000, "description": "How long the job may run before it is stopped, counted from JobStarted; at most thirty days; without it the job runs to its end" }
             }),
         ),

@@ -327,9 +327,9 @@ serverless GPU platforms do. It is refused at once only when no device of the cl
 hold it. `JobQueued` comes first, holding the order whole, with its id as `job` and `waiting: true` when it waits;
 the cloud places orders first come, first served, as soon as a member has the memory free, and an order that does not
 fit yet holds back none that does. `JobPlaced` names the member it was sent to, then the member's facts follow, and
-`JobStarted` names the order. `queue_seconds` bounds the wait (past it, `JobFailed` says it was never placed) and
-`deadline_seconds` the run from `JobStarted` (past it, the job is stopped and `JobStopped` says why); both are counted
-from the facts' own times, so a restart neither resets nor extends them. `stop-job` names a waiting order by its id,
+`JobStarted` names the order. `queue_seconds` bounds the wait, a day when the order names none (past it, `JobFailed`
+says it was never placed), and `deadline_seconds` the run from `JobStarted` (past it, the job is stopped and
+`JobStopped` says why); both are counted from the facts' own times, so a restart neither resets nor extends them. `stop-job` names a waiting order by its id,
 and it ends in `JobStopped` before it started. A member lost under an order queues it again once, `JobQueued`
 telling `attempt: 2`, and fails it the second time. `get-workloads` lists the orders not started yet as `queued`,
 oldest first. An order that waits counts against its credential's share and its count of jobs, as an admitted one
