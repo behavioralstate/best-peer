@@ -188,9 +188,10 @@ impl Member {
         self.exchange(req).await
     }
 
-    /// The member's event stream from after `last` (its event id), as it comes: each event's id and envelope. Ends
-    /// when the member closes it; the caller reconnects with the last id it saw.
-    pub async fn stream(&self, last: Option<&str>) -> Result<impl Stream<Item = (String, Envelope)>, Refusal> {
+    /// The member's event stream from after `last` (its event id), as it comes: each event's id and envelope, and
+    /// between events the word that the socket is alive. Ends when the member closes it; the caller reconnects with
+    /// the last id it saw.
+    pub async fn stream(&self, last: Option<&str>) -> Result<impl Stream<Item = Heard>, Refusal> {
         let mut req = self.request(Method::GET, "/events/stream", None);
         req.headers_mut()
             .insert(header::ACCEPT, "text/event-stream".parse().unwrap());
@@ -215,10 +216,18 @@ impl Member {
     }
 }
 
+/// What a member's stream said: an event, by its id and envelope; or only that the member is there, when bytes
+/// came that completed no event (a keep-alive comment, the first chunk of a long event). A reader that waits for
+/// the next item with a deadline thereby tells a quiet member from a dead socket.
+pub enum Heard {
+    Event(String, Box<Envelope>),
+    Alive,
+}
+
 /// Server-sent events parsed from a body as it streams: the `id` and the `data` of each event, the data as an
 /// envelope. Bytes are kept until an event is complete, so a character split across chunks is read whole. Comments
-/// (keep-alives) and events without an envelope are skipped.
-fn sse_events(body: Body) -> impl Stream<Item = (String, Envelope)> {
+/// (keep-alives) and events without an envelope carry no event, but a chunk of them says the member is alive.
+fn sse_events(body: Body) -> impl Stream<Item = Heard> {
     let mut buffer: Vec<u8> = Vec::new();
     body.into_data_stream()
         .take_while(|chunk| futures::future::ready(chunk.is_ok()))
@@ -237,8 +246,11 @@ fn sse_events(body: Body) -> impl Stream<Item = (String, Envelope)> {
                     }
                 }
                 if let (Some(id), Ok(envelope)) = (id, serde_json::from_str::<Envelope>(&data)) {
-                    out.push((id, envelope));
+                    out.push(Heard::Event(id, Box::new(envelope)));
                 }
+            }
+            if out.is_empty() {
+                out.push(Heard::Alive);
             }
             futures::stream::iter(out)
         })
@@ -269,12 +281,49 @@ mod tests {
         ];
         let body = Body::from_stream(futures::stream::iter(chunks));
         let got: Vec<(String, String, Value)> = sse_events(body)
-            .map(|(id, e)| (id, e.r#type, e.data["reason"].clone()))
+            .filter_map(|h| {
+                futures::future::ready(match h {
+                    Heard::Event(id, e) => Some((id, e.r#type, e.data["reason"].clone())),
+                    Heard::Alive => None,
+                })
+            })
             .collect()
             .await;
         assert_eq!(got.len(), 2);
         assert_eq!((got[0].0.as_str(), got[0].1.as_str()), ("one", "A"));
         assert_eq!(got[0].2, "crème brûlée");
         assert_eq!((got[1].0.as_str(), got[1].1.as_str()), ("two", "B"));
+    }
+
+    #[tokio::test]
+    async fn a_keep_alive_is_heard_as_the_member_being_alive_and_is_no_event() {
+        // Two keep-alive comments, as the member sends them every fifteen seconds while nothing happens, then the
+        // first half of an event: none is an event, each chunk says the member is there.
+        let half = format!(
+            "id: one
+data: {}",
+            "{\"specversion\": \"1.0\""
+        );
+        let chunks: Vec<Result<axum::body::Bytes, std::io::Error>> = vec![
+            Ok(axum::body::Bytes::from_static(
+                b": keepalive
+
+",
+            )),
+            Ok(axum::body::Bytes::from_static(
+                b": keepalive
+
+",
+            )),
+            Ok(axum::body::Bytes::from(half)),
+        ];
+        let heard: Vec<Heard> = sse_events(Body::from_stream(futures::stream::iter(chunks)))
+            .collect()
+            .await;
+        assert_eq!(heard.len(), 3);
+        assert!(
+            heard.iter().all(|h| matches!(h, Heard::Alive)),
+            "a keep-alive or a part of an event is no event"
+        );
     }
 }

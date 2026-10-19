@@ -136,7 +136,7 @@ async fn best_shaped(res: Response) -> Response {
         StatusCode::PAYLOAD_TOO_LARGE => (
             "PAYLOAD_TOO_LARGE",
             format!(
-                "the body exceeds what this route takes: {MAX_COMMAND_BODY} bytes for a command, {MAX_BODY} otherwise"
+                "the body exceeds what this route takes: {MAX_COMMAND_BODY} bytes for a command, {MAX_BODY} otherwise; for a prompt, fewer or shorter messages"
             ),
         ),
         StatusCode::BAD_REQUEST => (

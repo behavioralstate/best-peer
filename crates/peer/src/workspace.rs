@@ -32,7 +32,6 @@ use crate::cloud::Cloud;
 use crate::domain::{
     self, Clouds, Membership, Service, MEMBERSHIP_COMMANDS, MEMBERSHIP_EVENTS, NAME_SHAPE, WORKSPACE_EVENTS,
 };
-use crate::endpoint::{Route, Upstream};
 use crate::holdings::Holdings;
 use crate::lifecycle::{list, new_id, require};
 use crate::transport::Transport;
@@ -321,7 +320,12 @@ async fn dispatch(
     req: Request,
 ) -> Response {
     let id = params.get("workspace").cloned().unwrap_or_default();
-    let key = crate::endpoint::credential(req.headers());
+    let key = req
+        .headers()
+        .get(best_peer_door::auth::AUTH_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .unwrap_or("");
     let Some(who) = (!key.is_empty()).then(|| reg.ctx.auth.authenticate(key)).flatten() else {
         return BestError::unauthorized().into_response();
     };
@@ -636,8 +640,7 @@ impl Workspace {
             )
             .with_partition(Workspaces::workspace_partition()),
         );
-        let router =
-            best_peer_door::tenant_router(door.clone()).merge(crate::endpoint::router(me.clone(), ctx.auth.clone()));
+        let router = best_peer_door::tenant_router(door.clone());
         let _ = me.door.set(door);
         let _ = me.router.set(router);
         Ok(me)
@@ -1168,16 +1171,30 @@ impl Service for Workspace {
             }
         }
     }
-}
 
-impl Upstream for Workspace {
-    fn upstream_of(&self, deployment: &str, who: &Credential) -> Result<Route, BestError> {
-        match self.cloud_of(deployment) {
-            Some(c) => c.upstream_of(deployment, who),
-            None => Err(BestError::not_found(
+    fn admit_prompt(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError> {
+        require(who, "prompt")?;
+        let id = cmd.data["deployment"].as_str().unwrap_or_default();
+        match self.cloud_of(id) {
+            Some(c) => c.admit_prompt(cmd, who),
+            None => Err(BestError::bad_request(
                 "NO_SUCH_DEPLOYMENT",
-                format!("no deployment {deployment} in this workspace: get-workloads lists what it runs for you, and deploy-model starts one"),
-            )),
+                format!("no deployment {id} in this workspace: get-workloads lists what it runs for you, and deploy-model starts one"),
+            )
+            .with_details(json!({ "deployment": id }))),
+        }
+    }
+
+    async fn prompt(self: Arc<Self>, cmd: Envelope, em: Emitter) {
+        let id = cmd.data["deployment"].as_str().unwrap_or_default().to_string();
+        match self.cloud_of(&id) {
+            Some(c) => c.prompt(cmd, em).await,
+            None => {
+                em.emit(
+                    "PromptFailed",
+                    json!({ "deployment": id, "reason": "the deployment ended between the prompt's admission and now", "fix": "deploy the model again, then prompt it" }),
+                );
+            }
         }
     }
 }

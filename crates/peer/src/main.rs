@@ -11,7 +11,6 @@
 
 mod cloud;
 mod domain;
-mod endpoint;
 mod holdings;
 mod lifecycle;
 mod member;
@@ -365,9 +364,7 @@ async fn peer_app(endpoint: &str, dir: &std::path::Path, log: Arc<EventLog>, aut
             "this door hosts workspaces: their clouds follow their members"
         );
     }
-    best_peer_door::router(door)
-        .merge(endpoint::router(peer, auth))
-        .merge(workspaces.router())
+    best_peer_door::router(door).merge(workspaces.router())
 }
 
 /// Serves `app` on `listener`, over TLS when a configuration is given, until `handle` says to stop.
@@ -417,7 +414,7 @@ fn parse_memory(text: &str) -> Result<u64, String> {
 /// person was shown. The token goes to the listen address only, never to the public endpoint, and over TLS to the
 /// certificate the peer serves and no other, when it serves one.
 fn approve(args: &[String]) {
-    const USAGE: &str = "usage: best-peer approve <code> [--may read,deploy,jobs | all] [--memory 40G]: the code the agent showed the person; what the credential may do (all when not said); the most device memory its workloads may hold together (no share when not said)";
+    const USAGE: &str = "usage: best-peer approve <code> [--may deploy,jobs,prompt | all] [--memory 40G]: the code the agent showed the person; what the credential may do (all when not said); the most device memory its workloads may hold together (no share when not said)";
     let Some(code) = args.first() else { fail(USAGE) };
     let (mut may, mut memory) = (None::<String>, None::<u64>);
     let mut rest = args[1..].iter();
@@ -566,16 +563,7 @@ mod tests {
     /// A peer over the fakes: the hardware given, a registry that serves the engines' images, and a signed-in
     /// agent. `log` carries a previous run's log across a restart.
     async fn bed(gpu: Arc<best_peer_gpu::Fake>, log: Arc<EventLog>, runtime: Arc<best_peer_runtime::Fake>) -> Bed {
-        bed_at(gpu, log, runtime, "engines.local").await
-    }
-
-    /// The same, with the engines reached at `engine_host`: `127.0.0.1` for a test that stands in for one.
-    async fn bed_at(
-        gpu: Arc<best_peer_gpu::Fake>,
-        log: Arc<EventLog>,
-        runtime: Arc<best_peer_runtime::Fake>,
-        engine_host: &str,
-    ) -> Bed {
+        let engine_host = "engines.local";
         bed_with(
             gpu,
             log,
@@ -653,6 +641,7 @@ mod tests {
                 ready: Duration::from_secs(1),
                 load: Duration::from_secs(1),
                 unload: Duration::from_secs(1),
+                prompt: Duration::from_secs(1),
             },
             holdings.clone(),
         )
@@ -674,9 +663,7 @@ mod tests {
         );
         let door = Arc::new(super::door(peer.clone(), workspaces.clone(), auth.clone()));
         best_peer_door::resume(&door).await;
-        let app = best_peer_door::router(door.clone())
-            .merge(endpoint::router(peer.clone(), auth))
-            .merge(workspaces.router());
+        let app = best_peer_door::router(door.clone()).merge(workspaces.router());
         let key = key(&app).await;
         Bed {
             door,
@@ -958,9 +945,7 @@ mod tests {
         let door = Arc::new(super::door(peer.clone(), workspaces.clone(), auth.clone()));
         best_peer_door::resume(&door).await;
         workspaces.start().await;
-        let app = best_peer_door::router(door)
-            .merge(endpoint::router(peer, auth.clone()))
-            .merge(workspaces.router());
+        let app = best_peer_door::router(door).merge(workspaces.router());
         let key = key(&app).await;
         Site {
             app,
@@ -1089,14 +1074,12 @@ mod tests {
         }
     }
 
-    /// Two members: `a` with a 24 GiB card whose engine is an echo on loopback, `b` with an 8 GiB card.
+    /// Two members: `a` with a 24 GiB card, `b` with an 8 GiB card, each over the fakes.
     async fn two_members() -> (Bed, Bed) {
-        let port = echo_engine().await;
-        let a = bed_at(
+        let a = bed(
             card(),
             Arc::new(EventLog::ephemeral()),
-            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![]).publishes(11434, port)),
-            "127.0.0.1",
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
         )
         .await;
         let small = Arc::new(
@@ -1264,15 +1247,17 @@ mod tests {
         let started = &events[3]["data"];
         assert_eq!(started["device"], "lab/a/gpu-0");
         let dep = started["deployment"].as_str().unwrap().to_string();
-        assert_eq!(
-            events[6]["data"]["endpoint"],
-            format!("{EP}/workspaces/{ws1}/deployments/{dep}/v1")
+        assert_eq!(events[6]["type"], "DeploymentReady");
+        assert_eq!(events[6]["data"]["peer"], "a", "the ready fact names the member");
+        assert!(
+            events[6]["data"].get("endpoint").is_none(),
+            "nothing of the engine is on the door"
         );
         let w1 = site.query(&ws1, "get-workloads").await;
         assert_eq!(w1["deployments"][0]["cloud"], "lab");
         assert_eq!(w1["deployments"][0]["peer"], "a");
         assert_eq!(w1["deployments"][0]["device"], "lab/a/gpu-0");
-        assert_eq!(w1["deployments"][0]["endpoint"], events[6]["data"]["endpoint"]);
+        assert_eq!(w1["deployments"][0]["phase"], "ready");
         // The member runs it under its own device name.
         assert_eq!(
             site.members[0].query("get-workloads").await["deployments"][0]["device"],
@@ -1315,32 +1300,32 @@ mod tests {
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert_eq!(e["error"]["code"], "NO_SUCH_DEPLOYMENT");
         assert_eq!(e["error"]["details"]["live"], json!([]));
-        let (s, _) = get_as(
+        let ask = json!({ "deployment": dep, "messages": [{ "role": "user", "content": "hi" }] });
+        let (s, e) = site.send(&ws2, "p0", "Prompt", "prompt", ask.clone()).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(e["error"]["code"], "NO_SUCH_DEPLOYMENT");
+        // A prompt in the first workspace is placed on the member that holds the deployment, and the answer comes
+        // back on the workspace's stream with the cloud and the peer named.
+        let (s, b) = site.send(&ws1, "p1", "Prompt", "prompt", ask).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let answered = events_as(
             &site.app,
-            &format!("/workspaces/{ws2}"),
+            &format!("/workspaces/{ws1}"),
             &site.key,
-            &format!("/deployments/{dep}/v1/models"),
+            "p1",
+            "PromptAnswered",
         )
         .await;
-        assert_eq!(s, StatusCode::NOT_FOUND);
-        // A prompt through the first workspace's endpoint reaches the model on the member, the credential ending at
-        // the door.
-        let res = site
-            .app
-            .clone()
-            .oneshot(
-                Request::post(format!("/workspaces/{ws1}/deployments/{dep}/v1/chat/completions"))
-                    .header(header::AUTHORIZATION, format!("Bearer {}", site.key))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"model":"llama3.2:3b","messages":[]}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let seen = body(res).await;
-        assert_eq!(seen["path"], "/v1/chat/completions");
-        assert_eq!(seen["saw_credential"], false);
+        let last = answered.last().unwrap();
+        assert_eq!(last["type"], "PromptAnswered");
+        assert_eq!(last["data"]["content"], "fake answer to: hi");
+        assert_eq!(last["data"]["cloud"], "lab");
+        assert_eq!(last["data"]["peer"], "a");
+        assert_eq!(last["data"]["deployment"], dep);
+        assert!(last["dataschema"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("{EP}/workspaces/{ws1}/")));
 
         // A placement names its cloud: by name, by the device, or not at all, which is refused with the clouds.
         let (s, e) = site.deploy(&ws2, "d2", None, 4, None).await;
@@ -2617,9 +2602,7 @@ mod tests {
             log,
         );
         let door = Arc::new(super::door(peer.clone(), workspaces.clone(), auth.clone()));
-        let app = best_peer_door::router(door)
-            .merge(endpoint::router(peer, auth))
-            .merge(workspaces.router());
+        let app = best_peer_door::router(door).merge(workspaces.router());
         let handle = axum_server::Handle::new();
         tokio::spawn(serve_on(listener, app, Some(config), handle.clone()));
         handle.listening().await;
@@ -2709,7 +2692,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_deploy_is_every_transition_on_the_stream_then_a_prompt_endpoint_and_an_undeploy_frees_the_device() {
+    async fn a_deploy_is_every_transition_on_the_stream_then_a_prompt_answered_and_an_undeploy_frees_the_device() {
         let bed = fresh().await;
         let (s, b) = bed.deploy("d1", "llama3.2:3b", "ollama", 8).await;
         assert_eq!(s, StatusCode::CREATED, "{b}");
@@ -2736,11 +2719,8 @@ mod tests {
         assert_eq!(events[1].data["progress_pct"], 100, "a pull that completed is 100");
         assert_eq!(events[4].data["progress_pct"], 25);
         let ready = &events[6].data;
-        assert_eq!(
-            ready["endpoint"],
-            format!("{EP}/deployments/{}/v1", started["deployment"].as_str().unwrap()),
-            "on the door, under the deployment"
-        );
+        assert_eq!(ready["engine"], "ollama");
+        assert!(ready.get("endpoint").is_none(), "nothing of the engine is on the door");
         assert_eq!(ready["deployment"], started["deployment"]);
         assert!(events.iter().all(|e| e.dataschema.as_deref().unwrap().starts_with(EP)));
         // The container runs the recipe on the device, and the engine loaded the model at the base the event names.
@@ -2756,9 +2736,23 @@ mod tests {
         );
         let w = bed.query("get-workloads").await;
         assert_eq!(w["deployments"][0]["phase"], "ready");
-        assert_eq!(w["deployments"][0]["endpoint"], ready["endpoint"]);
+        assert!(w["deployments"][0].get("endpoint").is_none());
 
         let dep = started["deployment"].as_str().unwrap();
+        // The one way to the model: a prompt command, answered as a fact.
+        let (s, b) = bed
+            .send(
+                "p1",
+                "Prompt",
+                "prompt",
+                json!({ "deployment": dep, "messages": [{ "role": "user", "content": "Say hello" }] }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let answered = bed.events_of("p1", "PromptAnswered").await;
+        assert_eq!(answered[0].data["content"], "fake answer to: Say hello");
+        assert_eq!(bed.engine.prompted_at("http://engines.local:41434").len(), 1);
+
         let (s, b) = bed
             .send("u1", "UndeployModel", "undeploy-model", json!({ "deployment": dep }))
             .await;
@@ -2820,210 +2814,174 @@ mod tests {
         assert_eq!(bed.deploy("d4", "tiny:1b", "ollama", 2).await.0, StatusCode::CREATED);
     }
 
-    /// An engine stand-in on a loopback port of its own: answers every request with what reached it.
-    async fn echo_engine() -> u16 {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let app = axum::Router::new().fallback(|req: axum::extract::Request| async move {
-            let (parts, body) = req.into_parts();
-            let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap();
-            axum::Json(json!({
-                "method": parts.method.as_str(),
-                "path": parts.uri.path(),
-                "query": parts.uri.query(),
-                "saw_credential": parts.headers.contains_key("X-Api-Key") || parts.headers.contains_key(header::AUTHORIZATION),
-                "headers": parts.headers.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
-                "body": String::from_utf8_lossy(&bytes),
-            }))
-        });
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        port
-    }
-
-    /// A loopback port nothing listens on.
-    fn closed_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    }
-
     #[tokio::test]
-    async fn the_endpoint_is_on_the_door_behind_its_credential_and_passes_prompts_through_to_the_engine() {
-        let port = echo_engine().await;
-        let bed = bed_at(
-            card(),
-            Arc::new(EventLog::ephemeral()),
-            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![]).publishes(11434, port)),
-            "127.0.0.1",
+    async fn a_prompt_is_a_command_on_the_door_and_nothing_of_the_engine_is() {
+        let bed = fresh().await;
+        let dep = bed.deployed("d1", "llama3.2:3b", 8).await;
+        let ask = |content: &str| json!({ "deployment": dep, "messages": [{ "role": "system", "content": "be brief" }, { "role": "user", "content": content }] });
+        // The prompt is accepted at ingest and answered as a fact under its own correlation id.
+        let (s, b) = bed.send("p1", "Prompt", "prompt", ask("Say hello")).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let events = bed.events_of("p1", "PromptAnswered").await;
+        assert_eq!(types(&events), vec!["PromptAnswered"]);
+        let answered = &events[0].data;
+        assert_eq!(answered["deployment"], dep);
+        assert_eq!(answered["model"], "llama3.2:3b");
+        assert_eq!(answered["content"], "fake answer to: Say hello");
+        assert_eq!(answered["finish"], "stop");
+        assert_eq!(answered["prompt_tokens"], 4);
+        // The engine was asked where its port is bound, with the whole conversation, and nowhere else.
+        let asked = bed.engine.prompted_at("http://engines.local:41434");
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].0, "llama3.2:3b");
+        assert_eq!(asked[0].1.len(), 2);
+        assert_eq!(asked[0].1[1].content, "Say hello");
+        // The door has no inference endpoint: nothing answers under the deployment, with or without the credential.
+        for (path, key) in [
+            (format!("/deployments/{dep}/v1/models"), Some(bed.key.as_str())),
+            (
+                format!("/deployments/{dep}/v1/chat/completions"),
+                Some(bed.key.as_str()),
+            ),
+            (format!("/deployments/{dep}"), None),
+        ] {
+            let mut req = Request::get(&path);
+            if let Some(k) = key {
+                req = req.header("X-Api-Key", k);
+            }
+            let res = bed.app.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+        // A prompt that does not fit the schema is refused with the field.
+        let (s, b) = bed.send("p2", "Prompt", "prompt", json!({ "deployment": dep })).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(b["error"]["code"], "SCHEMA_VALIDATION");
+        assert!(b["error"]["message"].as_str().unwrap().contains("messages"), "{b}");
+        // A deployment nobody made, refused at ingest with what to do.
+        let (s, b) = bed
+            .send(
+                "p3",
+                "Prompt",
+                "prompt",
+                json!({ "deployment": "dep-nope", "messages": [{ "role": "user", "content": "hi" }] }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(b["error"]["code"], "NO_SUCH_DEPLOYMENT");
+        assert!(b["error"]["message"].as_str().unwrap().contains("deploy-model"), "{b}");
+        // The scope: a credential approved to deploy and not to prompt is refused by name; one approved to prompt
+        // alone cannot deploy.
+        let deploys = key_with(&bed.app, Some("deploy"), None).await;
+        let (s, b) = send_as(&bed.app, "", &deploys, "p4", "Prompt", "prompt", ask("hi")).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(b["error"]["code"], "FORBIDDEN");
+        assert!(b["error"]["message"].as_str().unwrap().contains("prompt"), "{b}");
+        let prompts = key_with(&bed.app, Some("prompt"), None).await;
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &prompts,
+            "d9",
+            "DeployModel",
+            "deploy-model",
+            json!({ "model": "m", "engine": "ollama", "memory_bytes": GB }),
         )
         .await;
-        let dep = bed.deployed("d1", "llama3.2:3b", 8).await;
-        assert_eq!(
-            bed.query("get-workloads").await["deployments"][0]["endpoint"],
-            format!("{EP}/deployments/{dep}/v1")
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(b["error"]["code"], "FORBIDDEN");
+        // And another holder's deployment is not theirs to prompt.
+        let (s, b) = send_as(&bed.app, "", &prompts, "p5", "Prompt", "prompt", ask("hi")).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(b["error"]["code"], "FORBIDDEN");
+        assert!(
+            b["error"]["message"].as_str().unwrap().contains("another credential"),
+            "{b}"
         );
-        let path = format!("/deployments/{dep}/v1/chat/completions?stream=true");
-        let prompt = |headers: Vec<(&'static str, String)>| {
-            let mut req = Request::post(&path).header(header::CONTENT_TYPE, "application/json");
-            for (name, value) in headers {
-                req = req.header(name, value);
-            }
-            req.body(Body::from(r#"{"model":"llama3.2:3b","messages":[]}"#))
-                .unwrap()
-        };
-        // No credential: the door's refusal, and nothing reaches the engine.
-        let res = bed.app.clone().oneshot(prompt(vec![])).await.unwrap();
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(body(res).await["error"]["code"], "UNAUTHORIZED");
-        // The door's own header: the request reaches the engine as the client made it, less the credential.
-        let res = bed
-            .app
-            .clone()
-            .oneshot(prompt(vec![("X-Api-Key", bed.key.clone())]))
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let seen = body(res).await;
-        assert_eq!(seen["method"], "POST");
-        assert_eq!(seen["path"], "/v1/chat/completions");
-        assert_eq!(seen["query"], "stream=true");
-        assert_eq!(seen["body"], r#"{"model":"llama3.2:3b","messages":[]}"#);
-        assert_eq!(seen["saw_credential"], false, "the credential ends at the door");
-        // The header the OpenAI-compatible clients send, in whichever case.
-        for scheme in ["Bearer", "bearer"] {
-            let res = bed
-                .app
-                .clone()
-                .oneshot(prompt(vec![("authorization", format!("{scheme} {}", bed.key))]))
-                .await
-                .unwrap();
-            assert_eq!(res.status(), StatusCode::OK, "{scheme}");
-        }
-        // What the client encoded reaches the engine encoded, and what governs one connection stops at the hop.
-        let res = bed
-            .app
-            .clone()
-            .oneshot(
-                Request::get(format!("/deployments/{dep}/v1/a%20b/models%3Ffoo=bar"))
-                    .header("X-Api-Key", &bed.key)
-                    .header("connection", "close, x-secret")
-                    .header("x-secret", "s")
-                    .header("te", "trailers")
-                    .header("x-request-id", "r1")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let seen = body(res).await;
-        assert_eq!(seen["path"], "/v1/a%20b/models%3Ffoo=bar");
-        assert_eq!(seen["query"], Value::Null);
-        let names: Vec<&str> = seen["headers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert!(names.contains(&"x-request-id"), "{names:?}");
-        // Host is the engine's, set by the door's own client, not the door's as the client sent it.
-        for gone in ["connection", "x-secret", "te", "x-api-key"] {
-            assert!(!names.contains(&gone), "{gone} crossed: {names:?}");
-        }
-        // The deployment's base itself, with or without the slash, is the engine's root.
-        for base in [format!("/deployments/{dep}"), format!("/deployments/{dep}/")] {
-            let res = bed
-                .app
-                .clone()
-                .oneshot(
-                    Request::get(&base)
-                        .header("X-Api-Key", &bed.key)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(res.status(), StatusCode::OK, "{base}");
-            assert_eq!(body(res).await["path"], "/", "{base}");
-        }
-        let res = bed
-            .app
-            .clone()
-            .oneshot(Request::get("/deployments/dep-nope").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(
-            res.status(),
-            StatusCode::UNAUTHORIZED,
-            "the credential comes before the lookup"
-        );
-        // A wrong credential is refused like a missing one.
-        let res = bed
-            .app
-            .clone()
-            .oneshot(prompt(vec![("authorization", "Bearer bp_nope".into())]))
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-        // A deployment nobody made.
-        let res = bed
-            .app
-            .clone()
-            .oneshot(
-                Request::get("/deployments/dep-nope/v1/models")
-                    .header("X-Api-Key", &bed.key)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::NOT_FOUND);
-        assert_eq!(body(res).await["error"]["code"], "NO_SUCH_DEPLOYMENT");
-        // Once an undeploy is accepted the promise ends, before the engine is gone.
+        // Once the deployment is gone, so is the thing to prompt.
         let (s, _) = bed
             .send("u1", "UndeployModel", "undeploy-model", json!({ "deployment": dep }))
             .await;
         assert_eq!(s, StatusCode::CREATED);
         bed.events_of("u1", "Undeployed").await;
-        let res = bed
-            .app
-            .clone()
-            .oneshot(prompt(vec![("X-Api-Key", bed.key.clone())]))
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let (s, b) = bed.send("p6", "Prompt", "prompt", ask("hi")).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(b["error"]["code"], "NO_SUCH_DEPLOYMENT");
     }
 
     #[tokio::test]
-    async fn an_engine_that_does_not_answer_is_a_bad_gateway_with_the_fix() {
-        let bed = bed_at(
-            card(),
-            Arc::new(EventLog::ephemeral()),
-            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![]).publishes(11434, closed_port())),
-            "127.0.0.1",
-        )
-        .await;
-        let dep = bed.deployed("d1", "llama3.2:3b", 8).await;
-        let res = bed
-            .app
-            .clone()
-            .oneshot(
-                Request::get(format!("/deployments/{dep}/v1/models"))
-                    .header("X-Api-Key", &bed.key)
-                    .body(Body::empty())
-                    .unwrap(),
+    async fn a_deployment_that_is_starting_is_not_yet_to_prompt_and_says_what_to_follow() {
+        let bed = fresh().await;
+        // A deployment whose engine is still coming up, as the state holds it between DeploymentStarted and ready.
+        let dep = "dep-starting".to_string();
+        bed.peer.state.lock().unwrap().deployments.insert(
+            dep.clone(),
+            state::Deployment {
+                id: dep.clone(),
+                model: "llama3.2:3b".into(),
+                engine: best_peer_engine::Kind::Ollama,
+                device: "gpu-0".into(),
+                memory_bytes: 8 * GB,
+                container: ContainerId("c-starting".into()),
+                port: 41434,
+                ready: false,
+                holder: String::new(),
+                correlation: "d-starting".into(),
+                phase: state::Phase::Starting,
+                peer: None,
+            },
+        );
+        let (s, b) = bed
+            .send(
+                "p1",
+                "Prompt",
+                "prompt",
+                json!({ "deployment": dep, "messages": [{ "role": "user", "content": "hi" }] }),
             )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
-        let b = body(res).await;
-        assert_eq!(b["error"]["code"], "ENGINE_UNREACHABLE");
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "DEPLOYMENT_NOT_READY");
         assert!(
-            b["error"]["message"].as_str().unwrap().contains("DeploymentEnded"),
+            b["error"]["message"].as_str().unwrap().contains("DeploymentReady"),
             "{b}"
         );
+        assert_eq!(b["error"]["details"]["deployment"], dep);
+        // A prompt over the schema's bounds is refused naming the field, never accepted and lost.
+        let (s, b) = bed
+            .send(
+                "p2",
+                "Prompt",
+                "prompt",
+                json!({ "deployment": dep, "messages": [{ "role": "user", "content": "hi" }], "max_tokens": 5_000_000_000u64 }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(b["error"]["code"], "SCHEMA_VALIDATION");
+        assert!(b["error"]["message"].as_str().unwrap().contains("max_tokens"), "{b}");
+    }
+
+    #[tokio::test]
+    async fn a_prompt_the_engine_does_not_answer_is_a_failed_prompt_with_the_fix() {
+        let bed = fresh().await;
+        let dep = bed.deployed("d1", "llama3.2:3b", 8).await;
+        bed.engine.down("http://engines.local:41434");
+        let (s, b) = bed
+            .send(
+                "p1",
+                "Prompt",
+                "prompt",
+                json!({ "deployment": dep, "messages": [{ "role": "user", "content": "hi" }] }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let events = bed.events_of("p1", "PromptFailed").await;
+        assert_eq!(types(&events), vec!["PromptFailed"]);
+        let failed = &events[0].data;
+        assert_eq!(failed["deployment"], dep);
+        assert!(
+            failed["reason"].as_str().unwrap().contains("did not answer"),
+            "{failed}"
+        );
+        assert_eq!(failed["fix"], "read the engine's logs on the host");
     }
 
     #[tokio::test]
@@ -3200,20 +3158,20 @@ mod tests {
             b["error"]["message"].as_str().unwrap().contains("another credential"),
             "{b}"
         );
-        // Nor its endpoint, its events, or its name in a refusal: the team reads what is the team's.
-        let res = bed
-            .app
-            .clone()
-            .oneshot(
-                Request::get(format!("/deployments/{owner_dep}/v1/models"))
-                    .header("X-Api-Key", &team)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(body(res).await["error"]["code"], "FORBIDDEN");
+        // Nor is it the team's to prompt, nor are its events or its name in a refusal: the team reads what is the
+        // team's.
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &team,
+            "p-team",
+            "Prompt",
+            "prompt",
+            json!({ "deployment": owner_dep, "messages": [{ "role": "user", "content": "hi" }] }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(b["error"]["code"], "FORBIDDEN");
         let events = |key: String, corr: &'static str| {
             let app = bed.app.clone();
             async move {
@@ -3329,7 +3287,10 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        assert_eq!(m["best"]["authentication"]["scopes"], json!(["deploy", "jobs"]));
+        assert_eq!(
+            m["best"]["authentication"]["scopes"],
+            json!(["deploy", "jobs", "prompt"])
+        );
     }
 
     #[tokio::test]

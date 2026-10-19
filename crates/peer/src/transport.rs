@@ -58,11 +58,6 @@ impl Http {
             client: Client::builder(TokioExecutor::new()).build(connector),
         })
     }
-
-    /// With the public roots alone: enough for the engines on this host, which are plain HTTP on loopback.
-    pub fn plain() -> Self {
-        Self::new(&[]).expect("the built-in roots load")
-    }
 }
 
 impl Transport for Http {
