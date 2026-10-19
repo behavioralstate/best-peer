@@ -3056,6 +3056,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_request_the_client_gave_up_on_is_still_a_line() {
+        let bed = fresh().await;
+        let holder = bed.door.auth.authenticate(&bed.key).unwrap().holder();
+        let app = logged(bed.app.clone());
+        let lines = logged_lines(async {
+            let never_ends = Request::post("/commands")
+                .header("X-Api-Key", &bed.key)
+                .header(header::CONTENT_TYPE, "application/cloudevents+json")
+                .body(Body::from_stream(futures::stream::pending::<
+                    Result<Vec<u8>, std::io::Error>,
+                >()))
+                .unwrap();
+            let gave_up = tokio::time::timeout(Duration::from_millis(50), app.clone().oneshot(never_ends)).await;
+            assert!(gave_up.is_err(), "the body never came, so no answer did");
+        })
+        .await;
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        for p in [
+            "request abandoned",
+            "method=POST",
+            "path=/commands",
+            "status=-",
+            &format!("holder={holder}"),
+        ] {
+            assert!(lines[0].contains(p), "{p} in {}", lines[0]);
+        }
+    }
+
+    #[tokio::test]
     async fn every_request_is_one_line_with_where_it_came_from_and_whose_it_was_never_the_key() {
         let bed = fresh().await;
         let team = key_with(&bed.app, Some("deploy"), None).await;

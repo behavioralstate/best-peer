@@ -158,9 +158,16 @@ host changes or fewer than thirty days of it remain, which the start-up line say
 `~/.best-peer`) holds the event log, the credentials as hashes, the admin token, that certificate, and the record of
 where the door is that `best-peer approve` reads, so it reaches the peer over the same TLS, pinned to that
 certificate and no other.
-Every request to the door, a workspace's included, is one line in the peer's log at info: where it came from, the
-method and the path as it arrived (never the query string), the status, the holder when a credential opened it,
-refused or not, and how long the answer took. The key is never in it.
+Every request to the door, a workspace's included, is one line in the peer's log at info: where it came from (the
+client's address and port, so the log holds the addresses of everyone who reached the door), the method and the
+path as it arrived (never the query string), the status, the holder when a credential opened it, refused or not,
+and how long the answer took. The key is never in it. A request the client gave up on before its answer is a line
+too, `request abandoned` with the status `-`; an event stream's line is written when it opens, and its `ms` is the
+time to the headers, not how long it stayed open. The log is loud by design: an agent's polls, a cloud's ticks and
+every stream reconnect are lines. The lines are under the target `best_peer_door::router`, so
+`RUST_LOG=info,best_peer_door::router=warn` quiets them and keeps everything else. The peer writes its log to
+stderr and keeps no file of its own: the record lasts as long as whatever runs the peer keeps stderr (journald under
+systemd, by its own size and age limits), so an operator who counts on it as an audit trail sets that retention.
 
 Every door hosts **workspaces**, the BEST tenants. The root manifest declares their template
 (`/.well-known/best/{tenantId}`), and a workspace's own door is at `/workspaces/<id>` under the root, with its own

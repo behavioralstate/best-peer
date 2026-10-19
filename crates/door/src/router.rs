@@ -93,27 +93,48 @@ impl Answered {
 
 /// One line per request, at info, once it is answered: where it came from when the transport said, what it asked
 /// (the method and the path as it arrived, without the query string), what it got, the holder when a credential
-/// opened it, refused or not, and how long the answer took. The headers and the body are never in it: a key travels
-/// in a header, and the line never carries one. Layered once, around everything a door serves, workspaces included.
+/// opened it, refused or not, and how long the answer took. A request the client gave up on before its answer is
+/// still a line, with the status `-` and `abandoned`. For an event stream the line is written when the stream
+/// opens, and `ms` is the time to its headers, not how long it stayed open. The headers and the body are never in
+/// it: a key travels in a header, and the line never carries one. Layered once, around everything a door serves,
+/// workspaces included.
 pub async fn access_log(from: Option<ConnectInfo<SocketAddr>>, mut req: Request, next: Next) -> Response {
     let answered = Answered::default();
     req.extensions_mut().insert(answered.clone());
-    let method = req.method().clone();
-    let path = req.uri().path().to_string();
-    let started = Instant::now();
+    let mut line = Line {
+        from: from.map(|c| c.0.to_string()).unwrap_or_else(|| "-".into()),
+        method: req.method().to_string(),
+        path: req.uri().path().to_string(),
+        answered,
+        started: Instant::now(),
+        status: None,
+    };
     let res = next.run(req).await;
-    let from = from.map(|c| c.0.to_string()).unwrap_or_else(|| "-".into());
-    let holder = answered.0.get().map(String::as_str).unwrap_or("-");
-    tracing::info!(
-        %from,
-        %method,
-        %path,
-        status = res.status().as_u16(),
-        %holder,
-        ms = started.elapsed().as_millis() as u64,
-        "request"
-    );
+    line.status = Some(res.status().as_u16());
     res
+}
+
+/// The access log's line for one request, written when it is dropped: after the answer, or when the client went
+/// away before one.
+struct Line {
+    from: String,
+    method: String,
+    path: String,
+    answered: Answered,
+    started: Instant,
+    status: Option<u16>,
+}
+
+impl Drop for Line {
+    fn drop(&mut self) {
+        let holder = self.answered.0.get().map(String::as_str).unwrap_or("-");
+        let ms = self.started.elapsed().as_millis() as u64;
+        let (from, method, path) = (&self.from, &self.method, &self.path);
+        match self.status {
+            Some(status) => tracing::info!(%from, %method, %path, status, %holder, ms, "request"),
+            None => tracing::info!(%from, %method, %path, status = %"-", %holder, ms, "request abandoned"),
+        }
+    }
 }
 
 async fn require_key(State(door): State<Shared>, mut req: Request, next: Next) -> Response {
