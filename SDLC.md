@@ -11,11 +11,12 @@
   spec follow-ups issue, never a silent patch and never a spec change up front.
 - Ambiguity is resolved by reading the spec and the running code, never by guessing.
 - The board's Status says where each issue is:
-  - **In progress** from the first change, before it is made, while the work is built and its pull requests are
-    open.
-  - **In review** once its code is merged and released, when all that is left is the proof on a host or the owner's
+  - **In progress** from the first change, before it is made, until its code is in a release: while the work is
+    built, while its pull requests are open, and after they merge until the release that carries them.
+  - **In review** once its code is in a release, when all that is left is the proof on a host or the owner's
     acceptance.
-  - **Done** when the issue closes, every "Done when" ticked.
+  - **Done** when the issue closes, every "Done when" ticked. An issue with nothing to prove on a host or for the
+    owner to accept closes when its last pull request merges, and goes from In progress to Done.
   - An epic moves to **Ready** as soon as any of its issues has started.
 
 ## 2. Design rules every change is held to
