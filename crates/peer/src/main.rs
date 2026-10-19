@@ -1899,6 +1899,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_order_asking_for_a_user_namespace_waits_for_the_member_that_offers_it_though_another_has_room() {
+        let a = bed(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        let small = Arc::new(
+            best_peer_gpu::Fake::new()
+                .with_driver("fake 1.0")
+                .with_device(best_peer_gpu::Fake::cuda_card("gpu-0", "Card B", 8, "12.4")),
+        );
+        let b = bed(
+            small,
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(
+                best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])
+                    .with_isolation(best_peer_runtime::Isolation::UserNamespace),
+            ),
+        )
+        .await;
+        let (key_a, key_b) = (a.key.clone(), b.key.clone());
+        let site = site(vec![(A, a), (B, b)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a), ("b", B, &key_b)])
+            .await;
+        let lab = site.live_cloud(&ws, "lab");
+        site.order(&ws, "j1", 4, json!({ "isolation": "user-namespace" })).await;
+        let first = site.events(&ws, "j1", "JobStarted").await.last().unwrap()["data"].clone();
+        assert_eq!(first["peer"], "b");
+        // 6 GiB more does not fit b now; a has the room and not the isolation: the order waits for b.
+        let waits = site.order(&ws, "j2", 6, json!({ "isolation": "user-namespace" })).await;
+        assert_eq!(waits["waiting"], true);
+        assert_eq!(waits["isolation"], "user-namespace", "the ask is on the order");
+        lab.step(later(0)).await;
+        assert_eq!(
+            facts(&site.events(&ws, "j2", "JobQueued").await),
+            ["JobQueued"],
+            "not placed on a"
+        );
+        // b's job ends: the order is placed there.
+        let container = ContainerId(first["container"].as_str().unwrap().into());
+        site.members[1].runtime.stop(&container).await.unwrap();
+        site.events(&ws, "j1", "JobFinished").await;
+        lab.step(later(0)).await;
+        let placed = site.events(&ws, "j2", "JobStarted").await;
+        assert_eq!(placed.last().unwrap()["data"]["peer"], "b");
+    }
+
+    #[tokio::test]
+    async fn a_member_that_says_nothing_of_isolation_offers_a_process_and_is_refused_for_more() {
+        use axum::routing::get;
+        let (a, b) = two_members().await;
+        let site = site(vec![(A, a), (B, b)]).await;
+        // A member from before isolation was reported: its devices say nothing of it.
+        const OLD: &str = "https://old.test";
+        let old = axum::Router::new()
+            .route(
+                "/queries/get-workloads",
+                get(|| async { axum::Json(json!({ "deployments": [], "jobs": [] })) }),
+            )
+            .route(
+                "/queries/get-hardware-state",
+                get(|| async {
+                    axum::Json(json!({ "driver": "fake 1.0", "observed_at": "2026-10-19T00:00:00Z", "devices": [
+                        { "id": "gpu-0", "vendor": "nvidia", "name": "Old card", "memory": { "total_bytes": 24 * GB, "free_bytes": 24 * GB }, "compute": [{ "api": "cuda", "version": "12.4" }] }
+                    ] }))
+                }),
+            );
+        let old_down = site.switchboard.connect(OLD, old);
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("old", OLD, "a-key")]).await;
+        let hs = site.query(&ws, "get-hardware-state").await;
+        assert_eq!(hs["devices"][0]["id"], "lab/old/gpu-0", "{hs}");
+        assert_eq!(hs["devices"][0]["isolation"], "process");
+        let (s, e) = site
+            .send(
+                &ws,
+                "j1",
+                "RunJob",
+                "run-job",
+                json!({ "cloud": "lab", "image": "busybox", "memory_bytes": GB, "isolation": "container" }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "ISOLATION_UNAVAILABLE");
+        assert_eq!(e["error"]["details"]["offered"], json!(["process"]));
+        // No member answers: nothing to judge the ask by, and the refusal says why nothing can run.
+        old_down.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (s, e) = site
+            .send(
+                &ws,
+                "j2",
+                "RunJob",
+                "run-job",
+                json!({ "cloud": "lab", "image": "busybox", "isolation": "container" }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "NO_PEER");
+    }
+
+    #[tokio::test]
     async fn an_order_its_member_fails_before_it_started_ends_by_the_orders_id() {
         let (a, b) = two_members().await;
         let key_a = a.key.clone();

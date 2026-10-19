@@ -450,7 +450,11 @@ mod tests {
         s.apply(&ev(
             "JobQueued",
             "c1",
-            queued("job-1", 1, json!({ "queue_seconds": 60 })),
+            queued(
+                "job-1",
+                1,
+                json!({ "queue_seconds": 60, "isolation": "user-namespace" }),
+            ),
         ));
         s.apply(&ev("JobQueued", "c2", queued("job-2", 1, json!({}))));
         assert_eq!(
@@ -460,6 +464,12 @@ mod tests {
         );
         assert_eq!(s.orders["job-1"].args, ["a"]);
         assert_eq!(s.orders["job-1"].queue_seconds, Some(60));
+        assert_eq!(
+            s.orders["job-1"].isolation,
+            Some(best_peer_runtime::Isolation::UserNamespace),
+            "the ask is folded, so it holds after a restart"
+        );
+        assert_eq!(s.orders["job-2"].isolation, None);
         s.apply(&ev(
             "JobPlaced",
             "c1",

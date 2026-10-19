@@ -147,7 +147,6 @@ pub enum RuntimeError {
     Engine(String),
 }
 
-/// What the door needs from a container engine.
 /// What stands between a workload and the host and the other workloads on it, weakest first, so a workload that asks
 /// for one is placed only where at least that is offered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -200,6 +199,7 @@ impl Isolation {
     }
 }
 
+/// What the door needs from a container engine.
 #[async_trait]
 pub trait Runtime: Send + Sync {
     /// Makes the image present, telling `progress` as it goes: from the registry, whether or not it is held.

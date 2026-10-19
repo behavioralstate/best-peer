@@ -727,16 +727,22 @@ impl Cloud {
             .map(|m| m.name.clone())
     }
 
-    /// `host` held to `asked`: the devices that offer it, or the refusal naming what the cloud's members offer.
+    /// `host`, the devices a credential may use, held to `asked`: those that offer it, or the refusal naming what
+    /// those devices offer. With no device to judge (no member answers) nothing is refused here: what follows says
+    /// why nothing can be placed.
     fn held_to(&self, host: Host, isolations: &Isolations, asked: Option<Isolation>) -> Result<Host, BestError> {
         let held = Self::offering(&host, isolations, asked);
         match asked {
-            Some(a) if held.devices.is_empty() => {
-                let offered: Vec<Isolation> = isolations.values().copied().collect();
+            Some(a) if held.devices.is_empty() && !host.devices.is_empty() => {
+                let offered: Vec<Isolation> = host
+                    .devices
+                    .iter()
+                    .map(|d| isolations.get(&d.id.0).copied().unwrap_or(Isolation::Process))
+                    .collect();
                 Err(isolation_refused(
                     a,
                     &offered,
-                    &format!("no device of cloud {}: its members", self.name),
+                    &format!("cloud {}'s members", self.name),
                 ))
             }
             _ => Ok(held),
@@ -1674,6 +1680,11 @@ impl Cloud {
             body["memory_bytes"] = json!(m);
             body["device"] = json!(member_device);
         }
+        // The member checks the ask against its own engine as it is now, which may have changed since it was read.
+        // Only above process: a member older than isolation takes nothing more, and refuses a field it does not know.
+        if let Some(i) = o.isolation.filter(|i| *i > Isolation::Process) {
+            body["isolation"] = json!(i);
+        }
         let mc = order_correlation(o);
         let base = member.schema_base().await;
         let envelope = self.to_member_as(&base, &mc, "RunJob", "run-job", body);
@@ -1881,7 +1892,13 @@ impl Service for Cloud {
                 &em,
                 "DeployModel",
                 "deploy-model",
-                json!({ "model": data.model, "engine": data.engine, "memory_bytes": data.memory_bytes, "device": member_device }),
+                {
+                    let mut body = json!({ "model": data.model, "engine": data.engine, "memory_bytes": data.memory_bytes, "device": member_device });
+                    if let Some(i) = data.isolation.filter(|i| *i > Isolation::Process) {
+                        body["isolation"] = json!(i);
+                    }
+                    body
+                },
             )
             .await;
         if let Err(e) = placed {
