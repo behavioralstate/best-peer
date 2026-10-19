@@ -32,8 +32,12 @@ use crate::{manifest, Door};
 
 type Shared = Arc<Door>;
 
-/// The most a request body may carry: a command is a few kilobytes, a form a few hundred bytes.
-const MAX_BODY: usize = 256 * 1024;
+/// The most a request body may carry: a command is a few kilobytes, a prompt's conversation more, a form a few
+/// hundred bytes.
+pub const MAX_BODY: usize = 256 * 1024;
+/// What a tenant's door keeps below [`MAX_BODY`]: a workspace's cloud passes a command on to a member's door in an
+/// envelope of its own, and whatever the cloud took, the member takes.
+pub const TENANT_ROOM: usize = 4 * 1024;
 
 pub fn router(door: Shared) -> Router {
     let public = Router::new()
@@ -42,13 +46,13 @@ pub fn router(door: Shared) -> Router {
         .route("/auth/token", post(token))
         .route("/auth/verify", get(verify))
         .route("/auth/approve", post(approve));
-    shaped(public.merge(protected(&door)), door)
+    shaped(public.merge(protected(&door)), door, MAX_BODY)
 }
 
 /// The routes of a tenant's door: the four capabilities behind the credential, and nothing public. The host mounts
 /// it under the tenant's endpoint, with the path below that endpoint, and serves the tenant's manifest itself.
 pub fn tenant_router(door: Shared) -> Router {
-    shaped(protected(&door), door)
+    shaped(protected(&door), door, MAX_BODY - TENANT_ROOM)
 }
 
 fn protected(door: &Shared) -> Router<Shared> {
@@ -66,12 +70,12 @@ fn protected(door: &Shared) -> Router<Shared> {
         .layer(middleware::from_fn_with_state(door.clone(), require_key))
 }
 
-/// Every refusal in the BEST shape, the body bounded, an unknown route named.
-fn shaped(routes: Router<Shared>, door: Shared) -> Router {
+/// Every refusal in the BEST shape, the body bounded at `limit` bytes, an unknown route named.
+fn shaped(routes: Router<Shared>, door: Shared, limit: usize) -> Router {
     routes
         .fallback(unknown_route)
-        .layer(middleware::map_response(best_shaped))
-        .layer(DefaultBodyLimit::max(MAX_BODY))
+        .layer(middleware::map_response(move |res: Response| best_shaped(res, limit)))
+        .layer(DefaultBodyLimit::max(limit))
         .with_state(door)
 }
 
@@ -102,7 +106,7 @@ async fn unknown_route(req: Request) -> BestError {
 
 /// The framework answers some refusals on its own (a method the route lacks, a body over the limit, a query string
 /// it cannot read) in plain text; the spec wants every error in one shape, so those are rewritten here.
-async fn best_shaped(res: Response) -> Response {
+async fn best_shaped(res: Response, limit: usize) -> Response {
     let status = res.status();
     if !(status.is_client_error() || status.is_server_error()) {
         return res;
@@ -128,7 +132,7 @@ async fn best_shaped(res: Response) -> Response {
         StatusCode::PAYLOAD_TOO_LARGE => (
             "PAYLOAD_TOO_LARGE",
             format!(
-                "the body exceeds {MAX_BODY} bytes: send less in one command; for a prompt, fewer or shorter messages"
+                "the body exceeds {limit} bytes, the most this door takes: send less in one command; for a prompt, fewer or shorter messages"
             ),
         ),
         StatusCode::BAD_REQUEST => (
@@ -151,7 +155,11 @@ async fn best_shaped(res: Response) -> Response {
         s if s.is_server_error() => ("INTERNAL", "the door failed; try again".into()),
         _ => ("REFUSED", if text.is_empty() { status.to_string() } else { text }),
     };
-    let mut out = BestError::new(status, code, message).into_response();
+    let mut refusal = BestError::new(status, code, message);
+    if status == StatusCode::PAYLOAD_TOO_LARGE {
+        refusal = refusal.with_details(json!({ "limit_bytes": limit }));
+    }
+    let mut out = refusal.into_response();
     for (name, value) in parts
         .headers
         .iter()
@@ -216,6 +224,10 @@ struct ApproveForm {
     may: Option<String>,
     /// The most device memory the credential's workloads may hold together; absent for no share.
     memory_bytes: Option<u64>,
+    /// The most deployments the credential may run at once; absent for no count.
+    deployments: Option<u32>,
+    /// The most jobs the credential may run at once; absent for no count.
+    jobs: Option<u32>,
 }
 
 async fn approve(State(door): State<Shared>, headers: HeaderMap, body: Bytes) -> Result<Response, OAuthError> {
@@ -228,6 +240,8 @@ async fn approve(State(door): State<Shared>, headers: HeaderMap, body: Bytes) ->
                 .collect()
         }),
         memory_bytes: f.memory_bytes,
+        deployments: f.deployments,
+        jobs: f.jobs,
     };
     let admitted = door.auth.approve(f.user_code.trim(), f.proof.trim(), grant).await?;
     Ok(Json(json!({ "approved": true, "admitted": admitted })).into_response())
@@ -941,7 +955,8 @@ mod tests {
 
     #[tokio::test]
     async fn every_error_the_framework_answers_is_in_the_best_shape() {
-        let app = router(door());
+        let d = door();
+        let app = router(d.clone());
         let key = sign_in(&app, "test", "my-peer").await;
         let (s, _, b) = call(&app, get("/nothing/here", Some(&key))).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
@@ -965,6 +980,17 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(b["error"]["code"], "PAYLOAD_TOO_LARGE");
+        assert_eq!(b["error"]["details"]["limit_bytes"], MAX_BODY);
+        // A tenant's door takes a little less, so what a cloud took a member's door takes too.
+        let tenant = tenant_router(d.clone());
+        let near = "x".repeat(MAX_BODY - TENANT_ROOM);
+        let (s, _, b) = call(
+            &tenant,
+            post_json("/commands", &key, "application/json", json!({ "pad": near })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE, "{b}");
+        assert_eq!(b["error"]["details"]["limit_bytes"], MAX_BODY - TENANT_ROOM);
         let (s, _, b) = call(&app, get("/events?limit=0", Some(&key))).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert_eq!(b["error"]["details"]["parameter"], "limit");

@@ -25,7 +25,8 @@ use serde_json::{json, Value};
 use crate::domain::Service;
 use crate::holdings::Holdings;
 use crate::lifecycle::{
-    any_compute, mine, new_id, not_yours, parse, place, ready_deployment, require, within_share, workloads_view,
+    any_compute, has_share, mine, new_id, not_yours, parse, place, ready_deployment, require, within_count,
+    within_share, workloads_view,
 };
 use crate::member::{Heard, Member, Refusal};
 use crate::state::{JobPhase, Phase, Reservation, State};
@@ -250,8 +251,8 @@ impl Cloud {
         let weak = Arc::downgrade(&cloud);
         holdings.add(move |holder| {
             weak.upgrade()
-                .map(|c| c.state.lock().unwrap().held_by(holder))
-                .unwrap_or(0)
+                .map(|c| c.state.lock().unwrap().holdings_of(holder))
+                .unwrap_or_default()
         });
         cloud
     }
@@ -1166,9 +1167,10 @@ impl Service for Cloud {
         // One admission at a time across the door, and what the credential holds is read before the state is
         // locked, since the door's holdings read this state too.
         let _admitting = self.holdings.admitting();
-        let held = self.holdings.held_by(&who.holder());
+        let held = self.holdings.of(&who.holder());
         let mut state = self.state.lock().unwrap();
-        within_share(held, &who, data.memory_bytes)?;
+        within_share(held.memory_bytes, &who, data.memory_bytes)?;
+        within_count("deployment", held.deployments, who.grant.deployments)?;
         let (device, compute) = place(
             &host,
             &state,
@@ -1313,14 +1315,22 @@ impl Service for Cloud {
             )
             .with_details(json!({ "field": "memory_bytes" })));
         }
+        if has_share(&who) && data.memory_bytes.is_none() {
+            return Err(BestError::bad_request(
+                "JOB_NEEDS_DEVICE",
+                "this credential has a share, so its jobs run on a device, where the share counts them, never on the host with no device: send memory_bytes, the device memory the job needs",
+            )
+            .with_details(json!({ "field": "memory_bytes" })));
+        }
         if self.already_placed(&key).is_some() {
             return Ok(());
         }
         let (host, peers) = self.combined().await;
         let _admitting = self.holdings.admitting();
-        let held = self.holdings.held_by(&who.holder());
+        let held = self.holdings.of(&who.holder());
         let mut state = self.state.lock().unwrap();
-        within_share(held, &who, data.memory_bytes.unwrap_or(0))?;
+        within_share(held.memory_bytes, &who, data.memory_bytes.unwrap_or(0))?;
+        within_count("job", held.jobs, who.grant.jobs)?;
         let placement = match data.memory_bytes {
             Some(needed) => place(
                 &host,

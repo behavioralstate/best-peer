@@ -189,8 +189,8 @@ impl Peer {
         let weak = Arc::downgrade(self);
         self.holdings.add(move |holder| {
             weak.upgrade()
-                .map(|p| p.state.lock().unwrap().held_by(holder))
-                .unwrap_or(0)
+                .map(|p| p.state.lock().unwrap().holdings_of(holder))
+                .unwrap_or_default()
         });
     }
 
@@ -462,9 +462,10 @@ impl Peer {
         // One admission at a time across the door, and what the credential holds is read before the state is
         // locked, since the door's holdings read this state too.
         let _admitting = self.holdings.admitting();
-        let held = self.holdings.held_by(&who.holder());
+        let held = self.holdings.of(&who.holder());
         let mut state = self.state.lock().unwrap();
-        within_share(held, &who, data.memory_bytes)?;
+        within_share(held.memory_bytes, &who, data.memory_bytes)?;
+        within_count("deployment", held.deployments, who.grant.deployments)?;
         let (device, compute) = place(
             &host,
             &state,
@@ -792,14 +793,22 @@ impl Peer {
             )
             .with_details(json!({ "field": "memory_bytes" })));
         }
+        if has_share(&who) && data.memory_bytes.is_none() {
+            return Err(BestError::bad_request(
+                "JOB_NEEDS_DEVICE",
+                "this credential has a share, so its jobs run on a device, where the share counts them, never on the host with no device: send memory_bytes, the device memory the job needs",
+            )
+            .with_details(json!({ "field": "memory_bytes" })));
+        }
         let host = match data.memory_bytes {
             Some(_) => Some(self.hardware().await?),
             None => None,
         };
         let _admitting = self.holdings.admitting();
-        let held = self.holdings.held_by(&who.holder());
+        let held = self.holdings.of(&who.holder());
         let mut state = self.state.lock().unwrap();
-        within_share(held, &who, data.memory_bytes.unwrap_or(0))?;
+        within_share(held.memory_bytes, &who, data.memory_bytes.unwrap_or(0))?;
+        within_count("job", held.jobs, who.grant.jobs)?;
         let placement = match (data.memory_bytes, &host) {
             (Some(needed), Some(host)) => Some(place(
                 host,
@@ -1243,6 +1252,34 @@ pub(crate) fn within_share(held: u64, who: &Credential, needed: u64) -> Result<(
         ),
     )
     .with_details(json!({ "share_bytes": share, "held_bytes": held, "needed_bytes": needed, "room_bytes": share.saturating_sub(held) })))
+}
+
+/// Whether `who` was approved for a share of device memory. Such a credential runs its jobs on a device, where its
+/// share counts them: a job with no device would hold the host's memory and processors outside the share.
+pub(crate) fn has_share(who: &Credential) -> bool {
+    who.grant.memory_bytes.is_some()
+}
+
+/// A credential whose approver set a count runs `ceiling` workloads of `kind` at once across the door, `running` of
+/// them already, every workspace counted: one more is refused with what it runs and how to make room.
+pub(crate) fn within_count(kind: &str, running: usize, ceiling: Option<u32>) -> Result<(), BestError> {
+    let Some(ceiling) = ceiling.map(|c| c as usize) else {
+        return Ok(());
+    };
+    if running < ceiling {
+        return Ok(());
+    }
+    let (code, room) = match kind {
+        "job" => ("JOBS_EXCEEDED", "stop one or let one finish first"),
+        _ => ("DEPLOYMENTS_EXCEEDED", "undeploy one first"),
+    };
+    Err(BestError::bad_request(
+        code,
+        format!(
+            "this credential may run {ceiling} {kind}(s) at once and runs {running} across this door, every workspace counted: {room} (get-workloads on each door you use lists them), or ask whoever approved it for more"
+        ),
+    )
+    .with_details(json!({ "ceiling": ceiling, "running": running })))
 }
 
 /// A workload another credential holds is not this one's to end.

@@ -92,7 +92,8 @@ At your machine:
 Their client's next poll receives a key under that name. No accounts, no passwords: whoever controls the machine
 decides who is in, as with SSH keys, and what they may do: approved with nothing more said, a key may do everything;
 `--may deploy,prompt --memory 40G` makes one that may deploy models and prompt them but run no job, and hold 40 GiB
-of device memory at most across its workloads, which it alone sees, prompts and ends.
+of device memory at most across its workloads, which it alone sees, prompts and ends. `--deployments 2 --jobs 2` lets it
+run two of each at once at most.
 
 **4. More than one machine.** Run a peer on each, and one more `best-peer` anywhere as the door your team enters
 by: a laptop will do, with `BEST_PEER_GPU=none` and the runtime it has (`BEST_PEER_RUNTIME=fake` when it has none:
@@ -212,7 +213,9 @@ itself reaches the engines' ports, which are bound there and nowhere else whatev
 when the container engine is on this host, on that host's interfaces when it is elsewhere, so a container engine
 on another host sits on a network you trust. The peer alone reaches them: a prompt is a command on the door, and
 the peer carries it to the engine. Prompts are answered sixteen at a time per peer; the rest wait their turn,
-accepted, in order.
+accepted, in order. How many deployments and jobs a key runs at once is set when it is approved
+(`--deployments`, `--jobs`); a peer started with the old `BEST_PEER_DEPLOYMENTS_PER_HOLDER` or
+`BEST_PEER_JOBS_PER_HOLDER` refuses to start and says so.
 
 ## Deploy
 
@@ -265,7 +268,9 @@ Every command of this peer follows one pattern, and nothing else is needed to dr
    reads is the facts under its own correlations. A chain of commands under one correlation is one credential's. From that moment the
    command ends in a completing event, through a restart if need be: a command accepted and not yet run when the
    peer stops is run when it starts again, through the same state check, or failed with a `CommandFailed` that
-   says why; one whose workload had already started and did not survive the restart is failed with the fix.
+   says why; one whose workload had already started and did not survive the restart is failed with the fix. The
+   door keeps the command whole until it completes, then only its id, hash and correlation, which still answer a
+   retry as before, in memory and after a restart alike.
 2. Everything that happens is an event carrying that correlation id, in the order it happened. The command's
    schema document lists what it `produces` and, among those, what `completes` it: the events after which the
    command's outcome is known (`DeploymentReady` for a deploy, or `DeploymentFailed`, `DeploymentEnded` or
@@ -278,6 +283,11 @@ Every command of this peer follows one pattern, and nothing else is needed to dr
 4. A consumer that was not listening catches up with `GET /events?correlationId=...`, following `nextCursor` to
    the end, and follows from there with `GET /events/stream` and `Last-Event-ID`. There is no other channel for
    progress or outcome, and nothing to poll.
+
+Every string and list a command carries has a bound its schema document states (`maxLength`, `maxItems`), refused
+past it with `SCHEMA_VALIDATION` naming the field. A request body weighs 256 KiB at most on the door and 4 KiB less
+on a workspace's, refused with `PAYLOAD_TOO_LARGE` and `limit_bytes`: a cloud passes a command on to a member's door
+in an envelope of its own, so whatever the cloud took, the member takes.
 
 ## Sign in
 
@@ -310,7 +320,17 @@ scope it needs. A command the key may not send is refused at ingest with `FORBID
 a deploy or a job past the share with `SHARE_EXCEEDED`, what is held and the room left; a workload another key
 started, by name, whether a command, a prompt or the events are asked for, and a refusal names only what the key may
 see. `get-workloads` shows a key its own, with `held_bytes` against `share_bytes`; `DeploymentStarted` and
-`JobStarted` name the `holder`, an opaque id of the credential, never the key. Another sign-in is another holder,
-as the spec has it: what a key that expired or was replaced left running is the owner's to end with a key approved
-for all. The spec has no per-command scope field yet, so the requirement is in the description text; that is an
-entry on the spec follow-ups.
+`JobStarted` name the `holder`, an opaque id of the credential, never the key. A key with a share runs its jobs on
+a device, where its share counts them: a job without `memory_bytes`, which would run on the host with no device and
+hold the host's memory and processors outside the share, is refused with `JOB_NEEDS_DEVICE`; a key with scopes and
+no share is not held to it. In a workspace the rule holds for the cloud's jobs, and a member's owner who approved the
+cloud with a share holds every tenant of the cloud to it on that member. A key approved with `--deployments N` or
+`--jobs N` runs that many deployments or jobs at once at most, counted across the door like the share, every
+workspace's included, and the one past that is refused with `DEPLOYMENTS_EXCEEDED` or `JOBS_EXCEEDED`: what a
+workload claims in `memory_bytes` is its client's own word, so the share bounds what is promised and the counts how
+many, while neither bounds what a workload uses on a card that cannot be partitioned. A key approved without them is
+not counted. On a member the cloud's own credential is one holder, so a member's owner who approved the cloud with a
+count counts every tenant of the cloud together, and a deploy the cloud accepted can then be refused by the member,
+told on the workspace's stream as `DeploymentFailed` with the member's reason. Another sign-in is another holder, as the spec has it: what a key that expired or was
+replaced left running is the owner's to end with a key approved for all. The spec has no per-command scope field
+yet, so the requirement is in the description text; that is an entry on the spec follow-ups.
