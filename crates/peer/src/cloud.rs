@@ -82,13 +82,17 @@ enum Stopped {
 async fn read_until_stopped(
     stream: impl Stream<Item = Heard>,
     silence: Duration,
+    mut heard: impl FnMut(),
     mut relay: impl FnMut(String, Envelope),
 ) -> Stopped {
     let mut stream = std::pin::pin!(stream);
     loop {
         match tokio::time::timeout(silence, stream.next()).await {
-            Ok(Some(Heard::Event(id, e))) => relay(id, *e),
-            Ok(Some(Heard::Alive)) => {}
+            Ok(Some(Heard::Event(id, e))) => {
+                heard();
+                relay(id, *e)
+            }
+            Ok(Some(Heard::Alive)) => heard(),
             Ok(None) => return Stopped::Ended,
             Err(_) => return Stopped::Silent,
         }
@@ -98,8 +102,9 @@ async fn read_until_stopped(
 /// What each device of the cloud offers between a workload and its host, by `cloud/peer/device`.
 type Isolations = HashMap<String, Isolation>;
 
-/// The size admission read for an order, the menu's currency, and the receipt of the placement it made, if any.
-type AdmittedSize = (crate::menu::Size, String, Option<Value>);
+/// The size admission read for an order, the menu's currency, the receipt of the placement it made, if any, and
+/// how long the order may run, for the spending cap to count it before it is told.
+type AdmittedSize = (crate::menu::Size, String, Option<Value>, Option<u64>);
 
 /// A member's credential and the cloud's place on its stream, kept across restarts in the cloud's `members.json`.
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -212,6 +217,9 @@ pub struct Cloud {
     /// The size admission read for an order, with the menu's currency and the receipt of the placement it made,
     /// until the order's handler tells it: what the order is, whatever the menu became meanwhile.
     admitted_sizes: Mutex<HashMap<String, AdmittedSize>>,
+    /// The workspace's spending, which an order by size is checked against when it is taken; none for a cloud no
+    /// workspace counts.
+    purse: std::sync::OnceLock<Arc<crate::meter::Purse>>,
 }
 
 /// How long an order may wait for room when it names no `queue_seconds`: a day, as RunPod's default time-to-live.
@@ -354,6 +362,7 @@ impl Cloud {
             menu: Mutex::new(None),
             whole: Mutex::new(HashMap::new()),
             admitted_sizes: Mutex::new(HashMap::new()),
+            purse: std::sync::OnceLock::new(),
             name: name.into(),
             workspace: workspace.into(),
             log,
@@ -532,6 +541,34 @@ impl Cloud {
     /// Sets the sizes this cloud sells by; none for a cloud with no menu.
     pub fn set_menu(&self, menu: Option<Menu>) {
         *self.menu.lock().unwrap() = menu;
+    }
+
+    /// Counts this cloud's orders by size against `purse`, the workspace's spending; set once.
+    pub fn set_purse(&self, purse: Arc<crate::meter::Purse>) {
+        let _ = self.purse.set(purse);
+    }
+
+    /// The orders by size this cloud has taken and not ended, admitted ones included, as the spending cap counts
+    /// them. The admitted are read before the taken: an order between the two is read twice, never missed.
+    pub fn open_orders(&self) -> Vec<crate::meter::Open> {
+        let open = |id: String, size: &crate::menu::Size, currency: &str, deadline: Option<u64>| crate::meter::Open {
+            order: id,
+            currency: currency.to_string(),
+            most: deadline.map(|d| size.price_per_second * d as f64),
+        };
+        let mut out: Vec<crate::meter::Open> = self
+            .admitted_sizes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(key, (z, currency, _, deadline))| open(order_id(key), z, currency, *deadline))
+            .collect();
+        let s = self.state.lock().unwrap();
+        out.extend(s.orders.values().filter_map(|o| {
+            let (z, currency) = o.size.as_ref()?;
+            Some(open(o.id.clone(), z, currency, o.deadline_seconds))
+        }));
+        out
     }
 
     /// The cloud's menu as `get-menu` answers it, each size with the devices that meet it now; none without a menu.
@@ -719,11 +756,11 @@ impl Cloud {
         match (before, now) {
             (Some(true), false) | (None, false) => {
                 tracing::warn!(cloud = %self.name, peer = %member.name, %why, "a member peer is unreachable");
-                self.tell(
-                    &em,
-                    "PeerLost",
-                    json!({ "peer": member.name, "endpoint": member.endpoint, "reason": why }),
-                );
+                let mut lost = json!({ "peer": member.name, "endpoint": member.endpoint, "reason": why });
+                if let Some(t) = member.last_heard() {
+                    lost["last_heard"] = json!(t);
+                }
+                self.tell(&em, "PeerLost", lost);
                 Contact::Lost
             }
             (Some(false), true) | (None, true) => {
@@ -1245,7 +1282,14 @@ impl Cloud {
                 let last = me.cursors.lock().unwrap().get(&member.name).cloned();
                 match member.stream(last.as_deref()).await {
                     Ok(stream) => {
-                        match read_until_stopped(stream, STREAM_SILENCE, |id, e| me.relay(&member, &id, &e)).await {
+                        match read_until_stopped(
+                            stream,
+                            STREAM_SILENCE,
+                            || member.heard(),
+                            |id, e| me.relay(&member, &id, &e),
+                        )
+                        .await
+                        {
                             Stopped::Ended => {
                                 tracing::info!(cloud = %me.name, peer = %member.name, "the member's stream ended; reconnecting")
                             }
@@ -2176,6 +2220,10 @@ impl Service for Cloud {
             .held_to(host, &isolations, data.isolation)
             .map_err(|e| Self::with_peers(e, peers.clone()))?;
         let _admitting = self.holdings.admitting();
+        // Under the cap, before this cloud's state is held: the cap reads every cloud's open orders, this one's too.
+        if let (Some((size, menu)), Some(purse)) = (&sized, self.purse.get()) {
+            purse.allows(&size.name, size.price_per_second, &menu.currency, data.deadline_seconds)?;
+        }
         let held = self.holdings.of(&who.holder());
         let mut state = self.state.lock().unwrap();
         let needed = data
@@ -2229,6 +2277,7 @@ impl Service for Cloud {
                     size.clone(),
                     menu.currency.clone(),
                     placement.as_ref().map(|p| size.receipt(p, &menu.currency)),
+                    data.deadline_seconds,
                 ),
             );
             state.reserved.insert(
@@ -2345,7 +2394,7 @@ impl Service for Cloud {
         let waiting = r.device.is_none();
         let admitted = self.admitted_sizes.lock().unwrap().remove(&key);
         let (size, receipt) = match (data.size.as_deref(), admitted) {
-            (Some(_), Some((z, currency, receipt))) => (Some((z, currency)), receipt),
+            (Some(_), Some((z, currency, receipt, _))) => (Some((z, currency)), receipt),
             // Admission records the size with the reservation, and both live in memory: a reservation without it
             // is not made, so this is the placement gone, told as such, and whatever admission held is let go.
             (Some(_), None) => {
@@ -2593,11 +2642,20 @@ mod tests {
         // member with nothing to tell for a minute was reconnected every minute. The margin between a step and the
         // silence is wide, so a loaded runner's stall is not taken for silence.
         let silence = Duration::from_millis(500);
-        let mut relayed = 0;
-        let stopped =
-            read_until_stopped(keep_alives(Duration::from_millis(20), 30), silence, |_, _| relayed += 1).await;
+        let (mut relayed, mut heard) = (0, 0);
+        let stopped = read_until_stopped(
+            keep_alives(Duration::from_millis(20), 30),
+            silence,
+            || heard += 1,
+            |_, _| relayed += 1,
+        )
+        .await;
         assert_eq!(stopped, Stopped::Ended);
         assert_eq!(relayed, 0);
+        assert_eq!(
+            heard, 30,
+            "each keep-alive is the member heard, where a lost job's bill ends"
+        );
     }
 
     #[tokio::test]
@@ -2606,6 +2664,7 @@ mod tests {
         let stopped = read_until_stopped(
             futures::stream::pending::<Heard>(),
             Duration::from_millis(60),
+            || {},
             |_, _| {},
         )
         .await;
@@ -2623,9 +2682,12 @@ mod tests {
             Heard::Event("2".into(), Box::new(e("B"))),
         ];
         let mut got = Vec::new();
-        let stopped = read_until_stopped(futures::stream::iter(items), Duration::from_secs(1), |id, e| {
-            got.push((id, e.r#type))
-        })
+        let stopped = read_until_stopped(
+            futures::stream::iter(items),
+            Duration::from_secs(1),
+            || {},
+            |id, e| got.push((id, e.r#type)),
+        )
         .await;
         assert_eq!(stopped, Stopped::Ended);
         assert_eq!(

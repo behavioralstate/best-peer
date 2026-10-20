@@ -35,6 +35,7 @@ use crate::domain::{
 use crate::holdings::Holdings;
 use crate::lifecycle::{list, new_id, require};
 use crate::menu::{Menu, Size};
+use crate::meter::{Cap, Purse};
 use crate::transport::{Cleartext, Transport};
 
 /// Where the workspaces' doors are under the root: `/workspaces/<id>`.
@@ -599,6 +600,8 @@ pub struct Workspace {
     completions: Arc<HashMap<String, HashSet<String>>>,
     members: Mutex<BTreeMap<String, Role>>,
     clouds: Mutex<BTreeMap<String, CloudRecord>>,
+    /// Its spending cap and the clouds whose orders count against it.
+    purse: Arc<Purse>,
     door: OnceLock<Arc<Door>>,
     router: OnceLock<Router>,
     started: std::sync::atomic::AtomicBool,
@@ -615,6 +618,13 @@ struct SetMenuData {
     cloud: String,
     currency: String,
     sizes: Vec<Size>,
+}
+
+#[derive(Deserialize)]
+struct SetCapData {
+    amount: Option<f64>,
+    #[serde(default)]
+    currency: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -648,6 +658,7 @@ impl Workspace {
             ctx: ctx.clone(),
             members: Mutex::new(members),
             clouds: Mutex::new(BTreeMap::new()),
+            purse: Arc::new(Purse::new(log.clone())),
             door: OnceLock::new(),
             router: OnceLock::new(),
             started: std::sync::atomic::AtomicBool::new(false),
@@ -853,6 +864,16 @@ impl Workspace {
                     r.menu = menu;
                 }
             }
+            "SpendingCapSetV1" => {
+                let cap = d["amount"]
+                    .as_f64()
+                    .zip(d["currency"].as_str())
+                    .map(|(amount, currency)| Cap {
+                        amount,
+                        currency: currency.to_string(),
+                    });
+                self.purse.set(cap);
+            }
             _ => {}
         }
     }
@@ -886,6 +907,10 @@ impl Workspace {
                         self.ctx.holdings.clone(),
                     );
                     c.set_menu(r.menu.clone());
+                    c.set_purse(self.purse.clone());
+                    let counted = Arc::downgrade(&c);
+                    self.purse
+                        .add(move || counted.upgrade().map(|c| c.open_orders()).unwrap_or_default());
                     c.rebuild();
                     if self.started.load(std::sync::atomic::Ordering::SeqCst) {
                         c.follow();
@@ -1099,6 +1124,82 @@ impl Clouds for Workspace {
             &em,
             "CloudArchivedV1",
             json!({ "workspace": self.id, "cloud": cmd.data["cloud"] }),
+        );
+    }
+
+    fn usage(&self, who: &Credential, params: &HashMap<String, String>) -> Result<Value, BestError> {
+        let at = |name: &str| -> Result<Option<time::OffsetDateTime>, BestError> {
+            match params.get(name) {
+                None => Ok(None),
+                Some(t) => crate::meter::parse_time(t).map(Some).ok_or_else(|| {
+                    BestError::bad_request(
+                        "INVALID_PARAMETER",
+                        format!("{name}: {t:?} is not a time in RFC 3339, such as 2026-10-20T10:00:00Z"),
+                    )
+                    .with_details(json!({ "parameter": name }))
+                }),
+            }
+        };
+        let now = time::OffsetDateTime::now_utc();
+        let (from, to) = (at("from")?, at("to")?.unwrap_or(now));
+        // A member reads its own jobs; the owner, and a credential approved for every holder's, read every one.
+        let holder = who.holder();
+        let every = who.grant.is_all() || self.is_owner(&holder);
+        let jobs: Vec<crate::meter::Metered> = crate::meter::metered(&self.log)
+            .into_iter()
+            .filter(|j| every || j.holder.as_deref() == Some(holder.as_str()))
+            .filter(|j| params.get("cloud").is_none_or(|c| j.cloud == *c))
+            .filter(|j| {
+                params
+                    .get("job")
+                    .is_none_or(|x| j.job == *x || j.order.as_deref() == Some(x.as_str()))
+            })
+            .collect();
+        let mut answer = crate::meter::usage(&jobs, now, from, to);
+        if let Some(cap) = self.purse.cap() {
+            let (spent, held) = self.purse.standing(&cap.currency);
+            answer["cap"] = json!({ "amount": cap.amount, "currency": cap.currency, "spent": spent, "held": held });
+        }
+        Ok(answer)
+    }
+
+    fn admit_set_cap(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError> {
+        if !self.is_owner(&who.holder()) {
+            return Err(BestError::bad_request(
+                "FORBIDDEN",
+                "only the workspace's owner sets its spending cap: ask them",
+            )
+            .with_details(json!({ "workspace": self.id, "role": "member" })));
+        }
+        let data: SetCapData = crate::lifecycle::parse(&cmd.data)?;
+        if let Some(amount) = data.amount {
+            let currency = data.currency.unwrap_or_default();
+            if !amount.is_finite() {
+                return Err(
+                    BestError::bad_request("INVALID_CAP", "amount must be a number of 0 or more")
+                        .with_details(json!({ "field": "amount" })),
+                );
+            }
+            if currency.len() != 3 || !currency.chars().all(|c| c.is_ascii_uppercase()) {
+                return Err(BestError::bad_request(
+                    "INVALID_CAP",
+                    format!("currency {currency:?} is not an ISO 4217 code: send three capital letters with the amount, such as EUR or USD"),
+                )
+                .with_details(json!({ "field": "currency" })));
+            }
+        }
+        Ok(())
+    }
+
+    async fn set_cap(self: Arc<Self>, cmd: Envelope, em: Emitter) {
+        let Ok(data) = crate::lifecycle::parse::<SetCapData>(&cmd.data) else {
+            return;
+        };
+        let currency = data.amount.and(data.currency);
+        self.tell(
+            &em,
+            "SpendingCapSetV1",
+            json!({ "workspace": self.id, "amount": data.amount, "currency": currency }),
         );
     }
 }

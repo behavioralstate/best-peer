@@ -383,6 +383,23 @@ No adapter reports anything but `none` yet: which slices a consumer card can hol
 [spec#65](https://github.com/behavioralstate/spec/issues/65). Pinning stays the owner's: `memory_bytes` and `device`
 work as before.
 
+What the orders by size used, and what they cost, is `get-usage`, read from the workspace's own events. Each job is
+billed from its `JobStarted` to its end, at the price its receipt carries. A menu price changed while a job runs cuts
+it into intervals, each billed at the price it had, and a later change never rewrites what was billed. A job on a
+member that was lost is billed to the last moment that member was heard, an event or a keep-alive on its stream
+(`PeerLost`'s `last_heard`), never to the moment of the loss, and says `end_inferred`. The factor, the share of
+compute a job had against what its size gives it uncontended, is 1 while a job holds its device whole, which is
+every device until an adapter reports slicing. `from` and `to` bound the window, `cloud` and `job` narrow it, and the
+totals are per currency. A member reads its own jobs; the workspace's owner reads every one. An order by
+`memory_bytes` is not priced.
+
+The workspace's owner may cap what its orders by size cost together, with `set-spending-cap` (`{ "amount": 50,
+"currency": "EUR" }`, or `{ "amount": null }` to clear it). Under a cap an order by size sends `deadline_seconds`, so
+its most is its price times its deadline. It is refused when it is taken if what was spent, what the open orders may
+still spend and its own most would pass the cap, with each named, and refused on a cloud whose menu prices in
+another currency. Two things can still pass a cap after an order is taken: a price raised while its job runs, and an
+order queued again after its member was lost.
+
 The peer's state is the fold of the events it told. After a restart it is rebuilt from the log and squared with what
 the engine still runs; a workload that ended while the peer was down is told so then.
 

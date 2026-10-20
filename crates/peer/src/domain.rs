@@ -61,6 +61,9 @@ pub trait Clouds: Service {
     async fn menus(&self) -> Result<Value, BestError>;
     fn admit_set_menu(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError>;
     async fn set_menu(self: Arc<Self>, cmd: Envelope, em: Emitter);
+    fn usage(&self, who: &Credential, params: &HashMap<String, String>) -> Result<Value, BestError>;
+    fn admit_set_cap(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError>;
+    async fn set_cap(self: Arc<Self>, cmd: Envelope, em: Emitter);
 }
 
 /// What the root knows of its workspaces: which exist, who is in each, and the four commands that change that.
@@ -109,8 +112,10 @@ pub fn workspace_catalogue(ws: Arc<dyn Clouds>) -> Catalogue {
     let mut c = lifecycle(Catalogue::new(), ws.clone(), Where::Workspace)
         .query(clouds_query(ws.clone()))
         .query(menu_query(ws.clone()))
+        .query(usage_query(ws.clone()))
         .command(configure_cloud(ws.clone()))
         .command(set_menu(ws.clone()))
+        .command(set_spending_cap(ws.clone()))
         .command(archive_cloud(ws));
     for e in event_defs()
         .into_iter()
@@ -158,6 +163,7 @@ pub fn completions() -> HashMap<String, HashSet<String>> {
         ("ConfigureCloud".to_string(), set(&["CloudConfiguredV1"])),
         ("ArchiveCloud".to_string(), set(&["CloudArchivedV1"])),
         ("SetMenu".to_string(), set(&["MenuSetV1"])),
+        ("SetSpendingCap".to_string(), set(&["SpendingCapSetV1"])),
         ("RevokeAgent".to_string(), set(&["AgentRevokedV1"])),
     ])
 }
@@ -222,6 +228,7 @@ pub const WORKSPACE_EVENTS: &[&str] = &[
     "CloudConfiguredV1",
     "CloudArchivedV1",
     "MenuSetV1",
+    "SpendingCapSetV1",
     "PeerJoined",
     "PeerLost",
 ];
@@ -553,7 +560,7 @@ fn run_job(peer: Arc<dyn Service>, at: Where) -> CommandDef {
                 "device": { "type": "string", "maxLength": 256, "description": "A device id from this workspace's get-hardware-state, cloud/peer/device, to pin the placement; refused without memory_bytes" },
                 "queue_seconds": { "type": "integer", "minimum": 1, "maximum": 604800, "description": "How long the order may wait for room before it ends unplaced, counted from JobQueued; at most seven days; without it, a day (86400)" },
                 "deadline_seconds": { "type": "integer", "minimum": 1, "maximum": 2592000, "description": "How long the job may run before it is stopped, counted from JobStarted; at most thirty days; without it the job runs to its end" },
-                "size": { "type": "string", "minLength": 1, "maxLength": 64, "description": "A size from the cloud's menu (get-menu), instead of memory_bytes and device: the job is placed on a device that meets the size's floors, and JobPlaced and JobStarted carry its receipt. Refused when the cloud has no such size (NO_SUCH_SIZE, with the sizes it has) or no device of its members meets it (NO_SOURCE_FOR_SIZE, with the sizes that are met)" }
+                "size": { "type": "string", "minLength": 1, "maxLength": 64, "description": "A size from the cloud's menu (get-menu), instead of memory_bytes and device: the job is placed on a device that meets the size's floors, and JobPlaced and JobStarted carry its receipt. Refused when the cloud has no such size (NO_SUCH_SIZE, with the sizes it has) or no device of its members meets it (NO_SOURCE_FOR_SIZE, with the sizes that are met); under the workspace's spending cap (set-spending-cap), when it sends no deadline_seconds (DEADLINE_NEEDED), when its cloud's menu prices in another currency (SPENDING_CAP_CURRENCY), or when what it may cost would pass the cap (SPENDING_CAP). get-usage reads what it used and cost" }
             }),
         ),
     };
@@ -797,6 +804,90 @@ fn set_menu(ws: Arc<dyn Clouds>) -> CommandDef {
         handler: Arc::new(move |cmd, emitter| {
             let ws = ws.clone();
             Box::pin(async move { ws.set_menu(cmd, emitter).await })
+        }),
+    }
+}
+
+fn usage_query(ws: Arc<dyn Clouds>) -> QueryDef {
+    let interval = json!({ "type": "object", "properties": {
+        "from": { "type": "string" }, "to": { "type": "string" }, "seconds": { "type": "number" },
+        "price_per_second": { "type": "number", "description": "The price it was billed at, from the receipt or the menu set while it ran" },
+        "factor": { "type": "number", "description": "The share of compute it had against what its size gives it uncontended; never above 1" },
+        "cost": { "type": "number", "description": "seconds times price_per_second times factor" }
+    } });
+    QueryDef {
+        schema: "get-usage".into(),
+        version: "1.0".into(),
+        description: "What the orders by size of this workspace used and what they cost, read from its own events: each job from its JobStarted, whose receipt carries the price per second, to its JobFinished, JobFailed or JobStopped, a running one up to now. A menu price changed while a job ran cuts it into intervals, each billed at the price it had; a later change never rewrites what was billed. A job on a member peer that was lost is billed to the last moment that member was heard (PeerLost's last_heard), and says end_inferred. The factor is 1 while a job has its device whole or a MIG slice, which nothing contends. from and to bound the window (RFC 3339; to is now when not said), and each job is clipped to it; cloud and job (the order's id or the job's) narrow it. A member reads its own jobs, the workspace's owner every job. An order by memory_bytes is unpriced and not listed. With a spending cap (set-spending-cap), cap says it, what was spent and what the open orders may still spend.".into(),
+        parameters: Some(json!({
+            "type": "object",
+            "properties": {
+                "from": { "type": "string", "maxLength": 64, "description": "The window's start, RFC 3339; every job since the first when not said" },
+                "to": { "type": "string", "maxLength": 64, "description": "The window's end, RFC 3339; now when not said" },
+                "cloud": { "type": "string", "maxLength": 64, "description": "One cloud's jobs" },
+                "job": { "type": "string", "maxLength": 128, "description": "One job, by the order's id from JobQueued or the job's from JobStarted" }
+            },
+            "additionalProperties": false
+        })),
+        response: json!({
+            "type": "object",
+            "required": ["to", "jobs", "totals"],
+            "properties": {
+                "from": { "type": ["string", "null"] },
+                "to": { "type": "string" },
+                "jobs": { "type": "array", "items": { "type": "object", "properties": {
+                    "job": { "type": "string" }, "order": { "type": ["string", "null"] }, "cloud": { "type": "string" }, "peer": { "type": ["string", "null"] },
+                    "device": { "type": ["string", "null"], "description": "cloud/peer/device" }, "gpu": { "type": ["string", "null"] },
+                    "size": { "type": "string" }, "currency": { "type": "string" },
+                    "started": { "type": "string" }, "ended": { "type": ["string", "null"] },
+                    "running": { "type": "boolean" },
+                    "end_inferred": { "type": "boolean", "description": "True when its member peer was lost and the end is the last moment the member was heard" },
+                    "seconds": { "type": "number" }, "factor": { "type": "number", "description": "Over the window, weighted by seconds" }, "cost": { "type": "number" },
+                    "intervals": { "type": "array", "items": interval }
+                } } },
+                "totals": { "type": "array", "items": { "type": "object", "properties": {
+                    "currency": { "type": "string" }, "seconds": { "type": "number" }, "cost": { "type": "number" }
+                } } },
+                "cap": { "type": "object", "description": "The workspace's spending cap, when it has one", "properties": {
+                    "amount": { "type": "number" }, "currency": { "type": "string" },
+                    "spent": { "type": "number", "description": "What its jobs by size cost up to now, every one" },
+                    "held": { "type": "number", "description": "What its open orders may still spend: each one's price times its deadline_seconds, less what its job already ran" }
+                } }
+            }
+        }),
+        handler: Arc::new(move |who, params| {
+            let ws = ws.clone();
+            Box::pin(async move { ws.usage(&who, &params) })
+        }),
+    }
+}
+
+fn set_spending_cap(ws: Arc<dyn Clouds>) -> CommandDef {
+    let admit = ws.clone();
+    CommandDef {
+        schema: "set-spending-cap".into(),
+        version: "1.0".into(),
+        command_type: "SetSpendingCap".into(),
+        description: "Sets the most this workspace's orders by size may cost together, in one currency, or clears it with amount null. Under a cap an order by size sends deadline_seconds, so what it may cost is bounded (DEADLINE_NEEDED without), and it is refused when it is taken, never after it ran, if what was spent, what the orders still open may spend and its own most (its price times its deadline_seconds) would pass the cap (SPENDING_CAP, naming each); one on a cloud whose menu prices in another currency is refused (SPENDING_CAP_CURRENCY). Two things may pass a cap after an order was taken: a menu price raised while its job runs, and an order queued again after a member peer was lost under it. get-usage reads the cap with what was spent and what is held. The outcome is a SpendingCapSetV1 event with this command's correlation id. Only the workspace's owner may set it.".into(),
+        data_schema: json!({
+            "type": "object",
+            "required": ["amount"],
+            "properties": {
+                "amount": { "type": ["number", "null"], "minimum": 0, "description": "The most, in currency; null clears the cap" },
+                "currency": { "type": "string", "minLength": 3, "maxLength": 3, "description": "ISO 4217: EUR, USD; needed with an amount" }
+            },
+            "additionalProperties": false
+        }),
+        produces: vec!["SpendingCapSetV1".into(), "CommandFailed".into()],
+        completes: completes("SetSpendingCap"),
+        impact: None,
+        admit: Some(Arc::new(move |cmd, who, _key| {
+            let ws = admit.clone();
+            Box::pin(async move { ws.admit_set_cap(cmd, &who) })
+        })),
+        handler: Arc::new(move |cmd, emitter| {
+            let ws = ws.clone();
+            Box::pin(async move { ws.set_cap(cmd, emitter).await })
         }),
     }
 }
@@ -1256,6 +1347,13 @@ pub fn cloud_event_defs() -> Vec<EventDef> {
             json!({ "workspace": s("The workspace"), "cloud": s("The cloud's name"), "currency": s("ISO 4217"), "sizes": { "type": "array", "description": "The sizes, as set-menu took them", "items": { "type": "object" } } }),
         ),
         event(
+            "spending-cap-set",
+            "SpendingCapSetV1",
+            "This workspace's orders by size may cost together at most this amount from now on, or, with amount null, any amount.",
+            &["workspace", "amount"],
+            json!({ "workspace": s("The workspace"), "amount": { "type": ["number", "null"], "description": "The most; null for no cap" }, "currency": { "type": ["string", "null"], "description": "ISO 4217; null for no cap" } }),
+        ),
+        event(
             "job-queued",
             "JobQueued",
             "A cloud took a run-job order: the order whole, as it is placed. waiting is true when no member peer has the room now; the cloud places it as soon as one does, first come, first served. attempt 2 says a member peer was lost under it and it was queued again, once.",
@@ -1298,7 +1396,7 @@ pub fn cloud_event_defs() -> Vec<EventDef> {
             "PeerLost",
             "A member peer stopped answering; every workload it held is told as ended under its own correlation id, and nothing is placed there until it answers again, which PeerJoined tells.",
             &["cloud", "peer", "endpoint", "reason"],
-            json!({ "cloud": s("The cloud the peer is a member of"), "peer": s("The member's name"), "endpoint": s("The member's own door"), "reason": s("What the cloud saw") }),
+            json!({ "cloud": s("The cloud the peer is a member of"), "peer": s("The member's name"), "endpoint": s("The member's own door"), "reason": s("What the cloud saw"), "last_heard": s("The last moment its stream said anything, an event or a keep-alive: a job by size on it is billed to then; absent when it was not heard since this peer began following it") }),
         ),
     ]
 }

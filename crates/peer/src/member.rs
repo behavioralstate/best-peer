@@ -71,6 +71,9 @@ pub struct Member {
     /// where it is reached.
     own_endpoint: Mutex<Option<String>>,
     pub transport: Arc<dyn Transport>,
+    /// The last moment its stream said anything, an event or a keep-alive: where the bill of a job on it ends when
+    /// it is lost (behavioralstate/spec#61).
+    heard: Mutex<Option<String>>,
 }
 
 impl Member {
@@ -81,7 +84,18 @@ impl Member {
             key: Mutex::new(key),
             own_endpoint: Mutex::new(None),
             transport,
+            heard: Mutex::new(None),
         }
+    }
+
+    /// Its stream said something now.
+    pub fn heard(&self) {
+        *self.heard.lock().unwrap() = Some(best_peer_door::envelope::now_rfc3339());
+    }
+
+    /// The last moment its stream said anything, since this peer began following it.
+    pub fn last_heard(&self) -> Option<String> {
+        self.heard.lock().unwrap().clone()
     }
 
     pub fn key(&self) -> Option<String> {
