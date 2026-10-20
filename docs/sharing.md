@@ -31,8 +31,9 @@ launches a second (`burn`: 4096 blocks of 256 threads, 2000 multiply-adds each),
 ## Compute: a ceiling fixed at start, not a guarantee
 
 - **`CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` caps a job even when it is alone.** Alone at 100 the probe ran 1,245 launches a
-  second, at 50 it ran 568 (46%), at 25 it ran 229 (18%). The steps follow the card's 22 multiprocessors, not the
-  percentage exactly.
+  second, at 50 it ran 568 (46%), at 25 it ran 229 (18%). Every share measured matches whole pairs of the card's 22
+  multiprocessors, rounded down: 10, 4, 6 and 14 of 22 for 50, 25, 30 and 70 (Turing pairs them in clusters). Single
+  multiprocessors would have given 50% and 23% for 50 and 25.
 - **Two at once take what their caps give.** At 30 and 70 they ran 339 and 786 (27% and 63% of one alone); at 50 and
   50, 552 each.
 - **A share is fixed for the life of the job.** `set_active_thread_percentage` on the MPS server, sent 12 s into a job
@@ -65,7 +66,8 @@ What the card did in total, against one job alone (launches a second, the comput
 | MPS, 50 and 50 | | 1,105 (88.8%) | |
 | MPS, 30 and 70 | | 1,125 (90.4%) | |
 
-Capped shares cost more than uncapped ones, since a cap rounds to whole multiprocessors and leaves the rest idle.
+Capped shares cost more than uncapped ones: a cap is rounded down to whole pairs of multiprocessors, and what it
+rounds away is left idle (50 and 50 used 20 of the 22).
 Memory-bound work and real engines were not measured.
 
 ## Isolation
@@ -98,8 +100,8 @@ Memory-bound work and real engines were not measured.
 - **Compute cannot be sold as decision 6 has it** with MPS on this card. There are two ways to sell it instead, for
   the owner to choose, and #63's sizes and #61's factor follow the choice:
   1. **A share as a ceiling.** Each size has a percentage, set when its job starts. The job gets that percentage
-     rounded down to whole multiprocessors, alone or not, and never the idle compute above it: on this card 50 gave
-     46% of one job alone, and 25 gave 18%. What a job is given never changes, so its factor is 1 when the size's
+     rounded down to the steps the card allows (here whole pairs of multiprocessors), alone or not, and never the
+     idle compute above it: on this card 50 gave 46% of one job alone, and 25 gave 18%. What a job is given never changes, so its factor is 1 when the size's
      share is that measured fraction, not the nominal percentage. A size priced at 25% would get 18% of the card.
   2. **No percentage.** Identical jobs on a card divided it evenly while they computed, and a job alone has all of it.
      If unequal jobs divide it evenly too, which was not measured, the factor of decision 7 is the share a job had,
