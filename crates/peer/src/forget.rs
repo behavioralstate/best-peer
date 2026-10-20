@@ -5,7 +5,7 @@
 //! holder's: a correlation the sender does not own is refused as a read of it is.
 
 use best_peer_door::auth::Credential;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use best_peer_door::{BestError, Emitter, Envelope, EventLog, Redacted, Stored};
 use serde::Deserialize;
@@ -125,9 +125,36 @@ pub fn forget(log: &EventLog, sender: &str, scope: &Scope) -> Result<Forgot, Str
         },
         strip,
     )?;
-    let outcomes: HashSet<String> = events.iter().filter_map(|s| s.envelope.correlationid.clone()).collect();
+    // One credential may send several prompts under one correlation: a prompt is taken by its own deployment, or,
+    // for a time, only when every outcome under its correlation was told before it, so nothing not named is lost.
+    let mut picked: HashMap<String, usize> = HashMap::new();
+    for s in &events {
+        if let Some(c) = &s.envelope.correlationid {
+            *picked.entry(c.clone()).or_default() += 1;
+        }
+    }
+    let mut told: HashMap<String, usize> = HashMap::new();
+    log.replay(|e| {
+        if let Some(c) = e.correlationid.as_ref().filter(|c| picked.contains_key(*c)) {
+            if CONTENT_EVENTS.contains(&e.r#type.as_str()) {
+                *told.entry(c.clone()).or_default() += 1;
+            }
+        }
+    });
     let commands = log.redact_commands(
-        |who, correlation, e| who == sender && e.r#type == "Prompt" && outcomes.contains(correlation),
+        |who, correlation, e| {
+            who == sender
+                && e.r#type == "Prompt"
+                && match scope {
+                    Scope::Correlation(c) => correlation == c,
+                    Scope::Deployment(d) => {
+                        picked.contains_key(correlation) && e.data["deployment"].as_str() == Some(d.as_str())
+                    }
+                    Scope::Before(_) => picked
+                        .get(correlation)
+                        .is_some_and(|n| told.get(correlation) == Some(n)),
+                }
+        },
         strip,
     )?;
     let in_flight = log
@@ -152,10 +179,11 @@ pub fn forget(log: &EventLog, sender: &str, scope: &Scope) -> Result<Forgot, Str
 pub fn answered_on(forgot: &Forgot) -> BTreeMap<(String, String), Vec<&Redacted>> {
     let mut on: BTreeMap<(String, String), Vec<&Redacted>> = BTreeMap::new();
     for prompt in &forgot.commands {
-        let outcome = forgot
-            .events
-            .iter()
-            .find(|s| s.envelope.correlationid.as_deref() == Some(prompt.correlation.as_str()));
+        // Its own outcome: under its correlation, from the deployment it asked, which one member holds.
+        let outcome = forgot.events.iter().find(|s| {
+            s.envelope.correlationid.as_deref() == Some(prompt.correlation.as_str())
+                && s.envelope.data["deployment"] == prompt.data["deployment"]
+        });
         let Some(d) = outcome.map(|s| &s.envelope.data) else {
             continue;
         };

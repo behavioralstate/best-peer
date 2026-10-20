@@ -2209,6 +2209,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prompts_under_one_correlation_are_forgotten_by_their_own_deployment() {
+        let dir = tempfile::tempdir().unwrap();
+        let bed = bed_with(
+            card(),
+            Arc::new(EventLog::open(dir.path()).unwrap()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+            Arc::new(best_peer_engine::Fake::new()),
+            "engines.local",
+            None,
+        )
+        .await;
+        let one = bed.deployed("d1", "llama3.2:3b", 4).await;
+        let two = bed.deployed("d2", "llama3.2:3b", 4).await;
+        // Two prompts of one credential under one correlation, each to its own deployment.
+        for (id, dep, said) in [("p1", &one, "first secret"), ("p2", &two, "second kept")] {
+            let req = Request::post("/commands")
+                .header("X-Api-Key", &bed.key)
+                .header(header::CONTENT_TYPE, "application/cloudevents+json")
+                .body(Body::from(
+                    json!({
+                        "specversion": "1.0", "id": id, "correlationid": "chain", "source": "https://agent.test", "type": "Prompt",
+                        "datacontenttype": "application/json", "dataschema": format!("{EP}/commands/prompt/1.0"),
+                        "time": "2026-10-12T10:30:00Z", "data": { "deployment": dep, "messages": [{ "role": "user", "content": said }] }
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            let res = bed.app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::CREATED);
+        }
+        for _ in 0..400 {
+            if bed
+                .log_of("chain")
+                .iter()
+                .filter(|e| e.r#type == "PromptAnswered")
+                .count()
+                == 2
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let (s, b) = bed.send("f1", "Forget", "forget", json!({ "deployment": one })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let forgotten = bed.events_of("f1", "Forgotten").await.last().unwrap().data.clone();
+        assert_eq!(
+            (forgotten["events"].clone(), forgotten["commands"].clone()),
+            (json!(1), json!(1))
+        );
+        let on_disk = every_file(dir.path());
+        assert!(
+            !on_disk.contains("first secret"),
+            "the prompt to the named deployment is forgotten"
+        );
+        assert!(
+            on_disk.contains("second kept"),
+            "the other prompt under the same correlation is not"
+        );
+    }
+
+    #[tokio::test]
     async fn a_forget_whose_rewrite_failed_is_done_by_the_next() {
         let dir = tempfile::tempdir().unwrap();
         let bed = bed_with(
