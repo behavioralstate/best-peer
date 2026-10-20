@@ -261,6 +261,11 @@ The container engine is Docker on the same host, reached through its socket or n
 without it unless `BEST_PEER_RUNTIME` says otherwise: `native` deploys to an engine already running on the host
 outside any container (an installed Ollama; no jobs), `fake` serves the whole surface against the in-memory fakes
 (what CI runs).
+A job's disk, for its inputs and outputs, is a file system of its own on a loop device, capped at its size, under
+`disks/` in the data folder: the peer makes it where Docker runs on Linux, and needs root to mount it; anywhere else
+a job with inputs or outputs is refused (`NO_DISK`). Its inputs are fetched and its outputs sent over `https://`
+only; `BEST_PEER_STORE_CLEARTEXT=loopback` also allows a store on this machine's loopback over `http://`, for a test
+or a developer's own store, on the cloud's door and on its members alike.
 A deploy or a job pulls an image named by tag each time, since a tag may have moved, as before; one pinned by digest
 (`name@sha256:...`, handed to Docker whole) names one image for good and is pulled only when Docker does not hold it.
 `BEST_PEER_PULL=missing` pulls any image only when Docker does not hold it: for a host with no way to a registry,
@@ -429,6 +434,33 @@ still spend and its own most would pass the cap, with each named, and refused on
 another currency. Three things can still pass a cap after an order is taken: a price raised while its job runs, an
 order queued again after its member was lost, and an order taken with no deadline before the cap was set, which runs
 on unbounded until `stop-job` ends it.
+
+A job reads and writes through the workspace's **store**, an S3-compatible bucket such as Verda's object storage. Its
+owner sets it once with `set-store`: the `endpoint` (`https://`), the `bucket`, the `region`, and the store's
+`access_key_id` and `secret_access_key`. The credential stays with the workspace's door: it is kept in a file of the
+workspace's own, readable by the peer's user alone, and is never recorded, never in an event, and never sent to a
+member; `get-store` shows the store without it. An order names its `inputs` by key, each with the path it lands on
+under `/in`, and its `outputs` by a key prefix:
+
+```json
+{ "cloud": "lab", "size": "small", "deadline_seconds": 3600,
+  "inputs": [{ "key": "scenes/shot-12.blend", "path": "shot-12.blend" }],
+  "outputs": { "prefix": "renders/shot-12" } }
+```
+
+The cloud checks each input is in the store when it takes the order, and refuses one that is not (`NO_SUCH_INPUT`).
+The member it places the order on gets only URLs the cloud signed for that order: one to read each input, one to
+write the outputs. Before the job starts, the member makes it a disk of its own, of `disk_bytes` (a size names its
+default in the menu, and an order may name its own), fetches the inputs there and tells `InputsFetched`. The job
+reads `/in`, read-only, and writes `/out`. When it exits, what it left under `/out` is packed as one tar archive and
+sent to `<prefix>/<order>.tar`, and `OutputsStored` says so, with the key, before `JobFinished`; a store that does not
+take it ends the job in `JobFailed`, its exit code kept. A stop while the outputs are being sent is refused
+(`STORING_OUTPUTS`), since the job's end follows. The disk goes with the job, whatever its end. A job with outputs
+sends `deadline_seconds`, six days at most, because the URL its outputs are sent with lives seven days at most. A
+member says the room it has for disks in `get-hardware-state` as `disk`, and an order is placed only on a member with
+its disk free, and waits for one; a disk no member could ever make is refused (`NO_DISK_ROOM`). At a peer's own door
+`run-job` takes the URLs themselves (`inputs` with a `url` and a `path`, `outputs` with a `url` and a `key`), records
+none of them, and does not wait.
 
 The peer's state is the fold of the events it told. After a restart it is rebuilt from the log and squared with what
 the engine still runs; a workload that ended while the peer was down is told so then.

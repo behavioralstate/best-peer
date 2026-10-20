@@ -63,6 +63,9 @@ pub trait Clouds: Service {
     async fn set_menu(self: Arc<Self>, cmd: Envelope, em: Emitter);
     fn usage(&self, who: &Credential, params: &HashMap<String, String>) -> Result<Value, BestError>;
     fn admit_set_cap(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError>;
+    fn store_view(&self) -> Result<Value, BestError>;
+    fn admit_set_store(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError>;
+    async fn set_store(self: Arc<Self>, cmd: Envelope, em: Emitter);
     async fn set_cap(self: Arc<Self>, cmd: Envelope, em: Emitter);
 }
 
@@ -113,9 +116,11 @@ pub fn workspace_catalogue(ws: Arc<dyn Clouds>) -> Catalogue {
         .query(clouds_query(ws.clone()))
         .query(menu_query(ws.clone()))
         .query(usage_query(ws.clone()))
+        .query(store_query(ws.clone()))
         .command(configure_cloud(ws.clone()))
         .command(set_menu(ws.clone()))
         .command(set_spending_cap(ws.clone()))
+        .command(set_store(ws.clone()))
         .command(archive_cloud(ws));
     for e in event_defs()
         .into_iter()
@@ -164,6 +169,7 @@ pub fn completions() -> HashMap<String, HashSet<String>> {
         ("ArchiveCloud".to_string(), set(&["CloudArchivedV1"])),
         ("SetMenu".to_string(), set(&["MenuSetV1"])),
         ("SetSpendingCap".to_string(), set(&["SpendingCapSetV1"])),
+        ("SetStore".to_string(), set(&["StoreSetV1"])),
         ("RevokeAgent".to_string(), set(&["AgentRevokedV1"])),
     ])
 }
@@ -229,6 +235,7 @@ pub const WORKSPACE_EVENTS: &[&str] = &[
     "CloudArchivedV1",
     "MenuSetV1",
     "SpendingCapSetV1",
+    "StoreSetV1",
     "PeerJoined",
     "PeerLost",
 ];
@@ -314,7 +321,7 @@ fn workloads_query(peer: Arc<dyn Service>, at: Where) -> QueryDef {
     });
     let mut job = json!({
         "job": { "type": "string" }, "image": { "type": "string" }, "device": { "type": ["string", "null"] },
-        "memory_bytes": { "type": "integer" }, "holder": { "type": "string" }, "phase": { "type": "string", "enum": ["running", "stopping"] }
+        "memory_bytes": { "type": "integer" }, "holder": { "type": "string" }, "phase": { "type": "string", "enum": ["running", "stopping", "storing"] }
     });
     let mut required_deployment = vec!["deployment", "model", "engine", "device", "memory_bytes", "phase"];
     let mut required_job = vec!["job", "image", "phase"];
@@ -564,6 +571,9 @@ fn run_job(peer: Arc<dyn Service>, at: Where) -> CommandDef {
             json!({
                 "device": { "type": "string", "maxLength": 256, "description": "A device id from get-hardware-state, to pin the placement; refused without memory_bytes" },
                 "queue_seconds": { "type": "integer", "minimum": 1, "maximum": 604800, "description": "How long the order may wait for a device with its room, counted from JobQueued; at most seven days. Without it, an order with no room now is refused (INSUFFICIENT_MEMORY), as a cloud placing on this peer expects" },
+                "inputs": { "type": "array", "maxItems": 1000, "writeOnly": true, "description": "The files the job finds under /in when it starts, each fetched from a URL such as a cloud signs for its store (https), to a plain relative path; never recorded", "items": { "type": "object", "required": ["url", "path"], "properties": { "url": { "type": "string", "maxLength": 8192 }, "path": { "type": "string", "minLength": 1, "maxLength": 1024 } }, "additionalProperties": false } },
+                "outputs": { "type": "object", "writeOnly": true, "required": ["url", "key"], "description": "Where what the job leaves under /out goes when it exits, packed as one tar archive: a URL that takes a PUT (https), and the key it names; never recorded", "properties": { "url": { "type": "string", "maxLength": 8192 }, "key": { "type": "string", "minLength": 1, "maxLength": 1024 } }, "additionalProperties": false },
+                "disk_bytes": { "type": "integer", "minimum": 1, "description": "The size of the job's own disk, where its inputs land and its outputs are written, capped there; needed with inputs or outputs, and refused where this peer has not the room (INSUFFICIENT_DISK) or makes no disk (NO_DISK)" },
                 "deadline_seconds": { "type": "integer", "minimum": 1, "maximum": 2592000, "description": "How long the job may run before it is stopped, counted from JobStarted; at most thirty days; without it the job runs to its end" }
             }),
         ),
@@ -574,6 +584,9 @@ fn run_job(peer: Arc<dyn Service>, at: Where) -> CommandDef {
                 "device": { "type": "string", "maxLength": 256, "description": "A device id from this workspace's get-hardware-state, cloud/peer/device, to pin the placement; refused without memory_bytes" },
                 "queue_seconds": { "type": "integer", "minimum": 1, "maximum": 604800, "description": "How long the order may wait for room before it ends unplaced, counted from JobQueued; at most seven days; without it, a day (86400)" },
                 "deadline_seconds": { "type": "integer", "minimum": 1, "maximum": 2592000, "description": "How long the job may run before it is stopped, counted from JobStarted; at most thirty days; without it the job runs to its end" },
+                "inputs": { "type": "array", "maxItems": 1000, "description": "The files the job finds under /in when it starts, each a key in this workspace's store (get-store) and the plain relative path it lands at; fetched by the machine before JobStarted, InputsFetched telling it. Refused when the store holds no such key (NO_SUCH_INPUT) or there is no store (NO_STORE)", "items": { "type": "object", "required": ["key", "path"], "properties": { "key": { "type": "string", "minLength": 1, "maxLength": 1024 }, "path": { "type": "string", "minLength": 1, "maxLength": 1024 } }, "additionalProperties": false } },
+                "outputs": { "type": "object", "required": ["prefix"], "description": "Where what the job leaves under /out goes when it exits: a key prefix in this workspace's store, under which one tar archive named for the order is put before JobFinished, OutputsStored naming its key and size; an upload that fails ends the job in JobFailed, its exit code kept. Needs deadline_seconds, six days at most (DEADLINE_NEEDED, TOO_LONG_FOR_THE_STORE)", "properties": { "prefix": { "type": "string", "minLength": 1, "maxLength": 512 } }, "additionalProperties": false },
+                "disk_bytes": { "type": "integer", "minimum": 1, "description": "The size of the job's own disk, where its inputs land and its outputs are written, capped there and removed with it: more than its size gives, or a disk for an order by memory_bytes; needed with inputs or outputs (DISK_NEEDED). It is placed only on a member with that disk free, and refused when no member could ever give it (NO_DISK_ROOM)" },
                 "size": { "type": "string", "minLength": 1, "maxLength": 64, "description": "A size from the cloud's menu (get-menu), instead of memory_bytes and device: the job is placed on a device that meets the size's floors and takes it whole, and JobPlaced and JobStarted carry its receipt, in the size's terms: no device, GPU or MIG profile is named on what this door serves. Refused when the cloud has no such size (NO_SUCH_SIZE, with the sizes it has) or no device of its members meets it (NO_SOURCE_FOR_SIZE, with the sizes that are met); under the workspace's spending cap (set-spending-cap), when it sends no deadline_seconds (DEADLINE_NEEDED), when its cloud's menu prices in another currency (SPENDING_CAP_CURRENCY), or when what it may cost would pass the cap (SPENDING_CAP). get-usage reads what it used and cost" }
             }),
         ),
@@ -583,7 +596,9 @@ fn run_job(peer: Arc<dyn Service>, at: Where) -> CommandDef {
             "JobQueued",
             "ImagePulling",
             "ImagePulled",
+            "InputsFetched",
             "JobStarted",
+            "OutputsStored",
             "JobFinished",
             "JobFailed",
             "JobStopped",
@@ -593,7 +608,9 @@ fn run_job(peer: Arc<dyn Service>, at: Where) -> CommandDef {
             "JobPlaced",
             "ImagePulling",
             "ImagePulled",
+            "InputsFetched",
             "JobStarted",
+            "OutputsStored",
             "JobFinished",
             "JobFailed",
             "JobStopped",
@@ -808,7 +825,8 @@ fn set_menu(ws: Arc<dyn Clouds>) -> CommandDef {
                 "compute": { "type": "object", "required": ["api"], "properties": { "api": { "type": "string", "enum": ["cuda", "rocm", "one-api", "metal", "vulkan", "cpu"] }, "version": { "type": "string", "maxLength": 32, "description": "The least version, dotted numbers: 12 or 12.4" } }, "description": "The compute API its device offers, at this version or newer" },
                 "host_memory_bytes": { "type": "integer", "minimum": 1, "description": "The least host memory of the machine its device is on" },
                 "share": { "type": "number", "exclusiveMinimum": 0, "maximum": 1, "description": "The share of a card's compute the size stands for, for the client to read: a MIG instance's fraction of its card, 1 for a whole card. Placement reads the floors, not this" },
-                "price_per_second": { "type": "number", "minimum": 0, "description": "What a second of it costs, in the menu's currency" }
+                "price_per_second": { "type": "number", "minimum": 0, "description": "What a second of it costs, in the menu's currency" },
+                "disk_bytes": { "type": "integer", "minimum": 1, "description": "The disk its job gets, where its inputs land and its outputs are written; an order may ask for more" }
             }, "additionalProperties": false } }
             },
             "additionalProperties": false
@@ -876,6 +894,59 @@ fn usage_query(ws: Arc<dyn Clouds>) -> QueryDef {
         handler: Arc::new(move |who, params| {
             let ws = ws.clone();
             Box::pin(async move { ws.usage(&who, &params) })
+        }),
+    }
+}
+
+fn store_query(ws: Arc<dyn Clouds>) -> QueryDef {
+    QueryDef {
+        schema: "get-store".into(),
+        version: "1.0".into(),
+        description: "This workspace's store, where its jobs' inputs come from and their outputs go: its endpoint, bucket and region, or null when its owner has set none (set-store). The credential is never shown.".into(),
+        parameters: None,
+        response: json!({
+            "type": "object",
+            "required": ["store"],
+            "properties": { "store": { "type": ["object", "null"], "properties": {
+                "endpoint": { "type": "string" }, "bucket": { "type": "string" }, "region": { "type": "string" }
+            } } }
+        }),
+        handler: Arc::new(move |_who, _params| {
+            let ws = ws.clone();
+            Box::pin(async move { ws.store_view() })
+        }),
+    }
+}
+
+fn set_store(ws: Arc<dyn Clouds>) -> CommandDef {
+    let admit = ws.clone();
+    CommandDef {
+        schema: "set-store".into(),
+        version: "1.0".into(),
+        command_type: "SetStore".into(),
+        description: "Sets the store this workspace's jobs read their inputs from and send their outputs to: an S3-compatible endpoint, a bucket, a region, and the credential that reaches them. The credential's fields are writeOnly: they are kept with the workspace, never recorded on its log and never told on an event, and no machine is ever given them; for each order the workspace signs short-lived URLs instead, a GET for each input and a PUT for its outputs. A store set again replaces the one before. The outcome is a StoreSetV1 event with this command's correlation id, naming the endpoint and the bucket. Refused when the endpoint is not https (INVALID_STORE) or the credential is missing. Only the workspace's owner may set it.".into(),
+        data_schema: json!({
+            "type": "object",
+            "required": ["endpoint", "bucket", "region", "access_key_id", "secret_access_key"],
+            "properties": {
+                "endpoint": { "type": "string", "maxLength": 512, "description": "The store's https address, scheme and host alone: https://objects.example.com" },
+                "bucket": { "type": "string", "minLength": 3, "maxLength": 63, "description": "The bucket the workspace's inputs and outputs are in" },
+                "region": { "type": "string", "minLength": 1, "maxLength": 64, "description": "The store's region, as it signs requests" },
+                "access_key_id": { "type": "string", "minLength": 1, "maxLength": 256, "writeOnly": true, "description": "The credential's key id; never recorded" },
+                "secret_access_key": { "type": "string", "minLength": 1, "maxLength": 512, "writeOnly": true, "description": "The credential's secret; never recorded" }
+            },
+            "additionalProperties": false
+        }),
+        produces: vec!["StoreSetV1".into(), "CommandFailed".into()],
+        completes: completes("SetStore"),
+        impact: None,
+        admit: Some(Arc::new(move |cmd, who, _key| {
+            let ws = admit.clone();
+            Box::pin(async move { ws.admit_set_store(cmd, &who) })
+        })),
+        handler: Arc::new(move |cmd, emitter| {
+            let ws = ws.clone();
+            Box::pin(async move { ws.set_store(cmd, emitter).await })
         }),
     }
 }
@@ -1271,8 +1342,25 @@ pub fn event_defs() -> Vec<EventDef> {
                 "instead_of": s("Queued again: the job the lost member peer was running for it"),
                 "cloud": s("On a workspace's door, the cloud that took it"),
                 "boxed": { "type": "boolean", "description": "On a peer's own door, true when its job runs in the closed box a credential with a share gets" },
+                "inputs": { "type": "array", "description": "Its inputs, each a key in the workspace's store and the path under /in", "items": { "type": "object" } },
+                "outputs": { "type": "object", "description": "The key prefix its outputs go under" },
+                "disk_bytes": { "type": "integer", "description": "The size of its disk" },
                 "size": { "type": "object", "description": "The size it ordered, as the cloud's menu had it then, with the menu's currency" }
             }),
+        ),
+        event(
+            "inputs-fetched",
+            "InputsFetched",
+            "The job's inputs are on its own disk, fetched from the store, before it starts: they are under /in.",
+            &["job", "inputs", "bytes", "seconds"],
+            placed(json!({ "job": s("The job"), "inputs": n("How many files"), "bytes": n("How many bytes in all"), "seconds": { "type": "number", "description": "How long the fetch took" } })),
+        ),
+        event(
+            "outputs-stored",
+            "OutputsStored",
+            "What the job left under /out is in the store, packed as one tar archive, before its end is told.",
+            &["job", "bytes", "seconds"],
+            placed(json!({ "job": s("The job"), "key": s("The archive's key in the store"), "bytes": n("The archive's size"), "seconds": { "type": "number", "description": "How long the upload took" } })),
         ),
         event(
             "job-started",
@@ -1309,7 +1397,7 @@ pub fn event_defs() -> Vec<EventDef> {
             "JobFailed",
             "The job did not start, or the engine ended it, or, on a workspace's door, the peer it ran on was lost; the reason says what happened and the fix what to do.",
             &["job", "reason", "fix"],
-            placed(json!({ "job": s("The job"), "image": s("The image"), "reason": s("What happened"), "fix": s("What to do") })),
+            placed(json!({ "job": s("The job"), "image": s("The image"), "reason": s("What happened"), "fix": s("What to do"), "exit_code": { "type": ["integer", "null"], "description": "The container's exit code, when it exited and what came after failed (its outputs not stored)" } })),
         ),
         event(
             "job-stopped",
@@ -1388,6 +1476,13 @@ pub fn cloud_event_defs() -> Vec<EventDef> {
             "A cloud of this workspace sells by these sizes from now on, replacing any it had; no sizes clears its menu. get-menu says which devices meet each.",
             &["workspace", "cloud", "currency", "sizes"],
             json!({ "workspace": s("The workspace"), "cloud": s("The cloud's name"), "currency": s("ISO 4217"), "sizes": { "type": "array", "description": "The sizes, as set-menu took them", "items": { "type": "object" } } }),
+        ),
+        event(
+            "store-set",
+            "StoreSetV1",
+            "This workspace's jobs read their inputs from, and send their outputs to, this store from now on. Its credential is kept with the workspace and never told.",
+            &["workspace", "endpoint", "bucket"],
+            json!({ "workspace": s("The workspace"), "endpoint": s("The store's https address"), "bucket": s("The bucket"), "region": s("The store's region") }),
         ),
         event(
             "spending-cap-set",

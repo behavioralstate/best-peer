@@ -33,6 +33,9 @@ pub struct Size {
     pub share: f64,
     /// What a second of the size costs, in the menu's currency.
     pub price_per_second: f64,
+    /// The disk its job gets, where its inputs land and its outputs are written; an order may ask for more.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_bytes: Option<u64>,
 }
 
 /// A cloud's menu: its sizes, priced in one currency.
@@ -263,6 +266,7 @@ mod tests {
             host_memory_bytes: None,
             share: 0.5,
             price_per_second: 0.001,
+            disk_bytes: None,
         }
     }
 

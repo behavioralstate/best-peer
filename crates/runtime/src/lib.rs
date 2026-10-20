@@ -158,6 +158,9 @@ pub enum RuntimeError {
     Unreachable(String),
     #[error("the engine failed: {0}")]
     Engine(String),
+    /// A job's disk could not be made, or this runtime makes none: the words say which.
+    #[error("{0}")]
+    NoDisk(String),
 }
 
 /// What stands between a workload and the host and the other workloads on it, weakest first, so a workload that asks
@@ -240,6 +243,21 @@ pub trait Runtime: Send + Sync {
     async fn isolation(&self) -> Isolation {
         Isolation::Process
     }
+    /// A disk of `bytes` for the job `id`, capped at that size so the job cannot fill the host, and the directory on
+    /// the host where it is mounted (behavioralstate/spec#66). A runtime that makes none refuses, in words.
+    async fn make_disk(&self, _id: &str, _bytes: u64) -> Result<std::path::PathBuf, RuntimeError> {
+        Err(RuntimeError::NoDisk(
+            "this peer's container engine makes no disk for a job: a job with inputs or outputs runs where Docker does, on Linux".into(),
+        ))
+    }
+    /// Removes the job `id`'s disk and everything on it; one already gone is no error.
+    async fn remove_disk(&self, _id: &str) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+    /// The space free, and in all, where this runtime makes disks; none when it makes none.
+    fn disk_room(&self) -> Option<(u64, u64)> {
+        None
+    }
 }
 
 /// An in-memory [`Runtime`] for tests: images the engine already holds, images a registry would serve, containers
@@ -269,6 +287,9 @@ pub struct Fake {
     refusal: Mutex<Option<String>>,
     /// What it says stands between its containers and the host: a container, unless a test says otherwise.
     isolation: Isolation,
+    /// Where its jobs' disks are made, a directory of its own, and the room it says it has there.
+    disks: std::path::PathBuf,
+    disk_free: Mutex<u64>,
 }
 
 impl Fake {
@@ -290,7 +311,19 @@ impl Fake {
             gate: Mutex::new(None),
             refusal: Mutex::new(None),
             isolation: Isolation::Container,
+            disks: std::env::temp_dir().join("best-peer-fake-disks").join(uuid_like()),
+            disk_free: Mutex::new(1 << 40),
         }
+    }
+
+    /// The room it says it has for disks from now on.
+    pub fn set_disk_room(&self, free: u64) {
+        *self.disk_free.lock().unwrap() = free;
+    }
+
+    /// Where the job `id`'s disk is, made or not.
+    pub fn disk_of(&self, id: &str) -> std::path::PathBuf {
+        self.disks.join(id)
     }
 
     /// An engine that offers `isolation`, as a rootless one offers a user namespace.
@@ -399,6 +432,18 @@ impl Fake {
     }
 }
 
+/// A name no other fake in this process or another uses: the fake's disks of one test stay apart from another's.
+fn uuid_like() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::SeqCst);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("{}-{t}-{n}", std::process::id())
+}
+
 #[async_trait]
 impl Runtime for Fake {
     async fn pull(&self, image: &ImageRef, progress: Progress) -> Result<(), RuntimeError> {
@@ -481,6 +526,30 @@ impl Runtime for Fake {
 
     fn events(&self) -> broadcast::Receiver<Event> {
         self.tx.subscribe()
+    }
+
+    async fn make_disk(&self, id: &str, bytes: u64) -> Result<std::path::PathBuf, RuntimeError> {
+        if bytes > *self.disk_free.lock().unwrap() {
+            return Err(RuntimeError::NoDisk(format!(
+                "no room for a disk of {bytes} bytes on this host"
+            )));
+        }
+        let dir = self.disk_of(id);
+        std::fs::create_dir_all(&dir).map_err(|e| RuntimeError::NoDisk(e.to_string()))?;
+        Ok(dir)
+    }
+
+    async fn remove_disk(&self, id: &str) -> Result<(), RuntimeError> {
+        match std::fs::remove_dir_all(self.disk_of(id)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(RuntimeError::NoDisk(e.to_string())),
+        }
+    }
+
+    fn disk_room(&self) -> Option<(u64, u64)> {
+        let free = *self.disk_free.lock().unwrap();
+        Some((free, free.max(1 << 40)))
     }
 
     fn runs_jobs(&self) -> bool {

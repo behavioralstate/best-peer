@@ -38,6 +38,8 @@ pub struct DockerRuntime {
     /// engines there, every interface when the container engine is on another host (`BEST_PEER_ENGINE_HOST`).
     bind_ip: String,
     tx: broadcast::Sender<Event>,
+    /// Where jobs' disks are made: each a file system of its own on a loop device, capped at the size asked for.
+    disks: Option<std::path::PathBuf>,
 }
 
 impl DockerRuntime {
@@ -55,6 +57,7 @@ impl DockerRuntime {
             exited: Arc::new(Mutex::new(Exited::default())),
             bind_ip: bind_ip.into(),
             tx,
+            disks: None,
         };
         sweep(&me.docker, &me.exited).await;
         me.follow();
@@ -277,6 +280,30 @@ impl Layers {
     }
 }
 
+impl DockerRuntime {
+    /// The same engine, making jobs' disks under `dir`.
+    pub fn with_disks(mut self, dir: std::path::PathBuf) -> Self {
+        self.disks = Some(dir);
+        self
+    }
+}
+
+/// Runs `program` with `args`, its failure in its own words.
+fn run(program: &str, args: &[&str]) -> Result<(), RuntimeError> {
+    let out = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|e| RuntimeError::NoDisk(format!("{program} could not run: {e}")))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(RuntimeError::NoDisk(format!(
+        "{program} {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr).trim()
+    )))
+}
+
 #[async_trait]
 impl Runtime for DockerRuntime {
     async fn pull(&self, image: &ImageRef, progress: Progress) -> Result<(), RuntimeError> {
@@ -308,6 +335,79 @@ impl Runtime for DockerRuntime {
 
     /// A container, or a user namespace when the engine runs rootless or remaps its users, as its own `info` says.
     /// An engine that does not answer is still the one the peer confines every container in.
+    async fn make_disk(&self, id: &str, bytes: u64) -> Result<std::path::PathBuf, RuntimeError> {
+        let Some(dir) = self.disks.clone() else {
+            return Err(RuntimeError::NoDisk(
+                "this peer makes no disk for a job: it was started without a place for them".into(),
+            ));
+        };
+        if !cfg!(target_os = "linux") {
+            return Err(RuntimeError::NoDisk(
+                "a job's disk is a file system on a loop device, which this peer makes on Linux only".into(),
+            ));
+        }
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| RuntimeError::NoDisk(format!("cannot make {}: {e}", dir.display())))?;
+            let image = dir.join(format!("{id}.img"));
+            let mount = dir.join(&id);
+            let file = std::fs::File::create(&image)
+                .map_err(|e| RuntimeError::NoDisk(format!("cannot make {}: {e}", image.display())))?;
+            file.set_len(bytes)
+                .map_err(|e| RuntimeError::NoDisk(format!("no room for a disk of {bytes} bytes: {e}")))?;
+            drop(file);
+            std::fs::create_dir_all(&mount).map_err(|e| RuntimeError::NoDisk(e.to_string()))?;
+            let (img, mnt) = (image.to_string_lossy().to_string(), mount.to_string_lossy().to_string());
+            run("mkfs.ext4", &["-q", "-F", &img])?;
+            run("mount", &["-o", "loop", &img, &mnt]).map_err(|e| {
+                RuntimeError::NoDisk(format!("{e}; a job's disk is mounted by the peer, which needs root"))
+            })?;
+            // Whoever the job's image runs as writes there.
+            run("chmod", &["0777", &mnt])?;
+            Ok(mount)
+        })
+        .await
+        .map_err(|e| RuntimeError::NoDisk(e.to_string()))?
+    }
+
+    async fn remove_disk(&self, id: &str) -> Result<(), RuntimeError> {
+        let Some(dir) = self.disks.clone() else {
+            return Ok(());
+        };
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mount = dir.join(&id);
+            if mount.exists() {
+                let _ = run("umount", &[&mount.to_string_lossy()]);
+                let _ = std::fs::remove_dir_all(&mount);
+            }
+            let _ = std::fs::remove_file(dir.join(format!("{id}.img")));
+            Ok(())
+        })
+        .await
+        .map_err(|e| RuntimeError::NoDisk(e.to_string()))?
+    }
+
+    fn disk_room(&self) -> Option<(u64, u64)> {
+        let dir = self.disks.clone()?;
+        if !cfg!(target_os = "linux") {
+            return None;
+        }
+        std::fs::create_dir_all(&dir).ok()?;
+        let out = std::process::Command::new("df")
+            .args(["-B1", "--output=avail,size", &dir.to_string_lossy()])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut numbers = text
+            .lines()
+            .nth(1)?
+            .split_whitespace()
+            .filter_map(|n| n.parse::<u64>().ok());
+        Some((numbers.next()?, numbers.next()?))
+    }
+
     async fn isolation(&self) -> Isolation {
         match self.docker.info().await {
             Ok(info) => Isolation::of_container_engine(&info.security_options.unwrap_or_default()),

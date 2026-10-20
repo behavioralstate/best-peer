@@ -31,7 +31,8 @@ the cloud's, which a peer's differs from only in placing on its own devices and 
 | Submit, asynchronously, and get an id | yes | `/run` | `run-job`, `JobQueued`'s `job` |
 | A synchronous call that waits for the result | no | `/runsync` | no: a command's outcome is always an event |
 | Status of a job | a status path | `/status` | the stream, `get-workloads` (`queued`, `jobs`) |
-| The job's output | a result path | `output` in `/status`, kept for a while | no: the exit code only; inputs and outputs are behavioralstate/spec#66 |
+| The job's output | a result path | `output` in `/status`, kept for a while | what it leaves under `/out`, one tar archive in the workspace's store, `OutputsStored` naming its key |
+| The job's input | the request's body | `input` in the request | files from the workspace's store under `/in`, `InputsFetched` before `JobStarted` |
 | A bound on the run | `deadline_seconds` | `executionTimeout` | `deadline_seconds` |
 | A bound on the wait | `queue_message_ttl_seconds` | `ttl`, from submission, covering the wait and the run | `queue_seconds`, the wait alone, a day by default |
 | Cancel a queued or running job | not documented | `/cancel` | `stop-job` |

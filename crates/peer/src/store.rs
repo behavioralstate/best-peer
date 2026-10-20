@@ -1,0 +1,252 @@
+//! A workspace's store, where its jobs' inputs come from and their outputs go (behavioralstate/spec#66). It speaks S3,
+//! so any S3-compatible store serves, Verda's object storage the first proven. The workspace's credential stays with
+//! its door: for each order the door signs short-lived URLs (S3 presigned, Signature Version 4, path-style), a GET for
+//! each input and a PUT for the outputs, and a member peer is handed those URLs and nothing else. The bytes go between
+//! the machine and the store; the door carries only keys and sizes.
+
+use std::path::Path;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
+
+/// The longest a signed URL may live, by Signature Version 4: seven days.
+pub const MOST_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+/// A workspace's store, as its owner set it.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Store {
+    /// The S3 endpoint, scheme and host: `https://objects.example.com`.
+    pub endpoint: String,
+    pub bucket: String,
+    pub region: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+}
+
+impl Store {
+    /// A URL that lets whoever holds it do `method` on `key` for `expires` seconds from `now`, and nothing else.
+    pub fn presign(&self, method: &str, key: &str, expires: u64, now: OffsetDateTime) -> String {
+        let endpoint = self.endpoint.trim_end_matches('/');
+        let host = endpoint.split_once("://").map_or(endpoint, |(_, h)| h);
+        let path = format!("/{}/{}", self.bucket, encode(key, false));
+        let query = signed_query(
+            method,
+            host,
+            &path,
+            &self.access_key_id,
+            &self.secret_access_key,
+            &self.region,
+            now,
+            expires.min(MOST_SECONDS),
+        );
+        format!("{endpoint}{path}?{query}")
+    }
+
+    /// The size of the object at `key`, or none when the store holds no such object; an error is the store not
+    /// answering as a store does.
+    pub async fn size_of(&self, key: &str) -> Result<Option<u64>, String> {
+        let url = self.presign("HEAD", key, 300, OffsetDateTime::now_utc());
+        tokio::task::spawn_blocking(move || {
+            let agent = agent();
+            match agent.head(&url).call() {
+                Ok(r) => Ok(r
+                    .headers()
+                    .get("content-length")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse().ok())
+                    .or(Some(0))),
+                Err(ureq::Error::StatusCode(404)) => Ok(None),
+                Err(ureq::Error::StatusCode(code)) => Err(format!("the store answered {code}")),
+                Err(e) => Err(format!("the store did not answer: {e}")),
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+}
+
+/// The HTTP client of the store's transfers: no timeout on a body, which may be gigabytes, a minute to connect.
+fn agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(60)))
+        .http_status_as_error(true)
+        .build()
+        .into()
+}
+
+/// Whether a member peer may fetch from or send to `url`: https anywhere, plain http only to this host's loopback
+/// when its operator allows it (a store on the same machine, as in a test), and never anywhere else, so an order
+/// cannot point a machine at what only it can reach.
+pub fn allowed(url: &str, cleartext_loopback: bool) -> bool {
+    if url.starts_with("https://") {
+        return true;
+    }
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let host = rest.split(['/', '?']).next().unwrap_or_default();
+    let host = host.rsplit_once(':').map_or(host, |(h, _)| h);
+    cleartext_loopback && matches!(host, "127.0.0.1" | "localhost" | "[::1]")
+}
+
+/// Fetches `url` into `to`, answering the bytes written.
+pub fn fetch(url: &str, to: &Path) -> Result<u64, String> {
+    if let Some(dir) = to.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
+    }
+    let mut file = std::fs::File::create(to).map_err(|e| format!("cannot write {}: {e}", to.display()))?;
+    let mut response = agent().get(url).call().map_err(|e| match e {
+        ureq::Error::StatusCode(code) => format!("the store answered {code}"),
+        e => format!("the store did not answer: {e}"),
+    })?;
+    std::io::copy(&mut response.body_mut().as_reader(), &mut file)
+        .map_err(|e| format!("fetching into {} stopped: {e}", to.display()))
+}
+
+/// Sends the file `from` to `url` whole, answering its bytes.
+pub fn put(url: &str, from: &Path) -> Result<u64, String> {
+    let file = std::fs::File::open(from).map_err(|e| format!("cannot read {}: {e}", from.display()))?;
+    let bytes = file.metadata().map_err(|e| e.to_string())?.len();
+    agent()
+        .put(url)
+        .header("content-length", &bytes.to_string())
+        .send(ureq::SendBody::from_reader(&mut std::io::BufReader::new(file)))
+        .map_err(|e| match e {
+            ureq::Error::StatusCode(code) => format!("the store answered {code}"),
+            e => format!("the store did not take it: {e}"),
+        })?;
+    Ok(bytes)
+}
+
+/// Packs the directory `dir` into the archive `to`, paths relative to it; answers the archive's bytes.
+pub fn pack(dir: &Path, to: &Path) -> Result<u64, String> {
+    let file = std::fs::File::create(to).map_err(|e| format!("cannot write {}: {e}", to.display()))?;
+    let mut archive = tar::Builder::new(file);
+    archive.follow_symlinks(false);
+    archive
+        .append_dir_all(".", dir)
+        .and_then(|_| archive.finish())
+        .map_err(|e| format!("cannot pack {}: {e}", dir.display()))?;
+    std::fs::metadata(to).map(|m| m.len()).map_err(|e| e.to_string())
+}
+
+/// The query string of a URL signed with Signature Version 4 for `method` on `path` at `host`, the payload
+/// unsigned, signing the host header alone.
+#[allow(clippy::too_many_arguments)]
+fn signed_query(
+    method: &str,
+    host: &str,
+    path: &str,
+    key_id: &str,
+    secret: &str,
+    region: &str,
+    now: OffsetDateTime,
+    expires: u64,
+) -> String {
+    let date = format!("{:04}{:02}{:02}", now.year(), now.month() as u8, now.day());
+    let stamp = format!("{date}T{:02}{:02}{:02}Z", now.hour(), now.minute(), now.second());
+    let scope = format!("{date}/{region}/s3/aws4_request");
+    let query = format!(
+        "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={}&X-Amz-Date={stamp}&X-Amz-Expires={expires}&X-Amz-SignedHeaders=host",
+        encode(&format!("{key_id}/{scope}"), true)
+    );
+    let canonical = format!("{method}\n{path}\n{query}\nhost:{host}\n\nhost\nUNSIGNED-PAYLOAD");
+    let to_sign = format!(
+        "AWS4-HMAC-SHA256\n{stamp}\n{scope}\n{}",
+        hex(&Sha256::digest(canonical.as_bytes()))
+    );
+    let mut key = hmac(format!("AWS4{secret}").as_bytes(), date.as_bytes());
+    for part in [region, "s3", "aws4_request"] {
+        key = hmac(&key, part.as_bytes());
+    }
+    format!("{query}&X-Amz-Signature={}", hex(&hmac(&key, to_sign.as_bytes())))
+}
+
+/// HMAC-SHA256 of `message` under `key`.
+fn hmac(key: &[u8], message: &[u8]) -> Vec<u8> {
+    let mut block = [0u8; 64];
+    if key.len() > 64 {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let pad = |b: u8| block.iter().map(|k| k ^ b).collect::<Vec<u8>>();
+    let inner = Sha256::new().chain_update(pad(0x36)).chain_update(message).finalize();
+    Sha256::new()
+        .chain_update(pad(0x5c))
+        .chain_update(inner)
+        .finalize()
+        .to_vec()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `s` percent-encoded as Signature Version 4 asks: every byte but the unreserved, and `/` too when `slash`.
+fn encode(s: &str, slash: bool) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (b as char).to_string(),
+            b'/' if !slash => "/".to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_url_is_signed_as_the_s3_documentation_signs_its_example() {
+        // AWS's own example of a presigned GET: the signature it documents for these inputs.
+        let now =
+            OffsetDateTime::parse("2013-05-24T00:00:00Z", &time::format_description::well_known::Rfc3339).unwrap();
+        let q = signed_query(
+            "GET",
+            "examplebucket.s3.amazonaws.com",
+            "/test.txt",
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "us-east-1",
+            now,
+            86400,
+        );
+        assert!(
+            q.ends_with("X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"),
+            "{q}"
+        );
+        assert!(q.contains("X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request"));
+    }
+
+    #[test]
+    fn a_store_signs_path_style_urls_for_a_key_and_never_longer_than_seven_days() {
+        let s = Store {
+            endpoint: "https://objects.test/".into(),
+            bucket: "renders".into(),
+            region: "fin-01".into(),
+            access_key_id: "id".into(),
+            secret_access_key: "secret".into(),
+        };
+        let url = s.presign("PUT", "out/job 1.tar", 30 * 24 * 3600, OffsetDateTime::now_utc());
+        assert!(
+            url.starts_with("https://objects.test/renders/out/job%201.tar?X-Amz-Algorithm="),
+            "{url}"
+        );
+        assert!(url.contains("X-Amz-Expires=604800"), "{url}");
+        assert!(!url.contains("secret"), "the secret never leaves: {url}");
+    }
+
+    #[test]
+    fn a_machine_reaches_a_store_over_https_and_plain_http_only_on_loopback_when_allowed() {
+        assert!(allowed("https://objects.test/b/k?x", false));
+        assert!(!allowed("http://objects.test/b/k", true));
+        assert!(!allowed("http://127.0.0.1:9000/b/k", false));
+        assert!(allowed("http://127.0.0.1:9000/b/k", true));
+        assert!(!allowed("http://169.254.169.254/latest/meta-data", true));
+        assert!(!allowed("file:///etc/passwd", true));
+    }
+}

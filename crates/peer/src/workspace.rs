@@ -36,6 +36,7 @@ use crate::holdings::Holdings;
 use crate::lifecycle::{list, new_id, require};
 use crate::menu::{Menu, Size};
 use crate::meter::{Cap, Purse};
+use crate::store::Store;
 use crate::transport::{Cleartext, Transport};
 
 /// Where the workspaces' doors are under the root: `/workspaces/<id>`.
@@ -59,6 +60,8 @@ pub struct Context {
     pub cleartext: Cleartext,
     /// What a credential with a share may do at once, counted across the root and every workspace.
     pub limits: Arc<Limits>,
+    /// Whether a workspace's store may be plain http on this host's loopback (a test's, a developer's); else https.
+    pub store_cleartext: bool,
 }
 
 impl Context {
@@ -625,6 +628,9 @@ pub struct Workspace {
     clouds: Mutex<BTreeMap<String, CloudRecord>>,
     /// Its spending cap and the clouds whose orders count against it.
     purse: Arc<Purse>,
+    /// Its store, where its jobs' inputs come from and their outputs go, as its owner set it: kept in its own file,
+    /// the credential never on the log.
+    store: Arc<Mutex<Option<Store>>>,
     door: OnceLock<Arc<Door>>,
     router: OnceLock<Router>,
     started: std::sync::atomic::AtomicBool,
@@ -641,6 +647,17 @@ struct SetMenuData {
     cloud: String,
     currency: String,
     sizes: Vec<Size>,
+}
+
+#[derive(Deserialize)]
+struct SetStoreData {
+    endpoint: String,
+    bucket: String,
+    region: String,
+    #[serde(default)]
+    access_key_id: Option<String>,
+    #[serde(default)]
+    secret_access_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -671,6 +688,10 @@ impl Workspace {
                 .map_err(|e| format!("cannot keep the log of workspace {id} in {}: {e}", dir.display()))?,
         );
         let endpoint = ctx.workspace_endpoint(id);
+        // Its store as its owner last set it, credential and all, from the workspace's own file.
+        let store: Option<Store> = std::fs::read(dir.join("store.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok());
         let me = Arc::new(Self {
             id: id.into(),
             dataschemas: Arc::new(domain::workspace_event_dataschemas(&endpoint)),
@@ -682,6 +703,7 @@ impl Workspace {
             members: Mutex::new(members),
             clouds: Mutex::new(BTreeMap::new()),
             purse: Arc::new(Purse::new(log.clone())),
+            store: Arc::new(Mutex::new(store)),
             door: OnceLock::new(),
             router: OnceLock::new(),
             started: std::sync::atomic::AtomicBool::new(false),
@@ -932,6 +954,7 @@ impl Workspace {
                     );
                     c.set_menu(r.menu.clone());
                     c.set_purse(self.purse.clone());
+                    c.set_store(self.store.clone());
                     let counted = Arc::downgrade(&c);
                     self.purse
                         .add(move || counted.upgrade().map(|c| c.open_orders()).unwrap_or_default());
@@ -1192,6 +1215,65 @@ impl Clouds for Workspace {
             answer["cap"] = json!({ "amount": cap.amount, "currency": cap.currency, "spent": spent, "held": held });
         }
         Ok(answer)
+    }
+
+    fn store_view(&self) -> Result<Value, BestError> {
+        let store = self.store.lock().unwrap().clone();
+        Ok(json!({ "store": store.map(|s| json!({ "endpoint": s.endpoint, "bucket": s.bucket, "region": s.region })) }))
+    }
+
+    /// Admits a store: the owner's, at an endpoint a machine may reach, with its credential, which is kept in the
+    /// workspace's own file now and never recorded (its fields are writeOnly).
+    fn admit_set_store(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError> {
+        if !self.is_owner(&who.holder()) {
+            return Err(
+                BestError::bad_request("FORBIDDEN", "only the workspace's owner sets its store: ask them")
+                    .with_details(json!({ "workspace": self.id, "role": "member" })),
+            );
+        }
+        let data: SetStoreData = crate::lifecycle::parse(&cmd.data)?;
+        let bad = |field: &str, message: &str| {
+            Err(BestError::bad_request("INVALID_STORE", message.to_string()).with_details(json!({ "field": field })))
+        };
+        let reachable = data.endpoint.starts_with("https://")
+            || (self.ctx.store_cleartext && crate::store::allowed(&format!("{}/x", data.endpoint), true));
+        if !reachable || data.endpoint.trim_end_matches('/').matches('/').count() != 2 {
+            return bad(
+                "endpoint",
+                "endpoint is the store's https address, scheme and host alone, such as https://objects.example.com",
+            );
+        }
+        let (Some(access_key_id), Some(secret_access_key)) = (data.access_key_id, data.secret_access_key) else {
+            return bad(
+                "access_key_id",
+                "a store needs its credential: access_key_id and secret_access_key, which are kept with the workspace and never recorded",
+            );
+        };
+        let store = Store {
+            endpoint: data.endpoint.trim_end_matches('/').to_string(),
+            bucket: data.bucket,
+            region: data.region,
+            access_key_id,
+            secret_access_key,
+        };
+        std::fs::create_dir_all(&self.dir)
+            .and_then(|_| {
+                crate::tls::write_private(
+                    &self.dir.join("store.json"),
+                    &serde_json::to_vec_pretty(&store).unwrap_or_default(),
+                )
+            })
+            .map_err(|e| BestError::internal(format!("the store could not be kept: {e}")))?;
+        *self.store.lock().unwrap() = Some(store);
+        Ok(())
+    }
+
+    async fn set_store(self: Arc<Self>, cmd: Envelope, em: Emitter) {
+        self.tell(
+            &em,
+            "StoreSetV1",
+            json!({ "workspace": self.id, "endpoint": cmd.data["endpoint"], "bucket": cmd.data["bucket"], "region": cmd.data["region"] }),
+        );
     }
 
     fn admit_set_cap(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError> {
