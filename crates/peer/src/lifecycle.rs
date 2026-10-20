@@ -1432,7 +1432,7 @@ impl Peer {
                 );
             }
         }
-        if self.runtime.disk_room().is_none() {
+        if !self.runtime.makes_disks() {
             return Err(BestError::bad_request(
                 "NO_DISK",
                 "this peer makes no disk for a job: a job with inputs or outputs runs on a peer whose container engine is Docker on Linux",
@@ -1447,8 +1447,12 @@ impl Peer {
 
     /// The room for jobs' disks here, free and in all: what the runtime says is free, the disks it made counted, less
     /// what is promised to jobs admitted and not given theirs yet.
-    fn disk_room(&self) -> Option<(u64, u64)> {
-        let (free, total) = self.runtime.disk_room()?;
+    async fn disk_room(&self) -> Option<(u64, u64)> {
+        let runtime = self.runtime.clone();
+        let (free, total) = tokio::task::spawn_blocking(move || runtime.disk_room())
+            .await
+            .ok()
+            .flatten()?;
         let promised: u64 = self.promised_disks.lock().unwrap().values().sum();
         Some((free.saturating_sub(promised), total))
     }
@@ -1463,11 +1467,15 @@ impl Peer {
         let (promised, runtime, id) = (self.promised_disks.clone(), self.runtime.clone(), id.to_string());
         tokio::task::spawn_blocking(move || {
             let mut promised = promised.lock().unwrap();
-            let free = runtime
-                .disk_room()
-                .map(|(f, _)| f)
-                .unwrap_or(0)
-                .saturating_sub(promised.values().sum());
+            let Some((free, _)) = runtime.disk_room() else {
+                // Told as no room now, so a cloud keeps the order to place again.
+                return Err(BestError::bad_request(
+                    "INSUFFICIENT_DISK",
+                    "this peer could not read the room for a job's disk now: its file system did not answer in time; try again, or order where there is room",
+                )
+                .with_details(json!({ "field": "disk_bytes" })));
+            };
+            let free = free.saturating_sub(promised.values().sum());
             if free < bytes {
                 return Err(BestError::bad_request(
                     "INSUFFICIENT_DISK",
@@ -2090,7 +2098,7 @@ impl Service for Peer {
         for d in v["devices"].as_array_mut().into_iter().flatten() {
             d["isolation"] = json!(isolation);
         }
-        if let Some((free, total)) = self.disk_room() {
+        if let Some((free, total)) = self.disk_room().await {
             v["disk"] = json!({ "free_bytes": free, "total_bytes": total });
         }
         Ok(v)

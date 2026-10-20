@@ -391,6 +391,10 @@ impl Runtime for DockerRuntime {
         .map_err(|e| RuntimeError::NoDisk(e.to_string()))?
     }
 
+    fn makes_disks(&self) -> bool {
+        self.disks.is_some() && cfg!(target_os = "linux")
+    }
+
     fn disks(&self) -> Vec<String> {
         let Some(dir) = self.disks.clone() else {
             return vec![];
@@ -443,8 +447,9 @@ impl Runtime for DockerRuntime {
                     std::thread::sleep(std::time::Duration::from_millis(20))
                 }
                 _ => {
+                    // Killed, and left to a thread of its own to reap: one stuck in the file system may never end.
                     let _ = df.kill();
-                    let _ = df.wait();
+                    std::thread::spawn(move || df.wait());
                     return None;
                 }
             }

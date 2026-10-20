@@ -9472,4 +9472,23 @@ mod tests {
         assert_eq!(refused["error"]["code"], "INSUFFICIENT_DISK", "{refused}");
         assert_eq!(refused["error"]["details"]["free_bytes"], GB / 2);
     }
+
+    #[tokio::test]
+    async fn a_room_its_file_system_does_not_say_is_told_as_such_and_never_as_a_peer_that_makes_no_disk() {
+        let bed = fresh().await;
+        bed.runtime.room_unread(true);
+        let job = json!({ "image": "busybox", "memory_bytes": 4 * GB, "disk_bytes": GB });
+        let (s, b) = bed.send("j1", "RunJob", "run-job", job.clone()).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        // No room now, which a cloud places again later: not a peer that makes none.
+        assert_eq!(b["error"]["code"], "INSUFFICIENT_DISK", "{b}");
+        assert!(
+            b["error"]["message"].as_str().unwrap().contains("could not read"),
+            "{b}"
+        );
+        assert!(bed.query("get-hardware-state").await["disk"].is_null());
+        bed.runtime.room_unread(false);
+        let (s, b) = bed.send("j2", "RunJob", "run-job", job).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+    }
 }

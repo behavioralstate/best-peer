@@ -254,8 +254,12 @@ pub trait Runtime: Send + Sync {
     async fn remove_disk(&self, _id: &str) -> Result<(), RuntimeError> {
         Ok(())
     }
+    /// Whether this runtime makes jobs' disks at all; answered at once, without asking the file system.
+    fn makes_disks(&self) -> bool {
+        false
+    }
     /// The space free, and in all, where this runtime makes disks, the disks it made counted whole; none when it
-    /// makes none.
+    /// makes none, or the file system did not say. It may take a while: call it off the executor.
     fn disk_room(&self) -> Option<(u64, u64)> {
         None
     }
@@ -303,6 +307,8 @@ pub struct Fake {
     disks_made: Mutex<HashMap<String, u64>>,
     /// Why the next disk fails once it is begun, as a file system that cannot be made on it fails.
     broken_disk: Mutex<Option<String>>,
+    /// Whether its room can be read now: not, as a file system that does not answer.
+    room_unread: Mutex<bool>,
 }
 
 impl Fake {
@@ -328,7 +334,13 @@ impl Fake {
             disk_free: Mutex::new(1 << 40),
             disks_made: Mutex::new(HashMap::new()),
             broken_disk: Mutex::new(None),
+            room_unread: Mutex::new(false),
         }
+    }
+
+    /// From now on its room cannot be read, or can again.
+    pub fn room_unread(&self, unread: bool) {
+        *self.room_unread.lock().unwrap() = unread;
     }
 
     /// The next disk is begun, its directory made, and then fails with `why`.
@@ -572,7 +584,14 @@ impl Runtime for Fake {
         }
     }
 
+    fn makes_disks(&self) -> bool {
+        true
+    }
+
     fn disk_room(&self) -> Option<(u64, u64)> {
+        if *self.room_unread.lock().unwrap() {
+            return None;
+        }
         let free = *self.disk_free.lock().unwrap();
         let made: u64 = self.disks_made.lock().unwrap().values().sum();
         Some((free.saturating_sub(made), free.max(1 << 40)))
