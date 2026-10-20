@@ -401,7 +401,10 @@ engine is asked and what it answers are in the door's log like every other fact,
 correlations and by nobody else (behavioralstate/spec#53), and kept until the holder says otherwise.
 
 `forget` is how the holder says so (behavioralstate/spec#68). It names one prompt's correlation, a deployment (every
-prompt of the holder's to it) or a time (every prompt of the holder's told before it), and removes the content: the
+prompt of the holder's to it) or a time (every prompt of the holder's answered before it; where one correlation holds
+prompts answered on both sides of the time, the answers before it are forgotten and the prompts' messages kept, since
+which prompt each answer was for is not told apart, and `Forgotten` names those correlations as `held_back` to forget
+by correlation), and removes the content: the
 messages the holder sent, the answers' content, and what an engine said when a prompt failed. Each event and command
 stays as an envelope, its id, type, time and correlation with its deployment, model, token counts, holder, cloud and
 peer, marked `forgotten`, so a page of events, a replay of the stream and a restart serve it without its content, the

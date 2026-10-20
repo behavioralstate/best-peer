@@ -2258,6 +2258,10 @@ mod tests {
             (forgotten["events"].clone(), forgotten["commands"].clone()),
             (json!(1), json!(1))
         );
+        assert!(
+            forgotten.get("held_back").is_none(),
+            "a deployment holds nothing back: {forgotten}"
+        );
         let on_disk = every_file(dir.path());
         assert!(
             !on_disk.contains("first secret"),

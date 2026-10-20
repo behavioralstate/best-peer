@@ -169,11 +169,16 @@ pub fn forget(log: &EventLog, sender: &str, scope: &Scope) -> Result<Forgot, Str
             scope.holds(Some(correlation), &e.data, &e.time)
         })
         .count();
-    let mut held_back: Vec<String> = picked
-        .iter()
-        .filter(|(c, n)| told.get(*c).is_some_and(|t| t > *n))
-        .map(|(c, _)| c.clone())
-        .collect();
+    // Only a time holds a prompt back: a deployment leaves a sibling under the same correlation because it was not
+    // named, which forgetting by correlation would take unasked.
+    let mut held_back: Vec<String> = match scope {
+        Scope::Before(_) => picked
+            .iter()
+            .filter(|(c, n)| told.get(*c).is_some_and(|t| t > *n))
+            .map(|(c, _)| c.clone())
+            .collect(),
+        Scope::Correlation(_) | Scope::Deployment(_) => Vec::new(),
+    };
     held_back.sort();
     Ok(Forgot {
         events,
