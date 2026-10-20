@@ -144,7 +144,11 @@ pub struct Peer {
     /// One placement step at a time.
     steps: tokio::sync::Mutex<()>,
     /// The orders placed and starting (their image pulled, their container started), not yet told as started.
+    /// Locked after `state` when both are held, never before.
     starting: Mutex<std::collections::HashSet<String>>,
+    /// The waiting orders a stop was admitted for, until it is told: a step starts none of them. Locked after `state`
+    /// when both are held, never before.
+    stopping: Mutex<std::collections::HashSet<String>>,
     /// The command behind each order, by the order's id: what completes the command.
     keys: Mutex<HashMap<String, String>>,
     /// The commands admitted from a credential held to the accelerators, until the order is told.
@@ -254,6 +258,7 @@ impl Peer {
             stepper: crate::queue::Stepper::default(),
             steps: tokio::sync::Mutex::new(()),
             starting: Mutex::new(std::collections::HashSet::new()),
+            stopping: Mutex::new(std::collections::HashSet::new()),
             keys: Mutex::new(HashMap::new()),
             held_to_accelerators: Mutex::new(std::collections::HashSet::new()),
         }
@@ -464,7 +469,20 @@ impl Peer {
     /// a device of this peer with its room, an order that does not fit holding back none after it.
     pub async fn step(self: &Arc<Self>, now: OffsetDateTime) {
         let _one = self.steps.lock().await;
-        let due = crate::queue::due(&self.state.lock().unwrap(), now);
+        // An order that is starting is no longer waiting for room, and one being stopped is the stop's to tell.
+        // Read with the state's lock held, as the lock order asks.
+        let held = || {
+            let mut held = self.starting.lock().unwrap().clone();
+            held.extend(self.stopping.lock().unwrap().iter().cloned());
+            held
+        };
+        let due = {
+            let s = self.state.lock().unwrap();
+            let held = held();
+            let mut due = crate::queue::due(&s, now);
+            due.expired.retain(|o| !held.contains(&o.id));
+            due
+        };
         for o in due.expired {
             self.tell(
                 &self.order_emitter(&o),
@@ -498,14 +516,9 @@ impl Peer {
             }
         }
         let waiting: Vec<crate::state::Order> = {
-            let starting = self.starting.lock().unwrap();
-            self.state
-                .lock()
-                .unwrap()
-                .waiting()
-                .into_iter()
-                .filter(|o| !starting.contains(&o.id))
-                .collect()
+            let s = self.state.lock().unwrap();
+            let held = held();
+            s.waiting().into_iter().filter(|o| !held.contains(&o.id)).collect()
         };
         if waiting.is_empty() {
             return;
@@ -516,22 +529,10 @@ impl Peer {
         for o in waiting {
             let reservation = {
                 let mut s = self.state.lock().unwrap();
-                // Stopped while the hardware was read.
-                if !s.orders.get(&o.id).is_some_and(|x| x.waiting()) {
+                // Stopped, or started, while the hardware was read.
+                if !s.orders.get(&o.id).is_some_and(|x| x.waiting()) || held().contains(&o.id) {
                     continue;
                 }
-                let on = if o.accelerators_only {
-                    accelerators(&host)
-                } else {
-                    host.clone()
-                };
-                let needed = o.memory_bytes.unwrap_or(0);
-                let Ok((device, compute)) = place(&on, &s, &any_compute(), needed, o.device.as_deref(), "", None)
-                else {
-                    continue;
-                };
-                // Promised there now, so the next order in this step sees the room taken; after a restart the
-                // promise is made again from the order.
                 let key = self
                     .keys
                     .lock()
@@ -539,20 +540,41 @@ impl Peer {
                     .get(&o.id)
                     .cloned()
                     .unwrap_or_else(|| o.id.clone());
-                s.reserved.retain(|k, r| r.id != o.id || *k == key);
-                let r = s.reserved.entry(key).or_insert_with(|| Reservation {
+                // Its own promise is not in its way: a promise admission made again after a restart, with the room
+                // it found then, is set aside while the order is placed, and made again from the order.
+                s.reserved.retain(|_, r| r.id != o.id);
+                let mut promise = Reservation {
                     id: o.id.clone(),
                     device: None,
                     compute: None,
-                    memory_bytes: needed,
+                    memory_bytes: o.memory_bytes.unwrap_or(0),
                     holder: o.holder.clone(),
                     boxed: o.boxed,
-                });
-                r.device = Some(device);
-                r.compute = Some(compute);
-                r.clone()
+                };
+                // An order with no memory_bytes runs with no device: nothing to place.
+                if let Some(needed) = o.memory_bytes {
+                    let on = if o.accelerators_only {
+                        accelerators(&host)
+                    } else {
+                        host.clone()
+                    };
+                    match place(&on, &s, &any_compute(), needed, o.device.as_deref(), "", None) {
+                        Ok((device, compute)) => {
+                            promise.device = Some(device);
+                            promise.compute = Some(compute);
+                        }
+                        Err(_) => {
+                            // Still waiting: it holds no device, and counts against its holder's share as before.
+                            s.reserved.insert(key, promise);
+                            continue;
+                        }
+                    }
+                }
+                // Promised there now, so the next order in this step sees the room taken.
+                s.reserved.insert(key, promise.clone());
+                self.starting.lock().unwrap().insert(o.id.clone());
+                promise
             };
-            self.starting.lock().unwrap().insert(o.id.clone());
             let (me, em) = (self.clone(), self.order_emitter(&o));
             tokio::spawn(async move {
                 me.start_job(&em, &o.image, &o.args, reservation, true).await;
@@ -1281,6 +1303,14 @@ impl Peer {
                 )
                 .with_details(json!({ "job": id })));
             }
+            // Claimed now, under the state's lock, so no step starts it and no second stop is admitted.
+            if !self.stopping.lock().unwrap().insert(id.to_string()) {
+                return Err(BestError::bad_request(
+                    "ALREADY_STOPPING",
+                    format!("order {id} is already being stopped: its JobStopped event follows"),
+                )
+                .with_details(json!({ "job": id })));
+            }
             return Ok(());
         }
         let running: Vec<String> = s
@@ -1326,6 +1356,7 @@ impl Peer {
             let stopped = json!({ "job": id, "reason": "stopped before it started" });
             self.tell(&self.order_emitter(&o), "JobStopped", stopped.clone());
             self.tell(&em, "JobStopped", stopped);
+            self.stopping.lock().unwrap().remove(&id);
             return;
         }
         let container = self.state.lock().unwrap().jobs.get(&id).map(|j| j.container.clone());
@@ -1529,10 +1560,12 @@ impl Peer {
         let s = self.state.lock().unwrap();
         let mut v = workloads_view(&s, who, None);
         v["held_bytes"] = json!(held);
-        // The orders of this peer's queue that wait, oldest first.
+        // The orders of this peer's queue that wait for room, oldest first: one starting has its device already.
+        let starting = self.starting.lock().unwrap().clone();
         v["queued"] = json!(s
             .waiting()
             .iter()
+            .filter(|o| !starting.contains(&o.id))
             .filter(|o| who.grant.is_all() || o.holder == who.holder())
             .map(|o| json!({
                 "job": o.id, "image": o.image, "memory_bytes": o.memory_bytes, "device": o.device,

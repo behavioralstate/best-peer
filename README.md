@@ -361,14 +361,15 @@ folded from these facts; [docs/queue.md](docs/queue.md) says what it does not do
 RunPod Serverless do.
 
 A peer's own door keeps the same queue, in the same code, for the orders sent to it directly, and waiting there is
-asked for. A `run-job` that sends `queue_seconds` or `deadline_seconds` goes through it. `JobQueued` comes first, with
-`waiting: true` while no device of this peer has its room, and the order is started as soon as one has, first come,
-first served, an order that does not fit holding back none that does. `queue_seconds` ends a wait unplaced,
-`deadline_seconds` stops a run, `stop-job` ends an order that waits, `get-workloads` lists the waiting ones as
-`queued`, and a restart keeps them. A `run-job` that sends neither is refused at once when there is no room
-(`INSUFFICIENT_MEMORY`), as before. That is what a cloud relies on: it sends its members nothing that asks them to
-wait, so a full member refuses, and the order stays in the cloud's queue, free to go to whichever member frees first.
-What an order waits for is a device it fits, whatever the device is: a whole card, a MIG instance or the host's CPU.
+asked for. A `run-job` that sends `queue_seconds` or `deadline_seconds` goes through it, `JobQueued` coming first; one
+that sends `queue_seconds` waits, with `waiting: true`, while no device of this peer has its room, and is started as
+soon as one has, first come, first served, an order that does not fit holding back none that does. `queue_seconds`
+ends a wait unplaced, `deadline_seconds` stops a run, `stop-job` ends an order that waits, `get-workloads` lists the
+waiting ones as `queued`, and a restart keeps them. A `run-job` that does not send `queue_seconds` is refused at once
+when there is no room (`INSUFFICIENT_MEMORY`), as before. That is what a cloud relies on: it sends its members nothing
+that asks them to wait, so a full member refuses, and the order stays in the cloud's queue, free to go to whichever
+member frees first. What an order waits for is a device it fits, whatever the device is: a whole card, a MIG instance
+or the host's CPU.
 
 A cloud can sell by **sizes** instead of hardware. Its owner sets a menu with `set-menu`: each size a name, its floors
 (the device memory it needs, the compute API at the least version, the host memory of the device's machine), the

@@ -1438,6 +1438,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_order_that_waited_starts_after_a_restart_when_the_job_in_its_way_ended_while_the_peer_was_down() {
+        let log = Arc::new(EventLog::ephemeral());
+        let runtime = Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![]));
+        let first = bed(card(), log.clone(), runtime.clone()).await;
+        let (s, b) = run_on(&first, "j1", 20, json!({})).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let blocker = ContainerId(
+            first.events_of("j1", "JobStarted").await.last().unwrap().data["container"]
+                .as_str()
+                .unwrap()
+                .into(),
+        );
+        let (s, b) = run_on(&first, "q1", 20, json!({ "queue_seconds": 600 })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let order = first.events_of("q1", "JobQueued").await[0].data["job"].clone();
+        // The peer dies; while it is down the job in the order's way ends.
+        first.peer.halt();
+        let credentials = first.door.auth.clone();
+        drop(first);
+        runtime.stop(&blocker).await.unwrap();
+        let again = bed_with(
+            card(),
+            log.clone(),
+            runtime.clone(),
+            Arc::new(best_peer_engine::Fake::new()),
+            "engines.local",
+            Some(credentials),
+        )
+        .await;
+        // The room is free when the peer is back: the order starts, not held back by its own promise.
+        let started = again.events_of("q1", "JobStarted").await;
+        assert_eq!(started.last().unwrap().data["order"], order);
+        assert_eq!(started.last().unwrap().data["memory_bytes"], 20 * GB);
+    }
+
+    #[tokio::test]
+    async fn two_stops_of_one_waiting_order_tell_it_stopped_once() {
+        let bed = bed(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        let (s, b) = run_on(&bed, "j1", 20, json!({})).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        bed.events_of("j1", "JobStarted").await;
+        let (s, b) = run_on(&bed, "q1", 10, json!({ "queue_seconds": 600 })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let order = bed.events_of("q1", "JobQueued").await[0].data["job"].clone();
+        let (a, b) = tokio::join!(
+            bed.send("s1", "StopJob", "stop-job", json!({ "job": order })),
+            bed.send("s2", "StopJob", "stop-job", json!({ "job": order }))
+        );
+        let created = [a.0, b.0].iter().filter(|s| **s == StatusCode::CREATED).count();
+        assert!(created >= 1, "{a:?} {b:?}");
+        bed.events_of("q1", "JobStopped").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            types(&bed.log_of("q1")).iter().filter(|t| *t == "JobStopped").count(),
+            1,
+            "the order ends once: {a:?} {b:?}"
+        );
+    }
+
     // ----- workspaces and clouds ----------------------------------------------------------------------------------
 
     /// A door that hosts workspaces: a CPU-only machine at the root, member peers in this process reachable through
