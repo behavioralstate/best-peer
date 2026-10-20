@@ -662,6 +662,22 @@ mod tests {
         ]);
         let u = usage(&jobs, at("20:00"), None, at("20:00"));
         assert_eq!(u["jobs"][0]["seconds"].as_f64(), Some(180.0));
+        // An engine's end the member told is its word as well.
+        let jobs = fold(&[
+            started("00:00", "j1", "a", 0.01),
+            fact(
+                "04:00",
+                "OutOfMemory",
+                json!({ "cloud": "lab", "peer": "a", "deployment": "d" }),
+            ),
+            fact(
+                "10:00",
+                "PeerLost",
+                json!({ "cloud": "lab", "peer": "a", "reason": "unreachable" }),
+            ),
+        ]);
+        let u = usage(&jobs, at("20:00"), None, at("20:00"));
+        assert_eq!(u["jobs"][0]["seconds"].as_f64(), Some(240.0));
     }
 
     #[test]
