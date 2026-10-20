@@ -1,7 +1,7 @@
 //! [`Runtime`] over the Docker Engine API through bollard. Every container this adapter creates carries the label
 //! `best-peer`, so `running` and the event feed see the peer's containers and nothing else. A device is handed over
-//! by the NVIDIA container toolkit when its id is an NVML UUID (`GPU-...`); other accelerators wait for their own
-//! adapter. A mount is a bind the engine refuses when its source is not there. A container is confined as its spec
+//! by the NVIDIA container toolkit when its id is an NVML UUID: a whole card (`GPU-...`) or one MIG instance of a split
+//! card (`MIG-...`), which the toolkit hands over alone; other accelerators wait for their own adapter. A mount is a bind the engine refuses when its source is not there. A container is confined as its spec
 //! says, in the engine's own words: capabilities dropped, no new privileges, a read-only root with a private `/tmp`,
 //! ceilings on processes and on memory with swap counted in, and its network. A container that exits is removed by
 //! this adapter once it has read the last lines the container wrote, which the exit then carries; one whose exit was
@@ -330,21 +330,11 @@ impl Runtime for DockerRuntime {
     }
 
     async fn start(&self, spec: Spec) -> Result<Started, RuntimeError> {
-        let mut device_requests = Vec::new();
-        for d in &spec.devices {
-            if !d.0.starts_with("GPU-") {
-                return Err(RuntimeError::DeviceUnavailable(format!(
-                    "{}: this adapter hands over NVIDIA devices (GPU-...) only",
-                    d.0
-                )));
-            }
-            device_requests.push(DeviceRequest {
-                driver: Some("nvidia".into()),
-                device_ids: Some(vec![d.0.clone()]),
-                capabilities: Some(vec![vec!["gpu".into()]]),
-                ..Default::default()
-            });
-        }
+        let device_requests = spec
+            .devices
+            .iter()
+            .map(|d| handed_over(&d.0))
+            .collect::<Result<Vec<_>, _>>()?;
         let port_bindings: HashMap<String, Option<Vec<PortBinding>>> = spec
             .ports
             .iter()
@@ -507,10 +497,39 @@ impl Runtime for DockerRuntime {
     }
 }
 
+/// What the NVIDIA container toolkit is asked for to hand device `id` to a container: a whole card by its `GPU-`
+/// UUID, or one MIG instance by its `MIG-` UUID. Any other id is not an NVIDIA device this adapter can hand over.
+fn handed_over(id: &str) -> Result<DeviceRequest, RuntimeError> {
+    if !(id.starts_with("GPU-") || id.starts_with("MIG-")) {
+        return Err(RuntimeError::DeviceUnavailable(format!(
+            "{id}: this adapter hands over NVIDIA cards (GPU-...) and MIG instances (MIG-...) only"
+        )));
+    }
+    Ok(DeviceRequest {
+        driver: Some("nvidia".into()),
+        device_ids: Some(vec![id.to_string()]),
+        capabilities: Some(vec![vec!["gpu".into()]]),
+        ..Default::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn a_whole_card_and_a_mig_instance_are_handed_over_by_their_uuid_and_nothing_else_is() {
+        for id in [
+            "GPU-314ff147-b152-3a61-162c-d127e3ec73e8",
+            "MIG-9d534ce5-32ef-5865-bac6-a1d9e895ee4a",
+        ] {
+            let r = handed_over(id).unwrap();
+            assert_eq!(r.device_ids, Some(vec![id.to_string()]));
+            assert_eq!(r.driver.as_deref(), Some("nvidia"));
+        }
+        assert!(matches!(handed_over("gpu-0"), Err(RuntimeError::DeviceUnavailable(_))));
+    }
 
     #[test]
     fn a_layer_extracted_after_it_downloaded_moves_the_share_on_and_never_back() {

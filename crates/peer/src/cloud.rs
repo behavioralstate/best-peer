@@ -255,6 +255,28 @@ fn in_size_terms(text: &str, devices: &[&str]) -> String {
     out
 }
 
+/// What an order of `size` on `cloud` is told when the member it was sent to did not take it: that it waits, when the
+/// member did not answer or had not the room after all, or the member's refusal in the size's terms (`devices` the
+/// ids it may quote).
+fn size_told(cloud: &str, size: &str, unreachable: bool, room: bool, said: &str, devices: &[&str]) -> String {
+    if unreachable {
+        format!(
+            "the member peer it was sent to did not answer: it is placed again as soon as a device of cloud {cloud} that meets size {size}'s floors has its room, after the orders before it"
+        )
+    } else if room {
+        format!(
+            "no device of cloud {cloud} that meets size {size}'s floors has its room now: it is placed as soon as one has, after the orders before it"
+        )
+    } else {
+        in_size_terms(said, devices)
+    }
+}
+
+/// What an order of `size` is told when the place it was given is no longer a member of `cloud`.
+fn size_gone(cloud: &str, size: &str) -> String {
+    format!("the place size {size} was given is no longer a member of cloud {cloud}")
+}
+
 /// An order's id: the command's key hashed, so the command run again after a restart finds its order.
 fn order_id(key: &str) -> String {
     format!("job-{}", &hash_key(key)[..12])
@@ -1898,14 +1920,7 @@ impl Cloud {
             .and_then(|(peer, d)| self.member(peer).map(|m| (m, d.to_string())))
         else {
             match &o.size {
-                Some((z, _)) => fail(
-                    format!(
-                        "the place size {} was given is no longer a member of cloud {}",
-                        z.name, self.name
-                    ),
-                    "order it again",
-                    None,
-                ),
+                Some((z, _)) => fail(size_gone(&self.name, &z.name), "order it again", None),
                 None => fail(
                     format!("device {} names no member of this cloud", device.0),
                     "get-hardware-state lists the devices; order it again on one of them",
@@ -1939,6 +1954,7 @@ impl Cloud {
             return;
         };
         self.issued.lock().unwrap().remove(&(member.name.clone(), mc));
+        let unreachable = matches!(e, Refusal::Unreachable(_));
         let room = match &e {
             Refusal::Unreachable(_) => true,
             Refusal::Refused { body, .. } => body["error"]["code"] == "INSUFFICIENT_MEMORY",
@@ -1949,14 +1965,14 @@ impl Cloud {
         let said = match &o.size {
             Some((z, _)) => {
                 tracing::info!(cloud = %self.name, peer = %member.name, said = %refused.message, "a member refused an order by size");
-                if room {
-                    format!(
-                        "no device of cloud {} that meets size {}'s floors has its room now: it is placed as soon as one has, after the orders before it",
-                        self.name, z.name
-                    )
-                } else {
-                    in_size_terms(&refused.message, &[&device.0, &member_device])
-                }
+                size_told(
+                    &self.name,
+                    &z.name,
+                    unreachable,
+                    room,
+                    &refused.message,
+                    &[&device.0, &member_device],
+                )
             }
             None => refused.message,
         };
@@ -2707,6 +2723,32 @@ mod tests {
             "cloud-0123456789abcdef-dep-1",
             "a command of the cloud's own carries the cloud's identity on the member"
         );
+    }
+
+    #[test]
+    fn an_order_by_size_its_member_did_not_take_is_told_why_in_the_sizes_terms() {
+        let devices = ["split/b/MIG-1", "MIG-1"];
+        let silent = size_told("split", "small", true, true, "connection refused by MIG-1", &devices);
+        assert!(
+            silent.contains("did not answer") && silent.contains("size small"),
+            "{silent}"
+        );
+        let full = size_told(
+            "split",
+            "small",
+            false,
+            true,
+            "MIG-1 (NVIDIA A100 MIG 1g.10gb) has 0 free of 9.5 GiB",
+            &devices,
+        );
+        assert!(
+            full.contains("has its room now") && !full.contains("A100") && !full.contains("MIG"),
+            "{full}"
+        );
+        let refused = size_told("split", "small", false, false, "device MIG-1 refused", &devices);
+        assert_eq!(refused, "device its device refused");
+        let gone = size_gone("split", "small");
+        assert!(gone.contains("size small") && !gone.contains("MIG"), "{gone}");
     }
 
     #[test]

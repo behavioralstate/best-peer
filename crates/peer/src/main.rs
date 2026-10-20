@@ -2092,6 +2092,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_relayed_failure_of_an_order_by_size_that_quotes_its_device_is_told_in_the_sizes_terms() {
+        // The member takes the order, then its engine refuses the start in words that name the instance.
+        let runtime = Arc::new(best_peer_runtime::Fake::new(vec!["MIG-1".into()], vec![]));
+        runtime.refuse_starts("could not select device driver \"nvidia\" for MIG-1");
+        let gpu = best_peer_gpu::Fake::new()
+            .with_driver("fake 1.0")
+            .with_device(best_peer_gpu::Fake::mig_instance("MIG-1", "A100", "1g.10gb", 9, "13.0"));
+        let b = bed(Arc::new(gpu), Arc::new(EventLog::ephemeral()), runtime).await;
+        let (key_b, member_log) = (b.key.clone(), b.peer.log.clone());
+        let site = site(vec![(B, b)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "split", &[("b", B, &key_b)]).await;
+        let data = json!({ "cloud": "split", "currency": "EUR", "sizes": [
+            { "name": "small", "memory_bytes": 8 * GB, "compute": { "api": "cuda", "version": "12" }, "share": 0.15, "price_per_second": 0.0005 }
+        ] });
+        let (s, b) = site.send(&ws, "m1", "SetMenu", "set-menu", data).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "m1", "MenuSetV1").await;
+        let (s, b) = site
+            .send(
+                &ws,
+                "s1",
+                "RunJob",
+                "run-job",
+                json!({ "cloud": "split", "image": "busybox", "size": "small" }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let served = site.events(&ws, "s1", "JobFailed").await;
+        let failed = &served.last().unwrap()["data"];
+        assert!(failed["reason"].as_str().unwrap().contains("its device"), "{failed}");
+        assert!(
+            !serde_json::to_string(&served).unwrap().contains("MIG-1"),
+            "{served:#?}"
+        );
+        // It was the member's own words, relayed: the member's log has them whole.
+        let (theirs, _) = member_log.list(&best_peer_door::Filter {
+            r#type: Some("JobFailed".into()),
+            ..Default::default()
+        });
+        assert!(
+            theirs
+                .iter()
+                .any(|e| e.data["reason"].as_str().unwrap_or_default().contains("MIG-1")),
+            "{theirs:#?}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_device_a_size_holds_whole_and_the_menu_are_held_across_a_restart() {
         let a = member_with("Card A", 24, "12.4", best_peer_gpu::Slicing::None).await;
         let key_a = a.key.clone();
