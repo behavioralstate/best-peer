@@ -14,6 +14,8 @@ W=${SPIKE_DIR:-$(cd "$(dirname "$0")" && pwd)}
 IMG=nvidia/cuda:12.4.1-base-ubuntu22.04
 DEVEL=nvidia/cuda:12.4.1-devel-ubuntu22.04
 UUID=$(nvidia-smi --query-gpu=uuid --format=csv,noheader | head -1)
+# More than the card holds, so an allocation without a limit ends where the card does, whatever its size.
+PAST=$(( $(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1) + 1024 ))
 GPU=(--gpus "device=$UUID")
 PIPE=/tmp/nvidia-mps
 MPS=(--ipc=host -v "$PIPE:$PIPE" -e "CUDA_MPS_PIPE_DIRECTORY=$PIPE")
@@ -43,11 +45,11 @@ for n in 2 3; do
 done
 
 say "B. without MPS: nothing holds a container to a share of memory"
-probe greedy -- alloc 512 8000 5 | grep -E 'failed|holding'
+probe greedy -- alloc 512 "$PAST" 5 | grep -E 'failed|holding'
 note "while one holds 3 GiB, what a second sees and can take"
 probe holder -- alloc 512 3072 25 | grep -E 'holding|done' &
 sleep 8
-probe second -- alloc 512 8000 1 | grep -E 'seen|failed|holding'
+probe second -- alloc 512 "$PAST" 1 | grep -E 'seen|failed|holding'
 docker run --rm "${GPU[@]}" "$IMG" nvidia-smi --query-compute-apps=pid,used_memory --format=csv | sed 's/^/  [nvidia-smi in a third] /'
 wait
 
@@ -73,7 +75,7 @@ wait
 note "one with no limit beside one held to 1 GiB"
 probe lim1g-b "${MPS[@]}" -e CUDA_MPS_PINNED_DEVICE_MEM_LIMIT=0=1G -- alloc 256 1024 15 | grep -E 'seen|holding|failed' &
 sleep 3
-probe nolimit "${MPS[@]}" -- alloc 512 8000 1 | grep -E 'seen|failed|holding'
+probe nolimit "${MPS[@]}" -- alloc 512 "$PAST" 1 | grep -E 'seen|failed|holding'
 wait
 
 say "F. MPS: a share of compute per container (CUDA_MPS_ACTIVE_THREAD_PERCENTAGE)"

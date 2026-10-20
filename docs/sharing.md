@@ -7,7 +7,7 @@ runtime (Docker and the NVIDIA container toolkit). The menu's sizes
 ([spec#61](https://github.com/behavioralstate/spec/issues/61)) are to follow what this page says the card can hold.
 
 **Where it ran:** an NVIDIA GeForce GTX 1660 SUPER (Turing, compute capability 7.5, 6 GB, no MIG), driver 575.51.03,
-Docker 28.1.1 with overlay2 on ext4, in a VM rented on Vast.ai on 2026-10-20. The owner's call was that a cheaper
+Docker 28.1.1 with overlay2 on an ext file system (Docker reports `extfs`), in a VM rented on Vast.ai on 2026-10-20. The owner's call was that a cheaper
 consumer card answers the questions the 5090 was named for. The 5090 (Blackwell, 32 GB) may give other numbers: the
 same script answers it in ten minutes before its fractions are sold.
 
@@ -21,10 +21,11 @@ launches a second (`burn`: 4096 blocks of 256 threads, 2000 multiply-adds each),
 - **Without MPS nothing holds a container to a share.** One container took 5,632 of the 5,749 MiB the card offers. A
   second, started while another held 3 GiB, saw 2,541 MiB free and failed after 2,048.
 - **Under MPS, `CUDA_MPS_PINNED_DEVICE_MEM_LIMIT` holds.** A container limited to `0=1G` saw 962 MiB free and failed
-  at 768 MiB. Beside it at the same time, one with no limit took 4,608 MiB, untouched. One limited to `0=2G` failed
-  at 1,792 MiB. About 250 MiB of each limit goes to the job's own CUDA context.
-- **The failure is the job's own.** It is CUDA's ordinary `out of memory` inside the job, the same as on a full
-  card. Nothing outside the job sees it: the job ends or carries on as its code decides, and the peer learns only its
+  at 768 MiB. Beside it at the same time, one with no limit took 4,608 MiB, untouched. One limited to `0=2G` saw
+  1,986 MiB free and failed at 1,792. About 60 MiB of each limit goes to the job's own CUDA context, as the free
+  memory each saw says; the failures fall lower because the probe allocates in steps of 256 MiB.
+- **The failure is the job's own.** It is CUDA's ordinary `out of memory` inside the job (`alloc failed at 768 MiB:
+  out of memory`), the same as on a full card. Nothing outside the job sees it: the job ends or carries on as its code decides, and the peer learns only its
   exit code. A `JobFailed` can name the slice the size reserved, not the allocation that failed.
 
 ## Compute: a ceiling fixed at start, not a guarantee
@@ -40,17 +41,18 @@ launches a second (`burn`: 4096 blocks of 256 threads, 2000 multiply-adds each),
   asked for nothing.
 - **A job joining or leaving does not move the others.** A job at 50 ran at 564 a second throughout while another
   joined and left beside it, their caps together under 100.
-- **With no percentage, MPS divides the card evenly** between the jobs computing: 605 each for two, 400 each for
-  three. A job alone gets all of it.
+- **With no percentage, MPS divided the card evenly** between identical jobs computing: 605 each for two, 400 each
+  for three. A job alone gets all of it. Jobs asking for different amounts were not measured.
 
 So the percentage is a ceiling. A job capped at 50 does not use the other half when the card is idle, which is what
 decision 6 of [spec#64](https://github.com/behavioralstate/spec/issues/64) asks: a guaranteed share, and idle compute
 above it.
 
-## Without MPS: time-slicing in equal parts
+## Without MPS: time-slicing
 
-Two containers computing at once ran 596 launches a second each, three ran 392 each: equal parts, whatever each
-asks for.
+Two identical containers computing at once ran 596 launches a second each, three ran 392 each: equal parts. Whether
+containers asking for different amounts get equal parts, or what each asks for, was not measured: every container ran
+the same kernel.
 
 ## The cost of sharing
 
@@ -73,14 +75,16 @@ Memory-bound work and real engines were not measured.
 - **Under MPS, a fault ends its neighbours' work.** The same fault made the job computing beside it fail with the same
   error after 1,020 launches. The MPS server took new jobs afterwards.
 - **A job sees how much memory the others hold**, with MPS and without: its free memory is the card's less theirs.
-  `nvidia-smi` in a container lists the other containers' processes, by their host process id, with their memory.
-- **Exclusive-process mode is not a lock on MPS.** A container started without the MPS pipe, at a moment when no MPS
-  job was running, made a context of its own on the card. Whether one is refused while an MPS job runs was not tried.
-  The peer has to start every job on a shared card through MPS, with its limits, itself.
+  `nvidia-smi` in a container lists the other containers' processes, by their host process id, with their memory:
+  `5100, 3138 MiB` for one holding 3 GiB.
+- **Exclusive-process mode did not keep a container off the card.** A container started without the MPS pipe, at a
+  moment when no MPS job was running, made a context of its own on the card. Whether one is refused while an MPS job
+  runs was not tried. Either way, the peer has to start every job on a shared card through MPS, with its limits,
+  itself.
 
 ## Disk
 
-- **Docker's own cap needs XFS.** On the host's overlay2 over ext4, `--storage-opt size=1G` was refused: "supported only
+- **Docker's own cap needs XFS.** On the host's overlay2 over an ext file system, `--storage-opt size=1G` was refused: "supported only
   for overlay over xfs with 'pquota' mount option".
 - **On XFS with project quotas it holds.** With Docker's data root moved to an XFS file system mounted with `pquota`,
   a container started with `--storage-opt size=1G` that wrote 2,000 MiB stopped at 1,024 MiB, its root full.
@@ -90,15 +94,17 @@ Memory-bound work and real engines were not measured.
 ## What it means for the menu
 
 - **Memory slices can be sold on a consumer card with no MIG,** where the peer runs MPS and starts each job on the card
-  with its pinned limit: `slicing: mps`. Each slice loses about 250 MiB to the job's context.
+  with its pinned limit: `slicing: mps`. Each slice loses about 60 MiB to the job's context.
 - **Compute cannot be sold as decision 6 has it** with MPS on this card. There are two ways to sell it instead, for
   the owner to choose, and #63's sizes and #61's factor follow the choice:
-  1. **A share as a ceiling.** Each size's share is its percentage, set when its job starts. The job has exactly
-     that, alone or not, and never the idle compute above it. What it was given never changes, so its factor is
-     always 1 and the size's price is the share's.
-  2. **No percentage.** The jobs on a card divide it evenly while they compute, and a job alone has all of it. The
-     factor of decision 7 is then the share a job had, one over the number of jobs computing on the card, known from
-     the allocation the peer made, and it changes as jobs join and leave.
+  1. **A share as a ceiling.** Each size has a percentage, set when its job starts. The job gets that percentage
+     rounded down to whole multiprocessors, alone or not, and never the idle compute above it: on this card 50 gave
+     46% of one job alone, and 25 gave 18%. What a job is given never changes, so its factor is 1 when the size's
+     share is that measured fraction, not the nominal percentage. A size priced at 25% would get 18% of the card.
+  2. **No percentage.** Identical jobs on a card divided it evenly while they computed, and a job alone has all of it.
+     If unequal jobs divide it evenly too, which was not measured, the factor of decision 7 is the share a job had,
+     one over the number of jobs computing on the card. It is known from the allocation the peer made, and it changes
+     as jobs join and leave.
 - **Strangers do not share a card under MPS.** A fault in one job ends its neighbours' work, and each job sees the
   others' memory. Decision 8's line holds: a card shared under MPS is shared by one client's jobs, or by pilot clients
   who accept it in writing. Other clients get whole cards.
