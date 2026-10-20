@@ -2330,8 +2330,11 @@ impl Service for Cloud {
         let (size, receipt) = match (data.size.as_deref(), admitted) {
             (Some(_), Some((z, currency, receipt))) => (Some((z, currency)), receipt),
             // Admission records the size with the reservation, and both live in memory: a reservation without it
-            // is not made, so this is the placement gone, told as such.
+            // is not made, so this is the placement gone, told as such, and whatever admission held is let go.
             (Some(_), None) => {
+                self.state.lock().unwrap().reserved.remove(&key);
+                self.whole.lock().unwrap().remove(&id);
+                self.held_to_accelerators.lock().unwrap().remove(&key);
                 self.tell(
                     &em,
                     "CommandFailed",
