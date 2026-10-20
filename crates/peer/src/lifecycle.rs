@@ -146,8 +146,8 @@ pub struct Peer {
     /// The orders placed and starting (their image pulled, their container started), not yet told as started.
     /// Locked after `state` when both are held, never before.
     starting: Mutex<std::collections::HashSet<String>>,
-    /// The waiting orders a stop was admitted for, until it is told: a step starts none of them. Locked after `state`
-    /// when both are held, never before.
+    /// The waiting orders claimed for their end, by a stop admitted for one or by its expiry, until it is told: a step
+    /// starts none of them, and nothing else ends them. Locked after `state` when both are held, never before.
     stopping: Mutex<std::collections::HashSet<String>>,
     /// The command behind each order, by the order's id: what completes the command.
     keys: Mutex<HashMap<String, String>>,
@@ -484,11 +484,22 @@ impl Peer {
             due
         };
         for o in due.expired {
+            // Claimed for its end under the state's lock, as a stop claims one: whichever comes first tells it, once.
+            let claimed = {
+                let s = self.state.lock().unwrap();
+                s.orders.get(&o.id).is_some_and(|x| x.waiting())
+                    && !self.starting.lock().unwrap().contains(&o.id)
+                    && self.stopping.lock().unwrap().insert(o.id.clone())
+            };
+            if !claimed {
+                continue;
+            }
             self.tell(
                 &self.order_emitter(&o),
                 "JobFailed",
                 json!({ "job": o.id, "image": o.image, "reason": crate::queue::expired_reason(&o, "no device of this peer"), "fix": "order it again with a longer queue_seconds or less memory_bytes, or when get-workloads shows room" }),
             );
+            self.stopping.lock().unwrap().remove(&o.id);
         }
         for (o, job, _) in due.overdue {
             let container = {
@@ -1307,7 +1318,7 @@ impl Peer {
             if !self.stopping.lock().unwrap().insert(id.to_string()) {
                 return Err(BestError::bad_request(
                     "ALREADY_STOPPING",
-                    format!("order {id} is already being stopped: its JobStopped event follows"),
+                    format!("order {id} is already ending: its JobStopped or JobFailed event follows"),
                 )
                 .with_details(json!({ "job": id })));
             }

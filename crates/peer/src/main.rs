@@ -1475,7 +1475,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn two_stops_of_one_waiting_order_tell_it_stopped_once() {
+    async fn a_stop_claims_a_waiting_order_so_no_second_stop_and_no_step_takes_it_and_it_ends_once() {
         let bed = bed(
             card(),
             Arc::new(EventLog::ephemeral()),
@@ -1484,23 +1484,65 @@ mod tests {
         .await;
         let (s, b) = run_on(&bed, "j1", 20, json!({})).await;
         assert_eq!(s, StatusCode::CREATED, "{b}");
-        bed.events_of("j1", "JobStarted").await;
+        let j1 = bed.events_of("j1", "JobStarted").await.last().unwrap().data["job"].clone();
         let (s, b) = run_on(&bed, "q1", 10, json!({ "queue_seconds": 600 })).await;
         assert_eq!(s, StatusCode::CREATED, "{b}");
         let order = bed.events_of("q1", "JobQueued").await[0].data["job"].clone();
-        let (a, b) = tokio::join!(
-            bed.send("s1", "StopJob", "stop-job", json!({ "job": order })),
-            bed.send("s2", "StopJob", "stop-job", json!({ "job": order }))
+        // The first stop's admission claims the order; a second, admitted before the first is told, is refused.
+        let who = bed.door.auth.authenticate(&bed.key).unwrap();
+        let stop = Envelope::event(
+            "io.best.agents",
+            "StopJob",
+            json!({ "job": order }),
+            Some("s1".into()),
+            None,
         );
-        let created = [a.0, b.0].iter().filter(|s| **s == StatusCode::CREATED).count();
-        assert!(created >= 1, "{a:?} {b:?}");
-        bed.events_of("q1", "JobStopped").await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        bed.peer.admit_stop_job(stop.clone(), &who).unwrap();
+        let e = bed.peer.admit_stop_job(stop.clone(), &who).unwrap_err();
+        assert_eq!(e.code, "ALREADY_STOPPING", "{e:?}");
+        // Room frees meanwhile: no step starts the claimed order.
+        let (s, b) = bed.send("s0", "StopJob", "stop-job", json!({ "job": j1 })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        bed.events_of("s0", "JobStopped").await;
+        bed.peer.step(later(0)).await;
+        assert!(
+            !types(&bed.log_of("q1")).iter().any(|t| t == "JobStarted"),
+            "{:?}",
+            types(&bed.log_of("q1"))
+        );
+        // The first stop is told: the order ends once, before it started.
+        bed.peer.stop_job(stop, bed.peer.emitter("s1")).await;
+        assert_eq!(types(&bed.log_of("q1")), ["JobQueued", "JobStopped"]);
         assert_eq!(
-            types(&bed.log_of("q1")).iter().filter(|t| *t == "JobStopped").count(),
-            1,
-            "the order ends once: {a:?} {b:?}"
+            bed.log_of("s1").last().unwrap().data["reason"],
+            "stopped before it started"
         );
+    }
+
+    #[tokio::test]
+    async fn an_order_with_no_memory_bytes_that_waits_in_the_fold_is_started_with_no_device() {
+        let bed = bed(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        // As after a restart between its JobQueued and its JobStarted: the fold holds it, and nothing was promised.
+        let queued = Envelope::event(
+            "io.best.agents",
+            "JobQueued",
+            json!({ "job": "job-nomem", "image": "busybox", "args": [], "memory_bytes": null, "device": null,
+                "queue_seconds": null, "deadline_seconds": 600, "holder": "h1", "accelerators_only": false,
+                "attempt": 1, "waiting": false }),
+            Some("q9".into()),
+            None,
+        );
+        bed.peer.state.lock().unwrap().apply(&queued);
+        bed.peer.step(later(0)).await;
+        let started = bed.events_of("q9", "JobStarted").await;
+        let data = &started.last().unwrap().data;
+        assert_eq!(data["order"], "job-nomem");
+        assert_eq!(data["device"], Value::Null, "it asked for no device: {data}");
     }
 
     // ----- workspaces and clouds ----------------------------------------------------------------------------------
