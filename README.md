@@ -397,8 +397,9 @@ The workspace's owner may cap what its orders by size cost together, with `set-s
 "currency": "EUR" }`, or `{ "amount": null }` to clear it). Under a cap an order by size sends `deadline_seconds`, so
 its most is its price times its deadline. It is refused when it is taken if what was spent, what the open orders may
 still spend and its own most would pass the cap, with each named, and refused on a cloud whose menu prices in
-another currency. Two things can still pass a cap after an order is taken: a price raised while its job runs, and an
-order queued again after its member was lost.
+another currency. Three things can still pass a cap after an order is taken: a price raised while its job runs, an
+order queued again after its member was lost, and an order taken with no deadline before the cap was set, which runs
+on unbounded until `stop-job` ends it.
 
 The peer's state is the fold of the events it told. After a restart it is rebuilt from the log and squared with what
 the engine still runs; a workload that ended while the peer was down is told so then.

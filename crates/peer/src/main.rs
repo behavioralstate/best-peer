@@ -2108,6 +2108,19 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
         assert_eq!(e["error"]["code"], "INVALID_PARAMETER");
+        // A window that ends before it begins is refused, never answered with nothing.
+        let (s, e) = get_as(
+            &site.app,
+            &format!("/workspaces/{ws}"),
+            &site.key,
+            "/queries/get-usage?from=2026-10-20T10:00:00Z&to=2026-10-20T09:00:00Z",
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(
+            (e["error"]["code"].clone(), e["error"]["details"]["parameter"].clone()),
+            (json!("INVALID_PARAMETER"), json!("from"))
+        );
     }
 
     #[tokio::test]
@@ -2200,6 +2213,152 @@ mod tests {
         let (s, b) = site.order_small(&ws, "j5", json!({})).await;
         assert_eq!(s, StatusCode::CREATED, "{b}");
         assert!(site.usage(&ws, "").await.get("cap").is_none());
+    }
+
+    /// A member of `ws` other than its owner, approved for jobs alone: answers its key.
+    async fn joined(site: &Site, ws: &str) -> String {
+        let bob = key_with(&site.app, Some("jobs"), None).await;
+        let (_, w) = get_as(&site.app, "", &bob, "/queries/get-workspaces").await;
+        let bob_id = w["identity"].as_str().unwrap().to_string();
+        let (s, b) = send_as(
+            &site.app,
+            "",
+            &site.key,
+            "i1",
+            "InviteMember",
+            "invite-member",
+            json!({ "workspace": ws, "identity": bob_id }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        events_as(&site.app, "", &site.key, "i1", "MemberInvitedV1").await;
+        let (s, b) = send_as(
+            &site.app,
+            "",
+            &bob,
+            "a1",
+            "AcceptInvitation",
+            "accept-invitation",
+            json!({ "workspace": ws }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        events_as(&site.app, "", &bob, "a1", "MemberJoinedV1").await;
+        bob
+    }
+
+    #[tokio::test]
+    async fn a_member_reads_the_usage_of_its_own_jobs_and_only_the_owner_sets_the_cap() {
+        let (site, ws) = priced_site(0.5).await;
+        let prefix = format!("/workspaces/{ws}");
+        let bob = joined(&site, &ws).await;
+        // The owner's job, then bob's, which waits for the card.
+        let (s, b) = site.order_small(&ws, "j1", json!({ "deadline_seconds": 60 })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let owners = site.events(&ws, "j1", "JobStarted").await.last().unwrap()["data"]["order"].clone();
+        let (s, b) = send_as(
+            &site.app,
+            &prefix,
+            &bob,
+            "b1",
+            "RunJob",
+            "run-job",
+            json!({ "cloud": "lab", "image": "busybox", "size": "small", "deadline_seconds": 60 }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        events_as(&site.app, &prefix, &bob, "b1", "JobQueued").await;
+        let (s, b) = site
+            .send(&ws, "s1", "StopJob", "stop-job", json!({ "job": owners }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let bobs = events_as(&site.app, &prefix, &bob, "b1", "JobStarted")
+            .await
+            .last()
+            .unwrap()["data"]["order"]
+            .clone();
+
+        let (s, mine) = get_as(&site.app, &prefix, &bob, "/queries/get-usage").await;
+        assert_eq!(s, StatusCode::OK, "{mine}");
+        let orders: Vec<Value> = mine["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|j| j["order"].clone())
+            .collect();
+        assert_eq!(orders, vec![bobs.clone()], "a member reads its own jobs: {mine}");
+        let every = site.usage(&ws, "").await;
+        assert_eq!(
+            every["jobs"].as_array().unwrap().len(),
+            2,
+            "the owner reads every one: {every}"
+        );
+
+        let (s, e) = send_as(
+            &site.app,
+            &prefix,
+            &bob,
+            "c1",
+            "SetSpendingCap",
+            "set-spending-cap",
+            json!({ "amount": 1, "currency": "EUR" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "FORBIDDEN");
+    }
+
+    #[tokio::test]
+    async fn the_cap_and_the_orders_it_counts_are_held_across_a_restart() {
+        let a = member_with("Card A", 24, "12.4", best_peer_gpu::Slicing::None).await;
+        let key_a = a.key.clone();
+        let data = Arc::new(tempfile::tempdir().unwrap());
+        let log = Arc::new(EventLog::ephemeral());
+        let first = site_over(
+            vec![(A, a)],
+            data.clone(),
+            log.clone(),
+            None,
+            Arc::new(Limits::default()),
+        )
+        .await;
+        let ws = first.workspace("c1", "Research").await;
+        first.cloud(&ws, "k1", "lab", &[("a", A, &key_a)]).await;
+        let menu = json!({ "cloud": "lab", "currency": "EUR", "sizes": [
+            { "name": "small", "memory_bytes": 8 * GB, "compute": { "api": "cuda", "version": "12" }, "share": 0.5, "price_per_second": 0.5 }
+        ] });
+        let (s, b) = first.send(&ws, "m1", "SetMenu", "set-menu", menu).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        first.events(&ws, "m1", "MenuSetV1").await;
+        let (s, b) = first
+            .send(
+                &ws,
+                "c1",
+                "SetSpendingCap",
+                "set-spending-cap",
+                json!({ "amount": 100, "currency": "EUR" }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        first.events(&ws, "c1", "SpendingCapSetV1").await;
+        let (s, b) = first.order_small(&ws, "j1", json!({ "deadline_seconds": 150 })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        first.events(&ws, "j1", "JobStarted").await;
+        let owner = first.key.clone();
+        let (auth, members) = (first.auth.clone(), first.members);
+        first.workspaces.get(&ws).unwrap().cloud_for_test("lab").halt();
+        drop(first.app);
+        drop(first.workspaces);
+        drop(first.switchboard);
+
+        let again = site_over(Vec::new(), data.clone(), log, Some(auth), Arc::new(Limits::default())).await;
+        again.switchboard.connect(A, members[0].app.clone());
+        let again = Site { key: owner, ..again };
+        // The cap is the log's, and the running order still holds what it may spend: 50 more would pass 100.
+        let (s, e) = again.order_small(&ws, "j2", json!({ "deadline_seconds": 100 })).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "SPENDING_CAP");
+        assert_eq!(again.usage(&ws, "").await["cap"]["amount"].as_f64(), Some(100.0));
     }
 
     #[tokio::test]

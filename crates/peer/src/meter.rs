@@ -132,7 +132,7 @@ impl Metered {
     }
 }
 
-fn text(t: OffsetDateTime) -> String {
+pub fn text(t: OffsetDateTime) -> String {
     t.format(&Rfc3339).unwrap_or_default()
 }
 
@@ -146,13 +146,25 @@ pub fn parse_time(t: &str) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(t, &Rfc3339).ok()
 }
 
+/// The facts only a member peer tells, relayed by its cloud: what it said, never what the cloud did or saw.
+const MEMBER_WORDS: &[&str] = &[
+    "ImagePulling",
+    "ImagePulled",
+    "DeploymentStarted",
+    "DeploymentReady",
+    "JobStarted",
+    "JobFinished",
+    "PromptAnswered",
+];
+
 /// The fold of a workspace's facts into its jobs by size, in the order the log holds them.
 #[derive(Default)]
 pub struct Fold {
     jobs: Vec<Metered>,
     /// The jobs still running, by `(cloud, job)`, as an index into `jobs`.
     running: HashMap<(String, String), usize>,
-    /// The last fact a member peer gave, by `(cloud, peer)`: a job on a member lost is billed to it at least.
+    /// The last fact a member peer told, by `(cloud, peer)`: where a job on a member lost is billed to when the
+    /// loss does not say when the member was last heard.
     last_fact: HashMap<(String, String), OffsetDateTime>,
 }
 
@@ -165,7 +177,7 @@ impl Fold {
         let cloud = d["cloud"].as_str().unwrap_or_default().to_string();
         if let Some(peer) = d["peer"]
             .as_str()
-            .filter(|_| !cloud.is_empty() && e.r#type != "PeerLost")
+            .filter(|_| !cloud.is_empty() && MEMBER_WORDS.contains(&e.r#type.as_str()))
         {
             self.last_fact.insert((cloud.clone(), peer.to_string()), at);
         }
@@ -181,7 +193,7 @@ impl Fold {
                 let peer = d["peer"].as_str().unwrap_or_default().to_string();
                 let heard = d["last_heard"].as_str().and_then(parse_time);
                 let fact = self.last_fact.get(&(cloud.clone(), peer.clone())).copied();
-                let last = heard.max(fact);
+                let last = heard.or(fact);
                 let lost: Vec<(String, String)> = self
                     .running
                     .iter()
@@ -578,6 +590,54 @@ mod tests {
         assert_eq!(
             (other["running"].clone(), other["seconds"].as_f64()),
             (json!(true), Some(1200.0))
+        );
+    }
+
+    #[test]
+    fn what_the_cloud_told_of_a_member_after_it_was_last_heard_does_not_lengthen_the_bill() {
+        let jobs = fold(&[
+            started("00:00", "j1", "a", 0.01),
+            // The cloud's own facts naming the member: a placement and a prompt that failed for want of it.
+            fact(
+                "03:00",
+                "JobPlaced",
+                json!({ "cloud": "lab", "peer": "a", "job": "o2" }),
+            ),
+            fact(
+                "04:00",
+                "PromptFailed",
+                json!({ "cloud": "lab", "peer": "a", "deployment": "d", "reason": "unreachable" }),
+            ),
+            fact(
+                "05:00",
+                "PeerLost",
+                json!({ "cloud": "lab", "peer": "a", "reason": "unreachable", "last_heard": "2026-10-20T10:02:30Z" }),
+            ),
+        ]);
+        let u = usage(&jobs, at("20:00"), None, at("20:00"));
+        assert_eq!(u["jobs"][0]["seconds"].as_f64(), Some(150.0), "{u}");
+        // Without last_heard, they are not the member's word either.
+        let jobs = fold(&[
+            started("00:00", "j1", "a", 0.01),
+            fact(
+                "01:00",
+                "PromptAnswered",
+                json!({ "cloud": "lab", "peer": "a", "deployment": "d" }),
+            ),
+            fact(
+                "04:00",
+                "PromptFailed",
+                json!({ "cloud": "lab", "peer": "a", "deployment": "d", "reason": "unreachable" }),
+            ),
+            fact(
+                "05:00",
+                "PeerLost",
+                json!({ "cloud": "lab", "peer": "a", "reason": "unreachable" }),
+            ),
+        ]);
+        assert_eq!(
+            usage(&jobs, at("20:00"), None, at("20:00"))["jobs"][0]["seconds"].as_f64(),
+            Some(60.0)
         );
     }
 

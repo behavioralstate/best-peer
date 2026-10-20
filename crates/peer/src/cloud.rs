@@ -549,7 +549,8 @@ impl Cloud {
     }
 
     /// The orders by size this cloud has taken and not ended, admitted ones included, as the spending cap counts
-    /// them. The admitted are read before the taken: an order between the two is read twice, never missed.
+    /// them. An order leaves the admitted only after it is taken, and the admitted are read first: an order between
+    /// the two is read twice, never missed, and counted once by its id.
     pub fn open_orders(&self) -> Vec<crate::meter::Open> {
         let open = |id: String, size: &crate::menu::Size, currency: &str, deadline: Option<u64>| crate::meter::Open {
             order: id,
@@ -2392,7 +2393,9 @@ impl Service for Cloud {
             return;
         };
         let waiting = r.device.is_none();
-        let admitted = self.admitted_sizes.lock().unwrap().remove(&key);
+        // Read, not taken: it leaves the admitted once JobQueued has made it an order, so the spending cap, which
+        // reads the admitted and then the orders, never finds it in neither.
+        let admitted = self.admitted_sizes.lock().unwrap().get(&key).cloned();
         let (size, receipt) = match (data.size.as_deref(), admitted) {
             (Some(_), Some((z, currency, receipt, _))) => (Some((z, currency)), receipt),
             // Admission records the size with the reservation, and both live in memory: a reservation without it
@@ -2443,6 +2446,7 @@ impl Service for Cloud {
             ),
         });
         self.tell(&em, "JobQueued", queued_fact(&order, 1, waiting, reason, None));
+        self.admitted_sizes.lock().unwrap().remove(&key);
         match r.device {
             Some(device) => self.dispatch(&order, device, receipt).await,
             None => self.kick(),

@@ -1142,6 +1142,13 @@ impl Clouds for Workspace {
         };
         let now = time::OffsetDateTime::now_utc();
         let (from, to) = (at("from")?, at("to")?.unwrap_or(now));
+        if from.is_some_and(|f| f > to) {
+            return Err(BestError::bad_request(
+                "INVALID_PARAMETER",
+                "from is after to: send a window that begins before it ends (to is now when not said)",
+            )
+            .with_details(json!({ "parameter": "from", "to": crate::meter::text(to) })));
+        }
         // A member reads its own jobs; the owner, and a credential approved for every holder's, read every one.
         let holder = who.holder();
         let every = who.grant.is_all() || self.is_owner(&holder);

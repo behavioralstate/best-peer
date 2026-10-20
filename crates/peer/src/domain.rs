@@ -851,7 +851,7 @@ fn usage_query(ws: Arc<dyn Clouds>) -> QueryDef {
                 "cap": { "type": "object", "description": "The workspace's spending cap, when it has one", "properties": {
                     "amount": { "type": "number" }, "currency": { "type": "string" },
                     "spent": { "type": "number", "description": "What its jobs by size cost up to now, every one" },
-                    "held": { "type": "number", "description": "What its open orders may still spend: each one's price times its deadline_seconds, less what its job already ran" }
+                    "held": { "type": "number", "description": "What its open orders may still spend: each one's price times its deadline_seconds, less what its job already ran; an order with no deadline_seconds, taken before the cap, holds nothing and is counted in spent as it runs" }
                 } }
             }
         }),
@@ -868,7 +868,7 @@ fn set_spending_cap(ws: Arc<dyn Clouds>) -> CommandDef {
         schema: "set-spending-cap".into(),
         version: "1.0".into(),
         command_type: "SetSpendingCap".into(),
-        description: "Sets the most this workspace's orders by size may cost together, in one currency, or clears it with amount null. Under a cap an order by size sends deadline_seconds, so what it may cost is bounded (DEADLINE_NEEDED without), and it is refused when it is taken, never after it ran, if what was spent, what the orders still open may spend and its own most (its price times its deadline_seconds) would pass the cap (SPENDING_CAP, naming each); one on a cloud whose menu prices in another currency is refused (SPENDING_CAP_CURRENCY). Two things may pass a cap after an order was taken: a menu price raised while its job runs, and an order queued again after a member peer was lost under it. get-usage reads the cap with what was spent and what is held. The outcome is a SpendingCapSetV1 event with this command's correlation id. Only the workspace's owner may set it.".into(),
+        description: "Sets the most this workspace's orders by size may cost together, in one currency, or clears it with amount null. Under a cap an order by size sends deadline_seconds, so what it may cost is bounded (DEADLINE_NEEDED without), and it is refused when it is taken, never after it ran, if what was spent, what the orders still open may spend and its own most (its price times its deadline_seconds) would pass the cap (SPENDING_CAP, naming each); one on a cloud whose menu prices in another currency is refused (SPENDING_CAP_CURRENCY). Three things may pass a cap after an order was taken: a menu price raised while its job runs, an order queued again after a member peer was lost under it, and an order taken with no deadline_seconds before the cap was set, which is counted by what it has cost so far and runs on unbounded; stop-job ends it. get-usage reads the cap with what was spent and what is held. The outcome is a SpendingCapSetV1 event with this command's correlation id. Only the workspace's owner may set it.".into(),
         data_schema: json!({
             "type": "object",
             "required": ["amount"],
