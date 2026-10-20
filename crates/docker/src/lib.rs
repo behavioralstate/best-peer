@@ -288,6 +288,10 @@ impl DockerRuntime {
     }
 }
 
+/// Set while a `df` killed past its time has not ended, so a file system stuck for long leaves one behind, not one per
+/// question.
+static DF_STUCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Runs `program` with `args`, its failure in its own words.
 fn run(program: &str, args: &[&str]) -> Result<(), RuntimeError> {
     let out = std::process::Command::new(program)
@@ -431,14 +435,27 @@ impl Runtime for DockerRuntime {
         if !cfg!(target_os = "linux") {
             return None;
         }
-        std::fs::create_dir_all(&dir).ok()?;
+        // One df stuck in a file system at a time: until it ends, the room is not known, and no other is started.
+        if DF_STUCK.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
+        let failed = |why: String| {
+            tracing::warn!(dir = %dir.display(), %why, "the room for jobs' disks could not be read");
+            None
+        };
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            return failed(format!("the directory could not be made: {e}"));
+        }
         // Asked for ten seconds at most: a file system that does not answer is one with no room known.
-        let mut df = std::process::Command::new("df")
+        let mut df = match std::process::Command::new("df")
             .args(["-B1", "--output=avail,size", &dir.to_string_lossy()])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .ok()?;
+        {
+            Ok(df) => df,
+            Err(e) => return failed(format!("df could not run: {e}")),
+        };
         let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             match df.try_wait() {
@@ -449,19 +466,30 @@ impl Runtime for DockerRuntime {
                 _ => {
                     // Killed, and left to a thread of its own to reap: one stuck in the file system may never end.
                     let _ = df.kill();
-                    std::thread::spawn(move || df.wait());
-                    return None;
+                    DF_STUCK.store(true, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::spawn(move || {
+                        let _ = df.wait();
+                        DF_STUCK.store(false, std::sync::atomic::Ordering::SeqCst);
+                    });
+                    return failed("df did not answer within ten seconds".into());
                 }
             }
         }
         let mut text = String::new();
-        std::io::Read::read_to_string(&mut df.stdout.take()?, &mut text).ok()?;
+        let _ = df
+            .stdout
+            .take()
+            .map(|mut out| std::io::Read::read_to_string(&mut out, &mut text));
         let mut numbers = text
             .lines()
-            .nth(1)?
+            .nth(1)
+            .unwrap_or_default()
             .split_whitespace()
             .filter_map(|n| n.parse::<u64>().ok());
-        Some((numbers.next()?, numbers.next()?))
+        match (numbers.next(), numbers.next()) {
+            (Some(free), Some(total)) => Some((free, total)),
+            _ => failed(format!("df answered what does not read as room: {text:?}")),
+        }
     }
 
     /// A container, or a user namespace when the engine runs rootless or remaps its users, as its own `info` says.

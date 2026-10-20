@@ -9486,9 +9486,29 @@ mod tests {
             b["error"]["message"].as_str().unwrap().contains("could not read"),
             "{b}"
         );
-        assert!(bed.query("get-hardware-state").await["disk"].is_null());
+        // It still says it makes disks, its room not known just now.
+        let disk = bed.query("get-hardware-state").await["disk"].clone();
+        assert_eq!(disk, json!({ "free_bytes": null, "total_bytes": null }));
         bed.runtime.room_unread(false);
         let (s, b) = bed.send("j2", "RunJob", "run-job", job).await;
         assert_eq!(s, StatusCode::CREATED, "{b}");
+    }
+
+    #[tokio::test]
+    async fn an_order_on_a_cloud_whose_member_room_was_not_read_waits_for_it_rather_than_being_refused() {
+        let (site, ws, _s3, _logs) = site_with_store().await;
+        let member = &site.members[0];
+        member.runtime.room_unread(true);
+        let queued = site.order(&ws, "j1", 4, with_io()).await;
+        assert_eq!(queued["waiting"], true, "{queued}");
+        let hs = site.query(&ws, "get-hardware-state").await;
+        assert_eq!(
+            hs["peers"][0]["disk"],
+            json!({ "free_bytes": null, "total_bytes": null })
+        );
+        // The room is read again: the order is placed.
+        member.runtime.room_unread(false);
+        site.live_cloud(&ws, "lab").step(later(0)).await;
+        site.events(&ws, "j1", "JobStarted").await;
     }
 }

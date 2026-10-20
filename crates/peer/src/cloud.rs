@@ -2569,10 +2569,11 @@ impl Service for Cloud {
         let read = Instant::now();
         let (host, peers, isolations) = self.combined().await;
         if let Some(needed) = disk {
-            // A disk no member could ever give is refused now; one no member has the room for yet waits.
+            // A disk no member could ever give is refused now; one no member has the room for yet waits, and so does
+            // one a member that makes disks may give once its room is read again.
             if !peers
                 .iter()
-                .any(|p| p["disk"]["total_bytes"].as_u64().is_some_and(|t| t >= needed))
+                .any(|p| p["disk"].is_object() && p["disk"]["total_bytes"].as_u64().is_none_or(|t| t >= needed))
             {
                 return Err(Self::with_peers(
                     BestError::bad_request(

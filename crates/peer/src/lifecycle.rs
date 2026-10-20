@@ -1471,7 +1471,7 @@ impl Peer {
                 // Told as no room now, so a cloud keeps the order to place again.
                 return Err(BestError::bad_request(
                     "INSUFFICIENT_DISK",
-                    "this peer could not read the room for a job's disk now: its file system did not answer in time; try again, or order where there is room",
+                    "this peer could not read the room for a job's disk now, so it has none to promise: its operator finds why in its log; order where there is room, or again later",
                 )
                 .with_details(json!({ "field": "disk_bytes" })));
             };
@@ -2098,8 +2098,12 @@ impl Service for Peer {
         for d in v["devices"].as_array_mut().into_iter().flatten() {
             d["isolation"] = json!(isolation);
         }
-        if let Some((free, total)) = self.disk_room().await {
-            v["disk"] = json!({ "free_bytes": free, "total_bytes": total });
+        // A peer that makes disks says so, its room null when its file system did not say it just now.
+        if self.runtime.makes_disks() {
+            v["disk"] = match self.disk_room().await {
+                Some((free, total)) => json!({ "free_bytes": free, "total_bytes": total }),
+                None => json!({ "free_bytes": null, "total_bytes": null }),
+            };
         }
         Ok(v)
     }
