@@ -7,9 +7,9 @@ runtime (Docker and the NVIDIA container toolkit). The menu's sizes
 ([spec#61](https://github.com/behavioralstate/spec/issues/61)) are to follow what this page says the card can hold.
 
 **Where it ran:** an NVIDIA GeForce GTX 1660 SUPER (Turing, compute capability 7.5, 6 GB, no MIG), driver 575.51.03,
-Docker 28.1.1 with overlay2 on an ext file system (Docker reports `extfs`), in a VM rented on Vast.ai on 2026-10-20. The owner's call was that a cheaper
-consumer card answers the questions the 5090 was named for. The 5090 (Blackwell, 32 GB) may give other numbers: the
-same script answers it in ten minutes before its fractions are sold.
+Docker 28.1.1 with overlay2 on an ext file system (Docker reports `extfs`), in a VM rented on Vast.ai on 2026-10-20.
+The owner's call was that a cheaper consumer card answers the questions the 5090 was named for. The 5090 (Blackwell,
+32 GB) may give other numbers: the same script answers it in ten minutes before its fractions are sold.
 
 **How:** [sharing/spike.sh](sharing/spike.sh) runs [sharing/probe.cu](sharing/probe.cu) in containers on the one
 card. The probe allocates and touches memory in steps (`alloc`), runs a compute-bound kernel back to back and counts
@@ -25,8 +25,9 @@ launches a second (`burn`: 4096 blocks of 256 threads, 2000 multiply-adds each),
   1,986 MiB free and failed at 1,792. About 60 MiB of each limit goes to the job's own CUDA context, as the free
   memory each saw says; the failures fall lower because the probe allocates in steps of 256 MiB.
 - **The failure is the job's own.** It is CUDA's ordinary `out of memory` inside the job (`alloc failed at 768 MiB:
-  out of memory`), the same as on a full card. Nothing outside the job sees it: the job ends or carries on as its code decides, and the peer learns only its
-  exit code. A `JobFailed` can name the slice the size reserved, not the allocation that failed.
+  out of memory`), the same as on a full card. Nothing outside the job sees it: the job ends or carries on as its code
+  decides, and the peer learns only its exit code. A `JobFailed` can name the slice the size reserved, not the
+  allocation that failed.
 
 ## Compute: a ceiling fixed at start, not a guarantee
 
@@ -86,8 +87,8 @@ Memory-bound work and real engines were not measured.
 
 ## Disk
 
-- **Docker's own cap needs XFS.** On the host's overlay2 over an ext file system, `--storage-opt size=1G` was refused: "supported only
-  for overlay over xfs with 'pquota' mount option".
+- **Docker's own cap needs XFS.** On the host's overlay2 over an ext file system, `--storage-opt size=1G` was refused:
+  "supported only for overlay over xfs with 'pquota' mount option".
 - **On XFS with project quotas it holds.** With Docker's data root moved to an XFS file system mounted with `pquota`,
   a container started with `--storage-opt size=1G` that wrote 2,000 MiB stopped at 1,024 MiB, its root full.
 - **A size-limited volume per job holds too.** A 1 GiB ext4 file system on a loop device, mounted into the container,
@@ -95,14 +96,15 @@ Memory-bound work and real engines were not measured.
 
 ## What it means for the menu
 
-- **Memory slices can be sold on a consumer card with no MIG,** where the peer runs MPS and starts each job on the card
-  with its pinned limit: `slicing: mps`. Each slice loses about 60 MiB to the job's context.
+- **Memory slices can be sold on a consumer card with no MIG,** where the peer runs MPS and starts each job on the
+  card with its pinned limit: `slicing: mps`. Each slice loses about 60 MiB to the job's context.
 - **Compute cannot be sold as decision 6 has it** with MPS on this card. There are two ways to sell it instead, for
   the owner to choose, and #63's sizes and #61's factor follow the choice:
   1. **A share as a ceiling.** Each size has a percentage, set when its job starts. The job gets that percentage
      rounded down to the steps observed here (whole pairs of multiprocessors, cause untested), alone or not, never the
-     idle compute above it: on this card 50 gave 46% of one job alone, and 25 gave 18%. What a job is given never changes, so its factor is 1 when the size's
-     share is that measured fraction, not the nominal percentage. A size priced at 25% would get 18% of the card.
+     idle compute above it: on this card 50 gave 46% of one job alone, and 25 gave 18%. What a job is given never
+     changes, so its factor is 1 when the size's share is that measured fraction, not the nominal percentage. A size
+     priced at 25% would get 18% of the card.
   2. **No percentage.** Identical jobs on a card divided it evenly while they computed, and a job alone has all of it.
      If unequal jobs divide it evenly too, which was not measured, the factor of decision 7 is the share a job had,
      one over the number of jobs computing on the card. It is known from the allocation the peer made, and it changes
