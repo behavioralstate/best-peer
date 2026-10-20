@@ -2329,21 +2329,15 @@ impl Service for Cloud {
         let admitted = self.admitted_sizes.lock().unwrap().remove(&key);
         let (size, receipt) = match (data.size.as_deref(), admitted) {
             (Some(_), Some((z, currency, receipt))) => (Some((z, currency)), receipt),
-            (Some(name), None) => {
-                // Admitted before a restart that forgot what admission read: the order is the size as the menu
-                // has it now, or nothing when it is gone.
-                match self.size_named(name, &data) {
-                    Ok((z, menu)) => (Some((z, menu.currency)), None),
-                    Err(e) => {
-                        self.state.lock().unwrap().reserved.remove(&key);
-                        self.tell(
-                            &em,
-                            "CommandFailed",
-                            json!({ "type": cmd.r#type, "reason": format!("the size left the menu between the order's admission and now: {}", e.message) }),
-                        );
-                        return;
-                    }
-                }
+            // Admission records the size with the reservation, and both live in memory: a reservation without it
+            // is not made, so this is the placement gone, told as such.
+            (Some(_), None) => {
+                self.tell(
+                    &em,
+                    "CommandFailed",
+                    json!({ "type": cmd.r#type, "reason": "the command was accepted but its placement is gone; send it again" }),
+                );
+                return;
             }
             (None, _) => (None, None),
         };
