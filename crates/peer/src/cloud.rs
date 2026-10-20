@@ -343,9 +343,14 @@ struct OutputPrefix {
 /// lives seven days at most; six days, with room for its image's pull and its upload.
 const MOST_SECONDS_WITH_OUTPUTS: u64 = 6 * 24 * 60 * 60;
 
-/// What a disk of `bytes` holds for files: its file system keeps about a twentieth for itself.
+/// What a disk of `bytes` holds for files. Its file system, ext4 with no journal and nothing kept for root, keeps up
+/// to 6.5% of a disk under 512 MiB and under 2% of a larger one (measured with mkfs.ext4 1.47 from 16 MiB to 4 GiB):
+/// a tenth, and a twentieth, leave room for the blocks files round up to.
 pub(crate) fn usable(bytes: u64) -> u64 {
-    bytes - bytes / 20
+    match bytes < 512 << 20 {
+        true => bytes - bytes / 10,
+        false => bytes - bytes / 20,
+    }
 }
 
 /// `host` without the devices of the members that have not `needed` bytes free for a job's disk now, as `peers`
@@ -616,8 +621,9 @@ impl Cloud {
         self.store.get().and_then(|s| s.lock().unwrap().clone())
     }
 
-    /// The disk each member is promised for orders on their way to it and not started there, by member: what the
-    /// free space it says does not count until it makes the disk. Read with the state held.
+    /// The disk each member is promised for orders placed on it and not sent yet, by member: once a member admits an
+    /// order it counts the disk in the room it says itself, so it is counted here only before. Read with the state
+    /// held.
     fn disk_promised(&self, s: &State) -> HashMap<String, u64> {
         let mut out: HashMap<String, u64> = HashMap::new();
         // The member a reservation names, from its device (cloud/peer/device).
@@ -629,12 +635,12 @@ impl Cloud {
                 .and_then(|d| d.0.split('/').nth(1))
                 .map(str::to_string)
         };
-        // Taken and not started: where it was placed, or where its admission or a step is placing it.
-        for o in s.orders.values().filter(|o| o.job.is_none()) {
+        // Taken and not sent: where its admission or a step is placing it.
+        for o in s.orders.values().filter(|o| o.job.is_none() && o.placed.is_none()) {
             let Some(io) = &o.io else {
                 continue;
             };
-            if let Some(peer) = o.placed.as_ref().map(|(p, _)| p.clone()).or_else(|| member_of(&o.id)) {
+            if let Some(peer) = member_of(&o.id) {
                 *out.entry(peer).or_default() += io.disk_bytes;
             }
         }
@@ -2011,6 +2017,8 @@ impl Cloud {
             return;
         }
         let (host, peers, isolations) = self.combined().await;
+        // The disk of the orders this step sends, which the members' room read above does not count yet.
+        let mut sent: HashMap<String, u64> = HashMap::new();
         for o in waiting {
             let device = {
                 let mut s = self.state.lock().unwrap();
@@ -2025,13 +2033,11 @@ impl Cloud {
                 } else {
                     isolated.clone()
                 };
-                let on = with_disk_room(
-                    on,
-                    &peers,
-                    &self.name,
-                    o.io.as_ref().map(|io| io.disk_bytes),
-                    &self.disk_promised(&s),
-                );
+                let mut promised = self.disk_promised(&s);
+                for (peer, bytes) in &sent {
+                    *promised.entry(peer.clone()).or_default() += bytes;
+                }
+                let on = with_disk_room(on, &peers, &self.name, o.io.as_ref().map(|io| io.disk_bytes), &promised);
                 let mut receipt = None;
                 let pick = match (&o.size, o.memory_bytes) {
                     (Some((size, currency)), _) => match size.place(&on, &host, &s, &taken) {
@@ -2066,6 +2072,9 @@ impl Cloud {
                 }
                 (device, receipt)
             };
+            if let (Some(io), Some(peer)) = (&o.io, device.0 .0.split('/').nth(1)) {
+                *sent.entry(peer.to_string()).or_default() += io.disk_bytes;
+            }
             self.dispatch(&o, device.0, device.1).await;
         }
     }

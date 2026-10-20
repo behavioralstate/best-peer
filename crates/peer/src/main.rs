@@ -9284,4 +9284,33 @@ mod tests {
         assert_eq!(site.query(&ws, "get-store").await, before);
         assert_eq!(std::fs::read(&file).unwrap(), kept);
     }
+
+    #[tokio::test]
+    async fn a_disk_a_member_has_admitted_is_counted_once_so_the_room_beside_it_is_used() {
+        let (site, ws, _s3, _logs) = site_with_store().await;
+        let member = &site.members[0];
+        member.runtime.set_disk_room(3 * GB);
+        // The images do not arrive: every order stays admitted on the member, its disk promised and not made.
+        let _held = member.runtime.hold_pulls();
+        let free_on_member = || async {
+            member.query("get-hardware-state").await["disk"]["free_bytes"]
+                .as_u64()
+                .unwrap()
+        };
+        for (n, id) in ["j1", "j2", "j3"].into_iter().enumerate() {
+            let queued = site.order(&ws, id, 4, with_io()).await;
+            assert_eq!(queued["waiting"], false, "{id} has its room: {queued}");
+            let left = 3 * GB - (n as u64 + 1) * GB;
+            for _ in 0..400 {
+                if free_on_member().await == left {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(free_on_member().await, left, "the member promised {id}'s disk");
+        }
+        // The room is all promised now: the next one waits.
+        let fourth = site.order(&ws, "j4", 4, with_io()).await;
+        assert_eq!(fourth["waiting"], true, "{fourth}");
+    }
 }

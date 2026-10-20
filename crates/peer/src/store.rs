@@ -48,23 +48,25 @@ impl Store {
     /// answering as a store does.
     pub async fn size_of(&self, key: &str) -> Result<Option<u64>, String> {
         let url = self.presign("HEAD", key, 300, OffsetDateTime::now_utc());
-        tokio::task::spawn_blocking(move || {
-            let agent = agent(|c| c.timeout_global(Some(ASKING)));
-            match agent.head(&url).call() {
-                Ok(r) if r.status().is_success() => Ok(r
-                    .headers()
-                    .get("content-length")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse().ok())
-                    .or(Some(0))),
-                Ok(r) => Err(format!("the store answered {}", r.status().as_u16())),
-                Err(ureq::Error::StatusCode(404)) => Ok(None),
-                Err(ureq::Error::StatusCode(code)) => Err(format!("the store answered {code}")),
-                Err(e) => Err(format!("the store did not answer: {e}")),
-            }
-        })
-        .await
-        .map_err(|e| e.to_string())?
+        tokio::task::spawn_blocking(move || head(&url, ASKING))
+            .await
+            .map_err(|e| e.to_string())?
+    }
+}
+
+/// The size of what `url` names, asked within `limit`: none when the store holds nothing there.
+fn head(url: &str, limit: Duration) -> Result<Option<u64>, String> {
+    match agent(|c| c.timeout_global(Some(limit))).head(url).call() {
+        Ok(r) if r.status().is_success() => Ok(r
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .or(Some(0))),
+        Ok(r) => Err(format!("the store answered {}", r.status().as_u16())),
+        Err(ureq::Error::StatusCode(404)) => Ok(None),
+        Err(ureq::Error::StatusCode(code)) => Err(format!("the store answered {code}")),
+        Err(e) => Err(format!("the store did not answer: {e}")),
     }
 }
 
@@ -141,14 +143,16 @@ pub fn endpoint_allowed(endpoint: &str, cleartext_loopback: bool) -> bool {
 /// Fetches `url` into `to`, answering the bytes written; `bytes` is its size when known, which bounds how long it
 /// may take.
 pub fn fetch(url: &str, to: &Path, bytes: Option<u64>) -> Result<u64, String> {
+    fetch_within(url, to, STARTING, within(bytes))
+}
+
+/// The same, the store given `starting` to answer and `body` to send it all.
+fn fetch_within(url: &str, to: &Path, starting: Duration, body: Duration) -> Result<u64, String> {
     if let Some(dir) = to.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
     }
     let mut file = std::fs::File::create(to).map_err(|e| format!("cannot write {}: {e}", to.display()))?;
-    let agent = agent(|c| {
-        c.timeout_recv_response(Some(STARTING))
-            .timeout_recv_body(Some(within(bytes)))
-    });
+    let agent = agent(|c| c.timeout_recv_response(Some(starting)).timeout_recv_body(Some(body)));
     let mut response = agent.get(url).call().map_err(|e| match e {
         ureq::Error::StatusCode(code) => format!("the store answered {code}"),
         e => format!("the store did not answer: {e}"),
@@ -160,11 +164,16 @@ pub fn fetch(url: &str, to: &Path, bytes: Option<u64>) -> Result<u64, String> {
 
 /// Sends the file `from` to `url` whole, answering its bytes.
 pub fn put(url: &str, from: &Path) -> Result<u64, String> {
+    put_within(url, from, STARTING, |bytes| within(Some(bytes)))
+}
+
+/// The same, the archive given `body` of its bytes to be sent and the store `starting` to answer then.
+fn put_within(url: &str, from: &Path, starting: Duration, body: impl FnOnce(u64) -> Duration) -> Result<u64, String> {
     let file = std::fs::File::open(from).map_err(|e| format!("cannot read {}: {e}", from.display()))?;
     let bytes = file.metadata().map_err(|e| e.to_string())?.len();
     let agent = agent(|c| {
-        c.timeout_send_body(Some(within(Some(bytes))))
-            .timeout_recv_response(Some(STARTING))
+        c.timeout_send_body(Some(body(bytes)))
+            .timeout_recv_response(Some(starting))
     });
     let response = agent
         .put(url)
@@ -323,6 +332,50 @@ mod tests {
         assert_eq!(within(Some(0)), Duration::from_secs(600));
         assert_eq!(within(Some(1 << 30)), Duration::from_secs(600 + 1024));
         assert_eq!(within(None), Duration::from_secs(86_400));
+    }
+
+    /// A store on loopback that takes each connection, reads what comes, and says `said` and then nothing more,
+    /// holding the connection open: a store that stopped answering.
+    fn stalled(said: &'static [u8]) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = format!("http://{}/b/k", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let _ = stream.write_all(said);
+                    let _ = stream.flush();
+                    std::thread::sleep(Duration::from_secs(10));
+                });
+            }
+        });
+        at
+    }
+
+    #[test]
+    fn a_store_that_stops_answering_fails_the_question_the_fetch_and_the_upload_within_their_bounds() {
+        let second = Duration::from_secs(1);
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("out.tar");
+        std::fs::write(&from, b"x").unwrap();
+        let started = std::time::Instant::now();
+        // Says nothing at all.
+        let silent = stalled(b"");
+        let why = head(&silent, second).unwrap_err();
+        assert!(why.contains("did not answer"), "{why}");
+        let why = fetch_within(&silent, &dir.path().join("a"), second, second).unwrap_err();
+        assert!(why.contains("did not answer"), "{why}");
+        let why = put_within(&silent, &from, second, |_| second).unwrap_err();
+        assert!(why.contains("did not take it"), "{why}");
+        // Starts the body, then stops.
+        let halfway = stalled(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nten bytes!");
+        let why = fetch_within(&halfway, &dir.path().join("b"), second, second).unwrap_err();
+        assert!(why.contains("stopped"), "{why}");
+        assert!(started.elapsed() < Duration::from_secs(9), "each gave up at its bound");
     }
 
     #[tokio::test]

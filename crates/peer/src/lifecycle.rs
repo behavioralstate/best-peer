@@ -1286,6 +1286,18 @@ impl Peer {
             Some(_) => Some(usable_by(self.hardware().await?, &who, data.device.as_deref())?),
             None => None,
         };
+        // The room for its disk is read now, before any lock: the engine's answer may take a while.
+        let room = match &io {
+            Some(_) => {
+                let runtime = self.runtime.clone();
+                tokio::task::spawn_blocking(move || runtime.disk_room())
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|(free, _)| free)
+            }
+            None => None,
+        };
         let _admitting = self.holdings.admitting();
         let held = self.holdings.of(&who.holder());
         let mut state = self.state.lock().unwrap();
@@ -1319,8 +1331,9 @@ impl Peer {
             true => crate::queue::order_id(&key),
             false => new_id("job"),
         };
+        // A room the engine could not say is no room.
         if let Some(io) = &io {
-            self.claim_disk(&id, io.disk_bytes)?;
+            self.claim_disk(&id, io.disk_bytes, room.unwrap_or(0))?;
         }
         if data.queued() && accelerators_only(&who) {
             self.held_to_accelerators.lock().unwrap().insert(key.clone());
@@ -1427,15 +1440,11 @@ impl Peer {
     }
 
     /// Promises the job `id` a disk of `bytes`, until the disk is made or the job ends; refused, with what is free,
-    /// when the room is not there. The check and the promise are one step, so two jobs are never promised one room.
-    fn claim_disk(&self, id: &str, bytes: u64) -> Result<(), BestError> {
+    /// when the room is not there. `free` is the room the runtime says it has, read before any lock is taken; the
+    /// check and the promise are one step, so two jobs are never promised one room.
+    fn claim_disk(&self, id: &str, bytes: u64, free: u64) -> Result<(), BestError> {
         let mut promised = self.promised_disks.lock().unwrap();
-        let free = self
-            .runtime
-            .disk_room()
-            .map(|(f, _)| f)
-            .unwrap_or(0)
-            .saturating_sub(promised.values().sum());
+        let free = free.saturating_sub(promised.values().sum());
         if free < bytes {
             return Err(BestError::bad_request(
                 "INSUFFICIENT_DISK",

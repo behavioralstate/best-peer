@@ -334,7 +334,9 @@ impl Runtime for DockerRuntime {
     }
 
     /// A file system of its own for the job `id`: an ext4 file of `bytes`, allocated whole so the room it takes is
-    /// taken now, on a loop device mounted under the disks' directory. Linux only, and the peer needs root to mount.
+    /// taken now, on a loop device mounted under the disks' directory. It has no journal, which a disk that lives as
+    /// long as its job does not need, and keeps nothing for root, so the job has all of it. Linux only, and the peer
+    /// needs root to mount.
     async fn make_disk(&self, id: &str, bytes: u64) -> Result<std::path::PathBuf, RuntimeError> {
         let Some(dir) = self.disks.clone() else {
             return Err(RuntimeError::NoDisk(
@@ -359,7 +361,7 @@ impl Runtime for DockerRuntime {
                 .map_err(|e| RuntimeError::NoDisk(format!("no room for a disk of {bytes} bytes: {e}")))?;
             std::fs::create_dir_all(&mount).map_err(|e| RuntimeError::NoDisk(e.to_string()))?;
             let (img, mnt) = (image.to_string_lossy().to_string(), mount.to_string_lossy().to_string());
-            run("mkfs.ext4", &["-q", "-F", &img])?;
+            run("mkfs.ext4", &["-q", "-F", "-m", "0", "-O", "^has_journal", &img])?;
             run("mount", &["-o", "loop", &img, &mnt]).map_err(|e| {
                 RuntimeError::NoDisk(format!("{e}; a job's disk is mounted by the peer, which needs root"))
             })?;
