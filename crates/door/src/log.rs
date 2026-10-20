@@ -607,18 +607,21 @@ impl EventLog {
 
     /// Removes the content of the events `pick` chooses, keeping each one's envelope: `strip` takes its data down to
     /// what stays. They are rewritten in memory and in the files they were written to, so a page, a replay of the
-    /// stream and a restart serve them as they are now; a subscriber that heard one before heard it before. Answers
-    /// the redacted events' ids, or what could not be rewritten on disk (memory is redacted either way).
-    pub fn redact(&self, pick: impl Fn(&Stored) -> bool, strip: impl Fn(&mut Value)) -> Result<Vec<String>, String> {
+    /// stream and a restart serve them as they are now; a subscriber that heard one before heard it before. `strip`
+    /// is applied to what is already stripped as well, so a redaction that failed on disk is done again by the
+    /// next. Answers the events picked, as they are now, or what could not be rewritten on disk (memory is redacted
+    /// either way).
+    pub fn redact(&self, pick: impl Fn(&Stored) -> bool, strip: impl Fn(&mut Value)) -> Result<Vec<Stored>, String> {
         let mut events = self.events.lock().unwrap();
-        let mut changed: HashMap<u64, Stored> = HashMap::new();
+        // By the event's id: two files of one folder may hold the same seq (an older peer's file beside day files).
+        let mut changed: HashMap<String, Stored> = HashMap::new();
         for stored in events.iter_mut().filter(|s| pick(s)) {
             strip(&mut stored.envelope.data);
-            changed.insert(stored.seq, stored.clone());
+            changed.insert(stored.envelope.id.clone(), stored.clone());
         }
-        let ids: Vec<String> = changed.values().map(|s| s.envelope.id.clone()).collect();
+        let picked: Vec<Stored> = changed.values().cloned().collect();
         if changed.is_empty() {
-            return Ok(ids);
+            return Ok(picked);
         }
         let mut segments = self.segments.lock().unwrap();
         if let Some(segments) = segments.as_mut() {
@@ -638,7 +641,7 @@ impl EventLog {
                 }
                 let rewritten = rewrite(&path, |line| {
                     let s = serde_json::from_str::<Stored>(line).ok()?;
-                    let now = changed.get(&s.seq)?;
+                    let now = changed.get(&s.envelope.id)?;
                     serde_json::to_string(now).ok()
                 });
                 if let (true, Some(day)) = (reopen, day) {
@@ -650,7 +653,7 @@ impl EventLog {
             }
         }
         drop(events);
-        Ok(ids)
+        Ok(picked)
     }
 
     /// Removes the content of the finished commands `pick` chooses (by sender, correlation and the command as accepted), keeping
@@ -907,8 +910,8 @@ mod tests {
                 o.insert("forgotten".into(), json!(true));
             }
         };
-        let ids = first.redact(|s| s.envelope.r#type == "PromptAnswered", strip).unwrap();
-        assert_eq!(ids.len(), 1);
+        let picked = first.redact(|s| s.envelope.r#type == "PromptAnswered", strip).unwrap();
+        assert_eq!(picked.len(), 1);
         let done = first
             .redact_commands(|sender, _, e| sender == "alice" && e.r#type == "Prompt", strip)
             .unwrap();
@@ -1156,6 +1159,41 @@ mod tests {
             2,
             "the order goes on from the last event read"
         );
+    }
+
+    #[test]
+    fn a_redaction_finds_its_event_by_id_where_two_files_hold_the_same_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = EventLog::open(dir.path()).unwrap();
+        let mut said = ev_at("PromptAnswered", "2020-01-02T10:00:00Z");
+        said.data = serde_json::json!({ "content": "secret" });
+        first.append(said);
+        drop(first);
+        let back = serde_json::to_string(&Stored {
+            seq: 1,
+            envelope: ev_at("FromOlderPeer", "2020-01-03T10:00:00Z"),
+        })
+        .unwrap();
+        std::fs::write(dir.path().join("events.jsonl"), back + "\n").unwrap();
+        let again = EventLog::open(dir.path()).unwrap();
+        again
+            .redact(
+                |s| s.envelope.r#type == "PromptAnswered",
+                |d| {
+                    d.as_object_mut().unwrap().remove("content");
+                },
+            )
+            .unwrap();
+        let legacy = std::fs::read_to_string(dir.path().join("events.jsonl")).unwrap();
+        assert!(
+            legacy.contains("FromOlderPeer"),
+            "the older peer's event is left as it was: {legacy}"
+        );
+        drop(again);
+        let reopened = EventLog::open(dir.path()).unwrap();
+        assert_eq!(types(&reopened), vec!["FromOlderPeer", "PromptAnswered"]);
+        let (page, _) = reopened.list(&Filter::default());
+        assert!(page[1].data.get("content").is_none());
     }
 
     #[test]

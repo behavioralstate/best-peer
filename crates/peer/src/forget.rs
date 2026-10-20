@@ -5,6 +5,8 @@
 //! holder's: a correlation the sender does not own is refused as a read of it is.
 
 use best_peer_door::auth::Credential;
+use std::collections::{BTreeMap, HashSet};
+
 use best_peer_door::{BestError, Emitter, Envelope, EventLog, Redacted, Stored};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -101,38 +103,69 @@ pub fn sender_of(em: &Emitter) -> String {
         .unwrap_or_default()
 }
 
-/// What a `forget` removed from one log: how many events and commands, and the commands as they are now.
+/// What a `forget` found in one log: the events and commands of the scope, as they are now (without content), and
+/// how many of the sender's prompts in the scope were still in flight, which keep their content until they end.
 pub struct Forgot {
-    pub events: usize,
+    pub events: Vec<Stored>,
     pub commands: Vec<Redacted>,
+    pub in_flight: usize,
 }
 
 /// Removes, from `log`, the content of `sender`'s prompts that `scope` names: the answers and failures told under
-/// its correlations, and the prompts it sent.
+/// its correlations, and the prompts whose answer or failure that was. What is already forgotten is taken again,
+/// so a forget that failed partway, on disk or at a member, is done by the next. A prompt is judged by the log's
+/// own time on its outcome, never the time its sender wrote on it.
 pub fn forget(log: &EventLog, sender: &str, scope: &Scope) -> Result<Forgot, String> {
     let events = log.redact(
         |s: &Stored| {
             let e = &s.envelope;
             CONTENT_EVENTS.contains(&e.r#type.as_str())
-                && e.data["forgotten"] != true
                 && scope.holds(e.correlationid.as_deref(), &e.data, &e.time)
                 && log.visible_to(Some(sender), s)
         },
         strip,
     )?;
+    let outcomes: HashSet<String> = events.iter().filter_map(|s| s.envelope.correlationid.clone()).collect();
     let commands = log.redact_commands(
-        |who, correlation, e| {
-            who == sender
-                && e.r#type == "Prompt"
-                && e.data["forgotten"] != true
-                && scope.holds(Some(correlation), &e.data, &e.time)
-        },
+        |who, correlation, e| who == sender && e.r#type == "Prompt" && outcomes.contains(correlation),
         strip,
     )?;
+    let in_flight = log
+        .unfinished()
+        .iter()
+        .filter(|u| u.sender == sender && u.envelope.r#type == "Prompt")
+        .filter(|u| {
+            let e = &u.envelope;
+            let correlation = e.correlationid.as_deref().unwrap_or(&e.id);
+            scope.holds(Some(correlation), &e.data, &e.time)
+        })
+        .count();
     Ok(Forgot {
-        events: events.len(),
+        events,
         commands,
+        in_flight,
     })
+}
+
+/// The member peer that answered each forgotten prompt on a workspace, as its outcome names it, by `(cloud, peer)`,
+/// with the prompts' command ids and data.
+pub fn answered_on(forgot: &Forgot) -> BTreeMap<(String, String), Vec<&Redacted>> {
+    let mut on: BTreeMap<(String, String), Vec<&Redacted>> = BTreeMap::new();
+    for prompt in &forgot.commands {
+        let outcome = forgot
+            .events
+            .iter()
+            .find(|s| s.envelope.correlationid.as_deref() == Some(prompt.correlation.as_str()));
+        let Some(d) = outcome.map(|s| &s.envelope.data) else {
+            continue;
+        };
+        if let (Some(cloud), Some(peer)) = (d["cloud"].as_str(), d["peer"].as_str()) {
+            on.entry((cloud.to_string(), peer.to_string()))
+                .or_default()
+                .push(prompt);
+        }
+    }
+    on
 }
 
 /// Takes a forgotten event's or command's data down to what stays, and marks it forgotten.
@@ -150,9 +183,10 @@ fn strip(data: &mut Value) {
 pub fn tell_forgotten(em: &Emitter, scope: &Scope, forgot: &Forgot, peers: Option<Value>) -> Envelope {
     let mut data = json!({
         "scope": scope.named(),
-        "events": forgot.events,
+        "events": forgot.events.len(),
         "commands": forgot.commands.len(),
-        "removed": "the messages of your prompts, the answers' content, and what an engine said when a prompt failed",
+        "in_flight": forgot.in_flight,
+        "removed": "the messages of your prompts, the answers' content, and what an engine said when a prompt failed; a prompt still in flight keeps its content until it ends, and a forget sent then removes it",
         "kept": "every event and command as an envelope (its id, type, time and correlation) with its deployment, model, token counts, holder, cloud and peer: that a prompt happened and what it used",
     });
     if let Some(p) = peers {
@@ -164,6 +198,56 @@ pub fn tell_forgotten(em: &Emitter, scope: &Scope, forgot: &Forgot, peers: Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prompt(id: &str, deployment: &str, time: &str) -> Envelope {
+        let mut e = Envelope::event(
+            "io.best.agents",
+            "Prompt",
+            json!({ "deployment": deployment, "messages": [{ "role": "user", "content": "secret" }] }),
+            Some(id.into()),
+            None,
+        );
+        e.id = id.into();
+        e.time = time.into();
+        e
+    }
+
+    fn answer(correlation: &str, deployment: &str, time: &str) -> Envelope {
+        let mut e = Envelope::event(
+            "io.best.agents",
+            "PromptAnswered",
+            json!({ "deployment": deployment, "model": "m", "content": "secret answer" }),
+            Some(correlation.into()),
+            None,
+        );
+        e.time = time.into();
+        e
+    }
+
+    #[test]
+    fn a_prompt_in_flight_is_counted_and_kept_and_before_reads_the_logs_time_not_the_senders() {
+        let log = EventLog::ephemeral();
+        // p1 was answered at 10:00, though its sender's clock wrote 11:00 on it; p2 is still in flight.
+        log.accept_command("alice", "p1", "h", "p1", &prompt("p1", "dep-1", "2026-10-20T11:00:00Z"));
+        log.append(answer("p1", "dep-1", "2026-10-20T10:00:00Z"));
+        log.finish_command("alice", "p1");
+        log.accept_command("alice", "p2", "h", "p2", &prompt("p2", "dep-1", "2026-10-20T10:01:00Z"));
+        let before = OffsetDateTime::parse("2026-10-20T10:30:00Z", &Rfc3339).unwrap();
+        let forgot = forget(&log, "alice", &Scope::Before(before)).unwrap();
+        assert_eq!(forgot.events.len(), 1);
+        assert_eq!(forgot.in_flight, 1, "p2 has no answer yet");
+        let (page, _) = log.list(&best_peer_door::Filter::default());
+        assert!(page[0].data.get("content").is_none());
+        let still = log.unfinished();
+        assert_eq!(still.len(), 1);
+        assert_eq!(
+            still[0].envelope.data["messages"][0]["content"], "secret",
+            "a prompt in flight is left alone"
+        );
+        // Another sender's forget takes nothing of alice's.
+        let none = forget(&log, "bob", &Scope::Deployment("dep-1".into())).unwrap();
+        assert!(none.events.is_empty() && none.commands.is_empty());
+    }
 
     #[test]
     fn a_scope_holds_its_correlation_its_deployment_or_what_was_told_before_its_time() {

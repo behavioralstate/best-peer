@@ -1101,16 +1101,16 @@ pub fn event_defs() -> Vec<EventDef> {
         event(
             "prompt-answered",
             "PromptAnswered",
-            "The model's answer to a prompt, whole, under the prompt's correlation id; the counts are what the engine reported, null where it did not.",
-            &["deployment", "model", "content"],
-            placed(json!({ "deployment": s("The deployment that answered"), "model": s("The model that answered, as the engine names it"), "content": s("The answer"), "finish": { "type": ["string", "null"], "description": "Why the answer stopped, as the engine says: stop, length, or its own word" }, "prompt_tokens": { "type": ["integer", "null"] }, "completion_tokens": { "type": ["integer", "null"] } })),
+            "The model's answer to a prompt, whole, under the prompt's correlation id; the counts are what the engine reported, null where it did not. One its holder forgot has no content and says forgotten.",
+            &["deployment", "model"],
+            placed(json!({ "deployment": s("The deployment that answered"), "model": s("The model that answered, as the engine names it"), "content": s("The answer; absent once its holder forgot it"), "forgotten": { "type": "boolean", "description": "True once its holder forgot its content" }, "finish": { "type": ["string", "null"], "description": "Why the answer stopped, as the engine says: stop, length, or its own word" }, "prompt_tokens": { "type": ["integer", "null"] }, "completion_tokens": { "type": ["integer", "null"] } })),
         ),
         event(
             "prompt-failed",
             "PromptFailed",
-            "The prompt was accepted and not answered: the deployment ended meanwhile, or the engine failed or did not answer in time. The reason says what happened and the fix what to do.",
-            &["deployment", "reason", "fix"],
-            placed(json!({ "deployment": s("The deployment asked"), "reason": s("What happened"), "fix": s("What to do") })),
+            "The prompt was accepted and not answered: the deployment ended meanwhile, or the engine failed or did not answer in time. The reason says what happened and the fix what to do. One its holder forgot has no reason, since an engine's words may quote the prompt, and says forgotten.",
+            &["deployment", "fix"],
+            placed(json!({ "deployment": s("The deployment asked"), "reason": s("What happened; absent once its holder forgot it"), "fix": s("What to do"), "forgotten": { "type": "boolean", "description": "True once its holder forgot its content" } })),
         ),
         event(
             "deployment-failed",
@@ -1154,11 +1154,12 @@ pub fn event_defs() -> Vec<EventDef> {
             &["scope", "events", "commands", "removed", "kept"],
             json!({
                 "scope": { "type": "object", "description": "What forget named: correlation, deployment or before" },
-                "events": n("How many events lost their content"),
-                "commands": n("How many prompt commands lost their messages"),
+                "events": n("How many events of the scope are now without their content"),
+                "commands": n("How many prompt commands of the scope are now without their messages"),
+                "in_flight": n("How many prompts of the scope were still in flight: they keep their content until they end, and a forget sent then removes it"),
                 "removed": s("What was removed"),
                 "kept": s("What stays"),
-                "peers": { "type": "array", "description": "On a workspace's door: each member peer asked to forget its copy, and whether it took the request", "items": { "type": "object" } }
+                "peers": { "type": "array", "description": "On a workspace's door: each member peer that answered a prompt of the scope, how many prompts it was asked to forget, how many it took and how many it refused, with the last reason", "items": { "type": "object" } }
             }),
         ),
         event(

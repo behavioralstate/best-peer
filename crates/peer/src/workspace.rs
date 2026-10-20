@@ -1313,31 +1313,31 @@ impl Service for Workspace {
                 return;
             }
         };
+        // Each member that answered is asked for each prompt it holds, a few at a time, and told of once.
         let mut peers = Vec::new();
-        for prompt in &forgot.commands {
-            // Where the prompt was answered, as the facts under its correlation say.
-            let (page, _) = self.log.list(&best_peer_door::Filter {
-                correlation_id: Some(prompt.correlation.clone()),
-                ..Default::default()
-            });
-            let Some(answered) = page
+        for ((cloud, peer), prompts) in crate::forget::answered_on(&forgot) {
+            let c = self.cloud(&cloud).ok();
+            let asks: Vec<(Option<Arc<Cloud>>, String, String)> = prompts
                 .iter()
-                .find(|e| matches!(e.r#type.as_str(), "PromptAnswered" | "PromptFailed"))
-            else {
-                continue;
-            };
-            let (Some(cloud), Some(peer)) = (answered.data["cloud"].as_str(), answered.data["peer"].as_str()) else {
-                continue;
-            };
-            let on_member = crate::cloud::member_correlation(&format!("{sender}:{}", prompt.id), &prompt.data, None);
-            let told = match self.cloud(cloud) {
-                Ok(c) => c.forget_on_member(peer, &on_member).await,
-                Err(e) => Err(e.message),
-            };
-            peers.push(match told {
-                Ok(()) => json!({ "cloud": cloud, "peer": peer, "asked": true }),
-                Err(why) => json!({ "cloud": cloud, "peer": peer, "asked": false, "reason": why }),
+                .map(|prompt| {
+                    let on_member =
+                        crate::cloud::member_correlation(&format!("{sender}:{}", prompt.id), &prompt.data, None);
+                    (c.clone(), peer.clone(), on_member)
+                })
+                .collect();
+            let asks = asks.into_iter().map(|(c, peer, on_member)| async move {
+                match c {
+                    Some(c) => c.forget_on_member(&peer, &on_member).await,
+                    None => Err("its cloud is no longer live".to_string()),
+                }
             });
+            let told: Vec<Result<(), String>> = futures::stream::iter(asks).buffer_unordered(8).collect().await;
+            let refused: Vec<&String> = told.iter().filter_map(|t| t.as_ref().err()).collect();
+            let mut row = json!({ "cloud": cloud, "peer": peer, "prompts": told.len(), "asked": told.len() - refused.len(), "refused": refused.len() });
+            if let Some(why) = refused.last() {
+                row["reason"] = json!(why);
+            }
+            peers.push(row);
         }
         crate::forget::tell_forgotten(&em, &scope, &forgot, Some(json!(peers)));
     }

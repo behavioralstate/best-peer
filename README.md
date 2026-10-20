@@ -407,7 +407,9 @@ stays as an envelope, its id, type, time and correlation with its deployment, mo
 peer, marked `forgotten`, so a page of events, a replay of the stream and a restart serve it without its content, the
 state folds the same, and what a prompt used is still there to count. It is rewritten in the log's own files, so
 nothing of it stays on disk. On a workspace's door the member peer that answered each prompt is asked to forget its
-copy too, and `Forgotten`, which completes the command, says what was removed, what stays, and each member asked. A
+copy too, and `Forgotten`, which completes the command, says what was removed, what stays, and each member asked,
+with how many it took. A prompt still in flight keeps its content until it ends (`Forgotten` counts them as
+`in_flight`), and a `forget` sent again then, or after a member could not be reached, removes what is left. A
 correlation the holder's commands did not use is refused, as a read of it would be: nobody forgets another's prompts.
 
 Where the boundary lies: the engines' own ports are bound to loopback whatever the door listens on (in `native` mode

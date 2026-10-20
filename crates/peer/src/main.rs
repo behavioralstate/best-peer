@@ -2161,6 +2161,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forget_by_deployment_or_by_time_takes_the_holders_prompts_there_and_a_time_must_read() {
+        // On disk, as a peer keeps its log: a finished command's messages are held only in its file.
+        let dir = tempfile::tempdir().unwrap();
+        let bed = bed_with(
+            card(),
+            Arc::new(EventLog::open(dir.path()).unwrap()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+            Arc::new(best_peer_engine::Fake::new()),
+            "engines.local",
+            None,
+        )
+        .await;
+        let dep = bed.deployed("d1", "llama3.2:3b", 8).await;
+        let ask = json!({ "deployment": dep, "messages": [{ "role": "user", "content": "my secret question" }] });
+        for id in ["p1", "p2"] {
+            let (s, b) = bed.send(id, "Prompt", "prompt", ask.clone()).await;
+            assert_eq!(s, StatusCode::CREATED, "{b}");
+            bed.events_of(id, "PromptAnswered").await;
+        }
+        let (s, e) = bed
+            .send("f0", "Forget", "forget", json!({ "before": "yesterday" }))
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(e["error"]["code"], "INVALID_TIME");
+        // Nothing was told before the epoch: a forget of then takes nothing.
+        let (s, b) = bed
+            .send("f1", "Forget", "forget", json!({ "before": "1970-01-02T00:00:00Z" }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        assert_eq!(bed.events_of("f1", "Forgotten").await.last().unwrap().data["events"], 0);
+        // Everything of the holder's to the deployment.
+        let (s, b) = bed.send("f2", "Forget", "forget", json!({ "deployment": dep })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let forgotten = bed.events_of("f2", "Forgotten").await.last().unwrap().data.clone();
+        assert_eq!(forgotten["events"], 2);
+        assert_eq!(forgotten["commands"], 2);
+        assert_eq!(forgotten["in_flight"], 0);
+        let (_, page) = get_as(&bed.app, "", &bed.key, "/events?type=PromptAnswered").await;
+        assert!(!serde_json::to_string(&page).unwrap().contains("secret"), "{page}");
+        // And everything before now, again: what is forgotten stays so, and is counted as the scope's.
+        let (s, b) = bed
+            .send("f3", "Forget", "forget", json!({ "before": "2999-01-01T00:00:00Z" }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        assert_eq!(bed.events_of("f3", "Forgotten").await.last().unwrap().data["events"], 2);
+    }
+
+    #[tokio::test]
+    async fn a_forget_whose_rewrite_failed_is_done_by_the_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let bed = bed_with(
+            card(),
+            Arc::new(EventLog::open(dir.path()).unwrap()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+            Arc::new(best_peer_engine::Fake::new()),
+            "engines.local",
+            None,
+        )
+        .await;
+        let dep = bed.deployed("d1", "llama3.2:3b", 8).await;
+        let ask = json!({ "deployment": dep, "messages": [{ "role": "user", "content": "my secret question" }] });
+        let (s, b) = bed.send("p1", "Prompt", "prompt", ask).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        bed.events_of("p1", "PromptAnswered").await;
+        // The accepted commands' file cannot be replaced: the forget fails, and says to send it again.
+        let accepted = dir.path().join("accepted.jsonl");
+        let lock = |on: bool| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = if on { 0o555 } else { 0o755 };
+                std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+            #[cfg(not(unix))]
+            {
+                let mut p = std::fs::metadata(&accepted).unwrap().permissions();
+                p.set_readonly(on);
+                std::fs::set_permissions(&accepted, p).unwrap();
+            }
+        };
+        lock(true);
+        let (s, b) = bed.send("f1", "Forget", "forget", json!({ "correlation": "p1" })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let failed = bed.events_of("f1", "CommandFailed").await;
+        assert!(
+            failed.last().unwrap().data["reason"]
+                .as_str()
+                .unwrap()
+                .contains("send forget again"),
+            "{failed:?}"
+        );
+        lock(false);
+        let (s, b) = bed.send("f2", "Forget", "forget", json!({ "correlation": "p1" })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let done = bed.events_of("f2", "Forgotten").await.last().unwrap().data.clone();
+        assert_eq!((done["events"].clone(), done["commands"].clone()), (json!(1), json!(1)));
+        assert!(!every_file(dir.path()).contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn forget_in_a_workspace_asks_a_member_it_could_not_reach_again_on_the_next() {
+        let (a, b) = two_members().await;
+        let key_a = a.key.clone();
+        let site = site(vec![(A, a), (B, b)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a)]).await;
+        let (s, b) = site
+            .send(
+                &ws,
+                "d1",
+                "DeployModel",
+                "deploy-model",
+                json!({ "cloud": "lab", "model": "llama3.2:3b", "engine": "ollama", "memory_bytes": 4 * GB }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let ready = site.events(&ws, "d1", "DeploymentReady").await;
+        let dep = ready.last().unwrap()["data"]["deployment"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let ask = json!({ "deployment": dep, "messages": [{ "role": "user", "content": "my secret question" }] });
+        let (s, b) = site.send(&ws, "p1", "Prompt", "prompt", ask).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "p1", "PromptAnswered").await;
+        // a does not answer: the workspace forgets its own copy and says a refused.
+        site.down[A].store(true, std::sync::atomic::Ordering::SeqCst);
+        let (s, b) = site
+            .send(&ws, "f1", "Forget", "forget", json!({ "correlation": "p1" }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let first = site.events(&ws, "f1", "Forgotten").await.last().unwrap()["data"].clone();
+        assert_eq!(first["peers"][0]["refused"], 1, "{first}");
+        assert!(first["peers"][0]["reason"].is_string());
+        // a answers again: the same forget asks it again, and its copy goes.
+        site.down[A].store(false, std::sync::atomic::Ordering::SeqCst);
+        let (s, b) = site
+            .send(&ws, "f2", "Forget", "forget", json!({ "correlation": "p1" }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let second = site.events(&ws, "f2", "Forgotten").await.last().unwrap()["data"].clone();
+        assert_eq!(second["peers"][0]["asked"], 1, "{second}");
+        let member_log = site.members[0].peer.log.clone();
+        let mut gone = false;
+        for _ in 0..400 {
+            let (events, _) = member_log.list(&best_peer_door::Filter::default());
+            if !serde_json::to_string(&events).unwrap().contains("secret") {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(gone, "the member still holds the prompt's content");
+    }
+
+    #[tokio::test]
     async fn forget_in_a_workspace_asks_the_member_that_answered_to_forget_its_copy() {
         let (a, b) = two_members().await;
         let key_a = a.key.clone();
@@ -2202,7 +2358,7 @@ mod tests {
         assert_eq!(forgotten["commands"], 1);
         assert_eq!(
             forgotten["peers"],
-            json!([{ "cloud": "lab", "peer": "a", "asked": true }])
+            json!([{ "cloud": "lab", "peer": "a", "prompts": 1, "asked": 1, "refused": 0 }])
         );
         let (_, page) = get_as(
             &site.app,
