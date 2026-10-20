@@ -2269,6 +2269,146 @@ mod tests {
         );
     }
 
+    /// A prompt as a client sends it under a correlation it chose, to the door at `prefix`.
+    async fn prompt_under(
+        app: &axum::Router,
+        prefix: &str,
+        key: &str,
+        id: &str,
+        correlation: &str,
+        deployment: &str,
+        said: &str,
+    ) {
+        let req = Request::post(format!("{prefix}/commands"))
+            .header("X-Api-Key", key)
+            .header(header::CONTENT_TYPE, "application/cloudevents+json")
+            .body(Body::from(
+                json!({
+                    "specversion": "1.0", "id": id, "correlationid": correlation, "source": "https://agent.test", "type": "Prompt",
+                    "datacontenttype": "application/json", "dataschema": format!("{EP}{prefix}/commands/prompt/1.0"),
+                    "time": "2026-10-12T10:30:00Z", "data": { "deployment": deployment, "messages": [{ "role": "user", "content": said }] }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn a_time_that_splits_a_correlation_forgets_the_answers_before_it_and_names_the_correlation_held_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let bed = bed_with(
+            card(),
+            Arc::new(EventLog::open(dir.path()).unwrap()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+            Arc::new(best_peer_engine::Fake::new()),
+            "engines.local",
+            None,
+        )
+        .await;
+        let dep = bed.deployed("d1", "llama3.2:3b", 4).await;
+        prompt_under(&bed.app, "", &bed.key, "p1", "chain", &dep, "early secret").await;
+        bed.events_of("chain", "PromptAnswered").await;
+        // The next answer is told at a later second, and the time is that answer's.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        prompt_under(&bed.app, "", &bed.key, "p2", "chain", &dep, "late secret").await;
+        let mut answers = Vec::new();
+        for _ in 0..400 {
+            answers = bed
+                .log_of("chain")
+                .into_iter()
+                .filter(|e| e.r#type == "PromptAnswered")
+                .collect();
+            if answers.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let at = answers[1].time.clone();
+        let (s, b) = bed.send("f1", "Forget", "forget", json!({ "before": at })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let forgotten = bed.events_of("f1", "Forgotten").await.last().unwrap().data.clone();
+        assert_eq!(forgotten["events"], 1, "{forgotten}");
+        assert_eq!(
+            forgotten["commands"], 0,
+            "which prompt the early answer was for is not told apart"
+        );
+        assert_eq!(forgotten["held_back"], json!(["chain"]));
+        let on_disk = every_file(dir.path());
+        assert!(
+            on_disk.contains("late secret") && on_disk.contains("early secret"),
+            "the messages are kept"
+        );
+        // Forgotten by correlation, they go too.
+        let (s, b) = bed
+            .send("f2", "Forget", "forget", json!({ "correlation": "chain" }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        bed.events_of("f2", "Forgotten").await;
+        assert!(!every_file(dir.path()).contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn forget_in_a_workspace_asks_each_member_for_the_prompts_it_answered_under_one_correlation() {
+        let (a, b) = two_members().await;
+        let (key_a, key_b) = (a.key.clone(), b.key.clone());
+        let site = site(vec![(A, a), (B, b)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a), ("b", B, &key_b)])
+            .await;
+        let mut deps = Vec::new();
+        for (id, device) in [("d1", "lab/a/gpu-0"), ("d2", "lab/b/gpu-0")] {
+            let (s, b) = site
+                .send(
+                    &ws,
+                    id,
+                    "DeployModel",
+                    "deploy-model",
+                    json!({ "device": device, "model": "llama3.2:3b", "engine": "ollama", "memory_bytes": 4 * GB }),
+                )
+                .await;
+            assert_eq!(s, StatusCode::CREATED, "{b}");
+            let ready = site.events(&ws, id, "DeploymentReady").await;
+            deps.push(
+                ready.last().unwrap()["data"]["deployment"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        let prefix = format!("/workspaces/{ws}");
+        prompt_under(&site.app, &prefix, &site.key, "p1", "chain", &deps[0], "secret for a").await;
+        prompt_under(&site.app, &prefix, &site.key, "p2", "chain", &deps[1], "secret for b").await;
+        site.events_n(&ws, "chain", "PromptAnswered", 2).await;
+        let (s, b) = site
+            .send(&ws, "f1", "Forget", "forget", json!({ "correlation": "chain" }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let forgotten = site.events(&ws, "f1", "Forgotten").await.last().unwrap()["data"].clone();
+        assert_eq!(
+            forgotten["peers"],
+            json!([
+                { "cloud": "lab", "peer": "a", "prompts": 1, "asked": 1, "refused": 0 },
+                { "cloud": "lab", "peer": "b", "prompts": 1, "asked": 1, "refused": 0 }
+            ]),
+            "{forgotten}"
+        );
+        for member in &site.members {
+            let log = member.peer.log.clone();
+            let mut gone = false;
+            for _ in 0..400 {
+                let (events, _) = log.list(&best_peer_door::Filter::default());
+                if !serde_json::to_string(&events).unwrap().contains("secret") {
+                    gone = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(gone, "a member still holds its prompt's content");
+        }
+    }
+
     #[tokio::test]
     async fn a_forget_whose_rewrite_failed_is_done_by_the_next() {
         let dir = tempfile::tempdir().unwrap();

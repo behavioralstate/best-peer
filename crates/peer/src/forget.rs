@@ -109,6 +109,8 @@ pub struct Forgot {
     pub events: Vec<Stored>,
     pub commands: Vec<Redacted>,
     pub in_flight: usize,
+    /// For a time: the correlations some of whose outcomes came after it, whose prompts keep their messages.
+    pub held_back: Vec<String>,
 }
 
 /// Removes, from `log`, the content of `sender`'s prompts that `scope` names: the answers and failures told under
@@ -167,10 +169,17 @@ pub fn forget(log: &EventLog, sender: &str, scope: &Scope) -> Result<Forgot, Str
             scope.holds(Some(correlation), &e.data, &e.time)
         })
         .count();
+    let mut held_back: Vec<String> = picked
+        .iter()
+        .filter(|(c, n)| told.get(*c).is_some_and(|t| t > *n))
+        .map(|(c, _)| c.clone())
+        .collect();
+    held_back.sort();
     Ok(Forgot {
         events,
         commands,
         in_flight,
+        held_back,
     })
 }
 
@@ -217,6 +226,9 @@ pub fn tell_forgotten(em: &Emitter, scope: &Scope, forgot: &Forgot, peers: Optio
         "removed": "the messages of your prompts, the answers' content, and what an engine said when a prompt failed; a prompt still in flight keeps its content until it ends, and a forget sent then removes it",
         "kept": "every event and command as an envelope (its id, type, time and correlation) with its deployment, model, token counts, holder, cloud and peer: that a prompt happened and what it used",
     });
+    if !forgot.held_back.is_empty() {
+        data["held_back"] = json!(forgot.held_back);
+    }
     if let Some(p) = peers {
         data["peers"] = p;
     }

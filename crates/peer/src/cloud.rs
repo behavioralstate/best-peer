@@ -1526,11 +1526,11 @@ impl Cloud {
                 self.on_pull_fact(m, pull, &i.em, "ImagePullFailed", json!({ "reason": why }));
             } else if i.r#type == "Prompt" {
                 // The answer is not coming: the prompt is told as failed, to be sent again when the peer is back.
-                self.tell(
-                    &i.em,
-                    "PromptFailed",
-                    json!({ "reason": why, "fix": "prompt again once the peer answers: PeerJoined on this stream says so", "peer": m.name }),
-                );
+                let mut failed = json!({ "reason": why, "fix": "prompt again once the peer answers: PeerJoined on this stream says so", "peer": m.name });
+                if let Some(d) = i.note.as_ref().and_then(|n| n.get("deployment")) {
+                    failed["deployment"] = d.clone();
+                }
+                self.tell(&i.em, "PromptFailed", failed);
             } else if i.ends.is_some() || key.is_empty() {
                 self.tell(
                     &i.em,
@@ -2500,7 +2500,19 @@ impl Service for Cloud {
             .and_then(|d| d.peer.clone())
             .and_then(|p| self.member(&p));
         let outcome = match &member {
-            Some(m) => self.place_on(m, &em, "Prompt", "prompt", cmd.data.clone()).await,
+            // The deployment rides with the prompt's record, so a member lost before it answered is told as the
+            // prompt to that deployment failing.
+            Some(m) => {
+                self.place_on_noting(
+                    m,
+                    &em,
+                    "Prompt",
+                    "prompt",
+                    cmd.data.clone(),
+                    Some(json!({ "deployment": id })),
+                )
+                .await
+            }
             None => Err(BestError::internal(format!("deployment {id} names no member peer"))),
         };
         if let Err(e) = outcome {

@@ -1157,6 +1157,7 @@ pub fn event_defs() -> Vec<EventDef> {
                 "events": n("How many events of the scope are now without their content"),
                 "commands": n("How many prompt commands of the scope are now without their messages"),
                 "in_flight": n("How many prompts of the scope were still in flight: they keep their content until they end, and a forget sent then removes it"),
+                "held_back": { "type": "array", "items": { "type": "string" }, "description": "For a time: the correlations under which some prompts were answered after it; their answers before it are forgotten, and the prompts' messages under them kept, since which prompt each answer was for is not told apart; forget them by correlation" },
                 "removed": s("What was removed"),
                 "kept": s("What stays"),
                 "peers": { "type": "array", "description": "On a workspace's door: each member peer that answered a prompt of the scope, how many prompts it was asked to forget, how many it took and how many it refused, with the last reason", "items": { "type": "object" } }
