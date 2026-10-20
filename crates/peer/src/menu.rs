@@ -28,7 +28,8 @@ pub struct Size {
     /// The least host memory of the machine its device is on, where the size names one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_memory_bytes: Option<u64>,
-    /// The share of the device's compute the size guarantees, above 0 and at most 1.
+    /// The share of a card's compute the size stands for, above 0 and at most 1, for the client to read: a MIG
+    /// instance's fraction of its card, 1 for a whole card. Placement reads the floors, not this.
     pub share: f64,
     /// What a second of the size costs, in the menu's currency.
     pub price_per_second: f64,
@@ -92,7 +93,7 @@ impl Menu {
                     "INVALID_MENU",
                     "sizes",
                     format!(
-                        "size {}'s share {} is not above 0 and at most 1: a share is the part of a device's compute the size guarantees",
+                        "size {}'s share {} is not above 0 and at most 1: a share is the part of a card's compute the size stands for",
                         s.name, s.share
                     ),
                 );

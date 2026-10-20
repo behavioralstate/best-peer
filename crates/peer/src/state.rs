@@ -111,7 +111,7 @@ pub struct Order {
     /// The size it ordered from the cloud's menu, as the menu had it, and the menu's currency; none for an order of
     /// memory_bytes.
     pub size: Option<(crate::menu::Size, String)>,
-    /// What it got, as `JobPlaced` told it: the size, the device, the share and the price.
+    /// What it got, as `JobPlaced` told it, in the size's terms: the size, its price and the currency.
     pub receipt: Option<Value>,
 }
 

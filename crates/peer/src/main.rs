@@ -2044,6 +2044,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn what_a_member_says_of_the_device_an_order_by_size_went_to_is_told_in_the_sizes_terms() {
+        // The instance the member reports cannot be handed to a container: its engine says so, naming it.
+        let mut gpu = best_peer_gpu::Fake::new().with_driver("fake 1.0");
+        gpu = gpu.with_device(best_peer_gpu::Fake::mig_instance("MIG-1", "A100", "1g.10gb", 9, "13.0"));
+        let b = bed(
+            Arc::new(gpu),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec![], vec![])),
+        )
+        .await;
+        let key_b = b.key.clone();
+        let site = site(vec![(B, b)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "split", &[("b", B, &key_b)]).await;
+        let data = json!({ "cloud": "split", "currency": "EUR", "sizes": [
+            { "name": "small", "memory_bytes": 8 * GB, "compute": { "api": "cuda", "version": "12" }, "share": 0.15, "price_per_second": 0.0005 }
+        ] });
+        let (s, b) = site.send(&ws, "m1", "SetMenu", "set-menu", data).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "m1", "MenuSetV1").await;
+        let (s, b) = site
+            .send(
+                &ws,
+                "s1",
+                "RunJob",
+                "run-job",
+                json!({ "cloud": "split", "image": "busybox", "size": "small" }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let served = site.events(&ws, "s1", "JobFailed").await;
+        let text = serde_json::to_string(&served).unwrap();
+        assert!(!text.contains("MIG-1") && !text.contains("A100"), "{served:#?}");
+        assert!(
+            text.contains("its device"),
+            "the member named the device, told as its device: {served:#?}"
+        );
+        // The log keeps what the cloud told, and the cloud's log the device it placed on.
+        let (kept, _) = site.workspaces.get(&ws).unwrap().log.list(&best_peer_door::Filter {
+            correlation_id: Some("s1".into()),
+            ..Default::default()
+        });
+        assert!(kept
+            .iter()
+            .any(|e| e.r#type == "JobPlaced" && e.data["device"] == "split/b/MIG-1"));
+    }
+
+    #[tokio::test]
     async fn a_device_a_size_holds_whole_and_the_menu_are_held_across_a_restart() {
         let a = member_with("Card A", 24, "12.4", best_peer_gpu::Slicing::None).await;
         let key_a = a.key.clone();

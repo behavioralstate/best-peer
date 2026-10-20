@@ -211,8 +211,8 @@ pub struct Cloud {
     stopped_unstarted: Mutex<HashSet<String>>,
     /// The sizes this cloud sells by, as the workspace's owner set them; none for a cloud with no menu.
     menu: Mutex<Option<Menu>>,
-    /// The devices sizes hold whole, by the order placed there, from the moment it was placed: its receipt says so
-    /// once JobPlaced is told, and this covers the time before.
+    /// The devices sizes hold whole, by the order placed there, from the moment it was placed: JobPlaced's device
+    /// says so once it is told, and this covers the time before.
     whole: Mutex<HashMap<String, String>>,
     /// The size admission read for an order, with the menu's currency and the receipt of the placement it made,
     /// until the order's handler tells it: what the order is, whatever the menu became meanwhile.
@@ -224,6 +224,36 @@ pub struct Cloud {
 
 /// How long an order may wait for room when it names no `queue_seconds`: a day, as RunPod's default time-to-live.
 pub const DEFAULT_QUEUE_SECONDS: u64 = 24 * 60 * 60;
+
+/// `text` with the hardware it names put in the size's terms, for an order by size (behavioralstate/spec#64, decision
+/// 4): the device ids in `devices`, longest first, and any NVIDIA card or MIG instance id it quotes become "its
+/// device". What a member said is kept whole in the operator's log.
+fn in_size_terms(text: &str, devices: &[&str]) -> String {
+    let mut t = text.to_string();
+    let mut named: Vec<&&str> = devices.iter().filter(|d| !d.is_empty()).collect();
+    named.sort_by_key(|d| std::cmp::Reverse(d.len()));
+    for d in named {
+        t = t.replace(*d, "its device");
+    }
+    let mut out = String::with_capacity(t.len());
+    let mut rest = t.as_str();
+    while let Some(i) = [rest.find("GPU-"), rest.find("MIG-")].into_iter().flatten().min() {
+        let id = rest[i + 4..]
+            .chars()
+            .take_while(|c| c.is_ascii_hexdigit() || *c == '-')
+            .count();
+        if id >= 8 {
+            out.push_str(&rest[..i]);
+            out.push_str("its device");
+            rest = &rest[i + 4 + id..];
+        } else {
+            out.push_str(&rest[..i + 4]);
+            rest = &rest[i + 4..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
 
 /// An order's id: the command's key hashed, so the command run again after a restart finds its order.
 fn order_id(key: &str) -> String {
@@ -1107,6 +1137,24 @@ impl Cloud {
                     }
                 }
             }
+            // An order by size is told in the size's terms: what the member said of the device is not passed on.
+            let sized_on = ordered.as_ref().and_then(|(o, _)| {
+                let s = self.state.lock().unwrap();
+                let x = s.orders.get(o)?;
+                x.size.as_ref()?;
+                Some(x.placed.as_ref().and_then(|(_, d)| d.clone()).unwrap_or_default())
+            });
+            if let Some(device) = sized_on {
+                let on_member = device.rsplit('/').next().unwrap_or_default().to_string();
+                for field in ["reason", "fix"] {
+                    if let Some(t) = data[field].as_str() {
+                        if t != in_size_terms(t, &[&device, &on_member]) {
+                            tracing::info!(cloud = %self.name, peer = %member.name, said = %t, "a member's words about an order by size, told in the size's terms");
+                        }
+                        data[field] = json!(in_size_terms(t, &[&device, &on_member]));
+                    }
+                }
+            }
             if let Some(key) = pull {
                 self.on_pull_fact(member, &key, &em, &e.r#type, data);
             } else if let Some((o, None)) = &ordered {
@@ -1849,11 +1897,21 @@ impl Cloud {
             .split_device(&device.0)
             .and_then(|(peer, d)| self.member(peer).map(|m| (m, d.to_string())))
         else {
-            fail(
-                format!("device {} names no member of this cloud", device.0),
-                "get-hardware-state lists the devices; order it again on one of them",
-                None,
-            );
+            match &o.size {
+                Some((z, _)) => fail(
+                    format!(
+                        "the place size {} was given is no longer a member of cloud {}",
+                        z.name, self.name
+                    ),
+                    "order it again",
+                    None,
+                ),
+                None => fail(
+                    format!("device {} names no member of this cloud", device.0),
+                    "get-hardware-state lists the devices; order it again on one of them",
+                    None,
+                ),
+            }
             return;
         };
         let memory = o.memory_bytes.or(o.size.as_ref().map(|(z, _)| z.memory_bytes));
@@ -1886,17 +1944,29 @@ impl Cloud {
             Refusal::Refused { body, .. } => body["error"]["code"] == "INSUFFICIENT_MEMORY",
         };
         let refused = e.relayed(&member.name);
+        // An order by size is told in its size's terms; the member's own words, which may name the device and its
+        // card, go to the operator's log.
+        let said = match &o.size {
+            Some((z, _)) => {
+                tracing::info!(cloud = %self.name, peer = %member.name, said = %refused.message, "a member refused an order by size");
+                if room {
+                    format!(
+                        "no device of cloud {} that meets size {}'s floors has its room now: it is placed as soon as one has, after the orders before it",
+                        self.name, z.name
+                    )
+                } else {
+                    in_size_terms(&refused.message, &[&device.0, &member_device])
+                }
+            }
+            None => refused.message,
+        };
         if room {
             // Waiting again, in its place: the next step tries it on whatever has the room then.
             self.promise(o, None);
-            self.tell(
-                &em,
-                "JobQueued",
-                queued_fact(o, o.attempt, true, Some(refused.message), None),
-            );
+            self.tell(&em, "JobQueued", queued_fact(o, o.attempt, true, Some(said), None));
         } else {
             fail(
-                refused.message,
+                said,
                 "read the peer's refusal in the reason, then order it again",
                 Some(&member.name),
             );
@@ -2636,6 +2706,34 @@ mod tests {
             member_correlation(":anything", &json!({ "deployment": "dep-1" }), Some("0123456789abcdef")),
             "cloud-0123456789abcdef-dep-1",
             "a command of the cloud's own carries the cloud's identity on the member"
+        );
+    }
+
+    #[test]
+    fn a_reason_about_an_order_by_size_names_no_device() {
+        assert_eq!(
+            in_size_terms(
+                "device MIG-1 is not available to this engine",
+                &["split/b/MIG-1", "MIG-1"]
+            ),
+            "device its device is not available to this engine"
+        );
+        assert_eq!(
+            in_size_terms("split/b/MIG-1 has 2 free", &["split/b/MIG-1", "MIG-1"]),
+            "its device has 2 free",
+            "the cloud's id before the member's, so neither is left in part"
+        );
+        assert_eq!(
+            in_size_terms(
+                "GPU-314ff147-b152-3a61-162c-d127e3ec73e8 and MIG-9d534ce5-32ef-5865-bac6-a1d9e895ee4a are busy",
+                &[]
+            ),
+            "its device and its device are busy"
+        );
+        assert_eq!(
+            in_size_terms("the image MIG-ok was not found", &[]),
+            "the image MIG-ok was not found",
+            "a word that only starts like an id is left"
         );
     }
 
