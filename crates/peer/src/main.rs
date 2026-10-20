@@ -2397,10 +2397,15 @@ mod tests {
             .await;
         assert_eq!(s, StatusCode::CREATED, "{b}");
         site.events(&ws, "c1", "SpendingCapSetV1").await;
+        // An order open across the forget, waiting for the card the deployment holds: it holds 50 of the cap.
+        let (s, b) = site.order_small(&ws, "j2", json!({ "deadline_seconds": 100 })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        assert_eq!(site.events(&ws, "j2", "JobQueued").await[0]["data"]["waiting"], true);
         let window = format!("?to={}", meter::text(time::OffsetDateTime::now_utc()));
         let before = site.usage(&ws, &window).await;
         assert_eq!(before["jobs"].as_array().unwrap().len(), 1, "{before}");
         assert!(before["cap"]["spent"].as_f64().unwrap() > 0.0, "{before}");
+        assert_eq!(before["cap"]["held"].as_f64(), Some(50.0), "{before}");
         let (s, b) = site
             .send(&ws, "f1", "Forget", "forget", json!({ "correlation": "chat" }))
             .await;
