@@ -100,7 +100,7 @@ Memory-bound work and real engines were not measured.
 - **Compute cannot be sold as decision 6 has it** with MPS on this card. There are two ways to sell it instead, for
   the owner to choose, and #63's sizes and #61's factor follow the choice:
   1. **A share as a ceiling.** Each size has a percentage, set when its job starts. The job gets that percentage
-     rounded down to the steps the card allows (here whole pairs of multiprocessors), alone or not, and never the
+     rounded down to the steps observed here (whole pairs of multiprocessors, cause untested), alone or not, never the
      idle compute above it: on this card 50 gave 46% of one job alone, and 25 gave 18%. What a job is given never changes, so its factor is 1 when the size's
      share is that measured fraction, not the nominal percentage. A size priced at 25% would get 18% of the card.
   2. **No percentage.** Identical jobs on a card divided it evenly while they computed, and a job alone has all of it.
