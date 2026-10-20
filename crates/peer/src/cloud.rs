@@ -42,6 +42,7 @@ use crate::lifecycle::{
     ready_deployment, require, shown_to, usable_by, within_count, within_share, workloads_view,
 };
 use crate::member::{Heard, Member, Refusal};
+use crate::menu::{Menu, NotPlaced};
 use crate::state::{JobPhase, Order, Phase, Reservation, State};
 use crate::transport::Transport;
 
@@ -200,6 +201,13 @@ pub struct Cloud {
     /// Orders stopped after they were sent and before the member started them: their listener stays, so the job
     /// the member starts all the same is stopped there.
     stopped_unstarted: Mutex<HashSet<String>>,
+    /// The sizes this cloud sells by, as the workspace's owner set them; none for a cloud with no menu.
+    menu: Mutex<Option<Menu>>,
+    /// The devices sizes hold whole, by the order placed there, from the moment it was placed: its receipt says so
+    /// once JobPlaced is told, and this covers the time before.
+    whole: Mutex<HashMap<String, String>>,
+    /// The receipt of an order placed at admission, until its handler sends it.
+    receipts: Mutex<HashMap<String, Value>>,
 }
 
 /// How long an order may wait for room when it names no `queue_seconds`: a day, as RunPod's default time-to-live.
@@ -249,6 +257,11 @@ fn queued_fact(o: &Order, attempt: u32, waiting: bool, reason: Option<String>, i
         "queue_seconds": o.queue_seconds, "deadline_seconds": o.deadline_seconds, "holder": o.holder,
         "accelerators_only": o.accelerators_only, "isolation": o.isolation, "attempt": attempt, "waiting": waiting,
     });
+    if let Some((size, currency)) = &o.size {
+        let mut z = serde_json::to_value(size).unwrap_or(Value::Null);
+        z["currency"] = json!(currency);
+        v["size"] = z;
+    }
     if let Some(r) = reason {
         v["reason"] = json!(r);
     }
@@ -292,6 +305,8 @@ struct RunJobData {
     deadline_seconds: Option<u64>,
     #[serde(default)]
     isolation: Option<Isolation>,
+    #[serde(default)]
+    size: Option<String>,
 }
 
 impl Cloud {
@@ -332,6 +347,9 @@ impl Cloud {
             again: AtomicBool::new(false),
             steps: tokio::sync::Mutex::new(()),
             stopped_unstarted: Mutex::new(HashSet::new()),
+            menu: Mutex::new(None),
+            whole: Mutex::new(HashMap::new()),
+            receipts: Mutex::new(HashMap::new()),
             name: name.into(),
             workspace: workspace.into(),
             log,
@@ -452,7 +470,10 @@ impl Cloud {
             id: o.id.clone(),
             device: None,
             compute: None,
-            memory_bytes: o.memory_bytes.unwrap_or(0),
+            memory_bytes: o
+                .memory_bytes
+                .or(o.size.as_ref().map(|(z, _)| z.memory_bytes))
+                .unwrap_or(0),
             holder: o.holder.clone(),
             boxed: false,
         });
@@ -497,6 +518,79 @@ impl Cloud {
             .and_then(|()| std::fs::rename(&tmp, file));
         if let Err(e) = written {
             tracing::warn!(file = %file.display(), error = %e, "the members' credentials could not be saved");
+        }
+    }
+
+    /// Sets the sizes this cloud sells by; none for a cloud with no menu.
+    pub fn set_menu(&self, menu: Option<Menu>) {
+        *self.menu.lock().unwrap() = menu;
+    }
+
+    /// The cloud's menu as `get-menu` answers it, each size with the devices that meet it now; none without a menu.
+    pub async fn menu_view(&self) -> Option<Value> {
+        let menu = self.menu.lock().unwrap().clone()?;
+        let (host, _, _) = self.combined().await;
+        let s = self.state.lock().unwrap();
+        let taken = self.taken_whole(&s);
+        Some(menu.view(&self.name, &host, &s, &taken))
+    }
+
+    /// The devices a size holds whole: placed whole and not ended, by the cloud's own record and by the receipts
+    /// the orders were told with, so a restart keeps them.
+    fn taken_whole(&self, s: &State) -> HashSet<String> {
+        let mut whole = self.whole.lock().unwrap();
+        whole.retain(|order, _| s.orders.contains_key(order) || s.reserved.values().any(|r| &r.id == order));
+        let mut taken: HashSet<String> = whole.values().cloned().collect();
+        for o in s.orders.values() {
+            if let Some(r) = o.receipt.as_ref().filter(|r| r["shared"] == false) {
+                if let Some(d) = r["device"].as_str() {
+                    taken.insert(d.to_string());
+                }
+            }
+        }
+        taken
+    }
+
+    /// The size `name` on this cloud's menu, with the menu, or the refusal naming the sizes there are: a size says the
+    /// device memory and the device's floors, so it comes alone, without memory_bytes or a device.
+    fn size_named(&self, name: &str, data: &RunJobData) -> Result<(crate::menu::Size, Menu), BestError> {
+        if data.memory_bytes.is_some() || data.device.is_some() {
+            return Err(BestError::bad_request(
+                "SIZE_WITH_MEMORY",
+                "size names the device memory and the floors of the device the job runs on: send size alone, or memory_bytes (and device) without it",
+            )
+            .with_details(json!({ "field": "size" })));
+        }
+        let menu = self.menu.lock().unwrap().clone();
+        let Some(menu) = menu else {
+            return Err(BestError::bad_request(
+                "NO_SUCH_SIZE",
+                format!(
+                    "cloud {} has no menu: order by memory_bytes, or ask the workspace's owner to set one with set-menu",
+                    self.name
+                ),
+            )
+            .with_details(json!({ "field": "size", "size": name, "sizes": [] })));
+        };
+        match menu.size(name) {
+            Some(size) => Ok((size.clone(), menu.clone())),
+            None => Err(BestError::bad_request(
+                "NO_SUCH_SIZE",
+                format!(
+                    "cloud {} has no size {name}: its sizes are {}; get-menu says what each holds and costs",
+                    self.name,
+                    menu.names().join(", ")
+                ),
+            )
+            .with_details(json!({ "field": "size", "size": name, "sizes": menu.names() }))),
+        }
+    }
+
+    /// `host` without the devices a size holds whole: nothing else is placed there.
+    fn without(host: Host, taken: &HashSet<String>) -> Host {
+        Host {
+            devices: host.devices.into_iter().filter(|d| !taken.contains(&d.id.0)).collect(),
+            ..host
         }
     }
 
@@ -984,6 +1078,10 @@ impl Cloud {
                             Some((o, Some((holder, _)))) => {
                                 data["order"] = json!(o);
                                 data["holder"] = json!(holder);
+                                let receipt = self.state.lock().unwrap().orders.get(o).and_then(|x| x.receipt.clone());
+                                if let Some(r) = receipt {
+                                    data["receipt"] = r;
+                                }
                             }
                             _ if !sender.is_empty() => data["holder"] = json!(holder_of_hash(sender)),
                             _ => {}
@@ -1623,18 +1721,36 @@ impl Cloud {
                     continue;
                 }
                 let isolated = Self::offering(&host, &isolations, o.isolation);
-                let pick = match o.memory_bytes {
-                    Some(needed) => {
-                        let on = if o.accelerators_only {
-                            accelerators(&isolated)
-                        } else {
-                            isolated
-                        };
-                        place(&on, &s, &any_compute(), needed, o.device.as_deref(), "", None)
-                            .ok()
-                            .map(|(d, _)| d)
-                    }
-                    None => self
+                let taken = self.taken_whole(&s);
+                let on = if o.accelerators_only {
+                    accelerators(&isolated)
+                } else {
+                    isolated.clone()
+                };
+                let mut receipt = None;
+                let pick = match (&o.size, o.memory_bytes) {
+                    (Some((size, currency)), _) => match size.place(&on, &host, &s, &taken) {
+                        Ok(p) => {
+                            if !p.shared {
+                                self.whole.lock().unwrap().insert(o.id.clone(), p.device.0.clone());
+                            }
+                            receipt = Some(size.receipt(&p, currency));
+                            Some(p.device)
+                        }
+                        Err(_) => None,
+                    },
+                    (None, Some(needed)) => place(
+                        &Self::without(on, &taken),
+                        &s,
+                        &any_compute(),
+                        needed,
+                        o.device.as_deref(),
+                        "",
+                        None,
+                    )
+                    .ok()
+                    .map(|(d, _)| d),
+                    (None, None) => self
                         .first_up(&isolated, o.isolation)
                         .map(|m| DeviceId(format!("{}/{}/", self.name, m))),
                 };
@@ -1645,16 +1761,16 @@ impl Cloud {
                 if let Some(r) = s.reserved.values_mut().find(|r| r.id == o.id) {
                     r.device = Some(device.clone());
                 }
-                device
+                (device, receipt)
             };
-            self.dispatch(&o, device).await;
+            self.dispatch(&o, device.0, device.1).await;
         }
     }
 
-    /// Sends order `o` to the member `device` names, after telling `JobPlaced`. A member that turns out to have no
-    /// room, or does not answer, leaves the order waiting where it was; any other refusal fails it, with the
-    /// member's reason.
-    async fn dispatch(&self, o: &Order, device: DeviceId) {
+    /// Sends order `o` to the member `device` names, after telling `JobPlaced`, with `receipt` for an order of a
+    /// size. A member that turns out to have no room, or does not answer, leaves the order waiting where it was;
+    /// any other refusal fails it, with the member's reason.
+    async fn dispatch(&self, o: &Order, device: DeviceId, receipt: Option<Value>) {
         let em = self.order_emitter(o);
         let fail = |reason: String, fix: &str, peer: Option<&str>| {
             self.tell(
@@ -1674,14 +1790,15 @@ impl Cloud {
             );
             return;
         };
-        let with_device = o.memory_bytes.is_some();
-        self.tell(
-            &em,
-            "JobPlaced",
-            json!({ "job": o.id, "peer": member.name, "device": with_device.then(|| device.0.clone()) }),
-        );
+        let memory = o.memory_bytes.or(o.size.as_ref().map(|(z, _)| z.memory_bytes));
+        let with_device = memory.is_some();
+        let mut placed = json!({ "job": o.id, "peer": member.name, "device": with_device.then(|| device.0.clone()) });
+        if let Some(r) = receipt {
+            placed["receipt"] = r;
+        }
+        self.tell(&em, "JobPlaced", placed);
         let mut body = json!({ "image": o.image, "args": o.args });
-        if let Some(m) = o.memory_bytes {
+        if let Some(m) = memory {
             body["memory_bytes"] = json!(m);
             body["device"] = json!(member_device);
         }
@@ -1832,16 +1949,38 @@ impl Service for Cloud {
         let mut state = self.state.lock().unwrap();
         within_share(held.memory_bytes, &who, data.memory_bytes)?;
         within_count("deployment", held.deployments, who.grant.deployments)?;
-        let (device, compute) = place(
-            &host,
-            &state,
-            &data.engine.runs_on(),
-            data.memory_bytes,
-            data.device.as_deref(),
-            &format!("{} on {}", data.model, data.engine),
-            mine(&who).as_deref(),
-        )
-        .map_err(|e| Self::with_peers(e, peers))?;
+        let taken = self.taken_whole(&state);
+        let what = format!("{} on {}", data.model, data.engine);
+        let apis = data.engine.runs_on();
+        let pick = |on: &Host| {
+            place(
+                on,
+                &state,
+                &apis,
+                data.memory_bytes,
+                data.device.as_deref(),
+                &what,
+                mine(&who).as_deref(),
+            )
+        };
+        let (device, compute) = match pick(&Self::without(host.clone(), &taken)) {
+            Ok(p) => p,
+            // A device a size holds whole would have it: said so, rather than a reason that is not the one.
+            Err(_) if pick(&host).is_ok() => {
+                return Err(Self::with_peers(
+                    BestError::bad_request(
+                        "INSUFFICIENT_MEMORY",
+                        format!(
+                            "the devices of cloud {} that could hold {what} are held whole by orders of a size from its menu: deploy once one ends (get-workloads lists them), or in another cloud",
+                            self.name
+                        ),
+                    )
+                    .with_details(json!({ "held_whole": taken })),
+                    peers,
+                ))
+            }
+            Err(e) => return Err(Self::with_peers(e, peers)),
+        };
         state.reserved.insert(
             key,
             Reservation {
@@ -1976,6 +2115,10 @@ impl Service for Cloud {
     async fn admit_run_job(&self, cmd: Envelope, who: Credential, key: String) -> Result<(), BestError> {
         require(&who, "jobs")?;
         let data: RunJobData = parse(&cmd.data)?;
+        let sized = match data.size.as_deref() {
+            Some(name) => Some(self.size_named(name, &data)?),
+            None => None,
+        };
         if data.device.is_some() && data.memory_bytes.is_none() {
             return Err(BestError::bad_request(
                 "DEVICE_NEEDS_MEMORY",
@@ -1983,7 +2126,7 @@ impl Service for Cloud {
             )
             .with_details(json!({ "field": "memory_bytes" })));
         }
-        if has_share(&who) && data.memory_bytes.is_none() {
+        if has_share(&who) && data.memory_bytes.is_none() && sized.is_none() {
             return Err(BestError::bad_request(
                 "JOB_NEEDS_DEVICE",
                 "this credential has a share, so its jobs run on a device, where the share counts them, never on the host with no device: send memory_bytes, the device memory the job needs",
@@ -1995,9 +2138,14 @@ impl Service for Cloud {
             return Ok(());
         }
         let (host, peers, isolations) = self.combined().await;
-        let host = match data.memory_bytes {
-            Some(_) => usable_by(host, &who, data.device.as_deref()).map_err(|e| Self::with_peers(e, peers.clone()))?,
-            None => host,
+        // A size's floors read every device of the members that answer: the host memory of a device's machine is
+        // its CPU's, which a credential held to the accelerators is not shown.
+        let whole = host.clone();
+        let host = match (data.memory_bytes, &sized) {
+            (Some(_), _) | (None, Some(_)) => {
+                usable_by(host, &who, data.device.as_deref()).map_err(|e| Self::with_peers(e, peers.clone()))?
+            }
+            (None, None) => host,
         };
         let host = self
             .held_to(host, &isolations, data.isolation)
@@ -2005,8 +2153,73 @@ impl Service for Cloud {
         let _admitting = self.holdings.admitting();
         let held = self.holdings.of(&who.holder());
         let mut state = self.state.lock().unwrap();
-        within_share(held.memory_bytes, &who, data.memory_bytes.unwrap_or(0))?;
+        let needed = data
+            .memory_bytes
+            .or(sized.as_ref().map(|(z, _)| z.memory_bytes))
+            .unwrap_or(0);
+        within_share(held.memory_bytes, &who, needed)?;
         within_count("job", held.jobs, who.grant.jobs)?;
+        let taken = self.taken_whole(&state);
+        if let Some((size, menu)) = &sized {
+            let placement = match size.place(&host, &whole, &state, &taken) {
+                Ok(p) => Some(p),
+                // No device meeting its floors has its room now, where room can come free: it waits its turn.
+                Err(NotPlaced::Busy) => None,
+                Err(NotPlaced::Never) => {
+                    let met: Vec<&str> = menu
+                        .sizes
+                        .iter()
+                        .filter(|z| host.devices.iter().any(|d| z.meets(&whole, d)))
+                        .map(|z| z.name.as_str())
+                        .collect();
+                    return Err(Self::with_peers(
+                        BestError::bad_request(
+                            "NO_SOURCE_FOR_SIZE",
+                            format!(
+                                "no device of cloud {}'s members that answer meets size {}'s floors ({} bytes of device memory, {}{}): the sizes they meet are {}; get-menu says which device meets which",
+                                self.name,
+                                size.name,
+                                size.memory_bytes,
+                                size.compute_text(),
+                                size.host_memory_bytes
+                                    .map(|h| format!(", {h} bytes of host memory"))
+                                    .unwrap_or_default(),
+                                if met.is_empty() { "none".to_string() } else { met.join(", ") }
+                            ),
+                        )
+                        .with_details(json!({ "field": "size", "size": size.name, "sizes": met })),
+                        peers,
+                    ));
+                }
+            };
+            if accelerators_only(&who) {
+                self.held_to_accelerators.lock().unwrap().insert(key.clone());
+            }
+            if let Some(p) = &placement {
+                if !p.shared {
+                    self.whole.lock().unwrap().insert(order_id(&key), p.device.0.clone());
+                }
+                self.receipts
+                    .lock()
+                    .unwrap()
+                    .insert(key.clone(), size.receipt(p, &menu.currency));
+            }
+            state.reserved.insert(
+                key.clone(),
+                Reservation {
+                    id: order_id(&key),
+                    device: placement.as_ref().map(|p| p.device.clone()),
+                    compute: placement.map(|p| p.compute),
+                    memory_bytes: size.memory_bytes,
+                    holder: who.holder(),
+                    boxed: crate::lifecycle::boxed(&who),
+                },
+            );
+            return Ok(());
+        }
+        // The devices a size holds whole take nothing else, though an order that waits may come to have them.
+        let all = host.clone();
+        let host = Self::without(host, &taken);
         let placement = match data.memory_bytes {
             Some(needed) => match place(
                 &host,
@@ -2018,11 +2231,25 @@ impl Service for Cloud {
                 mine(&who).as_deref(),
             ) {
                 Ok(p) => Some(p),
-                // No room now, where room can come free: the order is taken, and waits its turn.
-                Err(e) if e.code == "INSUFFICIENT_MEMORY" && could_ever_hold(&host, needed, data.device.as_deref()) => {
-                    None
-                }
-                Err(e) => return Err(Self::with_peers(e, peers)),
+                // Read again over every device, those a size holds whole included, for the reason that holds: room
+                // only there, or no room now where room can come free, and the order is taken and waits its turn.
+                Err(_) => match place(
+                    &all,
+                    &state,
+                    &any_compute(),
+                    needed,
+                    data.device.as_deref(),
+                    &format!("a job from {}", data.image),
+                    mine(&who).as_deref(),
+                ) {
+                    Ok(_) => None,
+                    Err(e)
+                        if e.code == "INSUFFICIENT_MEMORY" && could_ever_hold(&all, needed, data.device.as_deref()) =>
+                    {
+                        None
+                    }
+                    Err(e) => return Err(Self::with_peers(e, peers)),
+                },
             },
             None => Some({
                 // No device wanted: the first member answering takes it, which is the same one every time.
@@ -2089,6 +2316,21 @@ impl Service for Cloud {
             return;
         };
         let waiting = r.device.is_none();
+        let size = match data.size.as_deref() {
+            Some(name) => match self.size_named(name, &data) {
+                Ok((z, menu)) => Some((z, menu.currency)),
+                Err(e) => {
+                    self.state.lock().unwrap().reserved.remove(&key);
+                    self.tell(
+                        &em,
+                        "CommandFailed",
+                        json!({ "type": cmd.r#type, "reason": format!("the size left the menu between the order's admission and now: {}", e.message) }),
+                    );
+                    return;
+                }
+            },
+            None => None,
+        };
         let order = Order {
             id: id.clone(),
             correlation: em.correlation().to_string(),
@@ -2107,17 +2349,24 @@ impl Service for Cloud {
             placed: None,
             job: None,
             started_at: None,
+            size,
+            receipt: None,
         };
-        let reason = waiting.then(|| {
-            format!(
+        let reason = waiting.then(|| match &order.size {
+            Some((z, _)) => format!(
+                "no device of cloud {} that meets size {}'s floors has its room now: it is placed as soon as one has, after the orders before it",
+                self.name, z.name
+            ),
+            None => format!(
                 "no member peer of cloud {} has {} bytes free on a device that runs it now: it is placed as soon as one has, after the orders before it",
                 self.name,
                 data.memory_bytes.unwrap_or(0)
-            )
+            ),
         });
         self.tell(&em, "JobQueued", queued_fact(&order, 1, waiting, reason, None));
+        let receipt = self.receipts.lock().unwrap().remove(&key);
         match r.device {
-            Some(device) => self.dispatch(&order, device).await,
+            Some(device) => self.dispatch(&order, device, receipt).await,
             None => self.kick(),
         }
     }

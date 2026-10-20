@@ -34,6 +34,7 @@ use crate::domain::{
 };
 use crate::holdings::Holdings;
 use crate::lifecycle::{list, new_id, require};
+use crate::menu::{Menu, Size};
 use crate::transport::{Cleartext, Transport};
 
 /// Where the workspaces' doors are under the root: `/workspaces/<id>`.
@@ -583,6 +584,8 @@ struct CloudRecord {
     members: Vec<(String, String)>,
     archived: bool,
     live: Option<Arc<Cloud>>,
+    /// The sizes it sells by, as `set-menu` last set them; none until then, or once set with no sizes.
+    menu: Option<Menu>,
 }
 
 pub struct Workspace {
@@ -605,6 +608,13 @@ pub struct Workspace {
 struct ConfigureData {
     cloud: String,
     members: Vec<MemberData>,
+}
+
+#[derive(Deserialize)]
+struct SetMenuData {
+    cloud: String,
+    currency: String,
+    sizes: Vec<Size>,
 }
 
 #[derive(Deserialize)]
@@ -831,6 +841,18 @@ impl Workspace {
                     r.archived = true;
                 }
             }
+            "MenuSetV1" => {
+                let menu = serde_json::from_value::<SetMenuData>(d.clone())
+                    .ok()
+                    .filter(|m| !m.sizes.is_empty())
+                    .map(|m| Menu {
+                        currency: m.currency,
+                        sizes: m.sizes,
+                    });
+                if let Some(r) = self.clouds.lock().unwrap().get_mut(&name) {
+                    r.menu = menu;
+                }
+            }
             _ => {}
         }
     }
@@ -845,7 +867,10 @@ impl Workspace {
                     c.halt();
                     r.live = None;
                 }
-                (Some(c), false) => c.reconfigure(&r.members),
+                (Some(c), false) => {
+                    c.reconfigure(&r.members);
+                    c.set_menu(r.menu.clone());
+                }
                 (None, false) => {
                     let c = Cloud::new(
                         name,
@@ -860,6 +885,7 @@ impl Workspace {
                         self.ctx.transport.clone(),
                         self.ctx.holdings.clone(),
                     );
+                    c.set_menu(r.menu.clone());
                     c.rebuild();
                     if self.started.load(std::sync::atomic::Ordering::SeqCst) {
                         c.follow();
@@ -994,6 +1020,53 @@ impl Clouds for Workspace {
             &em,
             "CloudConfiguredV1",
             json!({ "workspace": self.id, "cloud": data.cloud, "members": members }),
+        );
+    }
+
+    async fn menus(&self) -> Result<Value, BestError> {
+        let live: Vec<(String, Arc<Cloud>)> = self
+            .clouds
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(n, r)| r.live.clone().map(|c| (n.clone(), c)))
+            .collect();
+        let mut menus = Vec::new();
+        for (name, c) in live {
+            menus.push(
+                c.menu_view()
+                    .await
+                    .unwrap_or_else(|| json!({ "cloud": name, "currency": null, "sizes": [] })),
+            );
+        }
+        Ok(json!({ "menus": menus }))
+    }
+
+    fn admit_set_menu(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError> {
+        if !self.is_owner(&who.holder()) {
+            return Err(BestError::bad_request(
+                "FORBIDDEN",
+                "only the workspace's owner sets a cloud's menu: ask them",
+            )
+            .with_details(json!({ "workspace": self.id, "role": "member" })));
+        }
+        let data: SetMenuData = crate::lifecycle::parse(&cmd.data)?;
+        self.cloud(&data.cloud)?;
+        Menu {
+            currency: data.currency,
+            sizes: data.sizes,
+        }
+        .check()
+    }
+
+    async fn set_menu(self: Arc<Self>, cmd: Envelope, em: Emitter) {
+        let Ok(data) = crate::lifecycle::parse::<SetMenuData>(&cmd.data) else {
+            return;
+        };
+        self.tell(
+            &em,
+            "MenuSetV1",
+            json!({ "workspace": self.id, "cloud": data.cloud, "currency": data.currency, "sizes": data.sizes }),
         );
     }
 

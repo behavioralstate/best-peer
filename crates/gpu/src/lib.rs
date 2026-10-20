@@ -58,6 +58,19 @@ pub struct Memory {
     pub free_bytes: u64,
 }
 
+/// How a device holds a workload to the share of its memory it was given. `None`: it does not, so a workload sold a
+/// share of it is given the whole device, since a share nothing enforces is a promise nothing keeps. `Mps`: NVIDIA's
+/// multi-process service limits each process's device memory. `Mig`: the device is split into instances in hardware.
+/// No adapter reports anything but `None` yet: which of these a consumer card can hold to is behavioralstate/spec#65.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Slicing {
+    #[default]
+    None,
+    Mps,
+    Mig,
+}
+
 /// One accelerator as the peer sees it at `Host::observed_at`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Device {
@@ -72,6 +85,9 @@ pub struct Device {
     pub power_w: Option<f32>,
     /// Compute utilisation in percent, where the adapter can read it.
     pub utilisation_pct: Option<u8>,
+    /// How it holds a workload to its share of the memory; a peer that does not say holds none.
+    #[serde(default)]
+    pub slicing: Slicing,
 }
 
 /// Everything the hardware says about itself, taken at one instant.
@@ -94,6 +110,21 @@ impl Host {
             .collect();
         fit.sort_by_key(|d| std::cmp::Reverse(d.memory.free_bytes));
         fit
+    }
+}
+
+impl Compute {
+    /// Whether this API, as a device offers it, satisfies `wanted`: the same API, its version the same or newer.
+    pub fn satisfies(&self, wanted: &Compute) -> bool {
+        compatible(self, wanted)
+    }
+
+    /// Whether its version, where it has one, is dotted numbers, the only versions anything satisfies.
+    pub fn version_reads(&self) -> bool {
+        match self {
+            Compute::Cuda(v) | Compute::Rocm(v) | Compute::OneApi(v) => parse_version(v).is_some(),
+            Compute::Metal | Compute::Vulkan | Compute::Cpu => true,
+        }
     }
 }
 
@@ -183,6 +214,7 @@ impl Fake {
             temperature_c: None,
             power_w: None,
             utilisation_pct: None,
+            slicing: Slicing::None,
         }
     }
 
@@ -201,6 +233,7 @@ impl Fake {
             temperature_c: Some(40.0),
             power_w: Some(30.0),
             utilisation_pct: Some(0),
+            slicing: Slicing::None,
         }
     }
 
@@ -255,6 +288,7 @@ mod tests {
                 temperature_c: None,
                 power_w: None,
                 utilisation_pct: None,
+                slicing: Slicing::None,
             })
     }
 

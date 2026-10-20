@@ -15,6 +15,7 @@ mod domain;
 mod holdings;
 mod lifecycle;
 mod member;
+mod menu;
 mod state;
 mod tls;
 mod transport;
@@ -1564,6 +1565,350 @@ mod tests {
             assert_eq!(s, StatusCode::CREATED, "{b}");
             self.events(ws, id, "JobQueued").await[0]["data"].clone()
         }
+    }
+
+    // ----- the menu ------------------------------------------------------------------------------------------------
+
+    /// A member whose one card is `gb` GiB of CUDA `cuda`, holding jobs to their slices as `slicing` says.
+    async fn member_with(name: &str, gb: u64, cuda: &str, slicing: best_peer_gpu::Slicing) -> Bed {
+        let mut card = best_peer_gpu::Fake::cuda_card("gpu-0", name, gb, cuda);
+        card.slicing = slicing;
+        bed(
+            Arc::new(best_peer_gpu::Fake::new().with_driver("fake 1.0").with_device(card)),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await
+    }
+
+    /// The menu of a test: small (8 GiB, CUDA 12, half a device), large (40 GiB, CUDA 12.6, a whole one), and huge,
+    /// which no card here holds.
+    fn menu_of_three() -> Value {
+        json!({
+            "currency": "EUR",
+            "sizes": [
+                { "name": "small", "description": "a test", "memory_bytes": 8 * GB, "compute": { "api": "cuda", "version": "12" }, "share": 0.5, "price_per_second": 0.0005 },
+                { "name": "large", "memory_bytes": 40 * GB, "compute": { "api": "cuda", "version": "12.6" }, "share": 1.0, "price_per_second": 0.002 },
+                { "name": "huge", "memory_bytes": 100 * GB, "compute": { "api": "cuda", "version": "12" }, "share": 1.0, "price_per_second": 0.01 }
+            ]
+        })
+    }
+
+    #[tokio::test]
+    async fn a_cloud_sells_by_its_menu_and_an_order_by_size_goes_where_its_floors_are_met_with_the_receipt() {
+        let a = member_with("Card A", 24, "12.4", best_peer_gpu::Slicing::None).await;
+        let b = member_with("Card B", 48, "12.8", best_peer_gpu::Slicing::Mps).await;
+        let (key_a, key_b) = (a.key.clone(), b.key.clone());
+        let site = site(vec![(A, a), (B, b)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a), ("b", B, &key_b)])
+            .await;
+        // Each device says how it holds a job to its slice.
+        let hs = site.query(&ws, "get-hardware-state").await;
+        let slicing = |id: &str| {
+            hs["devices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["id"] == id)
+                .unwrap()["slicing"]
+                .clone()
+        };
+        assert_eq!(slicing("lab/a/gpu-0"), "none");
+        assert_eq!(slicing("lab/b/gpu-0"), "mps");
+
+        // Without a menu, an order by size is refused with what to do.
+        let (s, e) = site
+            .send(
+                &ws,
+                "j0",
+                "RunJob",
+                "run-job",
+                json!({ "cloud": "lab", "image": "busybox", "size": "small" }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "NO_SUCH_SIZE");
+        assert!(e["error"]["message"].as_str().unwrap().contains("set-menu"), "{e}");
+
+        let mut data = menu_of_three();
+        data["cloud"] = json!("lab");
+        let (s, b) = site.send(&ws, "m1", "SetMenu", "set-menu", data).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "m1", "MenuSetV1").await;
+
+        // The menu says which device meets which size: small both, large only b's newer CUDA and larger card, huge none.
+        let menus = site.query(&ws, "get-menu").await;
+        let lab = &menus["menus"][0];
+        assert_eq!(lab["cloud"], "lab");
+        assert_eq!(lab["currency"], "EUR");
+        let sources = |name: &str| -> Vec<String> {
+            lab["sizes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|z| z["name"] == name)
+                .unwrap()["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["device"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(sources("small"), ["lab/a/gpu-0", "lab/b/gpu-0"]);
+        assert_eq!(sources("large"), ["lab/b/gpu-0"]);
+        assert!(sources("huge").is_empty());
+
+        // An order of large is placed where its floors are met, and its receipt says what it got.
+        let (s, b) = site
+            .send(
+                &ws,
+                "j1",
+                "RunJob",
+                "run-job",
+                json!({ "cloud": "lab", "image": "busybox", "size": "large" }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let events = site.events(&ws, "j1", "JobStarted").await;
+        assert_eq!(facts(&events), ["JobQueued", "JobPlaced", "JobStarted"]);
+        assert_eq!(events[0]["data"]["size"]["name"], "large");
+        assert_eq!(events[0]["data"]["size"]["currency"], "EUR");
+        let receipt = &events[1]["data"]["receipt"];
+        assert_eq!(receipt["size"], "large");
+        assert_eq!(receipt["gpu"], "Card B");
+        assert_eq!(receipt["device"], "lab/b/gpu-0");
+        assert_eq!(receipt["shared"], true, "card b holds its jobs to their slices");
+        assert_eq!(receipt["share"], 1.0);
+        assert_eq!(receipt["price_per_second"], 0.002);
+        assert_eq!(
+            events.last().unwrap()["data"]["receipt"],
+            *receipt,
+            "JobStarted carries the receipt"
+        );
+        assert_eq!(
+            events.last().unwrap()["data"]["memory_bytes"],
+            40 * GB,
+            "the member holds the size's memory"
+        );
+
+        // A size the cloud does not have, one no device meets, and a size with memory_bytes are refused at ingest.
+        let (s, e) = site
+            .send(
+                &ws,
+                "j2",
+                "RunJob",
+                "run-job",
+                json!({ "cloud": "lab", "image": "busybox", "size": "medium" }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(e["error"]["code"], "NO_SUCH_SIZE");
+        assert_eq!(e["error"]["details"]["sizes"], json!(["small", "large", "huge"]));
+        let (s, e) = site
+            .send(
+                &ws,
+                "j3",
+                "RunJob",
+                "run-job",
+                json!({ "cloud": "lab", "image": "busybox", "size": "huge" }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(e["error"]["code"], "NO_SOURCE_FOR_SIZE");
+        assert_eq!(e["error"]["details"]["sizes"], json!(["small", "large"]));
+        let (s, e) = site
+            .send(
+                &ws,
+                "j4",
+                "RunJob",
+                "run-job",
+                json!({ "cloud": "lab", "image": "busybox", "size": "small", "memory_bytes": GB }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(e["error"]["code"], "SIZE_WITH_MEMORY");
+
+        // A menu placement could not read is refused with the field.
+        let (s, e) = site
+            .send(
+                &ws,
+                "m2",
+                "SetMenu",
+                "set-menu",
+                json!({ "cloud": "lab", "currency": "EUR", "sizes": [
+                    { "name": "odd", "memory_bytes": GB, "compute": { "api": "cuda", "version": "twelve" }, "share": 0.5, "price_per_second": 0 }
+                ] }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(e["error"]["code"], "INVALID_MENU");
+        let (s, e) = site
+            .send(
+                &ws,
+                "m3",
+                "SetMenu",
+                "set-menu",
+                json!({ "cloud": "nowhere", "currency": "EUR", "sizes": [] }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(e["error"]["code"], "NO_SUCH_CLOUD");
+    }
+
+    #[tokio::test]
+    async fn orders_of_a_size_share_a_device_that_holds_slices_and_wait_for_one_taken_whole() {
+        let a = member_with("Card A", 24, "12.4", best_peer_gpu::Slicing::None).await;
+        let b = member_with("Card B", 48, "12.8", best_peer_gpu::Slicing::Mps).await;
+        let (key_a, key_b) = (a.key.clone(), b.key.clone());
+        let site = site(vec![(A, a), (B, b)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        // One cloud per machine: a whole-device card, and a card that holds slices.
+        site.cloud(&ws, "k1", "whole", &[("a", A, &key_a)]).await;
+        site.cloud(&ws, "k2", "sliced", &[("b", B, &key_b)]).await;
+        for (id, cloud) in [("m1", "whole"), ("m2", "sliced")] {
+            let mut data = menu_of_three();
+            data["cloud"] = json!(cloud);
+            let (s, b) = site.send(&ws, id, "SetMenu", "set-menu", data).await;
+            assert_eq!(s, StatusCode::CREATED, "{b}");
+            site.events(&ws, id, "MenuSetV1").await;
+        }
+        let order = |id: &'static str, cloud: &'static str| {
+            let site = &site;
+            let ws = ws.clone();
+            async move {
+                let (s, b) = site
+                    .send(
+                        &ws,
+                        id,
+                        "RunJob",
+                        "run-job",
+                        json!({ "cloud": cloud, "image": "busybox", "size": "small" }),
+                    )
+                    .await;
+                assert_eq!(s, StatusCode::CREATED, "{b}");
+                site.events(&ws, id, "JobQueued").await[0]["data"].clone()
+            }
+        };
+
+        // Two smalls on the card that holds slices both start at once, each with its share, each told it shares.
+        order("s1", "sliced").await;
+        order("s2", "sliced").await;
+        for id in ["s1", "s2"] {
+            let started = site.events(&ws, id, "JobStarted").await;
+            let receipt = &started.last().unwrap()["data"]["receipt"];
+            assert_eq!(receipt["shared"], true, "{started:#?}");
+            assert_eq!(receipt["share"], 0.5);
+        }
+
+        // On the card that holds none, a small takes the card whole, and the next small waits, though the memory
+        // would fit, until the first ends.
+        order("w1", "whole").await;
+        let first = site.events(&ws, "w1", "JobStarted").await;
+        let receipt = &first.last().unwrap()["data"]["receipt"];
+        assert_eq!(receipt["shared"], false);
+        assert_eq!(receipt["share"], 1.0, "a whole device is all of its compute");
+        let second = order("w2", "whole").await;
+        assert_eq!(second["waiting"], true, "{second}");
+        let menus = site.query(&ws, "get-menu").await;
+        let whole = menus["menus"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["cloud"] == "whole")
+            .unwrap()
+            .clone();
+        assert_eq!(whole["sizes"][0]["sources"][0]["whole_device"], true);
+        assert_eq!(whole["sizes"][0]["sources"][0]["free_now"], false);
+        // Nor does anything else go on a card a size holds whole.
+        let (s, e) = site
+            .send(
+                &ws,
+                "x1",
+                "RunJob",
+                "run-job",
+                json!({ "cloud": "whole", "image": "busybox", "memory_bytes": GB, "queue_seconds": 60 }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{e}");
+        assert_eq!(site.events(&ws, "x1", "JobQueued").await[0]["data"]["waiting"], true);
+        let (s, e) = site
+            .send(
+                &ws,
+                "d1",
+                "DeployModel",
+                "deploy-model",
+                json!({ "cloud": "whole", "model": "a:7b", "engine": "ollama", "memory_bytes": GB }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "INSUFFICIENT_MEMORY");
+        assert_eq!(e["error"]["details"]["held_whole"], json!(["whole/a/gpu-0"]));
+        let job = first.last().unwrap()["data"]["job"].as_str().unwrap().to_string();
+        let (s, b) = site
+            .send(&ws, "st1", "StopJob", "stop-job", json!({ "job": job }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let placed = site.events(&ws, "w2", "JobStarted").await;
+        assert_eq!(placed.last().unwrap()["data"]["receipt"]["shared"], false);
+    }
+
+    #[tokio::test]
+    async fn a_device_a_size_holds_whole_and_the_menu_are_held_across_a_restart() {
+        let a = member_with("Card A", 24, "12.4", best_peer_gpu::Slicing::None).await;
+        let key_a = a.key.clone();
+        let data = Arc::new(tempfile::tempdir().unwrap());
+        let log = Arc::new(EventLog::ephemeral());
+        let first = site_over(
+            vec![(A, a)],
+            data.clone(),
+            log.clone(),
+            None,
+            Arc::new(Limits::default()),
+        )
+        .await;
+        let ws = first.workspace("c1", "Research").await;
+        first.cloud(&ws, "k1", "lab", &[("a", A, &key_a)]).await;
+        let mut menu = menu_of_three();
+        menu["cloud"] = json!("lab");
+        let (s, b) = first.send(&ws, "m1", "SetMenu", "set-menu", menu).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        first.events(&ws, "m1", "MenuSetV1").await;
+        let (s, b) = first
+            .send(
+                &ws,
+                "w1",
+                "RunJob",
+                "run-job",
+                json!({ "cloud": "lab", "image": "busybox", "size": "small" }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        first.events(&ws, "w1", "JobStarted").await;
+        let owner = first.key.clone();
+        let (auth, members) = (first.auth.clone(), first.members);
+        first.workspaces.get(&ws).unwrap().cloud_for_test("lab").halt();
+        drop(first.app);
+        drop(first.workspaces);
+        drop(first.switchboard);
+
+        let again = site_over(Vec::new(), data.clone(), log, Some(auth), Arc::new(Limits::default())).await;
+        again.switchboard.connect(A, members[0].app.clone());
+        let again = Site { key: owner, ..again };
+        // The menu is the log's, and the card is still the first order's whole: the next small waits for it.
+        let menus = again.query(&ws, "get-menu").await;
+        assert_eq!(menus["menus"][0]["sizes"][0]["name"], "small", "{menus}");
+        let (s, b) = again
+            .send(
+                &ws,
+                "w2",
+                "RunJob",
+                "run-job",
+                json!({ "cloud": "lab", "image": "busybox", "size": "small" }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        assert_eq!(again.events(&ws, "w2", "JobQueued").await[0]["data"]["waiting"], true);
     }
 
     /// The facts of a correlation, by type, oldest first, with the progress of a pull left out.

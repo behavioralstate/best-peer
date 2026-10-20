@@ -354,10 +354,33 @@ and it ends in `JobStopped` before it started. A member lost under an order queu
 telling `attempt: 2`, and fails it the second time. `get-workloads` lists the orders not started yet as `queued`,
 oldest first. An order that waits counts against its credential's share and its count of jobs, as an admitted one
 always has. Every member lists its host's CPU after its cards, with the host's memory, so an order the cards cannot
-hold runs on the CPU rather than waiting, unless it names a device or its key is approved `--accelerators-only`:
-approve the tenants of a GPU cloud that way until the menu's sizes ([spec#63](https://github.com/behavioralstate/spec/issues/63))
-name a compute API. The queue is the cloud's state, folded from these facts; [docs/queue.md](docs/queue.md) says what it does
-not do yet that Verda's batch jobs and RunPod Serverless do.
+hold runs on the CPU rather than waiting, unless it names a device or its key is approved `--accelerators-only`, or
+it orders a size from the cloud's menu, whose compute floor keeps it off the CPU. The queue is the cloud's state,
+folded from these facts; [docs/queue.md](docs/queue.md) says what it does not do yet that Verda's batch jobs and
+RunPod Serverless do.
+
+A cloud can sell by **sizes** instead of hardware. Its owner sets a menu with `set-menu`: each size a name, its floors
+(the device memory it reserves, the compute API at the least version, the host memory of the device's machine), the
+share of a device's compute it guarantees, and a price per second, in one currency for the menu:
+
+```json
+{ "cloud": "lab", "currency": "EUR", "sizes": [
+  { "name": "small", "memory_bytes": 8589934592, "compute": { "api": "cuda", "version": "12" }, "share": 0.5, "price_per_second": 0.0005 },
+  { "name": "large", "memory_bytes": 42949672960, "compute": { "api": "cuda", "version": "12.6" }, "share": 1, "price_per_second": 0.002 }
+] }
+```
+
+`get-menu` answers each size with the devices that meet its floors now, each with its GPU and whether it has the
+room free. `run-job` names a `size` instead of `memory_bytes` and `device`, and is placed on a device that meets the
+size, queued as any order is when none has the room yet. A size no device of the cloud meets is refused with the
+sizes that are met, and a size the menu lacks with the sizes it has. `JobPlaced` and `JobStarted` carry the
+**receipt**: the size, the GPU, the device, whether the job shares the device, the share of its compute guaranteed,
+and the price. A size's memory is a slice of a device only where the device holds a job to its slice, as
+`get-hardware-state`'s `slicing` says (`mps`, `mig`). Elsewhere (`none`) the size takes the whole device and all of
+its compute, and nothing else is placed there until it ends, so nothing is promised that the device does not keep.
+No adapter reports anything but `none` yet: which slices a consumer card can hold to is
+[spec#65](https://github.com/behavioralstate/spec/issues/65). Pinning stays the owner's: `memory_bytes` and `device`
+work as before.
 
 The peer's state is the fold of the events it told. After a restart it is rebuilt from the log and squared with what
 the engine still runs; a workload that ended while the peer was down is told so then.

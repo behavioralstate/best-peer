@@ -60,6 +60,8 @@ impl Gpu for NvmlGpu {
                 temperature_c: d.temperature(TemperatureSensor::Gpu).ok().map(|t| t as f32),
                 power_w: d.power_usage().ok().map(|mw| mw as f32 / 1000.0),
                 utilisation_pct: d.utilization_rates().ok().map(|u| u.gpu.min(100) as u8),
+                // Neither MPS nor MIG is set up by this adapter: a share of the card is held to by nothing yet.
+                slicing: best_peer_gpu::Slicing::None,
             });
         }
         Ok(Host {

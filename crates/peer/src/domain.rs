@@ -49,6 +49,9 @@ pub trait Clouds: Service {
     async fn configure(self: Arc<Self>, cmd: Envelope, em: Emitter);
     fn admit_archive(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError>;
     async fn archive(self: Arc<Self>, cmd: Envelope, em: Emitter);
+    async fn menus(&self) -> Result<Value, BestError>;
+    fn admit_set_menu(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError>;
+    async fn set_menu(self: Arc<Self>, cmd: Envelope, em: Emitter);
 }
 
 /// What the root knows of its workspaces: which exist, who is in each, and the four commands that change that.
@@ -96,7 +99,9 @@ pub fn catalogue(svc: Arc<dyn Service>, membership: Arc<dyn Membership>, auth: A
 pub fn workspace_catalogue(ws: Arc<dyn Clouds>) -> Catalogue {
     let mut c = lifecycle(Catalogue::new(), ws.clone(), Where::Workspace)
         .query(clouds_query(ws.clone()))
+        .query(menu_query(ws.clone()))
         .command(configure_cloud(ws.clone()))
+        .command(set_menu(ws.clone()))
         .command(archive_cloud(ws));
     for e in event_defs()
         .into_iter()
@@ -141,6 +146,7 @@ pub fn completions() -> HashMap<String, HashSet<String>> {
         ("LeaveWorkspace".to_string(), set(&["MemberLeftV1"])),
         ("ConfigureCloud".to_string(), set(&["CloudConfiguredV1"])),
         ("ArchiveCloud".to_string(), set(&["CloudArchivedV1"])),
+        ("SetMenu".to_string(), set(&["MenuSetV1"])),
         ("RevokeAgent".to_string(), set(&["AgentRevokedV1"])),
     ])
 }
@@ -204,6 +210,7 @@ pub const WORKSPACE_EVENTS: &[&str] = &[
     "MemberLeftV1",
     "CloudConfiguredV1",
     "CloudArchivedV1",
+    "MenuSetV1",
     "PeerJoined",
     "PeerLost",
 ];
@@ -238,6 +245,7 @@ fn hardware_query(svc: Arc<dyn Service>, at: Where) -> QueryDef {
         "temperature_c": { "type": ["number", "null"] },
         "power_w": { "type": ["number", "null"] },
         "utilisation_pct": { "type": ["integer", "null"] },
+        "slicing": { "type": "string", "enum": ["none", "mps", "mig"], "description": "How the device holds a workload to the share of its memory it was given: none (it does not, so a size from a cloud's menu takes the whole device), mps (NVIDIA's multi-process service limits each process), mig (the card is split into instances in hardware)" },
         "isolation": { "type": "string", "enum": ["process", "container", "user-namespace", "vm"], "description": "What stands between a workload on this device and the host and the other workloads, weakest first: process (an engine installed on the host), container (no capability, no new privilege, a ceiling on tasks, a tenant's job in a closed box), user-namespace (the same in a rootless or user-remapped container engine, so root in the container is nobody on the host), vm (a virtual machine; no peer offers it yet). deploy-model and run-job may ask for at least one of these" }
     });
     let mut properties = json!({
@@ -533,7 +541,8 @@ fn run_job(peer: Arc<dyn Service>, at: Where) -> CommandDef {
                 "cloud": cloud_property("to run in; may be left out when device names it"),
                 "device": { "type": "string", "maxLength": 256, "description": "A device id from this workspace's get-hardware-state, cloud/peer/device, to pin the placement; refused without memory_bytes" },
                 "queue_seconds": { "type": "integer", "minimum": 1, "maximum": 604800, "description": "How long the order may wait for room before it ends unplaced, counted from JobQueued; at most seven days; without it, a day (86400)" },
-                "deadline_seconds": { "type": "integer", "minimum": 1, "maximum": 2592000, "description": "How long the job may run before it is stopped, counted from JobStarted; at most thirty days; without it the job runs to its end" }
+                "deadline_seconds": { "type": "integer", "minimum": 1, "maximum": 2592000, "description": "How long the job may run before it is stopped, counted from JobStarted; at most thirty days; without it the job runs to its end" },
+                "size": { "type": "string", "minLength": 1, "maxLength": 64, "description": "A size from the cloud's menu (get-menu), instead of memory_bytes and device: the job is placed on a device that meets the size's floors, and JobPlaced and JobStarted carry its receipt. Refused when the cloud has no such size (NO_SUCH_SIZE, with the sizes it has) or no device of its members meets it (NO_SOURCE_FOR_SIZE, with the sizes that are met)" }
             }),
         ),
     };
@@ -671,6 +680,78 @@ fn clouds_query(ws: Arc<dyn Clouds>) -> QueryDef {
         handler: Arc::new(move |_who, _params| {
             let ws = ws.clone();
             Box::pin(async move { ws.clouds() })
+        }),
+    }
+}
+
+fn menu_query(ws: Arc<dyn Clouds>) -> QueryDef {
+    QueryDef {
+        schema: "get-menu".into(),
+        version: "1.0".into(),
+        description: "What each cloud of this workspace sells by: its sizes, each a name, its floors (the device memory it reserves, the compute API at the least version, the host memory of the device's machine), the share of a device's compute it guarantees and its price per second in the menu's currency; and with each size, sources: every device of the cloud's members that answer that meets its floors, with its GPU, whether a size takes it whole (a device that does not hold a job to its slice, as get-hardware-state's slicing says) and whether it has the size's room free now. run-job names a size instead of memory_bytes and is placed on a device that meets it. A cloud with no menu lists no sizes; its owner sets one with set-menu.".into(),
+        parameters: None,
+        response: json!({
+            "type": "object",
+            "required": ["menus"],
+            "properties": {
+                "menus": { "type": "array", "items": { "type": "object", "required": ["cloud", "currency", "sizes"], "properties": {
+                    "cloud": { "type": "string" },
+                    "currency": { "type": ["string", "null"], "description": "ISO 4217; null for a cloud with no menu" },
+                    "sizes": { "type": "array", "items": { "type": "object", "properties": {
+                        "name": { "type": "string" }, "description": { "type": "string" },
+                        "memory_bytes": { "type": "integer" }, "compute": { "type": "object" }, "host_memory_bytes": { "type": "integer" },
+                        "share": { "type": "number" }, "price_per_second": { "type": "number" },
+                        "sources": { "type": "array", "items": { "type": "object", "properties": {
+                            "peer": { "type": "string" }, "device": { "type": "string", "description": "cloud/peer/device" }, "gpu": { "type": "string", "description": "The device's name, as its peer reports it" },
+                            "whole_device": { "type": "boolean", "description": "True when the size takes the device whole: it holds no job to its slice" },
+                            "free_now": { "type": "boolean", "description": "Whether it has the size's room now; an order waits its turn otherwise" }
+                        } } }
+                    } } }
+                } } }
+            }
+        }),
+        handler: Arc::new(move |_who, _params| {
+            let ws = ws.clone();
+            Box::pin(async move { ws.menus().await })
+        }),
+    }
+}
+
+fn set_menu(ws: Arc<dyn Clouds>) -> CommandDef {
+    let admit = ws.clone();
+    CommandDef {
+        schema: "set-menu".into(),
+        version: "1.0".into(),
+        command_type: "SetMenu".into(),
+        description: format!("Sets the sizes a cloud of this workspace sells by, replacing any it had: each a name, its floors, the share of a device's compute it guarantees and its price per second, in one currency for the menu. An order then names a size instead of memory_bytes (run-job's size) and is placed on a device that meets the floors; get-menu says which devices do. A size's memory is a slice of a device only where the device holds a job to its slice (get-hardware-state's slicing); elsewhere a size takes the whole device, so nothing is promised that the device does not keep. Sizes are not checked against the hardware here: a size no device meets is refused when ordered, naming those that are met. No sizes clears the menu. The outcome is a MenuSetV1 event with this command's correlation id. Refused when the cloud is not this workspace's or is archived, when a size's name is not {NAME_SHAPE} or is listed twice, when a share is not above 0 and at most 1, when a compute version does not read as dotted numbers, and when the currency is not an ISO 4217 code. Only the workspace's owner may set a menu."),
+        data_schema: json!({
+            "type": "object",
+            "required": ["cloud", "currency", "sizes"],
+            "properties": {
+                "cloud": { "type": "string", "minLength": 1, "maxLength": 64, "description": "The cloud's name from get-clouds" },
+                "currency": { "type": "string", "minLength": 3, "maxLength": 3, "description": "The prices' currency, ISO 4217: EUR, USD" },
+                "sizes": { "type": "array", "maxItems": 32, "description": "The sizes, in the order a person reads them; none clears the menu", "items": { "type": "object", "required": ["name", "memory_bytes", "compute", "share", "price_per_second"], "properties": {
+                "name": { "type": "string", "minLength": 1, "maxLength": 64, "description": "What an order names, one word: small, medium, large" },
+                "description": { "type": "string", "maxLength": 512, "description": "What it is for, in words a person reads" },
+                "memory_bytes": { "type": "integer", "minimum": 1, "description": "The device memory the size reserves for its job, a floor its device must have" },
+                "compute": { "type": "object", "required": ["api"], "properties": { "api": { "type": "string", "enum": ["cuda", "rocm", "one-api", "metal", "vulkan", "cpu"] }, "version": { "type": "string", "maxLength": 32, "description": "The least version, dotted numbers: 12 or 12.4" } }, "description": "The compute API its device offers, at this version or newer" },
+                "host_memory_bytes": { "type": "integer", "minimum": 1, "description": "The least host memory of the machine its device is on" },
+                "share": { "type": "number", "exclusiveMinimum": 0, "maximum": 1, "description": "The share of the device's compute the size guarantees, where the device holds a job to its slice; elsewhere the size takes the whole device and all of its compute" },
+                "price_per_second": { "type": "number", "minimum": 0, "description": "What a second of it costs, in the menu's currency" }
+            }, "additionalProperties": false } }
+            },
+            "additionalProperties": false
+        }),
+        produces: vec!["MenuSetV1".into(), "CommandFailed".into()],
+        completes: completes("SetMenu"),
+        impact: None,
+        admit: Some(Arc::new(move |cmd, who, _key| {
+            let ws = admit.clone();
+            Box::pin(async move { ws.admit_set_menu(cmd, &who) })
+        })),
+        handler: Arc::new(move |cmd, emitter| {
+            let ws = ws.clone();
+            Box::pin(async move { ws.set_menu(cmd, emitter).await })
         }),
     }
 }
@@ -1019,7 +1100,7 @@ pub fn event_defs() -> Vec<EventDef> {
             "JobStarted",
             "The job's container runs.",
             &["job", "image", "container"],
-            placed(json!({ "job": s("The id stop-job names"), "order": s("On a workspace's door, the order it ran for: the id JobQueued gave it"), "holder": s("The credential that ran it, an opaque id; absent for one run before holders were told"), "image": s("The image"), "device": { "type": ["string", "null"] }, "memory_bytes": n("The memory promised to it"), "container": s("The engine's container id"), "boxed": { "type": "boolean", "description": "True when the job runs in the closed box a credential with a share gets: no network, a read-only filesystem, a ceiling on host memory" }, "host_memory_bytes": { "type": ["integer", "null"], "description": "The most host memory its container may hold; null for no ceiling" } })),
+            placed(json!({ "job": s("The id stop-job names"), "order": s("On a workspace's door, the order it ran for: the id JobQueued gave it"), "holder": s("The credential that ran it, an opaque id; absent for one run before holders were told"), "image": s("The image"), "device": { "type": ["string", "null"] }, "memory_bytes": n("The memory promised to it"), "container": s("The engine's container id"), "boxed": { "type": "boolean", "description": "True when the job runs in the closed box a credential with a share gets: no network, a read-only filesystem, a ceiling on host memory" }, "host_memory_bytes": { "type": ["integer", "null"], "description": "The most host memory its container may hold; null for no ceiling" }, "receipt": { "type": "object", "description": "On a workspace's door, for an order of a size: what the job got", "properties": { "size": { "type": "string" }, "gpu": { "type": "string", "description": "The device's name, as its peer reports it" }, "device": { "type": "string", "description": "cloud/peer/device" }, "shared": { "type": "boolean", "description": "True when the job has a slice of a device that may hold other jobs; false when it has the device whole" }, "share": { "type": "number", "description": "The share of the device's compute it is guaranteed: the size's on a shared device, 1 on a whole one" }, "price_per_second": { "type": "number" }, "currency": { "type": "string" } } } })),
         ),
         event(
             "job-finished",
@@ -1107,6 +1188,13 @@ pub fn cloud_event_defs() -> Vec<EventDef> {
             json!({ "workspace": s("The workspace"), "cloud": s("The cloud's name") }),
         ),
         event(
+            "menu-set",
+            "MenuSetV1",
+            "A cloud of this workspace sells by these sizes from now on, replacing any it had; no sizes clears its menu. get-menu says which devices meet each.",
+            &["workspace", "cloud", "currency", "sizes"],
+            json!({ "workspace": s("The workspace"), "cloud": s("The cloud's name"), "currency": s("ISO 4217"), "sizes": { "type": "array", "description": "The sizes, as set-menu took them", "items": { "type": "object" } } }),
+        ),
+        event(
             "job-queued",
             "JobQueued",
             "A cloud took a run-job order: the order whole, as it is placed. waiting is true when no member peer has the room now; the cloud places it as soon as one does, first come, first served. attempt 2 says a member peer was lost under it and it was queued again, once.",
@@ -1126,7 +1214,8 @@ pub fn cloud_event_defs() -> Vec<EventDef> {
                 "waiting": { "type": "boolean", "description": "True when no member peer has the room now" },
                 "reason": s("Why it waits, or why it was queued again"),
                 "instead_of": s("Queued again: the job the lost member peer was running for it"),
-                "cloud": s("The cloud that took it")
+                "cloud": s("The cloud that took it"),
+                "size": { "type": "object", "description": "The size it ordered, as the cloud's menu had it then, with the menu's currency" }
             }),
         ),
         event(
@@ -1134,7 +1223,7 @@ pub fn cloud_event_defs() -> Vec<EventDef> {
             "JobPlaced",
             "An order was sent to a member peer, which pulls the image and starts it: JobStarted follows, naming the order.",
             &["job", "peer", "cloud"],
-            json!({ "job": s("The order's id"), "peer": s("The member peer it was sent to"), "device": { "type": ["string", "null"], "description": "The device there, cloud/peer/device; null for a job with no device" }, "cloud": s("The cloud") }),
+            json!({ "job": s("The order's id"), "peer": s("The member peer it was sent to"), "device": { "type": ["string", "null"], "description": "The device there, cloud/peer/device; null for a job with no device" }, "cloud": s("The cloud"), "receipt": { "type": "object", "description": "On a workspace's door, for an order of a size: what the job got", "properties": { "size": { "type": "string" }, "gpu": { "type": "string", "description": "The device's name, as its peer reports it" }, "device": { "type": "string", "description": "cloud/peer/device" }, "shared": { "type": "boolean", "description": "True when the job has a slice of a device that may hold other jobs; false when it has the device whole" }, "share": { "type": "number", "description": "The share of the device's compute it is guaranteed: the size's on a shared device, 1 on a whole one" }, "price_per_second": { "type": "number" }, "currency": { "type": "string" } } } }),
         ),
         event(
             "peer-joined",
@@ -1170,7 +1259,8 @@ pub fn host_state(host: &Host) -> Value {
                 "compute": d.compute,
                 "temperature_c": d.temperature_c,
                 "power_w": d.power_w,
-                "utilisation_pct": d.utilisation_pct
+                "utilisation_pct": d.utilisation_pct,
+                "slicing": d.slicing
             })
         })
         .collect();

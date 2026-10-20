@@ -108,6 +108,11 @@ pub struct Order {
     /// The job it became, and when it started.
     pub job: Option<String>,
     pub started_at: Option<String>,
+    /// The size it ordered from the cloud's menu, as the menu had it, and the menu's currency; none for an order of
+    /// memory_bytes.
+    pub size: Option<(crate::menu::Size, String)>,
+    /// What it got, as `JobPlaced` told it: the size, the device, the share and the price.
+    pub receipt: Option<Value>,
 }
 
 impl Order {
@@ -326,12 +331,17 @@ impl State {
                         placed: None,
                         job: None,
                         started_at: None,
+                        size: serde_json::from_value::<crate::menu::Size>(data["size"].clone())
+                            .ok()
+                            .map(|z| (z, data["size"]["currency"].as_str().unwrap_or_default().to_string())),
+                        receipt: None,
                     },
                 );
             }
             "JobPlaced" => {
                 if let Some(o) = self.orders.get_mut(&text("job")) {
                     o.placed = Some((text("peer"), data["device"].as_str().map(str::to_string)));
+                    o.receipt = data.get("receipt").filter(|r| r.is_object()).cloned();
                 }
             }
             "JobStarted" => {
