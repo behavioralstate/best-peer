@@ -2385,9 +2385,22 @@ mod tests {
         let answered = site.events(&ws, "chat", "PromptAnswered").await.last().unwrap()["data"].clone();
 
         // One window, read before and after: the meter is the same, and what the prompt used stays on its event.
+        // Under a cap, so what was spent and what is held are read across the forget too.
+        let (s, b) = site
+            .send(
+                &ws,
+                "c1",
+                "SetSpendingCap",
+                "set-spending-cap",
+                json!({ "amount": 100, "currency": "EUR" }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "c1", "SpendingCapSetV1").await;
         let window = format!("?to={}", meter::text(time::OffsetDateTime::now_utc()));
         let before = site.usage(&ws, &window).await;
         assert_eq!(before["jobs"].as_array().unwrap().len(), 1, "{before}");
+        assert!(before["cap"]["spent"].as_f64().unwrap() > 0.0, "{before}");
         let (s, b) = site
             .send(&ws, "f1", "Forget", "forget", json!({ "correlation": "chat" }))
             .await;
