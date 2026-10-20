@@ -387,11 +387,12 @@ What the orders by size used, and what they cost, is `get-usage`, read from the 
 billed from its `JobStarted` to its end, at the price its receipt carries. A menu price changed while a job runs cuts
 it into intervals, each billed at the price it had, and a later change never rewrites what was billed. A job on a
 member that was lost is billed to the last moment that member was heard, an event or a keep-alive on its stream
-(`PeerLost`'s `last_heard`), never to the moment of the loss, and says `end_inferred`. The factor, the share of
-compute a job had against what its size gives it uncontended, is 1 while a job holds its device whole, which is
-every device until an adapter reports slicing. `from` and `to` bound the window, `cloud` and `job` narrow it, and the
-totals are per currency. A member reads its own jobs; the workspace's owner reads every one. An order by
-`memory_bytes` is not priced.
+(`PeerLost`'s `last_heard`), or, where the loss does not say it, to the last fact the member told, never to the moment
+of the loss, and says `end_inferred`. The factor, the share of compute a job had against what its size gives it
+uncontended, is 1 while a job holds its device whole, which is every device until an adapter reports slicing. `from`
+and `to` bound the window (a `from` after `to` is refused), `cloud` and `job` narrow it, and the totals are per
+currency. A member reads its own jobs; the workspace's owner reads every one. An order by `memory_bytes` is not
+priced.
 
 The workspace's owner may cap what its orders by size cost together, with `set-spending-cap` (`{ "amount": 50,
 "currency": "EUR" }`, or `{ "amount": null }` to clear it). Under a cap an order by size sends `deadline_seconds`, so

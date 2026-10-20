@@ -146,7 +146,10 @@ pub fn parse_time(t: &str) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(t, &Rfc3339).ok()
 }
 
-/// The facts only a member peer tells, relayed by its cloud: what it said, never what the cloud did or saw.
+/// The facts only a member peer tells, relayed by its cloud: what it said, never what the cloud did or saw. Those
+/// the cloud also tells itself about a member are left out (`JobFailed`, `JobStopped`, `DeploymentFailed`,
+/// `DeploymentEnded`, `Undeployed`, `PromptFailed`), since one of them names the member without the member saying
+/// anything.
 const MEMBER_WORDS: &[&str] = &[
     "ImagePulling",
     "ImagePulled",
@@ -154,6 +157,7 @@ const MEMBER_WORDS: &[&str] = &[
     "DeploymentReady",
     "JobStarted",
     "JobFinished",
+    "OutOfMemory",
     "PromptAnswered",
 ];
 
