@@ -288,9 +288,9 @@ impl DockerRuntime {
     }
 }
 
-/// Set while a `df` killed past its time has not ended, so a file system stuck for long leaves one behind, not one per
-/// question.
-static DF_STUCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// How many `df`s killed past their time have not ended: each counted until its own reaper sees it end, so the room
+/// stays unknown, and no other is started, while any is stuck.
+static DF_STUCK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Runs `program` with `args`, its failure in its own words.
 fn run(program: &str, args: &[&str]) -> Result<(), RuntimeError> {
@@ -435,8 +435,9 @@ impl Runtime for DockerRuntime {
         if !cfg!(target_os = "linux") {
             return None;
         }
-        // One df stuck in a file system at a time: until it ends, the room is not known, and no other is started.
-        if DF_STUCK.load(std::sync::atomic::Ordering::SeqCst) {
+        // While a df is stuck in the file system, the room is not known and no other is started: the dfs left behind
+        // are those that were already asking when it stopped answering, never one per question after.
+        if DF_STUCK.load(std::sync::atomic::Ordering::SeqCst) > 0 {
             return None;
         }
         let failed = |why: String| {
@@ -466,10 +467,10 @@ impl Runtime for DockerRuntime {
                 _ => {
                     // Killed, and left to a thread of its own to reap: one stuck in the file system may never end.
                     let _ = df.kill();
-                    DF_STUCK.store(true, std::sync::atomic::Ordering::SeqCst);
+                    DF_STUCK.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     std::thread::spawn(move || {
                         let _ = df.wait();
-                        DF_STUCK.store(false, std::sync::atomic::Ordering::SeqCst);
+                        DF_STUCK.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     });
                     return failed("df did not answer within ten seconds".into());
                 }
