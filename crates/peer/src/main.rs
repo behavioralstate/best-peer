@@ -1520,6 +1520,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stop_and_an_expiry_claim_a_waiting_order_one_at_a_time_and_let_the_claim_go_once_it_is_told() {
+        let bed = bed(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        let (s, b) = run_on(&bed, "j1", 20, json!({})).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        bed.events_of("j1", "JobStarted").await;
+        let who = bed.door.auth.authenticate(&bed.key).unwrap();
+        // A stop claims one order: its expiry, come meanwhile, leaves it to the stop, which ends it once.
+        let (s, b) = run_on(&bed, "q1", 10, json!({ "queue_seconds": 1 })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let q1 = bed.events_of("q1", "JobQueued").await[0].data["job"].clone();
+        let stop = Envelope::event(
+            "io.best.agents",
+            "StopJob",
+            json!({ "job": q1 }),
+            Some("s1".into()),
+            None,
+        );
+        bed.peer.admit_stop_job(stop.clone(), &who).unwrap();
+        bed.peer.step(later(5)).await;
+        assert!(
+            !types(&bed.log_of("q1")).iter().any(|t| t == "JobFailed"),
+            "{:?}",
+            types(&bed.log_of("q1"))
+        );
+        bed.peer.stop_job(stop, bed.peer.emitter("s1")).await;
+        assert_eq!(types(&bed.log_of("q1")), ["JobQueued", "JobStopped"]);
+        assert!(bed.peer.ending().is_empty(), "the stop let its claim go");
+        // An expiry claims another, tells it failed once, and lets the claim go: a stop after finds no order.
+        let (s, b) = run_on(&bed, "q2", 10, json!({ "queue_seconds": 1 })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let q2 = bed.events_of("q2", "JobQueued").await[0].data["job"].clone();
+        bed.peer.step(later(5)).await;
+        assert_eq!(types(&bed.log_of("q2")), ["JobQueued", "JobFailed"]);
+        assert!(bed.peer.ending().is_empty(), "the expiry let its claim go");
+        let late = Envelope::event(
+            "io.best.agents",
+            "StopJob",
+            json!({ "job": q2 }),
+            Some("s2".into()),
+            None,
+        );
+        assert_eq!(bed.peer.admit_stop_job(late, &who).unwrap_err().code, "NO_SUCH_JOB");
+    }
+
+    #[tokio::test]
     async fn an_order_with_no_memory_bytes_that_waits_in_the_fold_is_started_with_no_device() {
         let bed = bed(
             card(),

@@ -446,6 +446,33 @@ impl Peer {
         e
     }
 
+    /// Claims the waiting order `id` for its end, by a stop or by its expiry, with the state's lock held by the caller:
+    /// no step starts it then, and nothing else ends it, until the claimant tells its end and lets the claim go.
+    /// Refused for an order that is starting, or already claimed.
+    fn claim_end(&self, id: &str) -> Result<(), BestError> {
+        if self.starting.lock().unwrap().contains(id) {
+            return Err(BestError::bad_request(
+                "ALREADY_STARTING",
+                format!("order {id} is starting: stop it once JobStarted says it runs"),
+            )
+            .with_details(json!({ "job": id })));
+        }
+        if !self.stopping.lock().unwrap().insert(id.to_string()) {
+            return Err(BestError::bad_request(
+                "ALREADY_STOPPING",
+                format!("order {id} is already ending: its JobStopped or JobFailed event follows"),
+            )
+            .with_details(json!({ "job": id })));
+        }
+        Ok(())
+    }
+
+    /// The orders claimed for their end and not yet told, for a test to see the claim let go.
+    #[cfg(test)]
+    pub fn ending(&self) -> std::collections::HashSet<String> {
+        self.stopping.lock().unwrap().clone()
+    }
+
     /// Starts a placement step of this peer's queue, unless one runs.
     fn kick(&self) {
         if let Some(me) = self.me.get() {
@@ -487,9 +514,7 @@ impl Peer {
             // Claimed for its end under the state's lock, as a stop claims one: whichever comes first tells it, once.
             let claimed = {
                 let s = self.state.lock().unwrap();
-                s.orders.get(&o.id).is_some_and(|x| x.waiting())
-                    && !self.starting.lock().unwrap().contains(&o.id)
-                    && self.stopping.lock().unwrap().insert(o.id.clone())
+                s.orders.get(&o.id).is_some_and(|x| x.waiting()) && self.claim_end(&o.id).is_ok()
             };
             if !claimed {
                 continue;
@@ -1307,22 +1332,7 @@ impl Peer {
             if !who.grant.is_all() && o.holder != who.holder() {
                 return Err(not_yours("job", id));
             }
-            if self.starting.lock().unwrap().contains(id) {
-                return Err(BestError::bad_request(
-                    "ALREADY_STARTING",
-                    format!("order {id} is starting: stop it once JobStarted says it runs"),
-                )
-                .with_details(json!({ "job": id })));
-            }
-            // Claimed now, under the state's lock, so no step starts it and no second stop is admitted.
-            if !self.stopping.lock().unwrap().insert(id.to_string()) {
-                return Err(BestError::bad_request(
-                    "ALREADY_STOPPING",
-                    format!("order {id} is already ending: its JobStopped or JobFailed event follows"),
-                )
-                .with_details(json!({ "job": id })));
-            }
-            return Ok(());
+            return self.claim_end(id);
         }
         let running: Vec<String> = s
             .jobs
