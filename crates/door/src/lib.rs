@@ -30,7 +30,7 @@ pub use catalogue::{AdmitHook, Catalogue, CommandDef, Emitter, EventDef, QueryDe
 pub use envelope::Envelope;
 pub use error::BestError;
 pub use limits::Limits;
-pub use log::{Accept, EventLog, Filter, Stored, Unfinished};
+pub use log::{Accept, EventLog, Filter, Redacted, Stored, Unfinished};
 pub use pace::Pace;
 pub use streams::Streams;
 

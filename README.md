@@ -398,7 +398,17 @@ header the engine would read. A prompt needs the `prompt` scope and a deployment
 refused at ingest otherwise with what to do. The answer is one fact, not one per token: a token is not a fact about
 the machine, and streaming partial output is not here (behavioralstate/spec#54 says what is and what waits). What the
 engine is asked and what it answers are in the door's log like every other fact, read by the holder under its own
-correlations and by nobody else (behavioralstate/spec#53).
+correlations and by nobody else (behavioralstate/spec#53), and kept until the holder says otherwise.
+
+`forget` is how the holder says so (behavioralstate/spec#68). It names one prompt's correlation, a deployment (every
+prompt of the holder's to it) or a time (every prompt of the holder's told before it), and removes the content: the
+messages the holder sent, the answers' content, and what an engine said when a prompt failed. Each event and command
+stays as an envelope, its id, type, time and correlation with its deployment, model, token counts, holder, cloud and
+peer, marked `forgotten`, so a page of events, a replay of the stream and a restart serve it without its content, the
+state folds the same, and what a prompt used is still there to count. It is rewritten in the log's own files, so
+nothing of it stays on disk. On a workspace's door the member peer that answered each prompt is asked to forget its
+copy too, and `Forgotten`, which completes the command, says what was removed, what stays, and each member asked. A
+correlation the holder's commands did not use is refused, as a read of it would be: nobody forgets another's prompts.
 
 Where the boundary lies: the engines' own ports are bound to loopback whatever the door listens on (in `native` mode
 the installed engine keeps its own bind), and the peer is the one thing that reaches them. A prompt on a deployment

@@ -559,6 +559,23 @@ impl Cloud {
         taken
     }
 
+    /// Asks member `peer` to forget the content it holds under `correlation`, the member's own correlation of a
+    /// prompt this cloud sent it: the cloud's own command, whose facts nobody waits for. Answers whether the member
+    /// took the request, or why not.
+    pub async fn forget_on_member(&self, peer: &str, correlation: &str) -> Result<(), String> {
+        let member = self
+            .member(peer)
+            .ok_or_else(|| format!("peer {peer} is no longer a member of cloud {}", self.name))?;
+        let base = member.schema_base().await;
+        let mc = format!("forget-{}", &hash_key(correlation)[..24]);
+        let envelope = self.to_member_as(&base, &mc, "Forget", "forget", json!({ "correlation": correlation }));
+        member
+            .send(&envelope)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.relayed(peer).message)
+    }
+
     /// The size `name` on this cloud's menu, with the menu, or the refusal naming the sizes there are: a size says the
     /// device memory and the device's floors, so it comes alone, without memory_bytes or a device.
     fn size_named(&self, name: &str, data: &RunJobData) -> Result<(crate::menu::Size, Menu), BestError> {
@@ -2500,7 +2517,7 @@ impl Service for Cloud {
 /// and its id, the id hashed when that would be too long for an envelope), or, for a command of the cloud's own,
 /// the cloud's identity on the member (`own`, the holder of its credential there) and the workload it ends, so a
 /// cloud the member admitted again under a new credential owns its new correlations and is refused for none.
-fn member_correlation(key: &str, data: &Value, own: Option<&str>) -> String {
+pub(crate) fn member_correlation(key: &str, data: &Value, own: Option<&str>) -> String {
     let (sender, id) = key.split_once(':').unwrap_or(("", key));
     match (sender.is_empty(), data["deployment"].as_str().or(data["job"].as_str())) {
         (true, Some(workload)) => format!("cloud-{}-{workload}", own.unwrap_or("none")),

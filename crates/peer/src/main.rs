@@ -12,6 +12,7 @@
 
 mod cloud;
 mod domain;
+mod forget;
 mod holdings;
 mod lifecycle;
 mod member;
@@ -2018,6 +2019,209 @@ mod tests {
             .await;
         assert_eq!(s, StatusCode::CREATED, "{b}");
         assert_eq!(again.events(&ws, "w2", "JobQueued").await[0]["data"]["waiting"], true);
+    }
+
+    // ----- forget ----------------------------------------------------------------------------------------------------
+
+    /// Every file under `dir`, read as text, for a test that looks for what must not be there.
+    fn every_file(dir: &std::path::Path) -> String {
+        let mut text = String::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                text.push_str(&every_file(&path));
+            } else {
+                text.push_str(&String::from_utf8_lossy(&std::fs::read(&path).unwrap()));
+            }
+        }
+        text
+    }
+
+    #[tokio::test]
+    async fn forget_removes_a_prompts_content_and_keeps_its_envelope_on_a_page_the_stream_and_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![]));
+        let bed = bed_with(
+            card(),
+            Arc::new(EventLog::open(dir.path()).unwrap()),
+            runtime.clone(),
+            Arc::new(best_peer_engine::Fake::new()),
+            "engines.local",
+            None,
+        )
+        .await;
+        let dep = bed.deployed("d1", "llama3.2:3b", 8).await;
+        let ask = json!({ "deployment": dep, "messages": [{ "role": "user", "content": "my secret question" }] });
+        let (s, b) = bed.send("p1", "Prompt", "prompt", ask).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let answered = bed.events_of("p1", "PromptAnswered").await;
+        let before = answered.last().unwrap().clone();
+        assert!(before.data["content"].as_str().unwrap().contains("secret"));
+
+        // Another credential cannot forget it, nor can a forget name nothing or two things.
+        let other = key_with(&bed.app, Some("prompt"), None).await;
+        let (s, e) = send_as(
+            &bed.app,
+            "",
+            &other,
+            "f0",
+            "Forget",
+            "forget",
+            json!({ "correlation": "p1" }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "NO_SUCH_CORRELATION");
+        let (s, e) = bed.send("f8", "Forget", "forget", json!({})).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(e["error"]["code"], "FORGET_NAMES_ONE");
+        let (s, e) = bed
+            .send(
+                "f9",
+                "Forget",
+                "forget",
+                json!({ "correlation": "p1", "deployment": dep }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(e["error"]["code"], "FORGET_NAMES_ONE");
+
+        // Its holder forgets it: the answer and the prompt lose their content, and Forgotten says what stays.
+        let (s, b) = bed.send("f1", "Forget", "forget", json!({ "correlation": "p1" })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let forgotten = &bed.events_of("f1", "Forgotten").await.last().unwrap().data.clone();
+        assert_eq!(forgotten["events"], 1);
+        assert_eq!(forgotten["commands"], 1);
+        assert_eq!(forgotten["scope"], json!({ "correlation": "p1" }));
+        assert!(forgotten["kept"].as_str().unwrap().contains("token counts"));
+        let (_, page) = get_as(&bed.app, "", &bed.key, "/events?correlationId=p1").await;
+        let after = page["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["type"] == "PromptAnswered")
+            .unwrap()
+            .clone();
+        assert_eq!(after["id"], before.id, "the same event, by its id");
+        assert_eq!(after["data"]["forgotten"], true);
+        assert!(after["data"].get("content").is_none(), "{after}");
+        assert_eq!(after["data"]["deployment"], dep);
+        assert_eq!(
+            after["data"]["prompt_tokens"], before.data["prompt_tokens"],
+            "what it used stays"
+        );
+
+        // A replay of the stream from before the answer serves it as it is now.
+        let deployed = bed.events_of("d1", "DeploymentReady").await;
+        let res = bed
+            .app
+            .clone()
+            .oneshot(
+                Request::get("/events/stream")
+                    .header("X-Api-Key", &bed.key)
+                    .header("last-event-id", &deployed.last().unwrap().id)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let mut stream = res.into_body().into_data_stream();
+        let replayed = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut seen = String::new();
+            while let Some(frame) = stream.next().await {
+                seen.push_str(&String::from_utf8_lossy(&frame.unwrap()));
+                if seen.contains("Forgotten") {
+                    break;
+                }
+            }
+            seen
+        })
+        .await
+        .unwrap();
+        assert!(replayed.contains("PromptAnswered"), "{replayed}");
+        assert!(!replayed.contains("secret"), "{replayed}");
+
+        // Nothing of it is left on disk, and a restart folds the same and serves the same.
+        assert!(!every_file(dir.path()).contains("secret"));
+        drop(bed);
+        let again = bed_with(
+            card(),
+            Arc::new(EventLog::open(dir.path()).unwrap()),
+            runtime,
+            Arc::new(best_peer_engine::Fake::new()),
+            "engines.local",
+            None,
+        )
+        .await;
+        let (_, page) = get_as(&again.app, "", &again.key, "/events?type=PromptAnswered").await;
+        let kept = &page["events"].as_array().unwrap()[0];
+        assert_eq!(kept["id"], before.id);
+        assert!(kept["data"].get("content").is_none(), "{kept}");
+    }
+
+    #[tokio::test]
+    async fn forget_in_a_workspace_asks_the_member_that_answered_to_forget_its_copy() {
+        let (a, b) = two_members().await;
+        let key_a = a.key.clone();
+        let site = site(vec![(A, a), (B, b)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a)]).await;
+        let (s, b) = site
+            .send(
+                &ws,
+                "d1",
+                "DeployModel",
+                "deploy-model",
+                json!({ "cloud": "lab", "model": "llama3.2:3b", "engine": "ollama", "memory_bytes": 4 * GB }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let ready = site.events(&ws, "d1", "DeploymentReady").await;
+        let dep = ready.last().unwrap()["data"]["deployment"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let ask = json!({ "deployment": dep, "messages": [{ "role": "user", "content": "my secret question" }] });
+        let (s, b) = site.send(&ws, "p1", "Prompt", "prompt", ask).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "p1", "PromptAnswered").await;
+        let member_log = site.members[0].peer.log.clone();
+        let held = |log: &EventLog| {
+            let (events, _) = log.list(&best_peer_door::Filter::default());
+            serde_json::to_string(&events).unwrap().contains("secret")
+        };
+        assert!(held(&member_log), "the member holds the prompt's answer");
+
+        let (s, b) = site
+            .send(&ws, "f1", "Forget", "forget", json!({ "deployment": dep }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let forgotten = site.events(&ws, "f1", "Forgotten").await.last().unwrap()["data"].clone();
+        assert_eq!(forgotten["events"], 1);
+        assert_eq!(forgotten["commands"], 1);
+        assert_eq!(
+            forgotten["peers"],
+            json!([{ "cloud": "lab", "peer": "a", "asked": true }])
+        );
+        let (_, page) = get_as(
+            &site.app,
+            &format!("/workspaces/{ws}"),
+            &site.key,
+            "/events?correlationId=p1",
+        )
+        .await;
+        assert!(!serde_json::to_string(&page).unwrap().contains("secret"), "{page}");
+        // The member forgets its copy under its own correlation of the prompt.
+        let mut gone = false;
+        for _ in 0..400 {
+            if !held(&member_log) {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(gone, "the member still holds the prompt's content");
     }
 
     /// The facts of a correlation, by type, oldest first, with the progress of a pull left out.

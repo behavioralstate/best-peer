@@ -39,6 +39,15 @@ pub trait Service: Send + Sync + 'static {
     async fn stop_job(self: Arc<Self>, cmd: Envelope, em: Emitter);
     fn admit_prompt(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError>;
     async fn prompt(self: Arc<Self>, cmd: Envelope, em: Emitter);
+    /// A door that keeps prompts offers `forget`; one that keeps none (a cloud, which its workspace speaks for)
+    /// refuses it.
+    fn admit_forget(&self, _cmd: Envelope, _who: &Credential) -> Result<(), BestError> {
+        Err(BestError::bad_request(
+            "NOT_OFFERED",
+            "forget is offered by the door that keeps the prompts",
+        ))
+    }
+    async fn forget(self: Arc<Self>, _cmd: Envelope, _em: Emitter) {}
 }
 
 /// What a workspace adds to the lifecycle surface: its clouds, configured and archived.
@@ -121,7 +130,8 @@ fn lifecycle(c: Catalogue, svc: Arc<dyn Service>, at: Where) -> Catalogue {
         .command(undeploy_model(svc.clone()))
         .command(run_job(svc.clone(), at))
         .command(stop_job(svc.clone()))
-        .command(prompt(svc, at))
+        .command(prompt(svc.clone(), at))
+        .command(forget(svc, at))
 }
 
 /// What completes each command: the events after which its outcome is known, so a consumer stops waiting for the
@@ -140,6 +150,7 @@ pub fn completions() -> HashMap<String, HashSet<String>> {
         ("RunJob".to_string(), set(&["JobStarted", "JobFailed", "JobStopped"])),
         ("StopJob".to_string(), set(&["JobStopped"])),
         ("Prompt".to_string(), set(&["PromptAnswered", "PromptFailed"])),
+        ("Forget".to_string(), set(&["Forgotten"])),
         ("CreateWorkspace".to_string(), set(&["WorkspaceCreatedV1"])),
         ("InviteMember".to_string(), set(&["MemberInvitedV1"])),
         ("AcceptInvitation".to_string(), set(&["MemberJoinedV1"])),
@@ -591,6 +602,40 @@ fn run_job(peer: Arc<dyn Service>, at: Where) -> CommandDef {
         handler: Arc::new(move |cmd, emitter| {
             let peer = peer.clone();
             Box::pin(async move { peer.run_job(cmd, emitter).await })
+        }),
+    }
+}
+
+fn forget(peer: Arc<dyn Service>, at: Where) -> CommandDef {
+    let admit = peer.clone();
+    let description = match at {
+        Where::Root => "Forgets the content of your prompts on this peer: the messages you sent, the answers' content, and what an engine said when a prompt failed. Name one of correlation (one prompt command's), deployment (every prompt of yours to it) or before (every prompt of yours told before that time). Every event and command stays as an envelope (its id, type, time and correlation) with its deployment, model, token counts and holder, so the stream, a page of events and a replay serve it without its content, and what a prompt used is still counted. Forgotten follows with this command's correlation id, naming what was removed and what stays. Refused when it names none or more than one of the three, when before is not a time, and when the correlation is not one your commands used. Nothing of another credential's is touched.",
+        Where::Workspace => "Forgets the content of your prompts in this workspace: the messages you sent, the answers' content, and what an engine said when a prompt failed, on this workspace's door and on the member peer that answered each, which is asked to forget its copy. Name one of correlation (one prompt command's), deployment (every prompt of yours to it) or before (every prompt of yours told before that time). Every event and command stays as an envelope (its id, type, time and correlation) with its deployment, model, token counts, holder, cloud and peer, so the stream, a page of events and a replay serve it without its content, and what a prompt used is still counted. Forgotten follows with this command's correlation id, naming what was removed, what stays, and each member peer asked and whether it took the request. Refused when it names none or more than one of the three, when before is not a time, and when the correlation is not one your commands used. Nothing of another credential's is touched.",
+    };
+    CommandDef {
+        schema: "forget".into(),
+        version: "1.0".into(),
+        command_type: "Forget".into(),
+        description: description.into(),
+        data_schema: json!({
+            "type": "object",
+            "properties": {
+                "correlation": { "type": "string", "minLength": 1, "maxLength": 256, "description": "One prompt command's correlation id: its messages and its answer are forgotten" },
+                "deployment": { "type": "string", "minLength": 1, "maxLength": 128, "description": "A deployment: every prompt of yours to it is forgotten" },
+                "before": { "type": "string", "format": "date-time", "maxLength": 64, "description": "Every prompt of yours told before this time is forgotten" }
+            },
+            "additionalProperties": false
+        }),
+        produces: vec!["Forgotten".into(), "CommandFailed".into()],
+        completes: completes("Forget"),
+        impact: None,
+        admit: Some(Arc::new(move |cmd, who, _key| {
+            let peer = admit.clone();
+            Box::pin(async move { peer.admit_forget(cmd, &who) })
+        })),
+        handler: Arc::new(move |cmd, emitter| {
+            let peer = peer.clone();
+            Box::pin(async move { peer.forget(cmd, emitter).await })
         }),
     }
 }
@@ -1101,6 +1146,20 @@ pub fn event_defs() -> Vec<EventDef> {
             "The job's container runs.",
             &["job", "image", "container"],
             placed(json!({ "job": s("The id stop-job names"), "order": s("On a workspace's door, the order it ran for: the id JobQueued gave it"), "holder": s("The credential that ran it, an opaque id; absent for one run before holders were told"), "image": s("The image"), "device": { "type": ["string", "null"] }, "memory_bytes": n("The memory promised to it"), "container": s("The engine's container id"), "boxed": { "type": "boolean", "description": "True when the job runs in the closed box a credential with a share gets: no network, a read-only filesystem, a ceiling on host memory" }, "host_memory_bytes": { "type": ["integer", "null"], "description": "The most host memory its container may hold; null for no ceiling" }, "receipt": { "type": "object", "description": "On a workspace's door, for an order of a size: what the job got", "properties": { "size": { "type": "string" }, "gpu": { "type": "string", "description": "The device's name, as its peer reports it" }, "device": { "type": "string", "description": "cloud/peer/device" }, "shared": { "type": "boolean", "description": "True when the job has a slice of a device that may hold other jobs; false when it has the device whole" }, "share": { "type": "number", "description": "The share of the device's compute it is guaranteed: the size's on a shared device, 1 on a whole one" }, "price_per_second": { "type": "number" }, "currency": { "type": "string" } } } })),
+        ),
+        event(
+            "forgotten",
+            "Forgotten",
+            "The content forget named is gone: the messages of the holder's prompts, the answers' content, and what an engine said when a prompt failed. Each event and command stays as an envelope with what a prompt used, now marked forgotten.",
+            &["scope", "events", "commands", "removed", "kept"],
+            json!({
+                "scope": { "type": "object", "description": "What forget named: correlation, deployment or before" },
+                "events": n("How many events lost their content"),
+                "commands": n("How many prompt commands lost their messages"),
+                "removed": s("What was removed"),
+                "kept": s("What stays"),
+                "peers": { "type": "array", "description": "On a workspace's door: each member peer asked to forget its copy, and whether it took the request", "items": { "type": "object" } }
+            }),
         ),
         event(
             "job-finished",

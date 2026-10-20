@@ -1298,6 +1298,27 @@ impl Service for Peer {
         Peer::admit_prompt(self, cmd, who)
     }
 
+    fn admit_forget(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError> {
+        crate::forget::admit(&self.log, &cmd, who).map(|_| ())
+    }
+
+    async fn forget(self: Arc<Self>, cmd: Envelope, em: Emitter) {
+        let Ok(scope) = crate::forget::scope_of(&cmd) else {
+            return;
+        };
+        match crate::forget::forget(&self.log, &crate::forget::sender_of(&em), &scope) {
+            Ok(forgot) => {
+                crate::forget::tell_forgotten(&em, &scope, &forgot, None);
+            }
+            Err(why) => {
+                em.emit(
+                    "CommandFailed",
+                    json!({ "type": cmd.r#type, "reason": format!("the content is gone from what this peer serves, but its files could not all be rewritten: {why}; send forget again") }),
+                );
+            }
+        }
+    }
+
     async fn prompt(self: Arc<Self>, cmd: Envelope, em: Emitter) {
         Peer::prompt(&self, cmd, em).await
     }

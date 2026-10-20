@@ -1292,6 +1292,56 @@ impl Service for Workspace {
         }
     }
 
+    fn admit_forget(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError> {
+        crate::forget::admit(&self.log, &cmd, who).map(|_| ())
+    }
+
+    /// Forgets on this workspace's door, then asks the member peer that answered each forgotten prompt to forget its
+    /// copy, under the member's own correlation of it.
+    async fn forget(self: Arc<Self>, cmd: Envelope, em: Emitter) {
+        let Ok(scope) = crate::forget::scope_of(&cmd) else {
+            return;
+        };
+        let sender = crate::forget::sender_of(&em);
+        let forgot = match crate::forget::forget(&self.log, &sender, &scope) {
+            Ok(f) => f,
+            Err(why) => {
+                em.emit(
+                    "CommandFailed",
+                    json!({ "type": cmd.r#type, "reason": format!("the content is gone from what this door serves, but its files could not all be rewritten: {why}; send forget again") }),
+                );
+                return;
+            }
+        };
+        let mut peers = Vec::new();
+        for prompt in &forgot.commands {
+            // Where the prompt was answered, as the facts under its correlation say.
+            let (page, _) = self.log.list(&best_peer_door::Filter {
+                correlation_id: Some(prompt.correlation.clone()),
+                ..Default::default()
+            });
+            let Some(answered) = page
+                .iter()
+                .find(|e| matches!(e.r#type.as_str(), "PromptAnswered" | "PromptFailed"))
+            else {
+                continue;
+            };
+            let (Some(cloud), Some(peer)) = (answered.data["cloud"].as_str(), answered.data["peer"].as_str()) else {
+                continue;
+            };
+            let on_member = crate::cloud::member_correlation(&format!("{sender}:{}", prompt.id), &prompt.data, None);
+            let told = match self.cloud(cloud) {
+                Ok(c) => c.forget_on_member(peer, &on_member).await,
+                Err(e) => Err(e.message),
+            };
+            peers.push(match told {
+                Ok(()) => json!({ "cloud": cloud, "peer": peer, "asked": true }),
+                Err(why) => json!({ "cloud": cloud, "peer": peer, "asked": false, "reason": why }),
+            });
+        }
+        crate::forget::tell_forgotten(&em, &scope, &forgot, Some(json!(peers)));
+    }
+
     async fn prompt(self: Arc<Self>, cmd: Envelope, em: Emitter) {
         let id = cmd.data["deployment"].as_str().unwrap_or_default().to_string();
         match self.cloud_of(&id) {

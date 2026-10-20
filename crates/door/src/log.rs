@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
 use time::{Date, OffsetDateTime, UtcOffset};
@@ -122,7 +123,17 @@ pub struct EventLog {
     /// Where events are written, for a log kept on disk.
     segments: Mutex<Option<Segments>>,
     accepted_file: Mutex<Option<File>>,
+    /// Where the accepted commands are kept, for a log on disk: what a redaction rewrites.
+    accepted_path: Mutex<Option<PathBuf>>,
     tx: broadcast::Sender<Stored>,
+}
+
+/// A command the log accepted, as `redact_commands` found it: its id, its correlation, and its data as it is now.
+#[derive(Clone, Debug)]
+pub struct Redacted {
+    pub id: String,
+    pub correlation: String,
+    pub data: Value,
 }
 
 /// The day files of a log on disk, and the one being written.
@@ -165,6 +176,41 @@ fn segment_day(time: &str, today: Date, current: Option<Date>) -> Date {
     current.map_or(day, |c| day.max(c))
 }
 
+/// The path of `day`'s file under `dir`.
+fn self_day_path(dir: &Path, day: Date) -> PathBuf {
+    dir.join(segment_name(day))
+}
+
+/// Rewrites `path` line by line: `change` answers the new line for one it changes and nothing for one it keeps. The
+/// new file is written beside it and renamed over it, so a crash leaves the old file or the new one, never half.
+fn rewrite(path: &Path, mut change: impl FnMut(&str) -> Option<String>) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let text = std::fs::read(path).map_err(|e| format!("{} could not be read: {e}", path.display()))?;
+    let text = String::from_utf8_lossy(&text);
+    let mut out = String::with_capacity(text.len());
+    let mut changed = false;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        match change(line) {
+            Some(new) => {
+                out.push_str(&new);
+                changed = true;
+            }
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    if !changed {
+        return Ok(());
+    }
+    let tmp = path.with_extension("jsonl.rewrite");
+    let written = File::create(&tmp)
+        .and_then(|mut f| f.write_all(out.as_bytes()).and_then(|_| f.sync_all()))
+        .and_then(|_| std::fs::rename(&tmp, path));
+    written.map_err(|e| format!("{} could not be rewritten: {e}", path.display()))
+}
+
 /// `2026-10-19.jsonl`: the date first, its fields widest first at a fixed width, so the names sort as the days do.
 fn segment_name(day: Date) -> String {
     format!("{:04}-{:02}-{:02}.jsonl", day.year(), u8::from(day.month()), day.day())
@@ -202,6 +248,7 @@ impl EventLog {
             accepted_count: Mutex::new(0),
             segments: Mutex::new(None),
             accepted_file: Mutex::new(None),
+            accepted_path: Mutex::new(None),
             tx,
         }
     }
@@ -277,6 +324,7 @@ impl EventLog {
         };
         *log.segments.lock().unwrap() = Some(Segments { dir: events_dir, open });
         *log.accepted_file.lock().unwrap() = Some(append_to(&accepted_path)?);
+        *log.accepted_path.lock().unwrap() = Some(accepted_path);
         Ok(log)
     }
 
@@ -557,6 +605,96 @@ impl EventLog {
         self.events.lock().unwrap().iter().any(|s| s.envelope.id == id)
     }
 
+    /// Removes the content of the events `pick` chooses, keeping each one's envelope: `strip` takes its data down to
+    /// what stays. They are rewritten in memory and in the files they were written to, so a page, a replay of the
+    /// stream and a restart serve them as they are now; a subscriber that heard one before heard it before. Answers
+    /// the redacted events' ids, or what could not be rewritten on disk (memory is redacted either way).
+    pub fn redact(&self, pick: impl Fn(&Stored) -> bool, strip: impl Fn(&mut Value)) -> Result<Vec<String>, String> {
+        let mut events = self.events.lock().unwrap();
+        let mut changed: HashMap<u64, Stored> = HashMap::new();
+        for stored in events.iter_mut().filter(|s| pick(s)) {
+            strip(&mut stored.envelope.data);
+            changed.insert(stored.seq, stored.clone());
+        }
+        let ids: Vec<String> = changed.values().map(|s| s.envelope.id.clone()).collect();
+        if changed.is_empty() {
+            return Ok(ids);
+        }
+        let mut segments = self.segments.lock().unwrap();
+        if let Some(segments) = segments.as_mut() {
+            let legacy = segments.dir.parent().map(|d| d.join("events.jsonl"));
+            let days = day_files(&segments.dir).map_err(|e| format!("the events folder could not be read: {e}"))?;
+            let paths = legacy.into_iter().chain(days.iter().map(|(_, p)| p.clone()));
+            for path in paths {
+                let open = segments
+                    .open
+                    .as_ref()
+                    .map(|(day, _)| self_day_path(&segments.dir, *day));
+                // The file being written is closed for the rewrite and reopened after, so nothing is lost or torn.
+                let reopen = open.as_ref() == Some(&path);
+                let day = segments.open.as_ref().map(|(d, _)| *d);
+                if reopen {
+                    segments.open = None;
+                }
+                let rewritten = rewrite(&path, |line| {
+                    let s = serde_json::from_str::<Stored>(line).ok()?;
+                    let now = changed.get(&s.seq)?;
+                    serde_json::to_string(now).ok()
+                });
+                if let (true, Some(day)) = (reopen, day) {
+                    let file =
+                        append_to(&path).map_err(|e| format!("{} could not be opened again: {e}", path.display()))?;
+                    segments.open = Some((day, file));
+                }
+                rewritten?;
+            }
+        }
+        drop(events);
+        Ok(ids)
+    }
+
+    /// Removes the content of the finished commands `pick` chooses (by sender, correlation and the command as accepted), keeping
+    /// each one's record: `strip` takes its data down to what stays. A finished command's data is held only in the
+    /// file of accepted commands, which is rewritten. Answers the commands redacted, or what could not be rewritten.
+    pub fn redact_commands(
+        &self,
+        pick: impl Fn(&str, &str, &Envelope) -> bool,
+        strip: impl Fn(&mut Value),
+    ) -> Result<Vec<Redacted>, String> {
+        let accepted = self.accepted.lock().unwrap();
+        let mut file = self.accepted_file.lock().unwrap();
+        let Some(path) = self.accepted_path.lock().unwrap().clone() else {
+            return Ok(Vec::new());
+        };
+        let finished = |sender: &str, id: &str| {
+            accepted
+                .get(&(sender.to_string(), id.to_string()))
+                .is_some_and(|a| a.finished)
+        };
+        let mut done: Vec<Redacted> = Vec::new();
+        let had = file.take();
+        drop(had);
+        let rewritten = rewrite(&path, |line| {
+            let mut a = serde_json::from_str::<AcceptedLine>(line).ok()?;
+            let envelope = a.envelope.as_mut()?;
+            if !finished(&a.sender, &a.id) || !pick(&a.sender, &a.correlation, envelope) {
+                return None;
+            }
+            strip(&mut envelope.data);
+            if !done.iter().any(|d| d.id == a.id) {
+                done.push(Redacted {
+                    id: a.id.clone(),
+                    correlation: a.correlation.clone(),
+                    data: envelope.data.clone(),
+                });
+            }
+            serde_json::to_string(&a).ok()
+        });
+        *file = Some(append_to(&path).map_err(|e| format!("{} could not be opened again: {e}", path.display()))?);
+        rewritten?;
+        Ok(done)
+    }
+
     pub fn since_id(&self, id: &str) -> Vec<Stored> {
         let events = self.events.lock().unwrap();
         match events.iter().position(|s| s.envelope.id == id) {
@@ -746,6 +884,62 @@ mod tests {
             log.since_id("never-seen").len(),
             0,
             "an id the log never told replays nothing"
+        );
+    }
+
+    #[test]
+    fn a_redacted_event_and_command_keep_their_envelope_on_disk_through_a_restart_and_the_log_goes_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = EventLog::open(dir.path()).unwrap();
+        let mut said = ev("PromptAnswered", "c1");
+        said.data = json!({ "deployment": "dep-1", "content": "the secret answer", "completion_tokens": 3 });
+        first.append(said);
+        first.append(ev("DeploymentReady", "c1"));
+        let mut asked = ev("Prompt", "c1");
+        asked.data =
+            json!({ "deployment": "dep-1", "messages": [{ "role": "user", "content": "the secret question" }] });
+        first.accept_command("alice", "p1", "h", "c1", &asked);
+        first.finish_command("alice", "p1");
+        let strip = |d: &mut Value| {
+            if let Some(o) = d.as_object_mut() {
+                o.remove("content");
+                o.remove("messages");
+                o.insert("forgotten".into(), json!(true));
+            }
+        };
+        let ids = first.redact(|s| s.envelope.r#type == "PromptAnswered", strip).unwrap();
+        assert_eq!(ids.len(), 1);
+        let done = first
+            .redact_commands(|sender, _, e| sender == "alice" && e.r#type == "Prompt", strip)
+            .unwrap();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].correlation, "c1");
+        assert_eq!(done[0].data["deployment"], "dep-1");
+        // The log goes on: the file being written was reopened, and the next event lands after the others.
+        first.append(ev("After", "c1"));
+        drop(first);
+        let text = std::fs::read_to_string(dir.path().join("accepted.jsonl")).unwrap()
+            + &std::fs::read_dir(dir.path().join("events"))
+                .unwrap()
+                .map(|f| std::fs::read_to_string(f.unwrap().path()).unwrap())
+                .collect::<String>();
+        assert!(
+            !text.contains("secret"),
+            "nothing of the content is left on disk: {text}"
+        );
+        let again = EventLog::open(dir.path()).unwrap();
+        assert_eq!(types(&again), ["PromptAnswered", "DeploymentReady", "After"]);
+        let (page, _) = again.list(&Filter::default());
+        assert_eq!(
+            page[0].data,
+            json!({ "deployment": "dep-1", "completion_tokens": 3, "forgotten": true })
+        );
+        // A command's retry is still answered as before: the record of it stays.
+        assert_eq!(
+            again.accept_command("alice", "p1", "h", "c1", &asked),
+            Accept::Duplicate {
+                correlation: "c1".into()
+            }
         );
     }
 
