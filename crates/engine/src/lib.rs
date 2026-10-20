@@ -86,7 +86,8 @@ impl std::fmt::Display for Kind {
 pub const OLLAMA_IMAGE: &str = "ollama/ollama:0.40.6";
 /// Ollama's build for ROCm, of the same version; no ROCm host has proven a deploy yet.
 pub const OLLAMA_ROCM_IMAGE: &str = "ollama/ollama:0.40.6-rocm";
-/// vLLM's OpenAI-compatible server.
+/// vLLM's OpenAI-compatible server. It needs a driver offering CUDA 13 (580 or newer): its builds for CUDA 12.9 of
+/// this release and the one before carry a library built for CUDA 13 and do not start.
 pub const VLLM_IMAGE: &str = "vllm/vllm-openai:v0.32.0";
 
 /// What to run for one engine: the image, its arguments and environment, the container port it serves on, the

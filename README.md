@@ -268,7 +268,9 @@ whose images were put there by hand, a held image then runs as it is and is refr
 always pulls. Either way a credential may run any image Docker holds, the operator's own and locally built ones
 included, by naming it: a host shared with a tenant keeps in Docker only the images it would let that tenant run.
 The engines' images are pinned: `ollama/ollama:0.40.6` (`0.40.6-rocm` on ROCm) and `vllm/vllm-openai:v0.32.0`, so a
-new release upstream changes no deploy until a host has proven it; `BEST_PEER_OLLAMA_IMAGE` and `BEST_PEER_VLLM_IMAGE`
+new release upstream changes no deploy until a host has proven it. vLLM's needs an NVIDIA driver that offers CUDA 13
+(580 or newer; `get-hardware-state` says what the driver offers): on an older one its container is refused at start,
+and `DeploymentFailed` says to update the driver or name another build; `BEST_PEER_OLLAMA_IMAGE` and `BEST_PEER_VLLM_IMAGE`
 name others, or a mirror. `BEST_PEER_READY_SECONDS` (default 900) is how long an engine may take to answer after its
 container started, `BEST_PEER_LOAD_SECONDS` (default 3600) how long a model may take to load, and a prompt is given
 ten minutes to be answered. A pull from Ollama's registry that says nothing for five minutes while the engine does not

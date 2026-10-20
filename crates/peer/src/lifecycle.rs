@@ -1706,6 +1706,10 @@ fn fix_for_runtime(e: &RuntimeError) -> &'static str {
             "the container engine cannot hand over that device: check the container toolkit on the host"
         }
         RuntimeError::Unreachable(_) => "the container engine is not running on the host: start it",
+        // The NVIDIA toolkit refuses an image built for a CUDA newer than the host's driver offers.
+        RuntimeError::Engine(m) if m.contains("unsatisfied condition: cuda") => {
+            "the engine's image needs a newer NVIDIA driver than this host has (get-hardware-state says the CUDA version it offers): the host's operator updates the driver, or names a build of the engine for that CUDA with BEST_PEER_VLLM_IMAGE or BEST_PEER_OLLAMA_IMAGE"
+        }
         RuntimeError::Engine(_) => "read the container engine's logs on the host",
     }
 }
@@ -1824,6 +1828,20 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn an_image_built_for_a_newer_cuda_than_the_driver_is_refused_with_the_driver_and_the_override_named() {
+        let refused = RuntimeError::Engine("the container did not start: Docker responded with status code 500: failed to create task for container: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: error during container init: error running prestart hook #0: exit status 1, stdout: , stderr: Auto-detected mode as 'legacy'\nnvidia-container-cli: requirement error: unsatisfied condition: cuda>=13.0, please update your driver to a newer version, or use an earlier cuda container: unknown".into());
+        let fix = fix_for_runtime(&refused);
+        assert!(
+            fix.contains("newer NVIDIA driver") && fix.contains("BEST_PEER_VLLM_IMAGE"),
+            "{fix}"
+        );
+        assert_eq!(
+            fix_for_runtime(&RuntimeError::Engine("anything else".into())),
+            "read the container engine's logs on the host"
+        );
+    }
 
     #[test]
     fn a_card_with_room_wins_over_the_host_cpu_whatever_the_ram() {
