@@ -12,5 +12,6 @@ best-peer-gpu = { path = "../gpu" }
 best-peer-runtime = { path = "../runtime" }
 bollard = "0.21"
 futures = "0.3"
+time = { version = "0.3", features = ["parsing"] }
 tokio = { workspace = true }
 tracing = "0.1"

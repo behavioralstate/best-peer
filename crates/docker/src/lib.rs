@@ -4,8 +4,10 @@
 //! adapter. A mount is a bind the engine refuses when its source is not there. A container is confined as its spec
 //! says, in the engine's own words: capabilities dropped, no new privileges, a read-only root with a private `/tmp`,
 //! ceilings on processes and on memory with swap counted in, and its network. A container that exits is removed by
-//! this adapter once it has read the last lines the container wrote, which the exit then carries; one that exited
-//! while nobody watched is removed when the adapter starts. Thin; proven on a host by hand. Only the share of a pull, which is arithmetic over what the engine
+//! this adapter once it has read the last lines the container wrote, which the exit then carries; one whose exit was
+//! not heard (the peer was down, or the event feed broke) is removed by a sweep when the adapter starts, every minute,
+//! and after the feed reconnects, once it has been exited for a minute, so a peer that shares the engine has read its
+//! own first. Thin; proven on a host by hand. Only the share of a pull, which is arithmetic over what the engine
 //! reports, is unit-tested.
 
 use std::collections::HashMap;
@@ -50,29 +52,16 @@ impl DockerRuntime {
             bind_ip: bind_ip.into(),
             tx,
         };
-        me.sweep().await;
+        sweep(&me.docker).await;
         me.follow();
+        let docker = me.docker.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(SWEEP_EVERY).await;
+                sweep(&docker).await;
+            }
+        });
         Ok(me)
-    }
-
-    /// Removes the peer's containers that exited while nobody watched: nothing reads them now.
-    async fn sweep(&self) {
-        let filters = HashMap::from([("label", vec![LABEL]), ("status", vec!["exited", "dead"])]);
-        let Ok(list) = self
-            .docker
-            .list_containers(Some(
-                ListContainersOptionsBuilder::new().all(true).filters(&filters).build(),
-            ))
-            .await
-        else {
-            return;
-        };
-        for id in list.into_iter().filter_map(|c| c.id) {
-            let _ = self
-                .docker
-                .remove_container(&id, Some(RemoveContainerOptionsBuilder::new().force(true).build()))
-                .await;
-        }
     }
 
     fn follow(&self) {
@@ -121,8 +110,48 @@ impl DockerRuntime {
                     }
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                // The exits told while the feed was down were not heard: what they left is swept.
+                sweep(&docker).await;
             }
         });
+    }
+}
+
+/// How often the containers whose exit was not heard are looked for, and how long one must have been exited before
+/// it is removed: the peer that heard its exit has read its last words and removed it well before then.
+const SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Removes the peer's containers that have been exited for longer than [`SWEEP_EVERY`]: one whose exit nobody heard,
+/// or that another peer on this engine did not remove. A removal that fails is logged and tried at the next sweep.
+async fn sweep(docker: &Docker) {
+    let filters = HashMap::from([("label", vec![LABEL]), ("status", vec!["exited", "dead"])]);
+    let Ok(list) = docker
+        .list_containers(Some(
+            ListContainersOptionsBuilder::new().all(true).filters(&filters).build(),
+        ))
+        .await
+    else {
+        return;
+    };
+    let now = time::OffsetDateTime::now_utc();
+    for id in list.into_iter().filter_map(|c| c.id) {
+        let finished = docker
+            .inspect_container(&id, None::<bollard::query_parameters::InspectContainerOptions>)
+            .await
+            .ok()
+            .and_then(|c| c.state)
+            .and_then(|s| s.finished_at)
+            .and_then(|t| time::OffsetDateTime::parse(&t, &time::format_description::well_known::Rfc3339).ok());
+        // A time the engine does not give is taken as long ago: nothing else would ever remove it.
+        if finished.is_some_and(|f| now - f < SWEEP_EVERY) {
+            continue;
+        }
+        if let Err(e) = docker
+            .remove_container(&id, Some(RemoveContainerOptionsBuilder::new().force(true).build()))
+            .await
+        {
+            tracing::warn!(container = %id, error = %e, "an exited container could not be removed; trying again at the next sweep");
+        }
     }
 }
 

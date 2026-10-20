@@ -6527,6 +6527,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_engine_that_exits_once_its_deployment_was_ready_ends_it_with_its_last_words() {
+        let bed = fresh().await;
+        let dep = bed.deployed("d1", "llama3.2:3b", 8).await;
+        bed.runtime
+            .exit(&bed.container_of(&dep), 2, "panic: the engine stopped serving")
+            .unwrap();
+        let events = bed.events_of("d1", "DeploymentEnded").await;
+        let ended = &events.last().unwrap().data;
+        assert_eq!(ended["exit_code"], 2);
+        let reason = ended["reason"].as_str().unwrap();
+        assert!(
+            reason.starts_with("the container exited by itself") && reason.contains("the engine stopped serving"),
+            "{reason}"
+        );
+        assert!(
+            !events.iter().any(|e| e.r#type == "DeploymentFailed"),
+            "it was ready: an end, not a failure"
+        );
+    }
+
+    #[tokio::test]
     async fn by_default_a_tag_is_pulled_again_and_a_digest_the_peer_holds_is_not() {
         let tag = best_peer_runtime::ImageRef("team/trainer:1".into());
         let pinned = best_peer_runtime::ImageRef(format!("team/trainer@sha256:{}", "a".repeat(64)));
