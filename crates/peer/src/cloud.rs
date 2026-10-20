@@ -806,6 +806,14 @@ impl Cloud {
         }))
     }
 
+    /// The disk counted on each member for orders on their way to it, as a placement that read the room at `read`
+    /// sees it.
+    #[cfg(test)]
+    pub fn disk_counted(&self, read: Instant) -> HashMap<String, u64> {
+        let s = self.state.lock().unwrap();
+        self.disk_promised(&s, read)
+    }
+
     /// Counts this cloud's orders by size against `purse`, the workspace's spending; set once.
     pub fn set_purse(&self, purse: Arc<crate::meter::Purse>) {
         let _ = self.purse.set(purse);
@@ -2151,6 +2159,8 @@ impl Cloud {
         if let Some(r) = receipt {
             placed["receipt"] = r;
         }
+        // Sent again, it is counted again until the member answers this time.
+        self.answered_at.lock().unwrap().remove(&o.id);
         self.tell(&em, "JobPlaced", placed);
         let mut body = json!({ "image": o.image, "args": o.args });
         if let Some(m) = memory {

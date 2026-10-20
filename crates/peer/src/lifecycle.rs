@@ -249,7 +249,7 @@ struct JobDisk {
 }
 
 /// A disk promised at admission, let go again when the admission is refused after it, unless kept.
-struct Promise {
+pub(crate) struct Promise {
     disks: Arc<Mutex<HashMap<String, u64>>>,
     job: Option<String>,
 }
@@ -1313,15 +1313,11 @@ impl Peer {
             false => new_id("job"),
         };
         // Its disk first, before the state is held: the room is read with the promises held, which may take a while.
-        // Let go again if the job is refused after this.
-        let mut disk = Promise {
-            disks: self.promised_disks.clone(),
-            job: None,
+        // The promise comes back armed, and is let go if the job is refused after this.
+        let mut disk = match &io {
+            Some(io) => Some(self.claim_disk(&id, io.disk_bytes).await?),
+            None => None,
         };
-        if let Some(io) = &io {
-            self.claim_disk(&id, io.disk_bytes).await?;
-            disk.job = Some(id.clone());
-        }
         let _admitting = self.holdings.admitting();
         let held = self.holdings.of(&who.holder());
         let mut state = self.state.lock().unwrap();
@@ -1350,7 +1346,9 @@ impl Peer {
             },
             _ => None,
         };
-        disk.keep();
+        if let Some(promise) = disk.as_mut() {
+            promise.keep();
+        }
         if data.queued() && accelerators_only(&who) {
             self.held_to_accelerators.lock().unwrap().insert(key.clone());
         }
@@ -1458,8 +1456,10 @@ impl Peer {
     /// Promises the job `id` a disk of `bytes`, until the disk is made or the job ends; refused, with what is free,
     /// when the room is not there. The room is read with the promises held, and a promise goes only once its disk is
     /// made, so every disk counts once, as promised or as taken; the reading runs off the executor, and a room the
-    /// engine cannot say is none.
-    async fn claim_disk(&self, id: &str, bytes: u64) -> Result<(), BestError> {
+    /// engine cannot say is none. The promise comes back armed: dropped, by an admission refused later or abandoned
+    /// while it waited here, it is let go.
+    pub(crate) async fn claim_disk(&self, id: &str, bytes: u64) -> Result<Promise, BestError> {
+        let disks = self.promised_disks.clone();
         let (promised, runtime, id) = (self.promised_disks.clone(), self.runtime.clone(), id.to_string());
         tokio::task::spawn_blocking(move || {
             let mut promised = promised.lock().unwrap();
@@ -1475,8 +1475,8 @@ impl Peer {
                 )
                 .with_details(json!({ "field": "disk_bytes", "free_bytes": free })));
             }
-            promised.insert(id, bytes);
-            Ok(())
+            promised.insert(id.clone(), bytes);
+            Ok(Promise { disks, job: Some(id) })
         })
         .await
         .map_err(|e| BestError::internal(format!("the room for a disk could not be read: {e}")))?

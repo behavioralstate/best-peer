@@ -937,6 +937,10 @@ mod tests {
     #[derive(Default)]
     struct Switchboard {
         doors: std::sync::Mutex<std::collections::HashMap<String, (axum::Router, Arc<std::sync::atomic::AtomicBool>)>>,
+        /// The next command sent to an endpoint is refused with this code, as a member with no room refuses it.
+        refuse_next: std::sync::Mutex<std::collections::HashMap<String, String>>,
+        /// Commands sent to an endpoint wait for a permit, while it is held.
+        held: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>,
     }
 
     impl Switchboard {
@@ -948,6 +952,18 @@ mod tests {
                 .unwrap()
                 .insert(endpoint.into(), (router, down.clone()));
             down
+        }
+
+        /// Refuses the next command sent to `endpoint` with `code`.
+        fn refuse_next_command(&self, endpoint: &str, code: &str) {
+            self.refuse_next.lock().unwrap().insert(endpoint.into(), code.into());
+        }
+
+        /// Holds every command sent to `endpoint` until the permits answered are added.
+        fn hold_commands(&self, endpoint: &str) -> Arc<tokio::sync::Semaphore> {
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            self.held.lock().unwrap().insert(endpoint.into(), gate.clone());
+            gate
         }
     }
 
@@ -962,6 +978,26 @@ mod tests {
                 req.uri().authority().map(|a| a.as_str()).unwrap_or("")
             );
             let found = self.doors.lock().unwrap().get(&origin).cloned();
+            let command = req.method() == axum::http::Method::POST && req.uri().path().ends_with("/commands");
+            if command {
+                if let Some(code) = self.refuse_next.lock().unwrap().remove(&origin) {
+                    let body = json!({ "error": { "code": code, "message": "refused by the test" } }).to_string();
+                    return Box::pin(async move {
+                        Ok(axum::response::Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(body))
+                            .unwrap())
+                    });
+                }
+                let gate = self.held.lock().unwrap().get(&origin).cloned();
+                if let (Some(gate), Some((router, _))) = (gate, found.clone()) {
+                    return Box::pin(async move {
+                        let _permit = gate.acquire().await;
+                        transport::InProcess { router }.call(req).await
+                    });
+                }
+            }
             match found {
                 Some((_, down)) if down.load(std::sync::atomic::Ordering::SeqCst) => {
                     Box::pin(async { Err("connection refused".to_string()) })
@@ -9359,5 +9395,81 @@ mod tests {
         until("the first job's disk is removed", || !disk.exists()).await;
         site.live_cloud(&ws, "lab").step(later(0)).await;
         site.events(&ws, "j2", "JobStarted").await;
+    }
+
+    #[tokio::test]
+    async fn an_order_sent_again_counts_its_disk_until_the_member_answers_this_time() {
+        let (site, ws, _s3, _logs) = site_with_store().await;
+        let lab = site.live_cloud(&ws, "lab");
+        // The member refuses the order once, for its disk, as one whose room was taken meanwhile does.
+        site.switchboard.refuse_next_command(A, "INSUFFICIENT_DISK");
+        site.order(&ws, "j1", 4, with_io()).await;
+        let queued = site.events_n(&ws, "j1", "JobQueued", 2).await;
+        assert_eq!(
+            queued.iter().rfind(|e| e["type"] == "JobQueued").unwrap()["data"]["waiting"],
+            true
+        );
+        // Sent again, and held on its way: the member has not counted it, so the cloud does.
+        let gate = site.switchboard.hold_commands(A);
+        let stepping = tokio::spawn({
+            let lab = lab.clone();
+            async move { lab.step(later(0)).await }
+        });
+        site.events_n(&ws, "j1", "JobPlaced", 2).await;
+        assert_eq!(lab.disk_counted(std::time::Instant::now()).get("a"), Some(&GB));
+        gate.add_permits(100);
+        stepping.await.unwrap();
+        site.events(&ws, "j1", "JobStarted").await;
+        // Answered and started: the member counts it now, as made.
+        assert_eq!(lab.disk_counted(std::time::Instant::now()).get("a"), None);
+    }
+
+    #[tokio::test]
+    async fn a_disk_claimed_for_a_job_refused_after_it_or_abandoned_is_let_go_and_two_claims_never_share_one_room() {
+        let bed = fresh().await;
+        bed.runtime.set_disk_room(GB + GB / 2);
+        let free = || async {
+            bed.query("get-hardware-state").await["disk"]["free_bytes"]
+                .as_u64()
+                .unwrap()
+        };
+        // Refused for its memory once its disk was claimed: the claim is let go.
+        let (s, b) = bed
+            .send(
+                "j1",
+                "RunJob",
+                "run-job",
+                json!({ "image": "busybox", "memory_bytes": 30 * GB, "disk_bytes": GB }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_ne!(b["error"]["code"], "INSUFFICIENT_DISK", "{b}");
+        assert_eq!(free().await, GB + GB / 2);
+        // A claim abandoned while the room is read is let go too, once the reading ends.
+        {
+            let claim = bed.peer.claim_disk("job-abandoned", GB);
+            tokio::pin!(claim);
+            let _ = futures::poll!(&mut claim);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..400 {
+            if free().await == GB + GB / 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(free().await, GB + GB / 2);
+        // Two at once, with room for one: one is admitted, the other told the room left.
+        let _gate = bed.runtime.hold_pulls();
+        let job = json!({ "image": "busybox", "memory_bytes": 4 * GB, "disk_bytes": GB });
+        let (a, b) = tokio::join!(
+            bed.send("c1", "RunJob", "run-job", job.clone()),
+            bed.send("c2", "RunJob", "run-job", job.clone())
+        );
+        let admitted = [&a, &b].iter().filter(|r| r.0 == StatusCode::CREATED).count();
+        assert_eq!(admitted, 1, "{a:?} {b:?}");
+        let refused = if a.0 == StatusCode::CREATED { &b.1 } else { &a.1 };
+        assert_eq!(refused["error"]["code"], "INSUFFICIENT_DISK", "{refused}");
+        assert_eq!(refused["error"]["details"]["free_bytes"], GB / 2);
     }
 }

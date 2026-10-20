@@ -428,11 +428,29 @@ impl Runtime for DockerRuntime {
             return None;
         }
         std::fs::create_dir_all(&dir).ok()?;
-        let out = std::process::Command::new("df")
+        // Asked for ten seconds at most: a file system that does not answer is one with no room known.
+        let mut df = std::process::Command::new("df")
             .args(["-B1", "--output=avail,size", &dir.to_string_lossy()])
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
             .ok()?;
-        let text = String::from_utf8_lossy(&out.stdout);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match df.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() < until => {
+                    std::thread::sleep(std::time::Duration::from_millis(20))
+                }
+                _ => {
+                    let _ = df.kill();
+                    let _ = df.wait();
+                    return None;
+                }
+            }
+        }
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut df.stdout.take()?, &mut text).ok()?;
         let mut numbers = text
             .lines()
             .nth(1)?
