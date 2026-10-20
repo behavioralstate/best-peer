@@ -4462,7 +4462,10 @@ mod tests {
         assert_eq!(s, StatusCode::CREATED, "{b}");
         let failed = bed.events_of("j1", "JobFailed").await;
         let fix = failed.last().unwrap().data["fix"].as_str().unwrap().to_string();
-        assert!(fix.contains("name an image built for that CUDA"), "{fix}");
+        assert!(
+            fix.contains("a job may instead name an image built for that CUDA"),
+            "{fix}"
+        );
     }
 
     #[test]
