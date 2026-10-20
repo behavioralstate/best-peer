@@ -159,7 +159,7 @@ pub struct Peer {
     job_disks: Mutex<HashMap<String, JobDisk>>,
     /// The disk promised to each job admitted with one and not yet given it, by job: room the runtime does not count
     /// until the disk is made.
-    promised_disks: Mutex<HashMap<String, u64>>,
+    promised_disks: Arc<Mutex<HashMap<String, u64>>>,
     /// Whether a job may fetch from, and send to, a store over plain http on this host's loopback (a store on the
     /// same machine, as in a test); otherwise https only.
     store_cleartext: std::sync::atomic::AtomicBool,
@@ -246,6 +246,27 @@ struct JobDisk {
     outputs: Option<OutputData>,
     /// Whether where its outputs go is known: not for a disk found after a restart without its record.
     known: bool,
+}
+
+/// A disk promised at admission, let go again when the admission is refused after it, unless kept.
+struct Promise {
+    disks: Arc<Mutex<HashMap<String, u64>>>,
+    job: Option<String>,
+}
+
+impl Promise {
+    /// The admission went through: the promise stands until the disk is made or the job ends.
+    fn keep(&mut self) {
+        self.job = None;
+    }
+}
+
+impl Drop for Promise {
+    fn drop(&mut self) {
+        if let Some(job) = self.job.take() {
+            self.disks.lock().unwrap().remove(&job);
+        }
+    }
 }
 
 /// The record a job's disk keeps of where its outputs go, beside /in and /out and outside what the job's container
@@ -365,7 +386,7 @@ impl Peer {
             held_to_accelerators: Mutex::new(std::collections::HashSet::new()),
             pending_io: Mutex::new(HashMap::new()),
             job_disks: Mutex::new(HashMap::new()),
-            promised_disks: Mutex::new(HashMap::new()),
+            promised_disks: Arc::new(Mutex::new(HashMap::new())),
             store_cleartext: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -1286,18 +1307,21 @@ impl Peer {
             Some(_) => Some(usable_by(self.hardware().await?, &who, data.device.as_deref())?),
             None => None,
         };
-        // The room for its disk is read now, before any lock: the engine's answer may take a while.
-        let room = match &io {
-            Some(_) => {
-                let runtime = self.runtime.clone();
-                tokio::task::spawn_blocking(move || runtime.disk_room())
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|(free, _)| free)
-            }
-            None => None,
+        // A queued order's id is its command's, so the command run again after a restart finds its order.
+        let id = match data.queued() {
+            true => crate::queue::order_id(&key),
+            false => new_id("job"),
         };
+        // Its disk first, before the state is held: the room is read with the promises held, which may take a while.
+        // Let go again if the job is refused after this.
+        let mut disk = Promise {
+            disks: self.promised_disks.clone(),
+            job: None,
+        };
+        if let Some(io) = &io {
+            self.claim_disk(&id, io.disk_bytes).await?;
+            disk.job = Some(id.clone());
+        }
         let _admitting = self.holdings.admitting();
         let held = self.holdings.of(&who.holder());
         let mut state = self.state.lock().unwrap();
@@ -1326,15 +1350,7 @@ impl Peer {
             },
             _ => None,
         };
-        // A queued order's id is its command's, so the command run again after a restart finds its order.
-        let id = match data.queued() {
-            true => crate::queue::order_id(&key),
-            false => new_id("job"),
-        };
-        // A room the engine could not say is no room.
-        if let Some(io) = &io {
-            self.claim_disk(&id, io.disk_bytes, room.unwrap_or(0))?;
-        }
+        disk.keep();
         if data.queued() && accelerators_only(&who) {
             self.held_to_accelerators.lock().unwrap().insert(key.clone());
         }
@@ -1440,20 +1456,30 @@ impl Peer {
     }
 
     /// Promises the job `id` a disk of `bytes`, until the disk is made or the job ends; refused, with what is free,
-    /// when the room is not there. `free` is the room the runtime says it has, read before any lock is taken; the
-    /// check and the promise are one step, so two jobs are never promised one room.
-    fn claim_disk(&self, id: &str, bytes: u64, free: u64) -> Result<(), BestError> {
-        let mut promised = self.promised_disks.lock().unwrap();
-        let free = free.saturating_sub(promised.values().sum());
-        if free < bytes {
-            return Err(BestError::bad_request(
-                "INSUFFICIENT_DISK",
-                format!("this peer has {free} bytes free for a job's disk, less than the {bytes} asked for: ask for less disk_bytes, or wait for room"),
-            )
-            .with_details(json!({ "field": "disk_bytes", "free_bytes": free })));
-        }
-        promised.insert(id.to_string(), bytes);
-        Ok(())
+    /// when the room is not there. The room is read with the promises held, and a promise goes only once its disk is
+    /// made, so every disk counts once, as promised or as taken; the reading runs off the executor, and a room the
+    /// engine cannot say is none.
+    async fn claim_disk(&self, id: &str, bytes: u64) -> Result<(), BestError> {
+        let (promised, runtime, id) = (self.promised_disks.clone(), self.runtime.clone(), id.to_string());
+        tokio::task::spawn_blocking(move || {
+            let mut promised = promised.lock().unwrap();
+            let free = runtime
+                .disk_room()
+                .map(|(f, _)| f)
+                .unwrap_or(0)
+                .saturating_sub(promised.values().sum());
+            if free < bytes {
+                return Err(BestError::bad_request(
+                    "INSUFFICIENT_DISK",
+                    format!("this peer has {free} bytes free for a job's disk, less than the {bytes} asked for: ask for less disk_bytes, or wait for room"),
+                )
+                .with_details(json!({ "field": "disk_bytes", "free_bytes": free })));
+            }
+            promised.insert(id, bytes);
+            Ok(())
+        })
+        .await
+        .map_err(|e| BestError::internal(format!("the room for a disk could not be read: {e}")))?
     }
 
     pub async fn run_job(self: Arc<Self>, cmd: Envelope, em: Emitter) {

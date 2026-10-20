@@ -18,7 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use best_peer_door::auth::{hash_key, holder_of_hash, Credential};
@@ -222,6 +222,9 @@ pub struct Cloud {
     store: std::sync::OnceLock<Arc<Mutex<Option<crate::store::Store>>>>,
     /// The inputs, outputs and disk admission read for an order, until its handler tells it.
     admitted_io: Mutex<HashMap<String, Option<crate::state::OrderIo>>>,
+    /// When each order sent to a member was answered, by order, until it starts or ends: from then the member counts
+    /// its disk in the room it says.
+    answered_at: Mutex<HashMap<String, Instant>>,
 }
 
 /// `text` with the hardware it names put in the size's terms, for an order by size (behavioralstate/spec#64, decision
@@ -431,6 +434,7 @@ impl Cloud {
             purse: std::sync::OnceLock::new(),
             store: std::sync::OnceLock::new(),
             admitted_io: Mutex::new(HashMap::new()),
+            answered_at: Mutex::new(HashMap::new()),
             name: name.into(),
             workspace: workspace.into(),
             log,
@@ -621,10 +625,11 @@ impl Cloud {
         self.store.get().and_then(|s| s.lock().unwrap().clone())
     }
 
-    /// The disk each member is promised for orders placed on it and not sent yet, by member: once a member admits an
-    /// order it counts the disk in the room it says itself, so it is counted here only before. Read with the state
-    /// held.
-    fn disk_promised(&self, s: &State) -> HashMap<String, u64> {
+    /// The disk each member is promised for orders on their way to it that the room it said, read at `read`, does
+    /// not count yet, by member: an order chosen for it, one sent and not answered, and one answered after `read`.
+    /// Once the member has admitted an order it counts its disk itself, as promised or as made, so a disk is counted
+    /// once. Read with the state held.
+    fn disk_promised(&self, s: &State, read: Instant) -> HashMap<String, u64> {
         let mut out: HashMap<String, u64> = HashMap::new();
         // The member a reservation names, from its device (cloud/peer/device).
         let member_of = |id: &str| {
@@ -635,12 +640,20 @@ impl Cloud {
                 .and_then(|d| d.0.split('/').nth(1))
                 .map(str::to_string)
         };
-        // Taken and not sent: where its admission or a step is placing it.
-        for o in s.orders.values().filter(|o| o.job.is_none() && o.placed.is_none()) {
+        let mut answered = self.answered_at.lock().unwrap();
+        answered.retain(|order, _| s.orders.get(order).is_some_and(|o| o.job.is_none()));
+        for o in s.orders.values().filter(|o| o.job.is_none()) {
             let Some(io) = &o.io else {
                 continue;
             };
-            if let Some(peer) = member_of(&o.id) {
+            let peer = match &o.placed {
+                // Chosen, and not sent yet: where its admission or a step is placing it.
+                None => member_of(&o.id),
+                // Sent: until the member's answer is older than the room read.
+                Some((peer, _)) if answered.get(&o.id).is_none_or(|at| *at >= read) => Some(peer.clone()),
+                Some(_) => None,
+            };
+            if let Some(peer) = peer {
                 *out.entry(peer).or_default() += io.disk_bytes;
             }
         }
@@ -2016,9 +2029,8 @@ impl Cloud {
         if waiting.is_empty() {
             return;
         }
+        let read = Instant::now();
         let (host, peers, isolations) = self.combined().await;
-        // The disk of the orders this step sends, which the members' room read above does not count yet.
-        let mut sent: HashMap<String, u64> = HashMap::new();
         for o in waiting {
             let device = {
                 let mut s = self.state.lock().unwrap();
@@ -2033,11 +2045,13 @@ impl Cloud {
                 } else {
                     isolated.clone()
                 };
-                let mut promised = self.disk_promised(&s);
-                for (peer, bytes) in &sent {
-                    *promised.entry(peer.clone()).or_default() += bytes;
-                }
-                let on = with_disk_room(on, &peers, &self.name, o.io.as_ref().map(|io| io.disk_bytes), &promised);
+                let on = with_disk_room(
+                    on,
+                    &peers,
+                    &self.name,
+                    o.io.as_ref().map(|io| io.disk_bytes),
+                    &self.disk_promised(&s, read),
+                );
                 let mut receipt = None;
                 let pick = match (&o.size, o.memory_bytes) {
                     (Some((size, currency)), _) => match size.place(&on, &host, &s, &taken) {
@@ -2072,9 +2086,6 @@ impl Cloud {
                 }
                 (device, receipt)
             };
-            if let (Some(io), Some(peer)) = (&o.io, device.0 .0.split('/').nth(1)) {
-                *sent.entry(peer.to_string()).or_default() += io.disk_bytes;
-            }
             self.dispatch(&o, device.0, device.1).await;
         }
     }
@@ -2172,7 +2183,9 @@ impl Cloud {
         let base = member.schema_base().await;
         let envelope = self.to_member_as(&base, &mc, "RunJob", "run-job", body);
         self.listen_order(&member.name, &mc, &em, &o.id);
-        let Err(e) = member.send(&envelope).await else {
+        let sent = member.send(&envelope).await;
+        self.answered_at.lock().unwrap().insert(o.id.clone(), Instant::now());
+        let Err(e) = sent else {
             return;
         };
         self.issued.lock().unwrap().remove(&(member.name.clone(), mc));
@@ -2543,6 +2556,7 @@ impl Service for Cloud {
         }
         let io = self.admit_io(&data, sized.as_ref().map(|(z, _)| z)).await?;
         let disk = io.as_ref().map(|io| io.disk_bytes);
+        let read = Instant::now();
         let (host, peers, isolations) = self.combined().await;
         if let Some(needed) = disk {
             // A disk no member could ever give is refused now; one no member has the room for yet waits.
@@ -2589,7 +2603,7 @@ impl Service for Cloud {
         within_share(held.memory_bytes, &who, needed)?;
         within_count("job", held.jobs, who.grant.jobs)?;
         let taken = self.taken_whole(&state);
-        let promised = self.disk_promised(&state);
+        let promised = self.disk_promised(&state, read);
         if let Some((size, menu)) = &sized {
             let roomy = with_disk_room(host.clone(), &peers, &self.name, disk, &promised);
             let placement = match size.place(&roomy, &whole, &state, &taken) {

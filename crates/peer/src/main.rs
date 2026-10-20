@@ -9313,4 +9313,51 @@ mod tests {
         let fourth = site.order(&ws, "j4", 4, with_io()).await;
         assert_eq!(fourth["waiting"], true, "{fourth}");
     }
+
+    #[tokio::test]
+    async fn two_waiting_orders_one_step_releases_go_to_a_member_only_as_its_disk_room_allows() {
+        let (site, ws, _s3, _logs) = site_with_store().await;
+        let member = &site.members[0];
+        member.runtime.set_disk_room(GB + GB / 2);
+        // A job with no disk holds the card; two orders with a disk each wait for its memory.
+        site.order(&ws, "j0", 20, json!({ "args": ["sleep", "100"] })).await;
+        let blocker = site.events(&ws, "j0", "JobStarted").await.last().unwrap()["data"].clone();
+        for id in ["j1", "j2"] {
+            let queued = site.order(&ws, id, 10, with_io()).await;
+            assert_eq!(queued["waiting"], true, "{queued}");
+        }
+        // The card comes free: one step has memory for both, and disk room for one.
+        member
+            .runtime
+            .stop(&ContainerId(blocker["container"].as_str().unwrap().into()))
+            .await
+            .unwrap();
+        site.events(&ws, "j0", "JobFinished").await;
+        site.live_cloud(&ws, "lab").step(later(0)).await;
+        let first = site.events(&ws, "j1", "JobStarted").await;
+        assert_eq!(facts(&first), ["JobQueued", "JobPlaced", "InputsFetched", "JobStarted"]);
+        // The second was not sent to be refused: it waits as it was told, never placed, never queued again.
+        site.live_cloud(&ws, "lab").step(later(0)).await;
+        let (_, b) = get_as(
+            &site.app,
+            &format!("/workspaces/{ws}"),
+            &site.key,
+            "/events?correlationId=j2&limit=50",
+        )
+        .await;
+        let second = b["events"].as_array().cloned().unwrap_or_default();
+        assert_eq!(facts(&second), ["JobQueued"], "{second:?}");
+        // Its turn comes when the first's disk is gone.
+        let started = first.last().unwrap()["data"].clone();
+        member
+            .runtime
+            .stop(&ContainerId(started["container"].as_str().unwrap().into()))
+            .await
+            .unwrap();
+        site.events(&ws, "j1", "JobFinished").await;
+        let disk = member.runtime.disk_of(started["job"].as_str().unwrap());
+        until("the first job's disk is removed", || !disk.exists()).await;
+        site.live_cloud(&ws, "lab").step(later(0)).await;
+        site.events(&ws, "j2", "JobStarted").await;
+    }
 }
