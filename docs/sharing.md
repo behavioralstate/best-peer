@@ -30,10 +30,10 @@ launches a second (`burn`: 4096 blocks of 256 threads, 2000 multiply-adds each),
 
 ## Compute: a ceiling fixed at start, not a guarantee
 
-- **`CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` caps a job even when it is alone.** Alone at 100 the probe ran 1,245 launches a
-  second, at 50 it ran 568 (46%), at 25 it ran 229 (18%). Every share measured matches whole pairs of the card's 22
-  multiprocessors, rounded down: 10, 4, 6 and 14 of 22 for 50, 25, 30 and 70 (Turing pairs them in clusters). Single
-  multiprocessors would have given 50% and 23% for 50 and 25.
+- **`CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` caps a job even when it is alone.** Alone at 100 the probe ran 1,245 launches
+  a second, at 50 it ran 568 (46%), at 25 it ran 229 (18%). Every share measured matches whole pairs of the card's 22
+  multiprocessors, rounded down: 10, 4, 6 and 14 of 22 for 50, 25, 30 and 70. Whether the pairs are the card's or
+  MPS's was not tested. Single multiprocessors would have given 50% and 23% for 50 and 25.
 - **Two at once take what their caps give.** At 30 and 70 they ran 339 and 786 (27% and 63% of one alone); at 50 and
   50, 552 each.
 - **A share is fixed for the life of the job.** `set_active_thread_percentage` on the MPS server, sent 12 s into a job
@@ -122,5 +122,6 @@ Memory-bound work and real engines were not measured.
 ## Not answered here
 
 - **The 5090's own figures.** The behaviours above (a share fixed at start, a fault shared under MPS, a pinned limit
-  held) belong to MPS rather than to Turing, and are expected to hold on Blackwell, but that is unverified.
+  held) belong to MPS rather than to Turing, and are expected to hold on Blackwell, but that is unverified, and the
+  step a share is rounded to may differ there.
 - **Inference engines under MPS.** Ollama and vLLM keep their own memory pools and were not run with a pinned limit.
