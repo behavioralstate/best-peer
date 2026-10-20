@@ -78,6 +78,7 @@ impl Runtime for NativeRuntime {
         let _ = self.tx().send(Event::Exited {
             id: id.clone(),
             code: 0,
+            last_words: None,
         });
         Ok(())
     }

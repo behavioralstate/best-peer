@@ -337,7 +337,8 @@ The facts follow on the event stream under the command's correlation id, in orde
 `DeploymentStarted`, `WeightsLoading`, then `DeploymentReady`, or `DeploymentFailed`. While an image is pulled,
 `ImagePulling` says 99 at most and may fall back, since the engine learns of more to fetch as it goes; 100 comes with
 the pull's end, just before `ImagePulled`. What the engine does on its own
-later (`OutOfMemory`, `DeploymentEnded`) is told under the same correlation id. `prompt` names a ready deployment and
+later (`OutOfMemory`, `DeploymentEnded`) is told under the same correlation id. An engine whose container exits before
+its model is ready fails the deploy: `DeploymentFailed` carries its exit code and the last lines it wrote. `prompt` names a ready deployment and
 the conversation so far, and `PromptAnswered` follows under its own correlation id with the answer whole, or
 `PromptFailed` with the reason and the fix. `run-job` runs an image once, a tenant's in a closed box, and tells
 `JobStarted` and `JobFinished` with the exit code; `undeploy-model` and `stop-job` end them.

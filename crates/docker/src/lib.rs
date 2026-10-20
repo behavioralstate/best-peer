@@ -3,8 +3,9 @@
 //! by the NVIDIA container toolkit when its id is an NVML UUID (`GPU-...`); other accelerators wait for their own
 //! adapter. A mount is a bind the engine refuses when its source is not there. A container is confined as its spec
 //! says, in the engine's own words: capabilities dropped, no new privileges, a read-only root with a private `/tmp`,
-//! ceilings on processes and on memory with swap counted in, and its network. Containers are removed by the engine
-//! when they exit. Thin; proven on a host by hand. Only the share of a pull, which is arithmetic over what the engine
+//! ceilings on processes and on memory with swap counted in, and its network. A container that exits is removed by
+//! this adapter once it has read the last lines the container wrote, which the exit then carries; one that exited
+//! while nobody watched is removed when the adapter starts. Thin; proven on a host by hand. Only the share of a pull, which is arithmetic over what the engine
 //! reports, is unit-tested.
 
 use std::collections::HashMap;
@@ -49,8 +50,29 @@ impl DockerRuntime {
             bind_ip: bind_ip.into(),
             tx,
         };
+        me.sweep().await;
         me.follow();
         Ok(me)
+    }
+
+    /// Removes the peer's containers that exited while nobody watched: nothing reads them now.
+    async fn sweep(&self) {
+        let filters = HashMap::from([("label", vec![LABEL]), ("status", vec!["exited", "dead"])]);
+        let Ok(list) = self
+            .docker
+            .list_containers(Some(
+                ListContainersOptionsBuilder::new().all(true).filters(&filters).build(),
+            ))
+            .await
+        else {
+            return;
+        };
+        for id in list.into_iter().filter_map(|c| c.id) {
+            let _ = self
+                .docker
+                .remove_container(&id, Some(RemoveContainerOptionsBuilder::new().force(true).build()))
+                .await;
+        }
     }
 
     fn follow(&self) {
@@ -89,7 +111,11 @@ impl DockerRuntime {
                                 .and_then(|a| a.get("exitCode"))
                                 .and_then(|c| c.parse::<i64>().ok())
                                 .unwrap_or(-1);
-                            let _ = tx.send(Event::Exited { id, code });
+                            let last_words = last_words(&docker, &id.0).await;
+                            let _ = docker
+                                .remove_container(&id.0, Some(RemoveContainerOptionsBuilder::new().force(true).build()))
+                                .await;
+                            let _ = tx.send(Event::Exited { id, code, last_words });
                         }
                         _ => {}
                     }
@@ -98,6 +124,28 @@ impl DockerRuntime {
             }
         });
     }
+}
+
+/// The last lines a container wrote, out and error together, at most a screen of them: what an engine that ended
+/// said about why. None where the engine kept none.
+async fn last_words(docker: &Docker, id: &str) -> Option<String> {
+    let options = bollard::query_parameters::LogsOptionsBuilder::new()
+        .stdout(true)
+        .stderr(true)
+        .tail("20")
+        .build();
+    let mut logs = docker.logs(id, Some(options));
+    let mut text = String::new();
+    while let Some(Ok(chunk)) = logs.next().await {
+        text.push_str(&String::from_utf8_lossy(&chunk.into_bytes()));
+    }
+    let text = text.trim();
+    // A screen of text at most, its end kept: the last line is the one that says why.
+    let start = text.len().saturating_sub(2000);
+    let start = (start..=text.len())
+        .find(|i| text.is_char_boundary(*i))
+        .unwrap_or(text.len());
+    (!text.is_empty()).then(|| text[start..].to_string())
 }
 
 /// `name:tag` as the engine wants them apart; a reference without a tag means `latest`. A port in the registry's
@@ -253,7 +301,8 @@ impl Runtime for DockerRuntime {
             exposed_ports: Some(spec.ports.iter().map(|p| format!("{p}/tcp")).collect()),
             labels: Some(HashMap::from([(LABEL.to_string(), "1".to_string())])),
             host_config: Some(HostConfig {
-                auto_remove: Some(true),
+                // Not removed by the engine on exit: the adapter reads its last lines first, then removes it.
+                auto_remove: Some(false),
                 port_bindings: Some(port_bindings),
                 device_requests: (!device_requests.is_empty()).then_some(device_requests),
                 // A bind as a mount, not a `-v` string: the engine refuses a source that is not there instead of
@@ -360,7 +409,7 @@ impl Runtime for DockerRuntime {
             Err(bollard::errors::Error::DockerResponseServerError { status_code: 304, .. }) => {}
             Err(e) => return Err(RuntimeError::Engine(e.to_string())),
         }
-        // The engine removes it on exit; a container that was already stopped is removed here.
+        // The adapter removes it when its exit is heard; one already stopped, or not heard, is removed here.
         match self
             .docker
             .remove_container(&id.0, Some(RemoveContainerOptionsBuilder::new().force(true).build()))

@@ -1079,13 +1079,27 @@ impl Peer {
             return;
         };
         match (e, owner) {
-            (RuntimeEvent::Exited { code, .. }, Owner::Deployment(dep)) => {
+            (RuntimeEvent::Exited { code, last_words, .. }, Owner::Deployment(dep)) => {
+                let starting = dep.phase == Phase::Starting;
                 if self.claim_deployment(&dep.id) {
-                    self.tell(
-                        &em,
-                        "DeploymentEnded",
-                        json!({ "deployment": dep.id, "model": dep.model, "exit_code": code, "reason": "the container exited by itself" }),
-                    );
+                    let said = last_words
+                        .as_deref()
+                        .map(|w| format!(": its last words were {w:?}"))
+                        .unwrap_or_default();
+                    if starting {
+                        // It never served: the deploy failed, and the engine's own words say why.
+                        self.tell(
+                            &em,
+                            "DeploymentFailed",
+                            json!({ "deployment": dep.id, "model": dep.model, "exit_code": code, "reason": format!("the engine's container exited with code {code} before the model was ready{said}"), "fix": "read its last words: an image that does not start on this host is the operator's to change (BEST_PEER_OLLAMA_IMAGE, BEST_PEER_VLLM_IMAGE, or the driver); a model the engine cannot load is yours to change, then deploy again" }),
+                        );
+                    } else {
+                        self.tell(
+                            &em,
+                            "DeploymentEnded",
+                            json!({ "deployment": dep.id, "model": dep.model, "exit_code": code, "reason": format!("the container exited by itself{said}") }),
+                        );
+                    }
                 }
             }
             (RuntimeEvent::Exited { code, .. }, Owner::Job(job)) => {

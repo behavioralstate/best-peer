@@ -4922,6 +4922,50 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_engine_that_exits_before_its_model_is_ready_fails_the_deploy_with_its_last_words() {
+        let bed = bed_with(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+            Arc::new(best_peer_engine::Fake::new().stalling()),
+            "engines.local",
+            None,
+        )
+        .await;
+        let (s, b) = bed.deploy("d1", "llama3.2:3b", "vllm", 8).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let loading = bed.events_of("d1", "WeightsLoading").await;
+        let started = loading.iter().find(|e| e.r#type == "DeploymentStarted").unwrap();
+        let container = ContainerId(started.data["container"].as_str().unwrap().into());
+        bed.runtime
+            .exit(
+                &container,
+                1,
+                "ImportError: libnvrtc.so.13: cannot open shared object file",
+            )
+            .unwrap();
+        let events = bed.events_of("d1", "DeploymentFailed").await;
+        let failed = &events.last().unwrap().data;
+        let reason = failed["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("exited with code 1 before the model was ready"),
+            "{reason}"
+        );
+        assert!(reason.contains("libnvrtc.so.13"), "the engine's own words: {reason}");
+        assert!(failed["fix"].as_str().unwrap().contains("last words"), "{failed}");
+        assert_eq!(failed["exit_code"], 1);
+        // Told once: the load that was still waiting finds it ended and says nothing more.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let ends: Vec<String> = bed
+            .log_of("d1")
+            .iter()
+            .filter(|e| matches!(e.r#type.as_str(), "DeploymentFailed" | "DeploymentEnded"))
+            .map(|e| e.r#type.clone())
+            .collect();
+        assert_eq!(ends, ["DeploymentFailed"]);
+    }
+
     #[test]
     fn a_span_of_time_reads_as_a_person_writes_it() {
         assert_eq!(parse_duration("8h").unwrap(), Duration::from_secs(8 * 3600));

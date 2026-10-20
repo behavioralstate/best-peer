@@ -127,10 +127,23 @@ pub type Progress = Arc<dyn Fn(Option<u8>) + Send + Sync>;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Event {
-    Started { id: ContainerId, ports: Vec<Published> },
-    Exited { id: ContainerId, code: i64 },
-    OutOfMemory { id: ContainerId },
-    Failed { id: ContainerId, reason: String },
+    Started {
+        id: ContainerId,
+        ports: Vec<Published>,
+    },
+    /// It ended, with its exit code and the last lines it wrote, where the engine kept them.
+    Exited {
+        id: ContainerId,
+        code: i64,
+        last_words: Option<String>,
+    },
+    OutOfMemory {
+        id: ContainerId,
+    },
+    Failed {
+        id: ContainerId,
+        reason: String,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -366,6 +379,21 @@ impl Fake {
         Ok(())
     }
 
+    /// Ends a container on its own, as a process that exits does, with its exit code and the last lines it wrote.
+    pub fn exit(&self, id: &ContainerId, code: i64, last_words: &str) -> Result<(), RuntimeError> {
+        self.containers
+            .lock()
+            .unwrap()
+            .remove(id)
+            .ok_or_else(|| RuntimeError::NoSuchContainer(id.0.clone()))?;
+        let _ = self.tx.send(Event::Exited {
+            id: id.clone(),
+            code,
+            last_words: Some(last_words.to_string()),
+        });
+        Ok(())
+    }
+
     pub fn spec_of(&self, id: &ContainerId) -> Option<Spec> {
         self.containers.lock().unwrap().get(id).cloned()
     }
@@ -442,6 +470,7 @@ impl Runtime for Fake {
         let _ = self.tx.send(Event::Exited {
             id: id.clone(),
             code: 0,
+            last_words: None,
         });
         Ok(())
     }
