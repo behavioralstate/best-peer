@@ -17,7 +17,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -32,7 +31,6 @@ use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::domain::Service;
@@ -43,6 +41,7 @@ use crate::lifecycle::{
 };
 use crate::member::{Heard, Member, Refusal};
 use crate::menu::{Menu, NotPlaced};
+use crate::queue::{could_ever_hold, due, kick, order_id, queued_fact, Stepper, Steps, DEFAULT_QUEUE_SECONDS};
 use crate::state::{JobPhase, Order, Phase, Reservation, State};
 use crate::transport::Transport;
 
@@ -202,8 +201,7 @@ pub struct Cloud {
     /// The commands admitted from a credential held to the accelerators, until the order is told.
     held_to_accelerators: Mutex<HashSet<String>>,
     /// A placement step runs, and whether another was asked for meanwhile.
-    stepping: AtomicBool,
-    again: AtomicBool,
+    stepper: Stepper,
     /// One step at a time, however it was started: an order is placed once.
     steps: tokio::sync::Mutex<()>,
     /// Orders stopped after they were sent and before the member started them: their listener stays, so the job
@@ -221,9 +219,6 @@ pub struct Cloud {
     /// workspace counts.
     purse: std::sync::OnceLock<Arc<crate::meter::Purse>>,
 }
-
-/// How long an order may wait for room when it names no `queue_seconds`: a day, as RunPod's default time-to-live.
-pub const DEFAULT_QUEUE_SECONDS: u64 = 24 * 60 * 60;
 
 /// `text` with the hardware it names put in the size's terms, for an order by size (behavioralstate/spec#64, decision
 /// 4): the device ids in `devices`, longest first, and any NVIDIA card or MIG instance id it quotes become "its
@@ -277,62 +272,10 @@ fn size_gone(cloud: &str, size: &str) -> String {
     format!("the place size {size} was given is no longer a member of cloud {cloud}")
 }
 
-/// An order's id: the command's key hashed, so the command run again after a restart finds its order.
-fn order_id(key: &str) -> String {
-    format!("job-{}", &hash_key(key)[..12])
-}
-
 /// The id and correlation a member is given for an order: the order and its attempt, so an order queued again is a
 /// new command there, even on the member that had it.
 fn order_correlation(o: &Order) -> String {
     format!("{}-{}", o.id, o.attempt)
-}
-
-/// Whether `seconds` from `since` have passed at `now`; a bound not set, or a time that does not read, never has.
-fn past(since: Option<&str>, seconds: Option<u64>, now: OffsetDateTime) -> bool {
-    match (since.and_then(|t| OffsetDateTime::parse(t, &Rfc3339).ok()), seconds) {
-        (Some(t), Some(s)) => now >= t + time::Duration::seconds(s as i64),
-        _ => false,
-    }
-}
-
-/// Whether a device of `host` that runs a job could hold `needed` once nothing else held it there: an order that
-/// fits nowhere now waits only when room can come free.
-fn could_ever_hold(host: &Host, needed: u64, pinned: Option<&str>) -> bool {
-    let empty = Host {
-        devices: host
-            .devices
-            .iter()
-            .cloned()
-            .map(|mut d| {
-                d.memory.free_bytes = d.memory.total_bytes;
-                d
-            })
-            .collect(),
-        ..host.clone()
-    };
-    place(&empty, &State::default(), &any_compute(), needed, pinned, "", None).is_ok()
-}
-
-/// `JobQueued`'s body for `o`, at `attempt`.
-fn queued_fact(o: &Order, attempt: u32, waiting: bool, reason: Option<String>, instead_of: Option<&str>) -> Value {
-    let mut v = json!({
-        "job": o.id, "image": o.image, "args": o.args, "memory_bytes": o.memory_bytes, "device": o.device,
-        "queue_seconds": o.queue_seconds, "deadline_seconds": o.deadline_seconds, "holder": o.holder,
-        "accelerators_only": o.accelerators_only, "isolation": o.isolation, "attempt": attempt, "waiting": waiting,
-    });
-    if let Some((size, currency)) = &o.size {
-        let mut z = serde_json::to_value(size).unwrap_or(Value::Null);
-        z["currency"] = json!(currency);
-        v["size"] = z;
-    }
-    if let Some(r) = reason {
-        v["reason"] = json!(r);
-    }
-    if let Some(i) = instead_of {
-        v["instead_of"] = json!(i);
-    }
-    v
 }
 
 /// A member's `get-hardware-state`, as the abstraction's types.
@@ -407,8 +350,7 @@ impl Cloud {
             me: me.clone(),
             keys: Mutex::new(HashMap::new()),
             held_to_accelerators: Mutex::new(HashSet::new()),
-            stepping: AtomicBool::new(false),
-            again: AtomicBool::new(false),
+            stepper: Stepper::default(),
             steps: tokio::sync::Mutex::new(()),
             stopped_unstarted: Mutex::new(HashSet::new()),
             menu: Mutex::new(None),
@@ -1766,29 +1708,7 @@ impl Cloud {
 
     /// Starts a placement step, unless one runs, which then runs once more when it ends.
     fn kick(&self) {
-        if self.stepping.swap(true, Ordering::SeqCst) {
-            self.again.store(true, Ordering::SeqCst);
-            return;
-        }
-        let Some(me) = self.me.upgrade() else {
-            self.stepping.store(false, Ordering::SeqCst);
-            return;
-        };
-        tokio::spawn(async move {
-            loop {
-                me.again.store(false, Ordering::SeqCst);
-                me.step(OffsetDateTime::now_utc()).await;
-                if me.again.load(Ordering::SeqCst) {
-                    continue;
-                }
-                me.stepping.store(false, Ordering::SeqCst);
-                // Asked for between the last look and now: this task takes it, unless another already has.
-                if me.again.load(Ordering::SeqCst) && !me.stepping.swap(true, Ordering::SeqCst) {
-                    continue;
-                }
-                break;
-            }
-        });
+        kick(&self.me);
     }
 
     /// One placement step at `now`: an order waiting past its `queue_seconds` ends unplaced; a job running past its
@@ -1796,39 +1716,22 @@ impl Cloud {
     /// room, an order that does not fit holding back none after it.
     pub async fn step(&self, now: OffsetDateTime) {
         let _one = self.steps.lock().await;
-        let (expired, overdue) = {
-            let s = self.state.lock().unwrap();
-            let expired: Vec<Order> = s
-                .waiting()
-                .into_iter()
-                .filter(|o| past(Some(&o.queued_at), o.queue_seconds, now))
-                .collect();
-            let overdue: Vec<(Order, String, Option<String>)> = s
-                .orders
-                .values()
-                .filter(|o| past(o.started_at.as_deref(), o.deadline_seconds, now))
-                .filter_map(|o| {
-                    let j = s.jobs.get(o.job.as_deref()?)?;
-                    (j.phase == JobPhase::Running).then(|| (o.clone(), j.id.clone(), j.peer.clone()))
-                })
-                .collect();
-            (expired, overdue)
-        };
-        for o in expired {
+        let due = due(&self.state.lock().unwrap(), now);
+        for o in due.expired {
             self.tell(
                 &self.order_emitter(&o),
                 "JobFailed",
-                json!({ "job": o.id, "image": o.image, "reason": format!("no member peer had the room for it within its queue_seconds ({} s): it was never placed", o.queue_seconds.unwrap_or(0)), "fix": "order it again with a longer queue_seconds or less memory_bytes, or when get-workloads shows room" }),
+                json!({ "job": o.id, "image": o.image, "reason": crate::queue::expired_reason(&o, "no member peer"), "fix": "order it again with a longer queue_seconds or less memory_bytes, or when get-workloads shows room" }),
             );
         }
-        for (o, job, peer) in overdue {
+        for (o, job, peer) in due.overdue {
             let Some(m) = peer.as_deref().and_then(|p| self.member(p)) else {
                 continue;
             };
             if let Some(j) = self.state.lock().unwrap().jobs.get_mut(&job) {
                 j.phase = JobPhase::Stopping;
             }
-            let note = json!({ "reason": format!("it ran past its deadline_seconds ({} s), so the door stopped it", o.deadline_seconds.unwrap_or(0)) });
+            let note = json!({ "reason": crate::queue::deadline_reason(&o) });
             let stopped = self
                 .place_on_noting(
                     &m,
@@ -1995,6 +1898,16 @@ impl Cloud {
             o.insert("peers".into(), json!(peers));
         }
         e
+    }
+}
+
+impl Steps for Cloud {
+    fn stepper(&self) -> &Stepper {
+        &self.stepper
+    }
+
+    fn step_now(self: Arc<Self>) -> futures::future::BoxFuture<'static, ()> {
+        Box::pin(async move { self.step(OffsetDateTime::now_utc()).await })
     }
 }
 
@@ -2521,6 +2434,7 @@ impl Service for Cloud {
             queue_seconds: Some(data.queue_seconds.unwrap_or(DEFAULT_QUEUE_SECONDS)),
             deadline_seconds: data.deadline_seconds,
             accelerators_only: self.held_to_accelerators.lock().unwrap().remove(&key),
+            boxed: false,
             isolation: data.isolation,
             attempt: 1,
             queued_at: String::new(),

@@ -6,6 +6,10 @@ behaves; this page is only the comparison. Where a gap has an issue, it is named
 
 ## What the queue does
 
+The same queue, in the same code, serves a peer's own door for the orders sent to it that ask to wait (they send
+`queue_seconds` or `deadline_seconds`; [spec#76](https://github.com/behavioralstate/spec/issues/76)). What follows is
+the cloud's, which a peer's differs from only in placing on its own devices and in waiting being asked for.
+
 - An order is taken when a device of the cloud's members could ever hold it, and refused at once when none could.
   It waits only for room, and is placed first come, first served per cloud; an order that does not fit yet holds
   back none that does.

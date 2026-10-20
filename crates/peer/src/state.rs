@@ -111,6 +111,9 @@ pub struct Order {
     /// The size it ordered from the cloud's menu, as the menu had it, and the menu's currency; none for an order of
     /// memory_bytes.
     pub size: Option<(crate::menu::Size, String)>,
+    /// Whether its job runs in the closed box a credential with a share gets, where the door that runs it decides
+    /// (a peer's own queue); a cloud's member decides for the cloud's orders.
+    pub boxed: bool,
     /// What it got, as `JobPlaced` told it, in the size's terms: the size, its price and the currency.
     pub receipt: Option<Value>,
 }
@@ -324,6 +327,7 @@ impl State {
                         queue_seconds: data["queue_seconds"].as_u64(),
                         deadline_seconds: data["deadline_seconds"].as_u64(),
                         accelerators_only: data["accelerators_only"].as_bool().unwrap_or(false),
+                        boxed: data["boxed"].as_bool().unwrap_or(false),
                         isolation: serde_json::from_value(data["isolation"].clone()).ok(),
                         attempt,
                         queued_at,

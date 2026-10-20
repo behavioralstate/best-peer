@@ -20,6 +20,7 @@ use best_peer_runtime::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use time::OffsetDateTime;
 use tokio::sync::{broadcast, Semaphore};
 
 use crate::domain::Service;
@@ -137,6 +138,17 @@ pub struct Peer {
     prompts: Semaphore,
     /// What a credential holds across the door, for its share: this peer's own promises and every workspace's.
     holdings: Arc<Holdings>,
+    /// The peer itself, for the placement step its queue starts (behavioralstate/spec#76).
+    me: std::sync::OnceLock<std::sync::Weak<Peer>>,
+    stepper: crate::queue::Stepper,
+    /// One placement step at a time.
+    steps: tokio::sync::Mutex<()>,
+    /// The orders placed and starting (their image pulled, their container started), not yet told as started.
+    starting: Mutex<std::collections::HashSet<String>>,
+    /// The command behind each order, by the order's id: what completes the command.
+    keys: Mutex<HashMap<String, String>>,
+    /// The commands admitted from a credential held to the accelerators, until the order is told.
+    held_to_accelerators: Mutex<std::collections::HashSet<String>>,
 }
 
 #[derive(Deserialize)]
@@ -173,6 +185,19 @@ struct RunJobData {
     device: Option<String>,
     #[serde(default)]
     isolation: Option<Isolation>,
+    /// How long it may wait for a device with its room; an order that says none is refused when there is none.
+    #[serde(default)]
+    queue_seconds: Option<u64>,
+    /// How long its job may run before it is stopped.
+    #[serde(default)]
+    deadline_seconds: Option<u64>,
+}
+
+impl RunJobData {
+    /// Whether it goes through the queue: it asked to wait, or to be stopped at a deadline.
+    fn queued(&self) -> bool {
+        self.queue_seconds.is_some() || self.deadline_seconds.is_some()
+    }
 }
 
 /// Where a deploy stands when it fails: before its start was told, with the container to stop if one was started
@@ -225,6 +250,12 @@ impl Peer {
             tasks: Mutex::new(Vec::new()),
             prompts: Semaphore::new(PROMPTS_AT_ONCE),
             holdings: Arc::new(Holdings::default()),
+            me: std::sync::OnceLock::new(),
+            stepper: crate::queue::Stepper::default(),
+            steps: tokio::sync::Mutex::new(()),
+            starting: Mutex::new(std::collections::HashSet::new()),
+            keys: Mutex::new(HashMap::new()),
+            held_to_accelerators: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -236,6 +267,7 @@ impl Peer {
 
     /// Registers what this peer has promised with the door's holdings, so a share is counted across surfaces.
     pub fn register_holdings(self: &Arc<Self>) {
+        let _ = self.me.set(Arc::downgrade(self));
         let weak = Arc::downgrade(self);
         self.holdings.add(move |holder| {
             weak.upgrade()
@@ -365,6 +397,7 @@ impl Peer {
             loop {
                 tokio::time::sleep(RECONCILE_EVERY).await;
                 me.reconcile(false).await;
+                me.kick();
             }
         });
         self.tasks.lock().unwrap().extend([listening, squaring]);
@@ -392,7 +425,139 @@ impl Peer {
             em.completes_workload(&w, r#type);
         }
         self.state.lock().unwrap().apply(&e);
+        // A workload that ended may have freed the device an order waits for.
+        if matches!(
+            r#type,
+            "JobFinished"
+                | "JobFailed"
+                | "JobStopped"
+                | "Undeployed"
+                | "DeploymentEnded"
+                | "DeploymentFailed"
+                | "OutOfMemory"
+        ) {
+            self.kick();
+        }
         e
+    }
+
+    /// Starts a placement step of this peer's queue, unless one runs.
+    fn kick(&self) {
+        if let Some(me) = self.me.get() {
+            crate::queue::kick(me);
+        }
+    }
+
+    /// The emitter of the command behind order `o`: its correlation, its key when known, and what completes it.
+    fn order_emitter(&self, o: &crate::state::Order) -> Emitter {
+        let key = self.keys.lock().unwrap().get(&o.id).cloned().unwrap_or_default();
+        let completes: Vec<String> = self
+            .completions
+            .get("RunJob")
+            .map(|c| c.iter().cloned().collect())
+            .unwrap_or_default();
+        self.emitter(&o.correlation).with_key(&key).with_completes(&completes)
+    }
+
+    /// One placement step of this peer's queue at `now`: an order waiting past its `queue_seconds` ends unplaced; a
+    /// job running past its `deadline_seconds` is stopped; then every order that waits, oldest first, is started on
+    /// a device of this peer with its room, an order that does not fit holding back none after it.
+    pub async fn step(self: &Arc<Self>, now: OffsetDateTime) {
+        let _one = self.steps.lock().await;
+        let due = crate::queue::due(&self.state.lock().unwrap(), now);
+        for o in due.expired {
+            self.tell(
+                &self.order_emitter(&o),
+                "JobFailed",
+                json!({ "job": o.id, "image": o.image, "reason": crate::queue::expired_reason(&o, "no device of this peer"), "fix": "order it again with a longer queue_seconds or less memory_bytes, or when get-workloads shows room" }),
+            );
+        }
+        for (o, job, _) in due.overdue {
+            let container = {
+                let mut s = self.state.lock().unwrap();
+                let Some(j) = s.jobs.get_mut(&job) else {
+                    continue;
+                };
+                j.phase = JobPhase::Stopping;
+                j.container.clone()
+            };
+            match self.runtime.stop(&container).await {
+                Ok(()) | Err(RuntimeError::NoSuchContainer(_)) => {
+                    self.tell(
+                        &self.order_emitter(&o),
+                        "JobStopped",
+                        json!({ "job": job, "reason": crate::queue::deadline_reason(&o) }),
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(%job, why = %e, "a job past its deadline could not be stopped; trying again at the next tick");
+                    if let Some(j) = self.state.lock().unwrap().jobs.get_mut(&job) {
+                        j.phase = JobPhase::Running;
+                    }
+                }
+            }
+        }
+        let waiting: Vec<crate::state::Order> = {
+            let starting = self.starting.lock().unwrap();
+            self.state
+                .lock()
+                .unwrap()
+                .waiting()
+                .into_iter()
+                .filter(|o| !starting.contains(&o.id))
+                .collect()
+        };
+        if waiting.is_empty() {
+            return;
+        }
+        let Ok(host) = self.hardware().await else {
+            return;
+        };
+        for o in waiting {
+            let reservation = {
+                let mut s = self.state.lock().unwrap();
+                // Stopped while the hardware was read.
+                if !s.orders.get(&o.id).is_some_and(|x| x.waiting()) {
+                    continue;
+                }
+                let on = if o.accelerators_only {
+                    accelerators(&host)
+                } else {
+                    host.clone()
+                };
+                let needed = o.memory_bytes.unwrap_or(0);
+                let Ok((device, compute)) = place(&on, &s, &any_compute(), needed, o.device.as_deref(), "", None)
+                else {
+                    continue;
+                };
+                // Promised there now, so the next order in this step sees the room taken; after a restart the
+                // promise is made again from the order.
+                let key = self
+                    .keys
+                    .lock()
+                    .unwrap()
+                    .get(&o.id)
+                    .cloned()
+                    .unwrap_or_else(|| o.id.clone());
+                s.reserved.retain(|k, r| r.id != o.id || *k == key);
+                let r = s.reserved.entry(key).or_insert_with(|| Reservation {
+                    id: o.id.clone(),
+                    device: None,
+                    compute: None,
+                    memory_bytes: needed,
+                    holder: o.holder.clone(),
+                    boxed: o.boxed,
+                });
+                r.device = Some(device);
+                r.compute = Some(compute);
+                r.clone()
+            };
+            self.starting.lock().unwrap().insert(o.id.clone());
+            let (me, em) = (self.clone(), self.order_emitter(&o));
+            tokio::spawn(async move {
+                me.start_job(&em, &o.image, &o.args, reservation, true).await;
+            });
+        }
     }
 
     pub async fn hardware(&self) -> Result<Host, BestError> {
@@ -908,7 +1073,7 @@ impl Peer {
         within_share(held.memory_bytes, &who, data.memory_bytes.unwrap_or(0))?;
         within_count("job", held.jobs, who.grant.jobs)?;
         let placement = match (data.memory_bytes, &host) {
-            (Some(needed), Some(host)) => Some(place(
+            (Some(needed), Some(host)) => match place(
                 host,
                 &state,
                 &any_compute(),
@@ -916,13 +1081,32 @@ impl Peer {
                 data.device.as_deref(),
                 &format!("a job from {}", data.image),
                 mine(&who).as_deref(),
-            )?),
+            ) {
+                Ok(p) => Some(p),
+                // Asked to wait, and room can come free: taken, it waits its turn.
+                Err(e)
+                    if data.queue_seconds.is_some()
+                        && e.code == "INSUFFICIENT_MEMORY"
+                        && crate::queue::could_ever_hold(host, needed, data.device.as_deref()) =>
+                {
+                    None
+                }
+                Err(e) => return Err(e),
+            },
             _ => None,
+        };
+        if data.queued() && accelerators_only(&who) {
+            self.held_to_accelerators.lock().unwrap().insert(key.clone());
+        }
+        // A queued order's id is its command's, so the command run again after a restart finds its order.
+        let id = match data.queued() {
+            true => crate::queue::order_id(&key),
+            false => new_id("job"),
         };
         state.reserved.insert(
             key,
             Reservation {
-                id: new_id("job"),
+                id,
                 device: placement.as_ref().map(|(d, _)| d.clone()),
                 compute: placement.map(|(_, c)| c),
                 memory_bytes: data.memory_bytes.unwrap_or(0),
@@ -937,7 +1121,17 @@ impl Peer {
         let Ok(data) = parse::<RunJobData>(&cmd.data) else {
             return;
         };
-        let Some(reservation) = self.state.lock().unwrap().reserved.get(em.command_key()).cloned() else {
+        let key = em.command_key().to_string();
+        if data.queued() {
+            let id = crate::queue::order_id(&key);
+            self.keys.lock().unwrap().insert(id.clone(), key.clone());
+            // Run again after a restart: the fold holds the order, and the queue goes on.
+            if self.state.lock().unwrap().orders.contains_key(&id) {
+                self.kick();
+                return;
+            }
+        }
+        let Some(reservation) = self.state.lock().unwrap().reserved.get(&key).cloned() else {
             self.tell(
                 &em,
                 "CommandFailed",
@@ -945,13 +1139,84 @@ impl Peer {
             );
             return;
         };
+        if data.queued() {
+            let waiting = reservation.device.is_none() && data.memory_bytes.is_some();
+            let order = crate::state::Order {
+                id: reservation.id.clone(),
+                correlation: em.correlation().to_string(),
+                holder: reservation.holder.clone(),
+                image: data.image.clone(),
+                args: data.args.clone(),
+                memory_bytes: data.memory_bytes,
+                device: data.device.clone(),
+                queue_seconds: data.queue_seconds,
+                deadline_seconds: data.deadline_seconds,
+                accelerators_only: self.held_to_accelerators.lock().unwrap().remove(&key),
+                boxed: reservation.boxed,
+                isolation: data.isolation,
+                attempt: 1,
+                queued_at: String::new(),
+                arrival: 0,
+                placed: None,
+                job: None,
+                started_at: None,
+                size: None,
+                receipt: None,
+            };
+            let reason = waiting.then(|| {
+                format!(
+                    "no device of this peer has {} bytes free now: it is started as soon as one has, after the orders before it",
+                    data.memory_bytes.unwrap_or(0)
+                )
+            });
+            if !waiting {
+                self.starting.lock().unwrap().insert(order.id.clone());
+            }
+            self.tell(
+                &em,
+                "JobQueued",
+                crate::queue::queued_fact(&order, 1, waiting, reason, None),
+            );
+            if waiting {
+                self.kick();
+                return;
+            }
+        }
+        self.start_job(&em, &data.image, &data.args, reservation, data.queued())
+            .await;
+    }
+
+    /// Starts the job `reservation` holds the place of: its image held, then its container, told as `JobStarted`, or
+    /// `JobFailed` with the reason. A job of this peer's queue names its order, which it ends.
+    async fn start_job(
+        self: &Arc<Self>,
+        em: &Emitter,
+        image_name: &str,
+        args: &[String],
+        reservation: Reservation,
+        queued: bool,
+    ) {
         let id = reservation.id.clone();
-        let image = best_peer_runtime::ImageRef(data.image.clone());
+        self.run_container(em, image_name, args, reservation, queued).await;
+        self.starting.lock().unwrap().remove(&id);
+    }
+
+    async fn run_container(
+        self: &Arc<Self>,
+        em: &Emitter,
+        image_name: &str,
+        args: &[String],
+        reservation: Reservation,
+        queued: bool,
+    ) {
+        let em = em.clone();
+        let id = reservation.id.clone();
+        let image = best_peer_runtime::ImageRef(image_name.to_string());
         let fail = |reason: String, fix: &str| {
             self.tell(
                 &em,
                 "JobFailed",
-                json!({ "job": id, "image": data.image, "reason": reason, "fix": fix }),
+                json!({ "job": id, "image": image_name, "reason": reason, "fix": fix }),
             );
         };
         let held = match self.ensure(&em, &image).await {
@@ -968,7 +1233,7 @@ impl Peer {
         };
         let spec = Spec {
             image,
-            args: data.args.clone(),
+            args: args.to_vec(),
             env: vec![],
             devices,
             ports: vec![],
@@ -984,11 +1249,11 @@ impl Peer {
         };
         match self.runtime.start(spec).await {
             Ok(started) => {
-                self.tell(
-                    &em,
-                    "JobStarted",
-                    json!({ "job": id, "image": data.image, "device": reservation.device.as_ref().map(|d| d.0.clone()), "memory_bytes": reservation.memory_bytes, "container": started.id.0, "holder": reservation.holder, "boxed": reservation.boxed, "host_memory_bytes": host_memory_bytes }),
-                );
+                let mut fact = json!({ "job": id, "image": image_name, "device": reservation.device.as_ref().map(|d| d.0.clone()), "memory_bytes": reservation.memory_bytes, "container": started.id.0, "holder": reservation.holder, "boxed": reservation.boxed, "host_memory_bytes": host_memory_bytes });
+                if queued {
+                    fact["order"] = json!(id);
+                }
+                self.tell(&em, "JobStarted", fact);
                 em.bind_workload(&id);
                 self.replay_unowned(&started.id).await;
             }
@@ -1004,6 +1269,20 @@ impl Peer {
         require(who, "jobs")?;
         let id = cmd.data["job"].as_str().unwrap_or_default();
         let mut s = self.state.lock().unwrap();
+        // An order of this peer's queue that waits: stopped here, before it started.
+        if let Some(o) = s.orders.get(id).filter(|o| o.waiting()) {
+            if !who.grant.is_all() && o.holder != who.holder() {
+                return Err(not_yours("job", id));
+            }
+            if self.starting.lock().unwrap().contains(id) {
+                return Err(BestError::bad_request(
+                    "ALREADY_STARTING",
+                    format!("order {id} is starting: stop it once JobStarted says it runs"),
+                )
+                .with_details(json!({ "job": id })));
+            }
+            return Ok(());
+        }
         let running: Vec<String> = s
             .jobs
             .values()
@@ -1034,6 +1313,21 @@ impl Peer {
 
     pub async fn stop_job(&self, cmd: Envelope, em: Emitter) {
         let id = cmd.data["job"].as_str().unwrap_or_default().to_string();
+        let waiting = {
+            let mut s = self.state.lock().unwrap();
+            let o = s.orders.get(&id).filter(|o| o.waiting()).cloned();
+            if o.is_some() {
+                s.reserved.retain(|_, r| r.id != id);
+            }
+            o
+        };
+        if let Some(o) = waiting {
+            // The order ends under its own correlation, completing its command, and under the stop's.
+            let stopped = json!({ "job": id, "reason": "stopped before it started" });
+            self.tell(&self.order_emitter(&o), "JobStopped", stopped.clone());
+            self.tell(&em, "JobStopped", stopped);
+            return;
+        }
         let container = self.state.lock().unwrap().jobs.get(&id).map(|j| j.container.clone());
         let stopped = match &container {
             Some(c) => self.runtime.stop(c).await,
@@ -1232,9 +1526,30 @@ impl Peer {
     /// `get-workloads`: what is deployed and what runs, now.
     pub fn workloads(&self, who: &Credential) -> Result<Value, BestError> {
         let held = self.holdings.held_by(&who.holder());
-        let mut v = workloads_view(&self.state.lock().unwrap(), who, None);
+        let s = self.state.lock().unwrap();
+        let mut v = workloads_view(&s, who, None);
         v["held_bytes"] = json!(held);
+        // The orders of this peer's queue that wait, oldest first.
+        v["queued"] = json!(s
+            .waiting()
+            .iter()
+            .filter(|o| who.grant.is_all() || o.holder == who.holder())
+            .map(|o| json!({
+                "job": o.id, "image": o.image, "memory_bytes": o.memory_bytes, "device": o.device,
+                "holder": o.holder, "queued_at": o.queued_at, "queue_seconds": o.queue_seconds, "waiting": true
+            }))
+            .collect::<Vec<_>>());
         Ok(v)
+    }
+}
+
+impl crate::queue::Steps for Peer {
+    fn stepper(&self) -> &crate::queue::Stepper {
+        &self.stepper
+    }
+
+    fn step_now(self: Arc<Self>) -> futures::future::BoxFuture<'static, ()> {
+        Box::pin(async move { self.step(OffsetDateTime::now_utc()).await })
     }
 }
 

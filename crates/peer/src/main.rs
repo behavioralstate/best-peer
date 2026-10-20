@@ -18,6 +18,7 @@ mod lifecycle;
 mod member;
 mod menu;
 mod meter;
+mod queue;
 mod state;
 mod tls;
 mod transport;
@@ -1283,6 +1284,158 @@ mod tests {
             .iter()
             .map(|e| e["type"].as_str().unwrap_or("").to_string())
             .collect()
+    }
+
+    // ----- a peer's own queue (behavioralstate/spec#76) --------------------------------------------------------------
+
+    /// Runs `image` with `gb` GiB of device memory on the bed's own door, `more` merged in.
+    async fn run_on(bed: &Bed, id: &str, gb: u64, more: Value) -> (StatusCode, Value) {
+        let mut data = json!({ "image": "busybox", "memory_bytes": gb * GB });
+        for (k, v) in more.as_object().into_iter().flatten() {
+            data[k] = v.clone();
+        }
+        bed.send(id, "RunJob", "run-job", data).await
+    }
+
+    #[tokio::test]
+    async fn a_peer_queues_an_order_that_asked_to_wait_and_starts_it_when_its_device_frees() {
+        let bed = bed(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        // 20 of the card's 24 GiB, as before: no wait asked for, no JobQueued.
+        let (s, b) = run_on(&bed, "j1", 20, json!({})).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let first = bed.events_of("j1", "JobStarted").await;
+        assert!(types(&first).iter().all(|t| t != "JobQueued"), "{:?}", types(&first));
+        let j1 = first.last().unwrap().data["job"].as_str().unwrap().to_string();
+        // 10 more without asking to wait is refused, as a cloud placing here expects.
+        let (s, e) = run_on(&bed, "j2", 10, json!({})).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "INSUFFICIENT_MEMORY");
+        // Asking to wait, it is taken and waits.
+        let (s, b) = run_on(&bed, "j3", 10, json!({ "queue_seconds": 600 })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let queued = bed.events_of("j3", "JobQueued").await;
+        let order = queued[0].data.clone();
+        assert_eq!(order["waiting"], true, "{order}");
+        assert!(order["reason"].as_str().unwrap().contains("as soon as"), "{order}");
+        let w = bed.query("get-workloads").await;
+        assert_eq!(w["queued"][0]["job"], order["job"], "{w}");
+        // A small one that fits now is not held back by it: queued and started at once.
+        let (s, b) = run_on(&bed, "j4", 2, json!({ "queue_seconds": 600 })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let small = bed.events_of("j4", "JobStarted").await;
+        assert_eq!(types(&small)[0], "JobQueued");
+        assert_eq!(small[0].data["waiting"], false);
+        assert_eq!(small.last().unwrap().data["order"], small[0].data["job"]);
+        // One that no device could ever hold is refused at once, waiting or not.
+        let (s, e) = run_on(&bed, "j5", 30, json!({ "queue_seconds": 600 })).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "INSUFFICIENT_MEMORY");
+        // The first ends: the order that waited starts on the room it left, naming the order.
+        let (s, b) = bed.send("s1", "StopJob", "stop-job", json!({ "job": j1 })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let started = bed.events_of("j3", "JobStarted").await;
+        let data = &started.last().unwrap().data;
+        assert_eq!(data["order"], order["job"]);
+        assert_eq!(data["device"], "gpu-0");
+        assert_eq!(bed.query("get-workloads").await["queued"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn a_peers_queue_ends_a_wait_past_queue_seconds_stops_a_run_past_its_deadline_and_a_waiting_order_on_request()
+    {
+        let bed = bed(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        // A job with a deadline runs, and is stopped once past it.
+        let (s, b) = run_on(&bed, "d1", 20, json!({ "deadline_seconds": 1 })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        bed.events_of("d1", "JobStarted").await;
+        // Two wait behind it: one bounded to a second, one to ten minutes.
+        let (s, b) = run_on(&bed, "q1", 10, json!({ "queue_seconds": 1 })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let (s, b) = run_on(&bed, "q2", 10, json!({ "queue_seconds": 600 })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let q2 = bed.events_of("q2", "JobQueued").await[0].data["job"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // A stop of the one that waits ends it before it started, under its own correlation and the stop's.
+        let (s, b) = bed.send("s1", "StopJob", "stop-job", json!({ "job": q2 })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let stopped = bed.events_of("s1", "JobStopped").await;
+        assert_eq!(stopped.last().unwrap().data["reason"], "stopped before it started");
+        assert_eq!(
+            types(&bed.events_of("q2", "JobStopped").await),
+            ["JobQueued", "JobStopped"]
+        );
+        // Later than every bound: the wait ends unplaced and the run is stopped, naming its deadline.
+        bed.peer.step(later(5)).await;
+        let failed = bed.events_of("q1", "JobFailed").await;
+        assert!(
+            failed.last().unwrap().data["reason"]
+                .as_str()
+                .unwrap()
+                .contains("never placed"),
+            "{failed:?}"
+        );
+        let ended = bed.events_of("d1", "JobStopped").await;
+        assert!(
+            ended.last().unwrap().data["reason"]
+                .as_str()
+                .unwrap()
+                .contains("deadline_seconds"),
+            "{ended:?}"
+        );
+        let w = bed.query("get-workloads").await;
+        assert_eq!((w["jobs"].clone(), w["queued"].clone()), (json!([]), json!([])), "{w}");
+    }
+
+    #[tokio::test]
+    async fn an_order_that_waits_on_a_peer_is_held_across_a_restart_and_starts_when_its_device_frees() {
+        let log = Arc::new(EventLog::ephemeral());
+        let runtime = Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![]));
+        let first = bed(card(), log.clone(), runtime.clone()).await;
+        let (s, b) = run_on(&first, "j1", 20, json!({})).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let j1 = first.events_of("j1", "JobStarted").await.last().unwrap().data["job"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (s, b) = run_on(&first, "q1", 10, json!({ "queue_seconds": 600 })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let order = first.events_of("q1", "JobQueued").await[0].data["job"].clone();
+        // The peer dies and comes back over the same log and engine.
+        first.peer.halt();
+        let credentials = first.door.auth.clone();
+        drop(first);
+        let again = bed_with(
+            card(),
+            log.clone(),
+            runtime.clone(),
+            Arc::new(best_peer_engine::Fake::new()),
+            "engines.local",
+            Some(credentials),
+        )
+        .await;
+        let w = again.query("get-workloads").await;
+        assert_eq!(w["queued"][0]["job"], order, "the order still waits: {w}");
+        // The job that held the card ends: the order starts, once.
+        let (s, b) = again.send("s1", "StopJob", "stop-job", json!({ "job": j1 })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let started = again.events_of("q1", "JobStarted").await;
+        assert_eq!(started.last().unwrap().data["order"], order);
+        assert_eq!(
+            types(&again.log_of("q1")).iter().filter(|t| *t == "JobStarted").count(),
+            1
+        );
     }
 
     // ----- workspaces and clouds ----------------------------------------------------------------------------------
