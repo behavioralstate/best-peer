@@ -380,7 +380,8 @@ and the price. A size's memory is a slice of a device only where the device hold
 `get-hardware-state`'s `slicing` says (`mps`, `mig`). Elsewhere (`none`) the size takes the whole device and all of
 its compute, and nothing else is placed there until it ends, so nothing is promised that the device does not keep.
 No adapter reports anything but `none` yet: which slices a consumer card can hold to is
-[spec#65](https://github.com/behavioralstate/spec/issues/65). Pinning stays the owner's: `memory_bytes` and `device`
+[spec#65](https://github.com/behavioralstate/spec/issues/65), and [docs/sharing.md](docs/sharing.md) says what a test
+card showed. Pinning stays the owner's: `memory_bytes` and `device`
 work as before.
 
 What the orders by size used, and what they cost, is `get-usage`, read from the workspace's own events. Each job is
