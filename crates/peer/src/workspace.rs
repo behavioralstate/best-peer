@@ -22,7 +22,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Json, Router};
 use best_peer_door::auth::Credential;
-use best_peer_door::{Auth, BestError, Door, Emitter, Envelope, EventLog, Limits, Partition, Stored};
+use best_peer_door::{Auth, BestError, Door, Emitter, Envelope, EventLog, Limits, Partition, Stored, View};
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -206,6 +206,29 @@ impl Workspaces {
     /// whatever its grant, and of the lifecycle what the door's rule gives it.
     fn workspace_partition() -> Partition {
         Arc::new(|_who: &Credential, s: &Stored| WORKSPACE_EVENTS.contains(&s.envelope.r#type.as_str()).then_some(true))
+    }
+
+    /// What a reader is served of a workspace's facts: an order by size in the size's terms, never the hardware it
+    /// ran on (behavioralstate/spec#64, decision 4). Its facts carry its size (`JobQueued`) or its receipt
+    /// (`JobPlaced`, `JobStarted`); the device each was placed on stays in the log, for the cloud's own fold, and is
+    /// left off what is served, as is the hardware an older receipt named.
+    fn size_terms() -> View {
+        Arc::new(|e: &Envelope| {
+            let mut e = e.clone();
+            let receipt = e.data["receipt"].is_object();
+            if receipt || e.data["size"].is_object() {
+                if let Some(d) = e.data.as_object_mut() {
+                    d.remove("device");
+                    d.remove("gpu");
+                }
+            }
+            if receipt {
+                let r = e.data["receipt"].clone();
+                e.data["receipt"] =
+                    json!({ "size": r["size"], "price_per_second": r["price_per_second"], "currency": r["currency"] });
+            }
+            e
+        })
     }
 
     /// Folds one fact in, live and on replay: the record, the member list the workspace's door checks, and the
@@ -679,6 +702,7 @@ impl Workspace {
                 ctx.auth.clone(),
             )
             .with_partition(Workspaces::workspace_partition())
+            .with_view(Workspaces::size_terms())
             .with_limits(ctx.limits.clone()),
         );
         let router = best_peer_door::tenant_router(door.clone());

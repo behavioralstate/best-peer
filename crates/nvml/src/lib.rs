@@ -2,12 +2,13 @@
 //! on Linux, `nvml.dll` on Windows). Loaded once at start; a host without it is told so and the peer refuses to
 //! start, since a GPU host that cannot see its cards is misconfigured, not accelerator-less (`BEST_PEER_GPU=none`
 //! says the latter). Every snapshot reads the cards live: memory, temperature, power, utilisation, and the CUDA
-//! version the driver offers, which is what a workload asks for. Thin; proven on a GPU host by hand, never
-//! unit-tested.
+//! version the driver offers, which is what a workload asks for. A card the operator split with MIG is reported as
+//! its instances, each a device of its own with its `MIG-…` UUID and its own memory, and not as the card: the card
+//! runs nothing outside them. Thin; proven on a GPU host by hand, never unit-tested.
 
 use std::time::SystemTime;
 
-use best_peer_gpu::{Compute, Device, DeviceId, Gpu, GpuError, Host, Memory, Vendor};
+use best_peer_gpu::{Compute, Device, DeviceId, Gpu, GpuError, Host, Memory, Slicing, Vendor};
 use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
 use nvml_wrapper::error::NvmlError;
 use nvml_wrapper::{cuda_driver_version_major, cuda_driver_version_minor, Nvml};
@@ -44,6 +45,35 @@ impl Gpu for NvmlGpu {
         let mut devices = Vec::with_capacity(count as usize);
         for index in 0..count {
             let d = self.nvml.device_by_index(index).map_err(lib)?;
+            // MIG on (NVML's current mode 1): the card's instances are what runs work, each taken whole by one job.
+            // A card with MIG on and no instances made yet offers nothing until the operator makes them.
+            if d.mig_mode().is_ok_and(|m| m.current == 1) {
+                let slots = d.mig_device_count().unwrap_or(0);
+                let card = d.name().unwrap_or_else(|_| format!("NVIDIA device {index}"));
+                for slot in 0..slots {
+                    // An empty slot is not an instance: it answers NotFound.
+                    let Ok(m) = d.mig_device_by_index(slot) else {
+                        continue;
+                    };
+                    let memory = m.memory_info().map_err(lib)?;
+                    devices.push(Device {
+                        id: DeviceId(m.uuid().map_err(lib)?),
+                        vendor: Vendor::Nvidia,
+                        name: m.name().unwrap_or_else(|_| format!("{card} MIG instance {slot}")),
+                        memory: Memory {
+                            total_bytes: memory.total,
+                            free_bytes: memory.free,
+                        },
+                        compute: vec![Compute::Cuda(cuda.clone()), Compute::Vulkan],
+                        // An instance has no readings of its own; the card's are not its.
+                        temperature_c: None,
+                        power_w: None,
+                        utilisation_pct: None,
+                        slicing: Slicing::Mig,
+                    });
+                }
+                continue;
+            }
             // The UUID is stable across restarts and is what the container runtime is handed.
             let id = d.uuid().map_err(lib)?;
             let memory = d.memory_info().map_err(lib)?;
@@ -60,8 +90,7 @@ impl Gpu for NvmlGpu {
                 temperature_c: d.temperature(TemperatureSensor::Gpu).ok().map(|t| t as f32),
                 power_w: d.power_usage().ok().map(|mw| mw as f32 / 1000.0),
                 utilisation_pct: d.utilization_rates().ok().map(|u| u.gpu.min(100) as u8),
-                // Neither MPS nor MIG is set up by this adapter: a share of the card is held to by nothing yet.
-                slicing: best_peer_gpu::Slicing::None,
+                slicing: Slicing::None,
             });
         }
         Ok(Host {

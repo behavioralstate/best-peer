@@ -1,14 +1,14 @@
 //! A cloud's menu: the sizes an order names instead of hardware. A size is a name, its floors and a price: the device
-//! memory it reserves, the compute API and the least version its device offers, the host memory of the device's
-//! machine, the share of the device's compute it guarantees, and what a second of it costs. Placement checks the
-//! floors; people read the name. A size's memory is a slice of a device only where the device holds a job to its
-//! slice ([`Slicing`]); elsewhere the size takes the whole device, since a share nothing enforces is a promise nothing
-//! keeps (behavioralstate/spec#64, decision 3).
+//! memory it needs, the compute API and the least version its device offers, the host memory of the device's
+//! machine, the share of compute it stands for, and what a second of it costs. Placement checks the floors; people
+//! read the name. A size takes a device whole: a whole card, or one instance of a card MIG splits in hardware, which
+//! the peer reports as a device of its own. Nothing a client reads of a size names the hardware that served it
+//! (behavioralstate/spec#64, decisions 4, 12 and 13).
 
 use std::collections::HashSet;
 
 use best_peer_door::BestError;
-use best_peer_gpu::{Compute, Device, DeviceId, Host, Slicing};
+use best_peer_gpu::{Compute, Device, DeviceId, Host};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -41,15 +41,13 @@ pub struct Menu {
     pub sizes: Vec<Size>,
 }
 
-/// Where a size went, as its receipt says it: the device, how much of it was reserved, and whether the device may
-/// hold other jobs beside it.
+/// Where a size went: the device it takes whole, and how much of it was reserved. The cloud keeps it; the receipt a
+/// client reads does not name it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Placed {
     pub device: DeviceId,
     pub compute: Compute,
     pub reserved: u64,
-    pub shared: bool,
-    pub gpu: String,
 }
 
 /// Why a size was not placed now: no device has its room free yet, or no device of the cloud meets its floors at all.
@@ -128,30 +126,18 @@ impl Menu {
         self.sizes.iter().map(|s| s.name.as_str()).collect()
     }
 
-    /// The menu as `get-menu` answers it for one cloud: each size with the devices of `whole` (every device of the
-    /// cloud's members that answer) that meet its floors, and whether each has the size's room now.
+    /// The menu as `get-menu` answers it for one cloud: each size, whether some device of `whole` (every device of
+    /// the cloud's members that answer) could ever hold it, and whether one has its room now. The devices are not
+    /// named: a client deals in sizes.
     pub fn view(&self, cloud: &str, whole: &Host, state: &State, taken: &HashSet<String>) -> Value {
         let sizes: Vec<Value> = self
             .sizes
             .iter()
             .map(|s| {
-                let sources: Vec<Value> = whole
-                    .devices
-                    .iter()
-                    .filter(|d| s.meets(whole, d))
-                    .map(|d| {
-                        let now = s.room_on(d, state, taken);
-                        json!({
-                            "peer": peer_of(&d.id.0),
-                            "device": d.id.0,
-                            "gpu": d.name,
-                            "whole_device": d.slicing == Slicing::None,
-                            "free_now": now,
-                        })
-                    })
-                    .collect();
+                let meeting: Vec<&Device> = whole.devices.iter().filter(|d| s.meets(whole, d)).collect();
                 let mut v = serde_json::to_value(s).unwrap_or(Value::Null);
-                v["sources"] = json!(sources);
+                v["offered"] = json!(!meeting.is_empty());
+                v["available_now"] = json!(meeting.iter().any(|d| s.room_on(d, state, taken)));
                 v
             })
             .collect();
@@ -170,22 +156,20 @@ impl Size {
                 .is_none_or(|floor| host_memory(whole, d).is_some_and(|m| m >= floor))
     }
 
-    /// Whether `d` has this size's room now: a device that holds a job to its slice needs the slice free; any other
-    /// is taken whole, so it must hold nothing of this cloud's and have the size's memory free.
+    /// Whether `d` has this size's room now. A size takes its device whole, a card or a MIG instance alike, so the
+    /// device must hold nothing of this cloud's and have the size's memory free.
     fn room_on(&self, d: &Device, state: &State, taken: &HashSet<String>) -> bool {
         if taken.contains(&d.id.0) {
             return false;
         }
         let reserved = state.reserved_on(&d.id);
         let room = d.memory.free_bytes.min(d.memory.total_bytes.saturating_sub(reserved));
-        match d.slicing {
-            Slicing::None => reserved == 0 && room >= self.memory_bytes,
-            Slicing::Mps | Slicing::Mig => room >= self.memory_bytes,
-        }
+        reserved == 0 && room >= self.memory_bytes
     }
 
     /// Where this size goes on `host` (the devices the credential may use), the floors read against `whole`: among
-    /// the devices that meet them and have the room now, the one with the most room. `taken` are the devices a size
+    /// the devices that meet them and have the room now, the smallest, so a larger one stays free for a larger size (a
+    /// small size takes a 10 GB MIG instance before a 40 GB one). `taken` are the devices a size
     /// already holds whole.
     pub fn place(
         &self,
@@ -198,23 +182,15 @@ impl Size {
         if meeting.is_empty() {
             return Err(NotPlaced::Never);
         }
-        let room = |d: &Device| {
-            d.memory
-                .free_bytes
-                .min(d.memory.total_bytes.saturating_sub(state.reserved_on(&d.id)))
-        };
         let best = meeting
             .into_iter()
             .filter(|d| self.room_on(d, state, taken))
-            .max_by_key(|d| room(d))
+            .min_by_key(|d| d.memory.total_bytes)
             .ok_or(NotPlaced::Busy)?;
-        let shared = best.slicing != Slicing::None;
         Ok(Placed {
             device: best.id.clone(),
             compute: self.compute.clone(),
             reserved: self.memory_bytes,
-            shared,
-            gpu: best.name.clone(),
         })
     }
 
@@ -230,23 +206,15 @@ impl Size {
         }
     }
 
-    /// The receipt of this size placed as `p`, in `currency`: what the job got, as JobPlaced and JobStarted name it.
-    pub fn receipt(&self, p: &Placed, currency: &str) -> Value {
+    /// The receipt of this size, in `currency`: what the job got, in the client's terms, as JobPlaced and JobStarted
+    /// name it. The hardware that served it is not on it (behavioralstate/spec#64, decision 4).
+    pub fn receipt(&self, currency: &str) -> Value {
         json!({
             "size": self.name,
-            "gpu": p.gpu,
-            "device": p.device.0,
-            "shared": p.shared,
-            "share": if p.shared { self.share } else { 1.0 },
             "price_per_second": self.price_per_second,
             "currency": currency,
         })
     }
-}
-
-/// The member peer a cloud device id names: `cloud/peer/device` → `peer`.
-fn peer_of(id: &str) -> &str {
-    id.split('/').nth(1).unwrap_or_default()
 }
 
 /// The machine a device id is on: `cloud/peer/device` → `cloud/peer/`.
@@ -273,10 +241,8 @@ mod tests {
 
     const GB: u64 = 1 << 30;
 
-    fn dev(id: &str, gb: u64, cuda: &str, slicing: Slicing) -> Device {
-        let mut d = Fake::cuda_card(id, &format!("Card {id}"), gb, cuda);
-        d.slicing = slicing;
-        d
+    fn dev(id: &str, gb: u64, cuda: &str) -> Device {
+        Fake::cuda_card(id, &format!("Card {id}"), gb, cuda)
     }
 
     fn host(devices: Vec<Device>) -> Host {
@@ -300,32 +266,34 @@ mod tests {
     }
 
     #[test]
-    fn a_size_is_placed_only_where_its_floors_are_met_and_takes_a_device_whole_unless_the_device_holds_slices() {
+    fn a_size_is_placed_only_where_its_floors_are_met_and_takes_its_device_whole() {
         let cpu_a = Fake::host_cpu("lab/a/cpu-0", 64);
         let h = host(vec![
-            dev("lab/a/gpu-0", 24, "12.4", Slicing::None),
-            dev("lab/b/gpu-0", 48, "12.8", Slicing::Mps),
+            dev("lab/a/gpu-0", 24, "12.4"),
+            dev("lab/b/gpu-0", 48, "12.8"),
             cpu_a,
         ]);
         let state = State::default();
         let none = HashSet::new();
         // A floor of CUDA 12.6 rules the 12.4 card out; 40 GiB rules it out too.
         let big = size("large", 40, "12.6");
-        let p = big.place(&h, &h, &state, &none).unwrap();
-        assert_eq!(p.device.0, "lab/b/gpu-0");
-        assert!(p.shared, "the device holds its jobs to their slices");
-        // A small size fits both; the card that holds no slices is taken whole.
+        assert_eq!(big.place(&h, &h, &state, &none).unwrap().device.0, "lab/b/gpu-0");
+        // A small size fits both and takes the one it goes to whole: nothing else goes there while it runs.
         let small = size("small", 8, "12");
         let on_a = small
             .place(&host(vec![h.devices[0].clone()]), &h, &state, &none)
             .unwrap();
-        assert!(!on_a.shared);
+        assert_eq!(on_a.device.0, "lab/a/gpu-0");
+        let taken: HashSet<String> = ["lab/a/gpu-0".to_string()].into();
         assert_eq!(
-            small.receipt(&on_a, "EUR")["share"],
-            1.0,
-            "a whole device is all of its compute"
+            small.place(&host(vec![h.devices[0].clone()]), &h, &state, &taken),
+            Err(NotPlaced::Busy)
         );
-        assert_eq!(small.receipt(&p_for(&small, &h, &state), "EUR")["share"], 0.5);
+        // The receipt is the size's terms alone: no card, device or share of a card.
+        assert_eq!(
+            small.receipt("EUR"),
+            json!({ "size": "small", "price_per_second": 0.001, "currency": "EUR" })
+        );
         // A host memory floor reads the machine's CPU: a has 64 GiB, b lists none.
         let mut needs_ram = size("ram", 8, "12");
         needs_ram.host_memory_bytes = Some(32 * GB);
@@ -336,17 +304,29 @@ mod tests {
             size("huge", 100, "12").place(&h, &h, &state, &none),
             Err(NotPlaced::Never)
         );
-        // A device taken whole has no room for anything else; a free one meeting the floors is busy only.
-        let taken: HashSet<String> = ["lab/a/gpu-0".to_string()].into();
-        assert_eq!(
-            small.place(&host(vec![h.devices[0].clone()]), &h, &state, &taken),
-            Err(NotPlaced::Busy)
-        );
     }
 
-    fn p_for(s: &Size, h: &Host, state: &State) -> Placed {
-        s.place(&host(vec![h.devices[1].clone()]), h, state, &HashSet::new())
-            .unwrap()
+    #[test]
+    fn the_instances_of_a_card_split_by_mig_are_devices_each_taken_whole_by_one_size() {
+        let h = host(vec![
+            Fake::mig_instance("lab/a/MIG-1", "A100", "1g.10gb", 9, "13.0"),
+            Fake::mig_instance("lab/a/MIG-2", "A100", "1g.10gb", 9, "13.0"),
+            Fake::mig_instance("lab/a/MIG-3", "A100", "3g.40gb", 39, "13.0"),
+        ]);
+        let state = State::default();
+        // A small size goes to a 10 GB instance, never the 40 GB one while a small one is free; the large only fits there.
+        let small = size("small", 8, "12");
+        let large = size("large", 30, "12");
+        assert_eq!(
+            large.place(&h, &h, &state, &HashSet::new()).unwrap().device.0,
+            "lab/a/MIG-3"
+        );
+        let taken: HashSet<String> = ["lab/a/MIG-3".to_string()].into();
+        let p = small.place(&h, &h, &state, &taken).unwrap();
+        assert!(p.device.0 == "lab/a/MIG-1" || p.device.0 == "lab/a/MIG-2", "{p:?}");
+        // With every instance taken, a size waits.
+        let all: HashSet<String> = h.devices.iter().map(|d| d.id.0.clone()).collect();
+        assert_eq!(small.place(&h, &h, &state, &all), Err(NotPlaced::Busy));
     }
 
     #[test]

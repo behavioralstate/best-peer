@@ -679,6 +679,7 @@ async fn list_events(
 ) -> Result<Json<Value>, BestError> {
     let filter = filter_from(&q)?;
     let (events, next) = door.log.list_where(&filter, |s| door.visible_to(&sender, s));
+    let events: Vec<Envelope> = events.iter().map(|e| door.served(e)).collect();
     let mut body = json!({ "events": events });
     if let Some(n) = next {
         body["nextCursor"] = json!(n);
@@ -727,7 +728,7 @@ async fn stream_events(
             .into_iter()
             .filter(move |s| f1.matches(s) && door1.visible_to(&who1, s)),
     );
-    let door2 = door.clone();
+    let (door2, door3) = (door.clone(), door.clone());
     let ends = sender
         .expires_at
         .as_deref()
@@ -780,7 +781,7 @@ async fn stream_events(
             let _held = &slot;
             Ok(SseEvent::default()
                 .id(s.envelope.id.clone())
-                .data(serde_json::to_string(&s.envelope).unwrap_or_default()))
+                .data(serde_json::to_string(&door3.served(&s.envelope)).unwrap_or_default()))
         });
     Ok(Sse::new(out).keep_alive(KeepAlive::default().text("keepalive")))
 }
@@ -1984,6 +1985,79 @@ mod tests {
         assert_eq!(w["workflows"], json!([]));
         let (s, _, _) = call(&app, get("/workflows/nope", Some(&key))).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_door_with_a_view_serves_it_on_the_page_on_a_replay_and_live_while_the_log_keeps_the_event_whole() {
+        let viewed = Arc::try_unwrap(door())
+            .ok()
+            .unwrap()
+            .with_view(Arc::new(|e: &Envelope| {
+                let mut e = e.clone();
+                if let Some(d) = e.data.as_object_mut() {
+                    d.remove("device");
+                }
+                e
+            }));
+        let d = Arc::new(viewed);
+        let app = router(d.clone());
+        let key = sign_in(&app, "test", "my-peer").await;
+        let told = |t: &str| {
+            Envelope::event(
+                "io.best.agents",
+                t,
+                json!({ "kept": t, "device": "gpu-0" }),
+                Some("c".into()),
+                None,
+            )
+        };
+        let first = d.log.append(told("A"));
+        d.log.append(told("B"));
+        // The page.
+        let (s, _, page) = call(&app, get("/events?correlationId=c", Some(&key))).await;
+        assert_eq!(s, StatusCode::OK);
+        let datas: Vec<Value> = page["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["data"].clone())
+            .collect();
+        assert_eq!(datas, vec![json!({ "kept": "A" }), json!({ "kept": "B" })]);
+        // A replay after the first, then live.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::get("/events/stream?correlationId=c")
+                    .header(AUTH_HEADER, &key)
+                    .header("last-event-id", &first.envelope.id)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut body = res.into_body().into_data_stream();
+        let mut next_event = async || loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(2), body.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let text = String::from_utf8_lossy(&frame).to_string();
+            if text.contains("data:") && !text.contains("keepalive") {
+                return text;
+            }
+        };
+        let replayed = next_event().await;
+        assert!(
+            replayed.contains("\"kept\":\"B\"") && !replayed.contains("gpu-0"),
+            "{replayed}"
+        );
+        d.log.append(told("C"));
+        let live = next_event().await;
+        assert!(live.contains("\"kept\":\"C\"") && !live.contains("gpu-0"), "{live}");
+        // The log keeps every event whole.
+        let (kept, _) = d.log.list(&Filter::default());
+        assert!(kept.iter().all(|e| e.data["device"] == "gpu-0"));
     }
 
     #[tokio::test]

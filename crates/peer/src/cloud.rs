@@ -581,17 +581,15 @@ impl Cloud {
         Some(menu.view(&self.name, &host, &s, &taken))
     }
 
-    /// The devices a size holds whole: placed whole and not ended, by the cloud's own record and by the receipts
-    /// the orders were told with, so a restart keeps them.
+    /// The devices a size holds whole: placed and not ended, by the cloud's own record and by the device each
+    /// order by size was placed on (`JobPlaced`, kept in the log), so a restart keeps them.
     fn taken_whole(&self, s: &State) -> HashSet<String> {
         let mut whole = self.whole.lock().unwrap();
         whole.retain(|order, _| s.orders.contains_key(order) || s.reserved.values().any(|r| &r.id == order));
         let mut taken: HashSet<String> = whole.values().cloned().collect();
-        for o in s.orders.values() {
-            if let Some(r) = o.receipt.as_ref().filter(|r| r["shared"] == false) {
-                if let Some(d) = r["device"].as_str() {
-                    taken.insert(d.to_string());
-                }
+        for o in s.orders.values().filter(|o| o.size.is_some()) {
+            if let Some((_, Some(d))) = &o.placed {
+                taken.insert(d.clone());
             }
         }
         taken
@@ -1801,10 +1799,8 @@ impl Cloud {
                 let pick = match (&o.size, o.memory_bytes) {
                     (Some((size, currency)), _) => match size.place(&on, &host, &s, &taken) {
                         Ok(p) => {
-                            if !p.shared {
-                                self.whole.lock().unwrap().insert(o.id.clone(), p.device.0.clone());
-                            }
-                            receipt = Some(size.receipt(&p, currency));
+                            self.whole.lock().unwrap().insert(o.id.clone(), p.device.0.clone());
+                            receipt = Some(size.receipt(currency));
                             Some(p.device)
                         }
                         Err(_) => None,
@@ -1942,6 +1938,20 @@ impl Service for Cloud {
         let s = self.state.lock().unwrap();
         let mut v = workloads_view(&s, who, Some(&self.name));
         v["held_bytes"] = json!(held);
+        // A job ordered by size is told in the size's terms: its size, never the device it runs on.
+        let sized: HashMap<&str, &str> = s
+            .orders
+            .values()
+            .filter_map(|o| Some((o.job.as_deref()?, o.size.as_ref()?.0.name.as_str())))
+            .collect();
+        for j in v["jobs"].as_array_mut().into_iter().flatten() {
+            if let Some(size) = j["job"].as_str().and_then(|id| sized.get(id)) {
+                j["size"] = json!(size);
+                if let Some(row) = j.as_object_mut() {
+                    row.remove("device");
+                }
+            }
+        }
         // The orders not started yet, oldest first: each waits, or was sent to the peer named.
         let mut orders: Vec<&Order> = s
             .orders
@@ -1953,8 +1963,9 @@ impl Service for Cloud {
             .iter()
             .map(|o| json!({
                 "job": o.id, "cloud": self.name, "image": o.image, "memory_bytes": o.memory_bytes, "device": o.device,
-                "holder": o.holder, "attempt": o.attempt, "queued_at": o.queued_at,
-                "queue_seconds": o.queue_seconds, "waiting": o.waiting(), "peer": o.placed.as_ref().map(|(p, _)| p)
+                "size": o.size.as_ref().map(|(z, _)| &z.name), "holder": o.holder, "attempt": o.attempt,
+                "queued_at": o.queued_at, "queue_seconds": o.queue_seconds, "waiting": o.waiting(),
+                "peer": o.placed.as_ref().map(|(p, _)| p)
             }))
             .collect::<Vec<_>>());
         Ok(v)
@@ -2250,7 +2261,7 @@ impl Service for Cloud {
                         BestError::bad_request(
                             "NO_SOURCE_FOR_SIZE",
                             format!(
-                                "no device of cloud {}'s members that answer meets size {}'s floors ({} bytes of device memory, {}{}): the sizes they meet are {}; get-menu says which device meets which",
+                                "no device of cloud {}'s members that answer meets size {}'s floors ({} bytes of device memory, {}{}): the sizes they meet are {}; get-menu says which sizes are offered",
                                 self.name,
                                 size.name,
                                 size.memory_bytes,
@@ -2269,7 +2280,7 @@ impl Service for Cloud {
             if accelerators_only(&who) {
                 self.held_to_accelerators.lock().unwrap().insert(key.clone());
             }
-            if let Some(p) = placement.as_ref().filter(|p| !p.shared) {
+            if let Some(p) = placement.as_ref() {
                 self.whole.lock().unwrap().insert(order_id(&key), p.device.0.clone());
             }
             self.admitted_sizes.lock().unwrap().insert(
@@ -2277,7 +2288,7 @@ impl Service for Cloud {
                 (
                     size.clone(),
                     menu.currency.clone(),
-                    placement.as_ref().map(|p| size.receipt(p, &menu.currency)),
+                    placement.as_ref().map(|_| size.receipt(&menu.currency)),
                     data.deadline_seconds,
                 ),
             );

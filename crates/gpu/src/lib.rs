@@ -58,16 +58,15 @@ pub struct Memory {
     pub free_bytes: u64,
 }
 
-/// How a device holds a workload to the share of its memory it was given. `None`: it does not, so a workload sold a
-/// share of it is given the whole device, since a share nothing enforces is a promise nothing keeps. `Mps`: NVIDIA's
-/// multi-process service limits each process's device memory. `Mig`: the device is split into instances in hardware.
-/// No adapter reports anything but `None` yet: which of these a consumer card can hold to is behavioralstate/spec#65.
+/// What a device is of its card. `None`: a whole card. `Mig`: one instance of a card that MIG splits in hardware,
+/// with its own memory, compute and cache, reported as a device of its own in place of the card. Either way a device
+/// holds one sized workload at a time: a card is never split in software, since on a consumer card nothing held a
+/// job to its share and a fault in one job ended its neighbours' (behavioralstate/spec#64, decisions 12 and 13).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Slicing {
     #[default]
     None,
-    Mps,
     Mig,
 }
 
@@ -85,7 +84,7 @@ pub struct Device {
     pub power_w: Option<f32>,
     /// Compute utilisation in percent, where the adapter can read it.
     pub utilisation_pct: Option<u8>,
-    /// How it holds a workload to its share of the memory; a peer that does not say holds none.
+    /// Whether it is a whole card or one MIG instance of a card; a peer that does not say reports whole cards.
     #[serde(default)]
     pub slicing: Slicing,
 }
@@ -234,6 +233,26 @@ impl Fake {
             power_w: Some(30.0),
             utilisation_pct: Some(0),
             slicing: Slicing::None,
+        }
+    }
+
+    /// One MIG instance of a split card: `id` its `MIG-…` UUID, `profile` its MIG profile (`1g.10gb`), `gb` its own
+    /// memory, all of it free, as the NVML adapter reports an instance.
+    pub fn mig_instance(id: &str, card: &str, profile: &str, gb: u64, cuda: &str) -> Device {
+        let total = gb * 1024 * 1024 * 1024;
+        Device {
+            id: id.into(),
+            vendor: Vendor::Nvidia,
+            name: format!("{card} MIG {profile}"),
+            memory: Memory {
+                total_bytes: total,
+                free_bytes: total,
+            },
+            compute: vec![Compute::Cuda(cuda.to_string()), Compute::Vulkan],
+            temperature_c: None,
+            power_w: None,
+            utilisation_pct: None,
+            slicing: Slicing::Mig,
         }
     }
 

@@ -361,8 +361,8 @@ folded from these facts; [docs/queue.md](docs/queue.md) says what it does not do
 RunPod Serverless do.
 
 A cloud can sell by **sizes** instead of hardware. Its owner sets a menu with `set-menu`: each size a name, its floors
-(the device memory it reserves, the compute API at the least version, the host memory of the device's machine), the
-share of a device's compute it guarantees, and a price per second, in one currency for the menu:
+(the device memory it needs, the compute API at the least version, the host memory of the device's machine), the
+share of a card's compute it stands for, and a price per second, in one currency for the menu:
 
 ```json
 { "cloud": "lab", "currency": "EUR", "sizes": [
@@ -371,18 +371,34 @@ share of a device's compute it guarantees, and a price per second, in one curren
 ] }
 ```
 
-`get-menu` answers each size with the devices that meet its floors now, each with its GPU and whether it has the
-room free. `run-job` names a `size` instead of `memory_bytes` and `device`, and is placed on a device that meets the
-size, queued as any order is when none has the room yet. A size no device of the cloud meets is refused with the
-sizes that are met, and a size the menu lacks with the sizes it has. `JobPlaced` and `JobStarted` carry the
-**receipt**: the size, the GPU, the device, whether the job shares the device, the share of its compute guaranteed,
-and the price. A size's memory is a slice of a device only where the device holds a job to its slice, as
-`get-hardware-state`'s `slicing` says (`mps`, `mig`). Elsewhere (`none`) the size takes the whole device and all of
-its compute, and nothing else is placed there until it ends, so nothing is promised that the device does not keep.
-No adapter reports anything but `none` yet: which slices a consumer card can hold to is
-[spec#65](https://github.com/behavioralstate/spec/issues/65), and [docs/sharing.md](docs/sharing.md) says what a test
-card showed. Pinning stays the owner's: `memory_bytes` and `device`
-work as before.
+`get-menu` answers each size with whether the cloud's members offer it at all (`offered`) and whether one could
+start it now (`available_now`). `run-job` names a `size` instead of `memory_bytes` and `device`, and is placed on a
+device that meets the size, the smallest that does, so a larger one stays free for a larger size. It is queued as any
+order is when none has the room yet. A size no device of the cloud meets is refused with the sizes that are met, and a
+size the menu lacks with the sizes it has. `JobPlaced` and `JobStarted` carry the **receipt**: the size, its price per
+second and the currency.
+
+A client deals in sizes and never sees the hardware. Nothing the workspace door serves about an order by size names a
+card, a device or a MIG profile: not the receipt, not `get-menu`, `get-workloads` or `get-usage`, and not the order's
+events, on the page or on the stream. The door's log keeps the device each order went to, for the cloud's own count
+of what is held, and leaves it off what it serves. Pinning stays the owner's: `memory_bytes` and `device` work as
+before. `get-hardware-state` and `get-clouds` are the operator's views of the machines and still name them.
+
+A size takes a device whole: nothing else runs there until it ends. A device is a whole card, or one instance of a
+card split by **MIG** (an A100, H100 and newer). On such a card, the peer reports each instance as a device of its
+own, with `slicing: mig` and its own memory, in place of the card. So a split card serves several sizes at once, for
+one client or for several, each on an instance that holds its memory, compute and faults to itself. A consumer card
+such as a 5090 has no MIG and is sold whole: on one, a job's share of the card was held by nothing, and a fault in one
+job ended its neighbours' work ([docs/sharing.md](docs/sharing.md)). The machine's operator splits a card before the
+peer starts, as root, once per boot:
+
+```bash
+nvidia-smi -i 0 -mig 1
+nvidia-smi mig -cgi 1g.10gb,1g.10gb,2g.20gb,3g.40gb -C
+```
+
+The first turns MIG on, and the second makes the instances; `nvidia-smi mig -lgip` lists the profiles a card offers.
+The peer reads whatever instances there are. A card with MIG on and no instances offers nothing.
 
 What the orders by size used, and what they cost, is `get-usage`, read from the workspace's own events. Each job is
 billed from its `JobStarted` to its end, at the price its receipt carries. A menu price changed while a job runs cuts
@@ -390,10 +406,10 @@ it into intervals, each billed at the price it had, and a later change never rew
 member that was lost is billed to the last moment that member was heard, an event or a keep-alive on its stream
 (`PeerLost`'s `last_heard`), or, where the loss does not say it, to the last fact the member told, never to the moment
 of the loss, and says `end_inferred`. The factor, the share of compute a job had against what its size gives it
-uncontended, is 1 while a job holds its device whole, which is every device until an adapter reports slicing. `from`
-and `to` bound the window (a `from` after `to` is refused), `cloud` and `job` narrow it, and the totals are per
-currency. A member reads its own jobs; the workspace's owner reads every one. An order by `memory_bytes` is not
-priced.
+uncontended, is 1, since a job has its device to itself, a whole card or a MIG instance. Jobs are named by size, never
+by the hardware they ran on. `from` and `to` bound the window (a `from` after `to` is refused), `cloud` and `job`
+narrow it, and the totals are per currency. A member reads its own jobs; the workspace's owner reads every one. An
+order by `memory_bytes` is not priced.
 
 The workspace's owner may cap what its orders by size cost together, with `set-spending-cap` (`{ "amount": 50,
 "currency": "EUR" }`, or `{ "amount": null }` to clear it). Under a cap an order by size sends `deadline_seconds`, so

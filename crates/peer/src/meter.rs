@@ -40,8 +40,6 @@ pub struct Metered {
     pub peer: Option<String>,
     pub size: String,
     pub currency: String,
-    device: Option<String>,
-    gpu: Option<String>,
     started: OffsetDateTime,
     ended: Option<OffsetDateTime>,
     /// Ended by its member's loss: the end is the last moment the member was heard.
@@ -122,8 +120,8 @@ impl Metered {
             })
             .collect();
         Some(json!({
-            "job": self.job, "order": self.order, "cloud": self.cloud, "peer": self.peer, "device": self.device,
-            "gpu": self.gpu, "size": self.size, "currency": self.currency,
+            "job": self.job, "order": self.order, "cloud": self.cloud, "peer": self.peer,
+            "size": self.size, "currency": self.currency,
             "started": text(self.started), "ended": self.ended.map(text), "running": self.running(),
             "end_inferred": self.end_inferred,
             "seconds": round(seconds, 3), "factor": round(factor, 6), "cost": round(cost, 6),
@@ -242,8 +240,6 @@ impl Fold {
             peer: owned(&d["peer"]),
             size: size.into(),
             currency: currency.into(),
-            device: owned(&r["device"]),
-            gpu: owned(&r["gpu"]),
             started: at,
             ended: None,
             end_inferred: false,

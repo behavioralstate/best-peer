@@ -6,6 +6,11 @@ runtime (Docker and the NVIDIA container toolkit). The menu's sizes
 ([spec#63](https://github.com/behavioralstate/spec/issues/63)) and the fair bill's factor
 ([spec#61](https://github.com/behavioralstate/spec/issues/61)) are to follow what this page says the card can hold.
 
+**What was decided from it** (decisions 12 and 13 of [spec#64](https://github.com/behavioralstate/spec/issues/64)):
+consumer cards are sold whole, and a card is shared only through MIG, whose instances best-peer reports as devices of
+their own ([spec#75](https://github.com/behavioralstate/spec/issues/75)). MPS is not used, so the two ways of selling
+compute under "What it means for the menu" below were not taken.
+
 **Where it ran:** an NVIDIA GeForce GTX 1660 SUPER (Turing, compute capability 7.5, 6 GB, no MIG), driver 575.51.03,
 Docker 28.1.1 with overlay2 on an ext file system (Docker reports `extfs`), in a VM rented on Vast.ai on 2026-10-20.
 The owner's call was that a cheaper consumer card answers the questions the 5090 was named for. The 5090 (Blackwell,

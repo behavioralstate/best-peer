@@ -39,6 +39,11 @@ pub use streams::Streams;
 /// commands). The host sets one where a log carries facts addressed to identities (SPEC.md, Security
 /// Requirements: tenant context derives from the credential, streams are isolated per tenant).
 pub type Partition = Arc<dyn Fn(&auth::Credential, &Stored) -> Option<bool> + Send + Sync>;
+
+/// What a reader is served of an event the log keeps: the same event with what readers are not to see left out. The
+/// log keeps the event whole, for the service's own fold; every read path (the page, the stream, a replay) serves
+/// the view, so they agree.
+pub type View = Arc<dyn Fn(&Envelope) -> Envelope + Send + Sync>;
 pub use router::{payload_hash, resume, router, tenant_router};
 
 use std::collections::HashMap;
@@ -73,6 +78,8 @@ pub struct Door {
     pub partition: Option<Partition>,
     /// What a credential with a share may do at once, counted with every door that shares it.
     pub limits: Arc<Limits>,
+    /// What a reader is served of each event, when it is less than the log keeps.
+    pub view: Option<View>,
 }
 
 impl Door {
@@ -100,6 +107,21 @@ impl Door {
             tenants: None,
             partition: None,
             limits: Arc::new(Limits::default()),
+            view: None,
+        }
+    }
+
+    /// The same door, serving every event through `view`.
+    pub fn with_view(mut self, view: View) -> Self {
+        self.view = Some(view);
+        self
+    }
+
+    /// The event `e` as a reader is served it.
+    pub fn served(&self, e: &Envelope) -> Envelope {
+        match &self.view {
+            Some(v) => v(e),
+            None => e.clone(),
         }
     }
 

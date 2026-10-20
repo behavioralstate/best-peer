@@ -1583,6 +1583,21 @@ mod tests {
         .await
     }
 
+    /// A member whose one card MIG splits into `instances`, each `(id, profile, GiB)`: the instances are its devices.
+    async fn member_split(card: &str, instances: &[(&str, &str, u64)]) -> Bed {
+        let mut gpu = best_peer_gpu::Fake::new().with_driver("fake 1.0");
+        for (id, profile, gb) in instances {
+            gpu = gpu.with_device(best_peer_gpu::Fake::mig_instance(id, card, profile, *gb, "13.0"));
+        }
+        let ids = instances.iter().map(|(id, _, _)| (*id).into()).collect();
+        bed(
+            Arc::new(gpu),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(ids, vec![])),
+        )
+        .await
+    }
+
     /// The menu of a test: small (8 GiB, CUDA 12, half a device), large (40 GiB, CUDA 12.6, a whole one), and huge,
     /// which no card here holds.
     fn menu_of_three() -> Value {
@@ -1597,15 +1612,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cloud_sells_by_its_menu_and_an_order_by_size_goes_where_its_floors_are_met_with_the_receipt() {
+    async fn a_cloud_sells_by_its_menu_and_an_order_by_size_goes_where_its_floors_are_met_told_in_size_terms() {
         let a = member_with("Card A", 24, "12.4", best_peer_gpu::Slicing::None).await;
-        let b = member_with("Card B", 48, "12.8", best_peer_gpu::Slicing::Mps).await;
+        let b = member_with("Card B", 48, "12.8", best_peer_gpu::Slicing::None).await;
         let (key_a, key_b) = (a.key.clone(), b.key.clone());
         let site = site(vec![(A, a), (B, b)]).await;
         let ws = site.workspace("c1", "Research").await;
         site.cloud(&ws, "k1", "lab", &[("a", A, &key_a), ("b", B, &key_b)])
             .await;
-        // Each device says how it holds a job to its slice.
+        // Each device says what it is of its card: both are whole cards.
         let hs = site.query(&ws, "get-hardware-state").await;
         let slicing = |id: &str| {
             hs["devices"]
@@ -1617,7 +1632,7 @@ mod tests {
                 .clone()
         };
         assert_eq!(slicing("lab/a/gpu-0"), "none");
-        assert_eq!(slicing("lab/b/gpu-0"), "mps");
+        assert_eq!(slicing("lab/b/gpu-0"), "none");
 
         // Without a menu, an order by size is refused with what to do.
         let (s, e) = site
@@ -1639,29 +1654,36 @@ mod tests {
         assert_eq!(s, StatusCode::CREATED, "{b}");
         site.events(&ws, "m1", "MenuSetV1").await;
 
-        // The menu says which device meets which size: small both, large only b's newer CUDA and larger card, huge none.
+        // The menu says which sizes are offered and which could start now, and names no hardware.
         let menus = site.query(&ws, "get-menu").await;
         let lab = &menus["menus"][0];
         assert_eq!(lab["cloud"], "lab");
         assert_eq!(lab["currency"], "EUR");
-        let sources = |name: &str| -> Vec<String> {
+        let size = |name: &str| -> Value {
             lab["sizes"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .find(|z| z["name"] == name)
-                .unwrap()["sources"]
-                .as_array()
                 .unwrap()
-                .iter()
-                .map(|d| d["device"].as_str().unwrap().to_string())
-                .collect()
+                .clone()
         };
-        assert_eq!(sources("small"), ["lab/a/gpu-0", "lab/b/gpu-0"]);
-        assert_eq!(sources("large"), ["lab/b/gpu-0"]);
-        assert!(sources("huge").is_empty());
+        assert_eq!(
+            (size("small")["offered"].clone(), size("small")["available_now"].clone()),
+            (json!(true), json!(true))
+        );
+        assert_eq!(size("large")["offered"], true);
+        assert_eq!(
+            (size("huge")["offered"].clone(), size("huge")["available_now"].clone()),
+            (json!(false), json!(false))
+        );
+        let text = menus.to_string();
+        assert!(
+            !text.contains("Card") && !text.contains("gpu-0"),
+            "get-menu names no hardware: {menus}"
+        );
 
-        // An order of large is placed where its floors are met, and its receipt says what it got.
+        // An order of large is placed where its floors are met, and its receipt says what it got in the size's terms.
         let (s, b) = site
             .send(
                 &ws,
@@ -1677,12 +1699,27 @@ mod tests {
         assert_eq!(events[0]["data"]["size"]["name"], "large");
         assert_eq!(events[0]["data"]["size"]["currency"], "EUR");
         let receipt = &events[1]["data"]["receipt"];
-        assert_eq!(receipt["size"], "large");
-        assert_eq!(receipt["gpu"], "Card B");
-        assert_eq!(receipt["device"], "lab/b/gpu-0");
-        assert_eq!(receipt["shared"], true, "card b holds its jobs to their slices");
-        assert_eq!(receipt["share"], 1.0);
-        assert_eq!(receipt["price_per_second"], 0.002);
+        assert_eq!(
+            *receipt,
+            json!({ "size": "large", "price_per_second": 0.002, "currency": "EUR" })
+        );
+        for e in &events {
+            assert!(
+                e["data"].get("device").is_none() && e["data"].get("gpu").is_none(),
+                "{e}"
+            );
+        }
+        assert!(
+            !serde_json::to_string(&events).unwrap().contains("Card B"),
+            "no card is named: {events:#?}"
+        );
+        // The log keeps the device, for the cloud's own count of what is held.
+        let (kept, _) = site.workspaces.get(&ws).unwrap().log.list(&best_peer_door::Filter {
+            correlation_id: Some("j1".into()),
+            ..Default::default()
+        });
+        let placed = kept.iter().find(|e| e.r#type == "JobPlaced").unwrap();
+        assert_eq!(placed.data["device"], "lab/b/gpu-0");
         assert_eq!(
             events.last().unwrap()["data"]["receipt"],
             *receipt,
@@ -1861,30 +1898,54 @@ mod tests {
         site.down[A].store(false, std::sync::atomic::Ordering::SeqCst);
         lab.reconcile().await;
         lab.step(later(0)).await;
-        let events = site.events_n(&ws, "w1", "JobStarted", 2).await;
-        let second = events.iter().filter(|e| e["type"] == "JobStarted").nth(1).unwrap();
-        assert_eq!(second["data"]["receipt"]["device"], "lab/a/gpu-0");
-        assert_eq!(second["data"]["receipt"]["shared"], false);
+        site.events_n(&ws, "w1", "JobStarted", 2).await;
+        let (kept, _) = site.workspaces.get(&ws).unwrap().log.list(&best_peer_door::Filter {
+            correlation_id: Some("w1".into()),
+            ..Default::default()
+        });
+        let placed: Vec<&Envelope> = kept.iter().filter(|e| e.r#type == "JobPlaced").collect();
+        assert_eq!(placed.len(), 2);
+        assert_eq!(placed[1].data["device"], "lab/a/gpu-0");
     }
 
     #[tokio::test]
-    async fn orders_of_a_size_share_a_device_that_holds_slices_and_wait_for_one_taken_whole() {
+    async fn sizes_run_at_once_on_the_mig_instances_of_one_card_each_taken_whole_and_a_whole_card_holds_one() {
         let a = member_with("Card A", 24, "12.4", best_peer_gpu::Slicing::None).await;
-        let b = member_with("Card B", 48, "12.8", best_peer_gpu::Slicing::Mps).await;
+        let b = member_split(
+            "A100",
+            &[
+                ("MIG-1", "1g.10gb", 9),
+                ("MIG-2", "1g.10gb", 9),
+                ("MIG-3", "3g.40gb", 39),
+            ],
+        )
+        .await;
         let (key_a, key_b) = (a.key.clone(), b.key.clone());
         let site = site(vec![(A, a), (B, b)]).await;
         let ws = site.workspace("c1", "Research").await;
-        // One cloud per machine: a whole-device card, and a card that holds slices.
+        // One cloud per machine: a whole consumer card, and a card MIG splits into three instances.
         site.cloud(&ws, "k1", "whole", &[("a", A, &key_a)]).await;
-        site.cloud(&ws, "k2", "sliced", &[("b", B, &key_b)]).await;
-        for (id, cloud) in [("m1", "whole"), ("m2", "sliced")] {
-            let mut data = menu_of_three();
-            data["cloud"] = json!(cloud);
+        site.cloud(&ws, "k2", "split", &[("b", B, &key_b)]).await;
+        let hs = site.query(&ws, "get-hardware-state").await;
+        let split: Vec<Value> = hs["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|d| d["id"].as_str().unwrap().starts_with("split/"))
+            .cloned()
+            .collect();
+        assert_eq!(split.len(), 3, "the instances are the devices, not the card: {hs}");
+        assert!(split.iter().all(|d| d["slicing"] == "mig"));
+        for (id, cloud) in [("m1", "whole"), ("m2", "split")] {
+            let data = json!({ "cloud": cloud, "currency": "EUR", "sizes": [
+                { "name": "small", "memory_bytes": 8 * GB, "compute": { "api": "cuda", "version": "12" }, "share": 0.15, "price_per_second": 0.0005 },
+                { "name": "large", "memory_bytes": 30 * GB, "compute": { "api": "cuda", "version": "12" }, "share": 0.4, "price_per_second": 0.002 }
+            ] });
             let (s, b) = site.send(&ws, id, "SetMenu", "set-menu", data).await;
             assert_eq!(s, StatusCode::CREATED, "{b}");
             site.events(&ws, id, "MenuSetV1").await;
         }
-        let order = |id: &'static str, cloud: &'static str| {
+        let order = |id: &'static str, cloud: &'static str, size: &'static str| {
             let site = &site;
             let ws = ws.clone();
             async move {
@@ -1894,7 +1955,7 @@ mod tests {
                         id,
                         "RunJob",
                         "run-job",
-                        json!({ "cloud": cloud, "image": "busybox", "size": "small" }),
+                        json!({ "cloud": cloud, "image": "busybox", "size": size }),
                     )
                     .await;
                 assert_eq!(s, StatusCode::CREATED, "{b}");
@@ -1902,35 +1963,53 @@ mod tests {
             }
         };
 
-        // Two smalls on the card that holds slices both start at once, each with its share, each told it shares.
-        order("s1", "sliced").await;
-        order("s2", "sliced").await;
-        for id in ["s1", "s2"] {
+        // Two smalls and a large run at once on the one split card, each on an instance of its own, the smalls on
+        // the small instances; each is told in its size's terms.
+        order("s1", "split", "small").await;
+        order("s2", "split", "small").await;
+        order("l1", "split", "large").await;
+        for (id, size) in [("s1", "small"), ("s2", "small"), ("l1", "large")] {
             let started = site.events(&ws, id, "JobStarted").await;
-            let receipt = &started.last().unwrap()["data"]["receipt"];
-            assert_eq!(receipt["shared"], true, "{started:#?}");
-            assert_eq!(receipt["share"], 0.5);
+            let data = &started.last().unwrap()["data"];
+            assert_eq!(data["receipt"]["size"], size, "{started:#?}");
+            assert!(data.get("device").is_none(), "{data}");
         }
-
-        // On the card that holds none, a small takes the card whole, and the next small waits, though the memory
-        // would fit, until the first ends.
-        order("w1", "whole").await;
-        let first = site.events(&ws, "w1", "JobStarted").await;
-        let receipt = &first.last().unwrap()["data"]["receipt"];
-        assert_eq!(receipt["shared"], false);
-        assert_eq!(receipt["share"], 1.0, "a whole device is all of its compute");
-        let second = order("w2", "whole").await;
-        assert_eq!(second["waiting"], true, "{second}");
+        let (kept, _) = site.workspaces.get(&ws).unwrap().log.list(&best_peer_door::Filter {
+            r#type: Some("JobPlaced".into()),
+            ..Default::default()
+        });
+        let mut on: Vec<String> = kept
+            .iter()
+            .map(|e| e.data["device"].as_str().unwrap().to_string())
+            .collect();
+        on.sort();
+        assert_eq!(on, ["split/b/MIG-1", "split/b/MIG-2", "split/b/MIG-3"]);
+        // A third small waits: every instance is taken.
+        assert_eq!(order("s3", "split", "small").await["waiting"], true);
+        let w = site.query(&ws, "get-workloads").await;
+        let jobs = w["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 3, "{w}");
+        assert!(
+            jobs.iter().all(|j| j.get("device").is_none() && j["size"].is_string()),
+            "{w}"
+        );
         let menus = site.query(&ws, "get-menu").await;
-        let whole = menus["menus"]
+        let split_menu = menus["menus"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|m| m["cloud"] == "whole")
+            .find(|m| m["cloud"] == "split")
             .unwrap()
             .clone();
-        assert_eq!(whole["sizes"][0]["sources"][0]["whole_device"], true);
-        assert_eq!(whole["sizes"][0]["sources"][0]["free_now"], false);
+        assert_eq!(split_menu["sizes"][0]["available_now"], false, "{split_menu}");
+
+        // On the whole card, a small takes the card whole, and the next small waits, though the memory would fit,
+        // until the first ends.
+        order("w1", "whole", "small").await;
+        let first = site.events(&ws, "w1", "JobStarted").await;
+        assert_eq!(first.last().unwrap()["data"]["receipt"]["size"], "small");
+        let second = order("w2", "whole", "small").await;
+        assert_eq!(second["waiting"], true, "{second}");
         // Nor does anything else go on a card a size holds whole.
         let (s, e) = site
             .send(
@@ -1961,7 +2040,7 @@ mod tests {
             .await;
         assert_eq!(s, StatusCode::CREATED, "{b}");
         let placed = site.events(&ws, "w2", "JobStarted").await;
-        assert_eq!(placed.last().unwrap()["data"]["receipt"]["shared"], false);
+        assert_eq!(placed.last().unwrap()["data"]["receipt"]["size"], "small");
     }
 
     #[tokio::test]
@@ -2086,9 +2165,9 @@ mod tests {
             (j["size"].clone(), j["currency"].clone(), j["running"].clone()),
             (json!("small"), json!("EUR"), json!(false))
         );
-        assert_eq!(
-            (j["gpu"].clone(), j["device"].clone()),
-            (json!("Card A"), json!("lab/a/gpu-0"))
+        assert!(
+            j.get("gpu").is_none() && j.get("device").is_none(),
+            "a job is told in its size's terms: {j}"
         );
         assert_eq!(j["factor"], 1.0, "a device held whole is not contended");
         let seconds = j["seconds"].as_f64().unwrap();
