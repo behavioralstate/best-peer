@@ -1754,6 +1754,115 @@ mod tests {
             .await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert_eq!(e["error"]["code"], "NO_SUCH_CLOUD");
+
+        // Only the owner sets a menu: a member of the workspace is refused.
+        let bob = key_with(&site.app, Some("jobs"), None).await;
+        let (_, w) = get_as(&site.app, "", &bob, "/queries/get-workspaces").await;
+        let bob_id = w["identity"].as_str().unwrap().to_string();
+        let (s, b) = send_as(
+            &site.app,
+            "",
+            &site.key,
+            "i1",
+            "InviteMember",
+            "invite-member",
+            json!({ "workspace": ws, "identity": bob_id }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        events_as(&site.app, "", &site.key, "i1", "MemberInvitedV1").await;
+        let (s, b) = send_as(
+            &site.app,
+            "",
+            &bob,
+            "a1",
+            "AcceptInvitation",
+            "accept-invitation",
+            json!({ "workspace": ws }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        events_as(&site.app, "", &bob, "a1", "MemberJoinedV1").await;
+        let mut data = menu_of_three();
+        data["cloud"] = json!("lab");
+        let (s, e) = send_as(
+            &site.app,
+            &format!("/workspaces/{ws}"),
+            &bob,
+            "m4",
+            "SetMenu",
+            "set-menu",
+            data,
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "FORBIDDEN");
+
+        // No sizes clears the menu: get-menu lists none, and an order of a size is refused as on a cloud without one.
+        let (s, b) = site
+            .send(
+                &ws,
+                "m5",
+                "SetMenu",
+                "set-menu",
+                json!({ "cloud": "lab", "currency": "EUR", "sizes": [] }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "m5", "MenuSetV1").await;
+        let menus = site.query(&ws, "get-menu").await;
+        assert_eq!(menus["menus"][0]["sizes"], json!([]), "{menus}");
+        assert_eq!(menus["menus"][0]["currency"], Value::Null);
+        let (s, e) = site
+            .send(
+                &ws,
+                "j5",
+                "RunJob",
+                "run-job",
+                json!({ "cloud": "lab", "image": "busybox", "size": "small" }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(e["error"]["code"], "NO_SUCH_SIZE");
+    }
+
+    #[tokio::test]
+    async fn a_size_queued_again_after_its_member_was_lost_is_placed_again_on_the_device_it_held_whole() {
+        let a = member_with("Card A", 24, "12.4", best_peer_gpu::Slicing::None).await;
+        let key_a = a.key.clone();
+        let site = site(vec![(A, a)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a)]).await;
+        let lab = site.live_cloud(&ws, "lab");
+        let mut data = menu_of_three();
+        data["cloud"] = json!("lab");
+        let (s, b) = site.send(&ws, "m1", "SetMenu", "set-menu", data).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "m1", "MenuSetV1").await;
+        let (s, b) = site
+            .send(
+                &ws,
+                "w1",
+                "RunJob",
+                "run-job",
+                json!({ "cloud": "lab", "image": "busybox", "size": "small" }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "w1", "JobStarted").await;
+
+        // a is lost under it: the order waits again, attempt 2, and holds the card no more.
+        site.down[A].store(true, std::sync::atomic::Ordering::SeqCst);
+        lab.reconcile().await;
+        site.events_n(&ws, "w1", "JobQueued", 2).await;
+        // a answers again: the order is placed on the card it held, whole again.
+        site.down[A].store(false, std::sync::atomic::Ordering::SeqCst);
+        lab.reconcile().await;
+        lab.step(later(0)).await;
+        let events = site.events_n(&ws, "w1", "JobStarted", 2).await;
+        let second = events.iter().filter(|e| e["type"] == "JobStarted").nth(1).unwrap();
+        assert_eq!(second["data"]["receipt"]["device"], "lab/a/gpu-0");
+        assert_eq!(second["data"]["receipt"]["shared"], false);
     }
 
     #[tokio::test]

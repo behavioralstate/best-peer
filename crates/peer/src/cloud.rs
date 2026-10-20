@@ -98,6 +98,9 @@ async fn read_until_stopped(
 /// What each device of the cloud offers between a workload and its host, by `cloud/peer/device`.
 type Isolations = HashMap<String, Isolation>;
 
+/// The size admission read for an order, the menu's currency, and the receipt of the placement it made, if any.
+type AdmittedSize = (crate::menu::Size, String, Option<Value>);
+
 /// A member's credential and the cloud's place on its stream, kept across restarts in the cloud's `members.json`.
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Saved {
@@ -206,8 +209,9 @@ pub struct Cloud {
     /// The devices sizes hold whole, by the order placed there, from the moment it was placed: its receipt says so
     /// once JobPlaced is told, and this covers the time before.
     whole: Mutex<HashMap<String, String>>,
-    /// The receipt of an order placed at admission, until its handler sends it.
-    receipts: Mutex<HashMap<String, Value>>,
+    /// The size admission read for an order, with the menu's currency and the receipt of the placement it made,
+    /// until the order's handler tells it: what the order is, whatever the menu became meanwhile.
+    admitted_sizes: Mutex<HashMap<String, AdmittedSize>>,
 }
 
 /// How long an order may wait for room when it names no `queue_seconds`: a day, as RunPod's default time-to-live.
@@ -349,7 +353,7 @@ impl Cloud {
             stopped_unstarted: Mutex::new(HashSet::new()),
             menu: Mutex::new(None),
             whole: Mutex::new(HashMap::new()),
-            receipts: Mutex::new(HashMap::new()),
+            admitted_sizes: Mutex::new(HashMap::new()),
             name: name.into(),
             workspace: workspace.into(),
             log,
@@ -477,6 +481,10 @@ impl Cloud {
             holder: o.holder.clone(),
             boxed: false,
         });
+        // Waiting again, it holds no device: one it held whole is free for it and for every other order.
+        if device.is_none() {
+            self.whole.lock().unwrap().remove(&o.id);
+        }
         r.device = device;
     }
 
@@ -2195,15 +2203,17 @@ impl Service for Cloud {
             if accelerators_only(&who) {
                 self.held_to_accelerators.lock().unwrap().insert(key.clone());
             }
-            if let Some(p) = &placement {
-                if !p.shared {
-                    self.whole.lock().unwrap().insert(order_id(&key), p.device.0.clone());
-                }
-                self.receipts
-                    .lock()
-                    .unwrap()
-                    .insert(key.clone(), size.receipt(p, &menu.currency));
+            if let Some(p) = placement.as_ref().filter(|p| !p.shared) {
+                self.whole.lock().unwrap().insert(order_id(&key), p.device.0.clone());
             }
+            self.admitted_sizes.lock().unwrap().insert(
+                key.clone(),
+                (
+                    size.clone(),
+                    menu.currency.clone(),
+                    placement.as_ref().map(|p| size.receipt(p, &menu.currency)),
+                ),
+            );
             state.reserved.insert(
                 key.clone(),
                 Reservation {
@@ -2316,20 +2326,26 @@ impl Service for Cloud {
             return;
         };
         let waiting = r.device.is_none();
-        let size = match data.size.as_deref() {
-            Some(name) => match self.size_named(name, &data) {
-                Ok((z, menu)) => Some((z, menu.currency)),
-                Err(e) => {
-                    self.state.lock().unwrap().reserved.remove(&key);
-                    self.tell(
-                        &em,
-                        "CommandFailed",
-                        json!({ "type": cmd.r#type, "reason": format!("the size left the menu between the order's admission and now: {}", e.message) }),
-                    );
-                    return;
+        let admitted = self.admitted_sizes.lock().unwrap().remove(&key);
+        let (size, receipt) = match (data.size.as_deref(), admitted) {
+            (Some(_), Some((z, currency, receipt))) => (Some((z, currency)), receipt),
+            (Some(name), None) => {
+                // Admitted before a restart that forgot what admission read: the order is the size as the menu
+                // has it now, or nothing when it is gone.
+                match self.size_named(name, &data) {
+                    Ok((z, menu)) => (Some((z, menu.currency)), None),
+                    Err(e) => {
+                        self.state.lock().unwrap().reserved.remove(&key);
+                        self.tell(
+                            &em,
+                            "CommandFailed",
+                            json!({ "type": cmd.r#type, "reason": format!("the size left the menu between the order's admission and now: {}", e.message) }),
+                        );
+                        return;
+                    }
                 }
-            },
-            None => None,
+            }
+            (None, _) => (None, None),
         };
         let order = Order {
             id: id.clone(),
@@ -2364,7 +2380,6 @@ impl Service for Cloud {
             ),
         });
         self.tell(&em, "JobQueued", queued_fact(&order, 1, waiting, reason, None));
-        let receipt = self.receipts.lock().unwrap().remove(&key);
         match r.device {
             Some(device) => self.dispatch(&order, device, receipt).await,
             None => self.kick(),

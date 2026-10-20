@@ -355,7 +355,7 @@ telling `attempt: 2`, and fails it the second time. `get-workloads` lists the or
 oldest first. An order that waits counts against its credential's share and its count of jobs, as an admitted one
 always has. Every member lists its host's CPU after its cards, with the host's memory, so an order the cards cannot
 hold runs on the CPU rather than waiting, unless it names a device or its key is approved `--accelerators-only`, or
-it orders a size from the cloud's menu, whose compute floor keeps it off the CPU. The queue is the cloud's state,
+it orders a size from the cloud's menu whose compute floor is a GPU's API. The queue is the cloud's state,
 folded from these facts; [docs/queue.md](docs/queue.md) says what it does not do yet that Verda's batch jobs and
 RunPod Serverless do.
 
