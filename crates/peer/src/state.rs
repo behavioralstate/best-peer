@@ -123,13 +123,23 @@ pub struct Order {
     pub receipt: Option<Value>,
 }
 
-/// An order's inputs (each a key in the workspace's store and the path under /in it lands at), the key prefix its
-/// outputs go under, and the size of its disk.
+/// An order's inputs, the key prefix its outputs go under, the size of its disk, and the store it was taken for.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OrderIo {
-    pub inputs: Vec<(String, String)>,
+    pub inputs: Vec<OrderInput>,
     pub outputs: Option<String>,
     pub disk_bytes: u64,
+    /// The store its inputs were found in, endpoint and bucket: one set since is not the store it was taken for.
+    pub store: Option<(String, String)>,
+}
+
+/// One input of an order: its key in the workspace's store, the path under /in it lands at, and its size as the
+/// store said when the order was taken.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OrderInput {
+    pub key: String,
+    pub path: String,
+    pub bytes: Option<u64>,
 }
 
 impl OrderIo {
@@ -140,10 +150,20 @@ impl OrderIo {
                 .as_array()
                 .into_iter()
                 .flatten()
-                .filter_map(|i| Some((i["key"].as_str()?.to_string(), i["path"].as_str()?.to_string())))
+                .filter_map(|i| {
+                    Some(OrderInput {
+                        key: i["key"].as_str()?.to_string(),
+                        path: i["path"].as_str()?.to_string(),
+                        bytes: i["bytes"].as_u64(),
+                    })
+                })
                 .collect(),
             outputs: data["outputs"]["prefix"].as_str().map(str::to_string),
             disk_bytes: data["disk_bytes"].as_u64()?,
+            store: data["store"]["endpoint"]
+                .as_str()
+                .zip(data["store"]["bucket"].as_str())
+                .map(|(e, b)| (e.to_string(), b.to_string())),
         })
     }
 }

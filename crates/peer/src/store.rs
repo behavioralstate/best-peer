@@ -49,14 +49,15 @@ impl Store {
     pub async fn size_of(&self, key: &str) -> Result<Option<u64>, String> {
         let url = self.presign("HEAD", key, 300, OffsetDateTime::now_utc());
         tokio::task::spawn_blocking(move || {
-            let agent = agent();
+            let agent = agent(|c| c.timeout_global(Some(ASKING)));
             match agent.head(&url).call() {
-                Ok(r) => Ok(r
+                Ok(r) if r.status().is_success() => Ok(r
                     .headers()
                     .get("content-length")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.parse().ok())
                     .or(Some(0))),
+                Ok(r) => Err(format!("the store answered {}", r.status().as_u16())),
                 Err(ureq::Error::StatusCode(404)) => Ok(None),
                 Err(ureq::Error::StatusCode(code)) => Err(format!("the store answered {code}")),
                 Err(e) => Err(format!("the store did not answer: {e}")),
@@ -67,40 +68,92 @@ impl Store {
     }
 }
 
-/// The HTTP client of the store's transfers: no timeout on a body, which may be gigabytes, a minute to connect.
-fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(60)))
-        .http_status_as_error(true)
-        .build()
-        .into()
+/// How long a question to the store may take, and how long it may take to start answering a transfer.
+const ASKING: Duration = Duration::from_secs(60);
+const STARTING: Duration = Duration::from_secs(600);
+
+/// The slowest a transfer may go, on average, before it is given up as stalled: a mebibyte a second.
+const SLOWEST: u64 = 1 << 20;
+
+/// How long a transfer of `bytes` may take: ten minutes, and a second more for each mebibyte; a day when its size
+/// is not known. Past it the transfer fails, so a store that stops answering holds no job for ever.
+pub fn within(bytes: Option<u64>) -> Duration {
+    match bytes {
+        Some(b) => STARTING + Duration::from_secs(b / SLOWEST),
+        None => Duration::from_secs(24 * 60 * 60),
+    }
+}
+
+/// What a transfer's client is built from.
+type Limits = ureq::config::ConfigBuilder<ureq::typestate::AgentScope>;
+
+/// The HTTP client of the store's transfers, `limits` set on it: a minute to connect, every status but a success an
+/// error, and no redirect followed, so a URL cannot lead a machine on to a place it may not go.
+fn agent(limits: impl FnOnce(Limits) -> Limits) -> ureq::Agent {
+    limits(
+        ureq::Agent::config_builder()
+            .timeout_connect(Some(ASKING))
+            .http_status_as_error(true)
+            .max_redirects(0),
+    )
+    .build()
+    .into()
+}
+
+/// What a store answered that is not a success, a redirect among them, in words.
+fn answered<B>(r: &ureq::http::Response<B>) -> Result<(), String> {
+    match r.status().is_success() {
+        true => Ok(()),
+        false => Err(format!("the store answered {}", r.status().as_u16())),
+    }
 }
 
 /// Whether a member peer may fetch from or send to `url`: https anywhere, plain http only to this host's loopback
 /// when its operator allows it (a store on the same machine, as in a test), and never anywhere else, so an order
-/// cannot point a machine at what only it can reach.
+/// cannot point a machine at what only it can reach. A URL naming a user before its host is refused: it reaches
+/// another host than it seems to.
 pub fn allowed(url: &str, cleartext_loopback: bool) -> bool {
-    if url.starts_with("https://") {
-        return true;
-    }
-    let Some(rest) = url.strip_prefix("http://") else {
+    let Ok(uri) = url.parse::<axum::http::Uri>() else {
         return false;
     };
-    let host = rest.split(['/', '?']).next().unwrap_or_default();
-    let host = host.rsplit_once(':').map_or(host, |(h, _)| h);
-    cleartext_loopback && matches!(host, "127.0.0.1" | "localhost" | "[::1]")
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    if authority.as_str().contains('@') {
+        return false;
+    }
+    match uri.scheme_str() {
+        Some("https") => !authority.host().is_empty(),
+        Some("http") => cleartext_loopback && matches!(authority.host(), "127.0.0.1" | "localhost" | "[::1]"),
+        _ => false,
+    }
 }
 
-/// Fetches `url` into `to`, answering the bytes written.
-pub fn fetch(url: &str, to: &Path) -> Result<u64, String> {
+/// Whether `endpoint` is a store's address a machine may reach, as [`allowed`] says, and the address alone: a
+/// scheme and a host, with no path or query.
+pub fn endpoint_allowed(endpoint: &str, cleartext_loopback: bool) -> bool {
+    let Ok(uri) = endpoint.parse::<axum::http::Uri>() else {
+        return false;
+    };
+    allowed(endpoint, cleartext_loopback) && matches!(uri.path(), "" | "/") && uri.query().is_none()
+}
+
+/// Fetches `url` into `to`, answering the bytes written; `bytes` is its size when known, which bounds how long it
+/// may take.
+pub fn fetch(url: &str, to: &Path, bytes: Option<u64>) -> Result<u64, String> {
     if let Some(dir) = to.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
     }
     let mut file = std::fs::File::create(to).map_err(|e| format!("cannot write {}: {e}", to.display()))?;
-    let mut response = agent().get(url).call().map_err(|e| match e {
+    let agent = agent(|c| {
+        c.timeout_recv_response(Some(STARTING))
+            .timeout_recv_body(Some(within(bytes)))
+    });
+    let mut response = agent.get(url).call().map_err(|e| match e {
         ureq::Error::StatusCode(code) => format!("the store answered {code}"),
         e => format!("the store did not answer: {e}"),
     })?;
+    answered(&response)?;
     std::io::copy(&mut response.body_mut().as_reader(), &mut file)
         .map_err(|e| format!("fetching into {} stopped: {e}", to.display()))
 }
@@ -109,7 +162,11 @@ pub fn fetch(url: &str, to: &Path) -> Result<u64, String> {
 pub fn put(url: &str, from: &Path) -> Result<u64, String> {
     let file = std::fs::File::open(from).map_err(|e| format!("cannot read {}: {e}", from.display()))?;
     let bytes = file.metadata().map_err(|e| e.to_string())?.len();
-    agent()
+    let agent = agent(|c| {
+        c.timeout_send_body(Some(within(Some(bytes))))
+            .timeout_recv_response(Some(STARTING))
+    });
+    let response = agent
         .put(url)
         .header("content-length", &bytes.to_string())
         .send(ureq::SendBody::from_reader(&mut std::io::BufReader::new(file)))
@@ -117,6 +174,7 @@ pub fn put(url: &str, from: &Path) -> Result<u64, String> {
             ureq::Error::StatusCode(code) => format!("the store answered {code}"),
             e => format!("the store did not take it: {e}"),
         })?;
+    answered(&response)?;
     Ok(bytes)
 }
 
@@ -246,7 +304,53 @@ mod tests {
         assert!(!allowed("http://objects.test/b/k", true));
         assert!(!allowed("http://127.0.0.1:9000/b/k", false));
         assert!(allowed("http://127.0.0.1:9000/b/k", true));
+        assert!(allowed("http://[::1]/b/k", true) && allowed("http://localhost:9000/b/k", true));
         assert!(!allowed("http://169.254.169.254/latest/meta-data", true));
         assert!(!allowed("file:///etc/passwd", true));
+        // A user named before the host: the connection goes to the host after it, wherever the first part points.
+        assert!(!allowed("http://127.0.0.1:80@169.254.169.254/latest/meta-data", true));
+        assert!(!allowed("https://user:pass@objects.test/b/k", false));
+        assert!(!allowed("not a url", true));
+        // A store's endpoint is its address alone.
+        assert!(endpoint_allowed("https://objects.test", false) && endpoint_allowed("https://objects.test/", false));
+        assert!(!endpoint_allowed("https://objects.test/bucket", false));
+        assert!(!endpoint_allowed("https://objects.test?x=1", false));
+        assert!(!endpoint_allowed("http://127.0.0.1:1@evil.test", true));
+    }
+
+    #[test]
+    fn a_transfer_may_take_ten_minutes_and_a_second_a_mebibyte_and_a_day_when_its_size_is_not_known() {
+        assert_eq!(within(Some(0)), Duration::from_secs(600));
+        assert_eq!(within(Some(1 << 30)), Duration::from_secs(600 + 1024));
+        assert_eq!(within(None), Duration::from_secs(86_400));
+    }
+
+    #[tokio::test]
+    async fn a_store_that_answers_with_a_redirect_is_not_followed_and_its_body_is_not_taken_for_the_input() {
+        // A store that sends every request on, to a place on this machine.
+        let app = axum::Router::new().fallback(|| async {
+            (
+                axum::http::StatusCode::TEMPORARY_REDIRECT,
+                [(axum::http::header::LOCATION, "http://127.0.0.1:1/secret")],
+                "nope",
+            )
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = format!("http://{}/b/k", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let (to, from) = (dir.path().join("in"), dir.path().join("out.tar"));
+        std::fs::write(&from, b"x").unwrap();
+        let (fetched, sent) = {
+            let to = to.clone();
+            tokio::task::spawn_blocking(move || (fetch(&at, &to, Some(4)), put(&at, &from)))
+                .await
+                .unwrap()
+        };
+        let why = fetched.unwrap_err();
+        assert!(why.contains("307"), "{why}");
+        assert_ne!(std::fs::read(&to).unwrap_or_default(), b"nope");
+        let why = sent.unwrap_err();
+        assert!(why.contains("307"), "{why}");
     }
 }

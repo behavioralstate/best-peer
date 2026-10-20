@@ -6,7 +6,7 @@
 //! adapter (Docker or containerd through bollard, a microVM later) is a separate crate that implements [`Runtime`]
 //! and is proven on a host by hand, never unit-tested.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -254,8 +254,17 @@ pub trait Runtime: Send + Sync {
     async fn remove_disk(&self, _id: &str) -> Result<(), RuntimeError> {
         Ok(())
     }
-    /// The space free, and in all, where this runtime makes disks; none when it makes none.
+    /// The space free, and in all, where this runtime makes disks, the disks it made counted whole; none when it
+    /// makes none.
     fn disk_room(&self) -> Option<(u64, u64)> {
+        None
+    }
+    /// The jobs whose disks this runtime made and has not removed, as a restart finds them.
+    fn disks(&self) -> Vec<String> {
+        vec![]
+    }
+    /// Where the job `id`'s disk is mounted on the host, when it is.
+    fn disk_at(&self, _id: &str) -> Option<std::path::PathBuf> {
         None
     }
 }
@@ -290,6 +299,10 @@ pub struct Fake {
     /// Where its jobs' disks are made, a directory of its own, and the room it says it has there.
     disks: std::path::PathBuf,
     disk_free: Mutex<u64>,
+    /// The disks it made, with their sizes: each takes its whole size from the room, as an allocated file does.
+    disks_made: Mutex<HashMap<String, u64>>,
+    /// Why the next disk fails once it is begun, as a file system that cannot be made on it fails.
+    broken_disk: Mutex<Option<String>>,
 }
 
 impl Fake {
@@ -313,10 +326,17 @@ impl Fake {
             isolation: Isolation::Container,
             disks: std::env::temp_dir().join("best-peer-fake-disks").join(uuid_like()),
             disk_free: Mutex::new(1 << 40),
+            disks_made: Mutex::new(HashMap::new()),
+            broken_disk: Mutex::new(None),
         }
     }
 
-    /// The room it says it has for disks from now on.
+    /// The next disk is begun, its directory made, and then fails with `why`.
+    pub fn break_next_disk(&self, why: &str) {
+        *self.broken_disk.lock().unwrap() = Some(why.to_string());
+    }
+
+    /// The room it says it has for disks from now on, before the disks it made.
     pub fn set_disk_room(&self, free: u64) {
         *self.disk_free.lock().unwrap() = free;
     }
@@ -529,17 +549,22 @@ impl Runtime for Fake {
     }
 
     async fn make_disk(&self, id: &str, bytes: u64) -> Result<std::path::PathBuf, RuntimeError> {
-        if bytes > *self.disk_free.lock().unwrap() {
+        if self.disk_room().is_some_and(|(free, _)| bytes > free) {
             return Err(RuntimeError::NoDisk(format!(
                 "no room for a disk of {bytes} bytes on this host"
             )));
         }
         let dir = self.disk_of(id);
         std::fs::create_dir_all(&dir).map_err(|e| RuntimeError::NoDisk(e.to_string()))?;
+        if let Some(why) = self.broken_disk.lock().unwrap().take() {
+            return Err(RuntimeError::NoDisk(why));
+        }
+        self.disks_made.lock().unwrap().insert(id.to_string(), bytes);
         Ok(dir)
     }
 
     async fn remove_disk(&self, id: &str) -> Result<(), RuntimeError> {
+        self.disks_made.lock().unwrap().remove(id);
         match std::fs::remove_dir_all(self.disk_of(id)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -549,7 +574,22 @@ impl Runtime for Fake {
 
     fn disk_room(&self) -> Option<(u64, u64)> {
         let free = *self.disk_free.lock().unwrap();
-        Some((free, free.max(1 << 40)))
+        let made: u64 = self.disks_made.lock().unwrap().values().sum();
+        Some((free.saturating_sub(made), free.max(1 << 40)))
+    }
+
+    fn disks(&self) -> Vec<String> {
+        std::fs::read_dir(&self.disks)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect()
+    }
+
+    fn disk_at(&self, id: &str) -> Option<std::path::PathBuf> {
+        Some(self.disk_of(id)).filter(|d| d.is_dir())
     }
 
     fn runs_jobs(&self) -> bool {

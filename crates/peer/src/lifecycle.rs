@@ -155,8 +155,11 @@ pub struct Peer {
     held_to_accelerators: Mutex<std::collections::HashSet<String>>,
     /// A job's inputs, outputs and disk, by its command's key, from admission to its start.
     pending_io: Mutex<HashMap<String, JobIo>>,
-    /// The disk of each job that has one, by job, until its end is told.
+    /// The disk of each job that has one, by job, from when it is made until its end is told.
     job_disks: Mutex<HashMap<String, JobDisk>>,
+    /// The disk promised to each job admitted with one and not yet given it, by job: room the runtime does not count
+    /// until the disk is made.
+    promised_disks: Mutex<HashMap<String, u64>>,
     /// Whether a job may fetch from, and send to, a store over plain http on this host's loopback (a store on the
     /// same machine, as in a test); otherwise https only.
     store_cleartext: std::sync::atomic::AtomicBool,
@@ -213,11 +216,13 @@ struct RunJobData {
     disk_bytes: Option<u64>,
 }
 
-/// One input: the URL it is fetched from, and the path under /in it lands at.
+/// One input: the URL it is fetched from, the path under /in it lands at, and its size when the sender knows it.
 #[derive(Clone, Deserialize)]
 pub(crate) struct InputData {
     pub url: String,
     pub path: String,
+    #[serde(default)]
+    pub bytes: Option<u64>,
 }
 
 /// Where the outputs go: a URL that takes the archive with a PUT, and the key it names in the store.
@@ -239,6 +244,49 @@ pub(crate) struct JobIo {
 struct JobDisk {
     path: std::path::PathBuf,
     outputs: Option<OutputData>,
+    /// Whether where its outputs go is known: not for a disk found after a restart without its record.
+    known: bool,
+}
+
+/// The record a job's disk keeps of where its outputs go, beside /in and /out and outside what the job's container
+/// sees, readable by the peer alone: what a restart reads back. It goes with the disk.
+const RECORD: &str = "job.json";
+
+fn keep_record(disk: &std::path::Path, outputs: Option<&OutputData>) -> Result<(), String> {
+    let record = json!({ "outputs": outputs.map(|o| json!({ "url": o.url, "key": o.key })) });
+    crate::tls::write_private(&disk.join(RECORD), &serde_json::to_vec(&record).unwrap_or_default())
+        .map_err(|e| format!("the job's disk could not keep where its outputs go: {e}"))
+}
+
+/// Where a disk's job sends its outputs, as its record says: none when it has none to send, and nothing at all when
+/// the record is gone.
+fn read_record(disk: &std::path::Path) -> Option<Option<OutputData>> {
+    let record: Value = serde_json::from_slice(&std::fs::read(disk.join(RECORD)).ok()?).ok()?;
+    serde_json::from_value(record["outputs"].clone()).ok()
+}
+
+/// The first input whose path another's takes too, or that lies under another's, which is a file and so no
+/// directory: its index and why.
+pub(crate) fn path_clash<'a>(paths: impl IntoIterator<Item = &'a str>) -> Option<(usize, String)> {
+    let paths: Vec<&str> = paths.into_iter().collect();
+    for (n, p) in paths.iter().enumerate() {
+        for q in &paths[..n] {
+            if p == q {
+                return Some((
+                    n,
+                    format!("input path {p:?} is named twice: each input lands at a path of its own"),
+                ));
+            }
+            let (short, long) = if p.len() < q.len() { (p, q) } else { (q, p) };
+            if long.starts_with(&format!("{short}/")) {
+                return Some((
+                    n,
+                    format!("input paths {q:?} and {p:?} clash: {short:?} is a file, so nothing lands under it"),
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// Whether `path` is a plain relative path under /in: no root, no `..`, no backslash, not empty.
@@ -317,6 +365,7 @@ impl Peer {
             held_to_accelerators: Mutex::new(std::collections::HashSet::new()),
             pending_io: Mutex::new(HashMap::new()),
             job_disks: Mutex::new(HashMap::new()),
+            promised_disks: Mutex::new(HashMap::new()),
             store_cleartext: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -351,6 +400,41 @@ impl Peer {
             self.log.replay(|e| state.apply(e));
         }
         self.reconcile(true).await;
+        self.recover_disks().await;
+    }
+
+    /// After a restart: each disk a running job still has is followed again, with where its outputs go as its record
+    /// keeps it; every other, of a job that ended while the peer was down or never started, is removed.
+    async fn recover_disks(&self) {
+        let running: std::collections::HashSet<String> = {
+            let s = self.state.lock().unwrap();
+            s.jobs
+                .values()
+                .filter(|j| j.phase == JobPhase::Running)
+                .map(|j| j.id.clone())
+                .collect()
+        };
+        for id in self.runtime.disks() {
+            match running.contains(&id).then(|| self.runtime.disk_at(&id)).flatten() {
+                Some(path) => {
+                    let record = read_record(&path);
+                    self.job_disks.lock().unwrap().insert(
+                        id,
+                        JobDisk {
+                            path,
+                            known: record.is_some(),
+                            outputs: record.flatten(),
+                        },
+                    );
+                }
+                None => {
+                    tracing::info!(job = %id, "a job's disk no running job has is removed");
+                    if let Err(e) = self.runtime.remove_disk(&id).await {
+                        tracing::warn!(job = %id, error = %e, "a job's disk could not be removed");
+                    }
+                }
+            }
+        }
     }
 
     /// Squares the state with what the engine runs: a workload whose container is gone ended while nobody watched,
@@ -494,6 +578,9 @@ impl Peer {
         self.state.lock().unwrap().apply(&e);
         // A job that ended otherwise than by its exit (stopped, failed, past its deadline) leaves its disk behind.
         if matches!(r#type, "JobFailed" | "JobStopped") {
+            if let Some(job) = e.data["job"].as_str() {
+                self.promised_disks.lock().unwrap().remove(job);
+            }
             let gone = e.data["job"]
                 .as_str()
                 .and_then(|j| self.job_disks.lock().unwrap().remove(j).map(|_| j.to_string()));
@@ -1227,14 +1314,17 @@ impl Peer {
             },
             _ => None,
         };
-        if data.queued() && accelerators_only(&who) {
-            self.held_to_accelerators.lock().unwrap().insert(key.clone());
-        }
         // A queued order's id is its command's, so the command run again after a restart finds its order.
         let id = match data.queued() {
             true => crate::queue::order_id(&key),
             false => new_id("job"),
         };
+        if let Some(io) = &io {
+            self.claim_disk(&id, io.disk_bytes)?;
+        }
+        if data.queued() && accelerators_only(&who) {
+            self.held_to_accelerators.lock().unwrap().insert(key.clone());
+        }
         if let Some(io) = io {
             self.pending_io.lock().unwrap().insert(key.clone(), io);
         }
@@ -1295,6 +1385,17 @@ impl Peer {
                 );
             }
         }
+        if let Some((n, why)) = path_clash(data.inputs.iter().map(|i| i.path.as_str())) {
+            return bad("INVALID_INPUT_PATH", &format!("inputs/{n}/path"), why);
+        }
+        let inputs: u64 = data.inputs.iter().filter_map(|i| i.bytes).sum();
+        if inputs > crate::cloud::usable(bytes) {
+            return bad(
+                "INPUTS_EXCEED_DISK",
+                "disk_bytes",
+                format!("the inputs are {inputs} bytes together, more than a disk of {bytes} bytes holds once its file system takes its share: ask for more disk_bytes"),
+            );
+        }
         if let Some(o) = &data.outputs {
             if !crate::store::allowed(&o.url, cleartext) {
                 return bad(
@@ -1304,27 +1405,46 @@ impl Peer {
                 );
             }
         }
-        match self.runtime.disk_room() {
-            None => {
-                return Err(BestError::bad_request(
-                    "NO_DISK",
-                    "this peer makes no disk for a job: a job with inputs or outputs runs on a peer whose container engine is Docker on Linux",
-                ))
-            }
-            Some((free, _)) if free < bytes => {
-                return Err(BestError::bad_request(
-                    "INSUFFICIENT_DISK",
-                    format!("this peer has {free} bytes free for a job's disk, less than the {bytes} asked for: ask for less disk_bytes, or wait for room"),
-                )
-                .with_details(json!({ "field": "disk_bytes", "free_bytes": free })))
-            }
-            Some(_) => {}
+        if self.runtime.disk_room().is_none() {
+            return Err(BestError::bad_request(
+                "NO_DISK",
+                "this peer makes no disk for a job: a job with inputs or outputs runs on a peer whose container engine is Docker on Linux",
+            ));
         }
         Ok(Some(JobIo {
             inputs: data.inputs.clone(),
             outputs: data.outputs.clone(),
             disk_bytes: bytes,
         }))
+    }
+
+    /// The room for jobs' disks here, free and in all: what the runtime says is free, the disks it made counted, less
+    /// what is promised to jobs admitted and not given theirs yet.
+    fn disk_room(&self) -> Option<(u64, u64)> {
+        let (free, total) = self.runtime.disk_room()?;
+        let promised: u64 = self.promised_disks.lock().unwrap().values().sum();
+        Some((free.saturating_sub(promised), total))
+    }
+
+    /// Promises the job `id` a disk of `bytes`, until the disk is made or the job ends; refused, with what is free,
+    /// when the room is not there. The check and the promise are one step, so two jobs are never promised one room.
+    fn claim_disk(&self, id: &str, bytes: u64) -> Result<(), BestError> {
+        let mut promised = self.promised_disks.lock().unwrap();
+        let free = self
+            .runtime
+            .disk_room()
+            .map(|(f, _)| f)
+            .unwrap_or(0)
+            .saturating_sub(promised.values().sum());
+        if free < bytes {
+            return Err(BestError::bad_request(
+                "INSUFFICIENT_DISK",
+                format!("this peer has {free} bytes free for a job's disk, less than the {bytes} asked for: ask for less disk_bytes, or wait for room"),
+            )
+            .with_details(json!({ "field": "disk_bytes", "free_bytes": free })));
+        }
+        promised.insert(id.to_string(), bytes);
+        Ok(())
     }
 
     pub async fn run_job(self: Arc<Self>, cmd: Envelope, em: Emitter) {
@@ -1398,22 +1518,37 @@ impl Peer {
             .await;
     }
 
-    /// Makes the job `id`'s disk and fetches its inputs there, telling `InputsFetched`; or why not, with the fix,
-    /// the disk removed again.
+    /// Makes the job `id`'s disk, keeps where its outputs go beside it for a restart to find, and fetches its inputs
+    /// there, telling `InputsFetched`; or why not, with the fix, and nothing of the disk left.
     async fn prepare_disk(
         &self,
         em: &Emitter,
         id: &str,
         io: &JobIo,
     ) -> Result<std::path::PathBuf, (String, &'static str)> {
-        let disk = self
-            .runtime
-            .make_disk(id, io.disk_bytes)
-            .await
-            .map_err(|e| (e.to_string(), fix_for_runtime(&e)))?;
+        let made = self.runtime.make_disk(id, io.disk_bytes).await;
+        // Made or not, it is promised no longer: a disk made counts in the runtime's room as it is.
+        self.promised_disks.lock().unwrap().remove(id);
+        let disk = match made {
+            Ok(disk) => disk,
+            Err(e) => {
+                // What it made before it failed goes too.
+                let _ = self.runtime.remove_disk(id).await;
+                return Err((e.to_string(), fix_for_runtime(&e)));
+            }
+        };
+        self.job_disks.lock().unwrap().insert(
+            id.to_string(),
+            JobDisk {
+                path: disk.clone(),
+                outputs: io.outputs.clone(),
+                known: true,
+            },
+        );
         let fetched = {
-            let (disk, inputs) = (disk.clone(), io.inputs.clone());
+            let (disk, inputs, outputs) = (disk.clone(), io.inputs.clone(), io.outputs.clone());
             tokio::task::spawn_blocking(move || -> Result<(u64, f64), String> {
+                keep_record(&disk, outputs.as_ref())?;
                 for dir in ["in", "out"] {
                     std::fs::create_dir_all(disk.join(dir)).map_err(|e| e.to_string())?;
                     #[cfg(unix)]
@@ -1425,7 +1560,7 @@ impl Peer {
                 let started = Instant::now();
                 let mut bytes = 0;
                 for i in &inputs {
-                    bytes += crate::store::fetch(&i.url, &disk.join("in").join(&i.path))
+                    bytes += crate::store::fetch(&i.url, &disk.join("in").join(&i.path), i.bytes)
                         .map_err(|why| format!("input {} could not be fetched: {why}", i.path))?;
                 }
                 Ok((bytes, started.elapsed().as_secs_f64()))
@@ -1446,6 +1581,7 @@ impl Peer {
                 Ok(disk)
             }
             Err(why) => {
+                self.job_disks.lock().unwrap().remove(id);
                 let _ = self.runtime.remove_disk(id).await;
                 Err((
                     why,
@@ -1458,6 +1594,12 @@ impl Peer {
     /// Packs what the job `job` left under /out and sends it where its outputs go, telling `OutputsStored`; or why
     /// not.
     async fn store_outputs(&self, em: &Emitter, job: &str, disk: &JobDisk) -> Result<(), String> {
+        if !disk.known {
+            return Err(
+                "the peer restarted while the job ran and lost where they go; what it left under /out was not sent"
+                    .into(),
+            );
+        }
         let Some(outputs) = disk.outputs.clone() else {
             return Ok(());
         };
@@ -1541,13 +1683,6 @@ impl Peer {
                         container: "/out".into(),
                         read_only: false,
                     });
-                    self.job_disks.lock().unwrap().insert(
-                        id.clone(),
-                        JobDisk {
-                            path: disk,
-                            outputs: io.outputs.clone(),
-                        },
-                    );
                 }
                 Err((reason, fix)) => {
                     fail(reason, fix);
@@ -1729,7 +1864,7 @@ impl Peer {
                 match (disk, self.me.get().and_then(|m| m.upgrade())) {
                     // Its outputs go first, off the engine's events, which keep flowing meanwhile; no stop and no
                     // deadline ends it while they do, so its end is told once.
-                    (Some(disk), Some(me)) if disk.outputs.is_some() => {
+                    (Some(disk), Some(me)) if disk.outputs.is_some() || !disk.known => {
                         if let Some(j) = self.state.lock().unwrap().jobs.get_mut(&job) {
                             j.phase = JobPhase::Storing;
                         }
@@ -1920,7 +2055,7 @@ impl Service for Peer {
         for d in v["devices"].as_array_mut().into_iter().flatten() {
             d["isolation"] = json!(isolation);
         }
-        if let Some((free, total)) = self.runtime.disk_room() {
+        if let Some((free, total)) = self.disk_room() {
             v["disk"] = json!({ "free_bytes": free, "total_bytes": total });
         }
         Ok(v)

@@ -8718,6 +8718,9 @@ mod tests {
         assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
         assert_eq!(b["error"]["code"], "INVALID_STORE");
         assert_eq!(b["error"]["details"]["field"], "endpoint");
+        // Nor one that names a user before its host, which reaches the host after it.
+        let (_, b) = site.store(&ws, "st3", "http://127.0.0.1:1@objects.example.com").await;
+        assert_eq!(b["error"]["code"], "INVALID_STORE");
 
         // What the order gets wrong is refused before anything is sent, naming the field.
         let refusals = [
@@ -8748,7 +8751,23 @@ mod tests {
                 "deadline_seconds",
             ),
             (json!({ "disk_bytes": 4u64 << 40 }), "NO_DISK_ROOM", "disk_bytes"),
+            (
+                json!({ "inputs": [{ "key": "inputs/scene.txt", "path": "a" }, { "key": "inputs/scene.txt", "path": "a" }] }),
+                "INVALID_INPUT_PATH",
+                "inputs/1/path",
+            ),
+            (
+                json!({ "inputs": [{ "key": "inputs/scene.txt", "path": "a" }, { "key": "inputs/scene.txt", "path": "a/b" }] }),
+                "INVALID_INPUT_PATH",
+                "inputs/1/path",
+            ),
+            (
+                json!({ "inputs": [{ "key": "inputs/big.bin", "path": "big" }], "disk_bytes": 16 << 20 }),
+                "INPUTS_EXCEED_DISK",
+                "disk_bytes",
+            ),
         ];
+        s3.put("inputs/big.bin", &vec![0u8; 16 << 20]);
         for (n, (more, code, field)) in refusals.into_iter().enumerate() {
             let got = site.refused(&ws, &format!("r{n}"), amended(&with_io(), more)).await;
             assert_eq!(got, (code.to_string(), field.to_string()), "refusal {n}");
@@ -8758,8 +8777,9 @@ mod tests {
         let queued = site.order(&ws, "j1", 4, with_io()).await;
         assert_eq!(
             queued["inputs"],
-            json!([{ "key": "inputs/scene.txt", "path": "scene/scene.txt" }])
+            json!([{ "key": "inputs/scene.txt", "path": "scene/scene.txt", "bytes": 9 }])
         );
+        assert_eq!(queued["store"], json!({ "endpoint": endpoint, "bucket": "jobs" }));
         assert_eq!(queued["outputs"], json!({ "prefix": "renders/shot-12" }));
         assert_eq!(queued["disk_bytes"], GB);
         let events = site.events(&ws, "j1", "JobStarted").await;
@@ -9012,6 +9032,18 @@ mod tests {
             pair("INSUFFICIENT_DISK", "disk_bytes")
         );
         bed.runtime.set_disk_room(1 << 40);
+        let get = job["inputs"][0]["url"].clone();
+        let mut clash = job.clone();
+        clash["inputs"] = json!([{ "url": get, "path": "a" }, { "url": get, "path": "a/b" }]);
+        assert_eq!(refused("r6", clash).await, pair("INVALID_INPUT_PATH", "inputs/1/path"));
+        let mut big = job.clone();
+        big["inputs"][0]["bytes"] = json!(2 * GB);
+        assert_eq!(refused("r7", big).await, pair("INPUTS_EXCEED_DISK", "disk_bytes"));
+        let (s, b) = bed
+            .send("r8", "RunJob", "run-job", amended(&job, json!({ "disk_bytes": 1 })))
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "SCHEMA_VALIDATION");
 
         let (s, b) = bed.send("j1", "RunJob", "run-job", job.clone()).await;
         assert_eq!(s, StatusCode::CREATED, "{b}");
@@ -9051,5 +9083,205 @@ mod tests {
         let (_, told) = get_as(&bed.app, "", &bed.key, "/events?limit=500").await;
         assert!(!told.to_string().contains("X-Amz"), "{told}");
         assert!(holding(logs.path(), "X-Amz").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_disk_is_promised_from_admission_so_two_jobs_never_share_one_room_and_one_that_fails_leaves_nothing() {
+        let bed = fresh().await;
+        bed.runtime.set_disk_room(GB + GB / 2);
+        let free = |hs: Value| hs["disk"]["free_bytes"].as_u64().unwrap();
+        let gate = bed.runtime.hold_pulls();
+        let job = json!({ "image": "busybox", "memory_bytes": 4 * GB, "disk_bytes": GB });
+        let (s, b) = bed.send("j1", "RunJob", "run-job", job.clone()).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        // Its image is still on its way and its disk not made: the room is promised all the same.
+        assert_eq!(free(bed.query("get-hardware-state").await), GB / 2);
+        let (s, b) = bed.send("j2", "RunJob", "run-job", job.clone()).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "INSUFFICIENT_DISK");
+        assert_eq!(b["error"]["details"]["free_bytes"], GB / 2);
+        gate.add_permits(100);
+        let started = bed.events_of("j1", "JobStarted").await.last().unwrap().data.clone();
+        // Made, it counts once, as made.
+        assert_eq!(free(bed.query("get-hardware-state").await), GB / 2);
+        bed.runtime
+            .stop(&ContainerId(started["container"].as_str().unwrap().into()))
+            .await
+            .unwrap();
+        bed.events_of("j1", "JobFinished").await;
+        let disk = bed.runtime.disk_of(started["job"].as_str().unwrap());
+        until("the job's disk is removed", || !disk.exists()).await;
+        assert_eq!(free(bed.query("get-hardware-state").await), GB + GB / 2);
+
+        // A disk that fails once it is begun leaves nothing of it behind, and no promise.
+        bed.runtime
+            .break_next_disk("mkfs.ext4 failed: the file system could not be made");
+        let (s, b) = bed.send("j3", "RunJob", "run-job", job).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let failed = bed.events_of("j3", "JobFailed").await.last().unwrap().data.clone();
+        assert!(failed["reason"].as_str().unwrap().contains("mkfs.ext4"), "{failed}");
+        assert!(!bed.runtime.disk_of(failed["job"].as_str().unwrap()).exists());
+        assert_eq!(free(bed.query("get-hardware-state").await), GB + GB / 2);
+    }
+
+    #[tokio::test]
+    async fn a_job_s_disk_outlives_a_restart_its_outputs_still_sent_and_a_disk_no_running_job_has_is_removed() {
+        let (s3, endpoint) = FakeS3::start().await;
+        let store = crate::store::Store {
+            endpoint,
+            bucket: "jobs".into(),
+            region: "fin-01".into(),
+            access_key_id: "AKIDTESTONLY".into(),
+            secret_access_key: SECRET.into(),
+        };
+        let now = time::OffsetDateTime::now_utc();
+        let job = |key: &str| json!({ "image": "busybox", "memory_bytes": 4 * GB, "disk_bytes": GB, "outputs": { "url": store.presign("PUT", key, 600, now), "key": key } });
+        let log = Arc::new(EventLog::ephemeral());
+        let runtime = Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![]));
+        let first = bed(card(), log.clone(), runtime.clone()).await;
+        first.peer.allow_store_cleartext();
+        let mut started = vec![];
+        for (id, key) in [("j1", "renders/r1.tar"), ("j2", "renders/r2.tar")] {
+            let (s, b) = first.send(id, "RunJob", "run-job", job(key)).await;
+            assert_eq!(s, StatusCode::CREATED, "{b}");
+            started.push(first.events_of(id, "JobStarted").await.last().unwrap().data.clone());
+        }
+        let disk = |n: usize| runtime.disk_of(started[n]["job"].as_str().unwrap());
+        let container = |n: usize| ContainerId(started[n]["container"].as_str().unwrap().into());
+        // A disk no job has: the disk of a job that never started, its peer gone before it removed it.
+        runtime.make_disk("job-stray", GB).await.unwrap();
+        // The peer dies; its jobs run on, and one of their disks loses its record.
+        first.peer.halt();
+        let credentials = first.door.auth.clone();
+        drop(first);
+        std::fs::remove_file(disk(1).join("job.json")).unwrap();
+        std::fs::write(disk(0).join("out/result.txt"), b"42").unwrap();
+        let again = bed_with(
+            card(),
+            log.clone(),
+            runtime.clone(),
+            Arc::new(best_peer_engine::Fake::new()),
+            "engines.local",
+            Some(credentials),
+        )
+        .await;
+        assert!(!runtime.disk_of("job-stray").exists(), "removed at start");
+        assert!(disk(0).exists() && disk(1).exists(), "the running jobs keep theirs");
+        // The first exits: its outputs go where its disk's record says, then its end is told.
+        runtime.stop(&container(0)).await.unwrap();
+        let events = again.events_of("j1", "JobFinished").await;
+        assert!(
+            types(&events).contains(&"OutputsStored".to_string()),
+            "{:?}",
+            types(&events)
+        );
+        assert_eq!(
+            unpacked(&s3.get("renders/r1.tar").unwrap()),
+            [("result.txt".to_string(), "42".to_string())].into()
+        );
+        // The second's record is gone, so where its outputs go is not known: its end says so, and is no finish.
+        runtime.stop(&container(1)).await.unwrap();
+        let failed = again.events_of("j2", "JobFailed").await.last().unwrap().data.clone();
+        assert!(failed["reason"].as_str().unwrap().contains("restarted"), "{failed}");
+        assert_eq!(failed["exit_code"], 0);
+        assert!(s3.get("renders/r2.tar").is_none());
+        until("both disks are removed", || !disk(0).exists() && !disk(1).exists()).await;
+    }
+
+    #[tokio::test]
+    async fn orders_whose_disks_fit_a_member_one_at_a_time_take_turns_and_the_member_says_its_room() {
+        let (site, ws, _s3, _logs) = site_with_store().await;
+        let member = &site.members[0];
+        member.runtime.set_disk_room(GB + GB / 2);
+        let first = site.order(&ws, "j1", 4, with_io()).await;
+        assert_eq!(first["waiting"], false, "{first}");
+        // The memory is there for both; the disk for one at a time.
+        let second = site.order(&ws, "j2", 4, with_io()).await;
+        assert_eq!(second["waiting"], true, "{second}");
+        let started = site.events(&ws, "j1", "JobStarted").await.last().unwrap()["data"].clone();
+        let hs = site.query(&ws, "get-hardware-state").await;
+        assert_eq!(hs["peers"][0]["disk"]["free_bytes"], GB / 2, "{hs}");
+        member
+            .runtime
+            .stop(&ContainerId(started["container"].as_str().unwrap().into()))
+            .await
+            .unwrap();
+        site.events(&ws, "j1", "JobFinished").await;
+        let disk = member.runtime.disk_of(started["job"].as_str().unwrap());
+        until("the first job's disk is removed", || !disk.exists()).await;
+        site.live_cloud(&ws, "lab").step(later(0)).await;
+        let events = site.events(&ws, "j2", "JobStarted").await;
+        assert_eq!(
+            facts(&events),
+            ["JobQueued", "JobPlaced", "InputsFetched", "JobStarted"]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_order_whose_store_was_replaced_while_it_waited_fails_when_its_turn_comes_rather_than_read_another() {
+        let (site, ws, _s3, _logs) = site_with_store().await;
+        site.order(&ws, "j1", 20, json!({ "args": ["sleep", "100"] })).await;
+        let started = site.events(&ws, "j1", "JobStarted").await.last().unwrap()["data"].clone();
+        let waits = site.order(&ws, "j2", 20, with_io()).await;
+        assert_eq!(waits["waiting"], true, "{waits}");
+        // The owner moves the workspace to another bucket while the order waits.
+        let endpoint = site.query(&ws, "get-store").await["store"]["endpoint"].clone();
+        let (s, b) = site
+            .send(
+                &ws,
+                "st2",
+                "SetStore",
+                "set-store",
+                json!({ "endpoint": endpoint, "bucket": "jobs-2", "region": "fin-01", "access_key_id": "AKIDTESTONLY", "secret_access_key": SECRET }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "st2", "StoreSetV1").await;
+        site.members[0]
+            .runtime
+            .stop(&ContainerId(started["container"].as_str().unwrap().into()))
+            .await
+            .unwrap();
+        site.events(&ws, "j1", "JobFinished").await;
+        site.live_cloud(&ws, "lab").step(later(0)).await;
+        let events = site.events(&ws, "j2", "JobFailed").await;
+        assert_eq!(
+            facts(&events),
+            ["JobQueued", "JobFailed"],
+            "failed before it was placed"
+        );
+        let reason = events.last().unwrap()["data"]["reason"].as_str().unwrap().to_string();
+        assert!(
+            reason.contains("replaced while the order waited") && reason.contains("bucket jobs "),
+            "{reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_admitted_is_set_only_when_its_command_runs_so_one_that_never_runs_changes_nothing() {
+        use crate::domain::Clouds;
+        let (site, ws, _s3, _logs) = site_with_store().await;
+        let before = site.query(&ws, "get-store").await;
+        let file = site.data.path().join("workspaces").join(&ws).join("store.json");
+        let kept = std::fs::read(&file).unwrap();
+        let owner = site
+            .auth
+            .credential_by_hash(&best_peer_door::auth::hash_key(&site.key))
+            .unwrap();
+        let cmd = Envelope::event(
+            "test",
+            "SetStore",
+            json!({ "endpoint": "https://objects.example.com", "bucket": "other", "region": "x", "access_key_id": "AKIDOTHER", "secret_access_key": "another-secret" }),
+            None,
+            None,
+        );
+        // Admitted, as a command is before the door records it; a restart then fails it before it runs.
+        site.workspaces
+            .get(&ws)
+            .unwrap()
+            .admit_set_store(cmd, &owner, "owner:never-run".into())
+            .unwrap();
+        assert_eq!(site.query(&ws, "get-store").await, before);
+        assert_eq!(std::fs::read(&file).unwrap(), kept);
     }
 }

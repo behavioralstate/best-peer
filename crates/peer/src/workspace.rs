@@ -631,6 +631,9 @@ pub struct Workspace {
     /// Its store, where its jobs' inputs come from and their outputs go, as its owner set it: kept in its own file,
     /// the credential never on the log.
     store: Arc<Mutex<Option<Store>>>,
+    /// A store admitted and not yet set, by its command's key: set by the handler that tells StoreSetV1, so what the
+    /// workspace uses is what its log says, and a command refused after admission changes nothing.
+    pending_store: Mutex<HashMap<String, Store>>,
     door: OnceLock<Arc<Door>>,
     router: OnceLock<Router>,
     started: std::sync::atomic::AtomicBool,
@@ -704,6 +707,7 @@ impl Workspace {
             clouds: Mutex::new(BTreeMap::new()),
             purse: Arc::new(Purse::new(log.clone())),
             store: Arc::new(Mutex::new(store)),
+            pending_store: Mutex::new(HashMap::new()),
             door: OnceLock::new(),
             router: OnceLock::new(),
             started: std::sync::atomic::AtomicBool::new(false),
@@ -1224,7 +1228,7 @@ impl Clouds for Workspace {
 
     /// Admits a store: the owner's, at an endpoint a machine may reach, with its credential, which is kept in the
     /// workspace's own file now and never recorded (its fields are writeOnly).
-    fn admit_set_store(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError> {
+    fn admit_set_store(&self, cmd: Envelope, who: &Credential, key: String) -> Result<(), BestError> {
         if !self.is_owner(&who.holder()) {
             return Err(
                 BestError::bad_request("FORBIDDEN", "only the workspace's owner sets its store: ask them")
@@ -1235,9 +1239,7 @@ impl Clouds for Workspace {
         let bad = |field: &str, message: &str| {
             Err(BestError::bad_request("INVALID_STORE", message.to_string()).with_details(json!({ "field": field })))
         };
-        let reachable = data.endpoint.starts_with("https://")
-            || (self.ctx.store_cleartext && crate::store::allowed(&format!("{}/x", data.endpoint), true));
-        if !reachable || data.endpoint.trim_end_matches('/').matches('/').count() != 2 {
+        if !crate::store::endpoint_allowed(&data.endpoint, self.ctx.store_cleartext) {
             return bad(
                 "endpoint",
                 "endpoint is the store's https address, scheme and host alone, such as https://objects.example.com",
@@ -1256,24 +1258,34 @@ impl Clouds for Workspace {
             access_key_id,
             secret_access_key,
         };
-        std::fs::create_dir_all(&self.dir)
-            .and_then(|_| {
-                crate::tls::write_private(
-                    &self.dir.join("store.json"),
-                    &serde_json::to_vec_pretty(&store).unwrap_or_default(),
-                )
-            })
-            .map_err(|e| BestError::internal(format!("the store could not be kept: {e}")))?;
-        *self.store.lock().unwrap() = Some(store);
+        self.pending_store.lock().unwrap().insert(key, store);
         Ok(())
     }
 
+    /// Sets the store admitted under this command: kept in the workspace's own file, then used, then told. A
+    /// command whose credential is no longer held here, after a restart, fails and changes nothing.
     async fn set_store(self: Arc<Self>, cmd: Envelope, em: Emitter) {
-        self.tell(
-            &em,
-            "StoreSetV1",
-            json!({ "workspace": self.id, "endpoint": cmd.data["endpoint"], "bucket": cmd.data["bucket"], "region": cmd.data["region"] }),
-        );
+        let failed = |reason: String| {
+            self.tell(&em, "CommandFailed", json!({ "type": cmd.r#type, "reason": reason }));
+        };
+        let Some(store) = self.pending_store.lock().unwrap().remove(em.command_key()) else {
+            failed("the store's credential is no longer held here: send set-store again".into());
+            return;
+        };
+        let kept = std::fs::create_dir_all(&self.dir).and_then(|_| {
+            crate::tls::write_private(
+                &self.dir.join("store.json"),
+                &serde_json::to_vec_pretty(&store).unwrap_or_default(),
+            )
+        });
+        if let Err(e) = kept {
+            failed(format!("the store could not be kept: {e}; the store before it stays"));
+            return;
+        }
+        let told =
+            json!({ "workspace": self.id, "endpoint": store.endpoint, "bucket": store.bucket, "region": store.region });
+        *self.store.lock().unwrap() = Some(store);
+        self.tell(&em, "StoreSetV1", told);
     }
 
     fn admit_set_cap(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError> {

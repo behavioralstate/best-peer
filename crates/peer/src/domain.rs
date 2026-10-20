@@ -64,7 +64,7 @@ pub trait Clouds: Service {
     fn usage(&self, who: &Credential, params: &HashMap<String, String>) -> Result<Value, BestError>;
     fn admit_set_cap(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError>;
     fn store_view(&self) -> Result<Value, BestError>;
-    fn admit_set_store(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError>;
+    fn admit_set_store(&self, cmd: Envelope, who: &Credential, key: String) -> Result<(), BestError>;
     async fn set_store(self: Arc<Self>, cmd: Envelope, em: Emitter);
     async fn set_cap(self: Arc<Self>, cmd: Envelope, em: Emitter);
 }
@@ -273,10 +273,14 @@ fn hardware_query(svc: Arc<dyn Service>, at: Where) -> QueryDef {
         "slicing": { "type": "string", "enum": ["none", "mig"], "description": "What the device is of its card: none, a whole card; mig, one instance of a card MIG splits in hardware, with its own memory, compute and cache, listed in place of the card. Either way it runs one workload of a size at a time" },
         "isolation": { "type": "string", "enum": ["process", "container", "user-namespace", "vm"], "description": "What stands between a workload on this device and the host and the other workloads, weakest first: process (an engine installed on the host), container (no capability, no new privilege, a ceiling on tasks, a tenant's job in a closed box), user-namespace (the same in a rootless or user-remapped container engine, so root in the container is nobody on the host), vm (a virtual machine; no peer offers it yet). deploy-model and run-job may ask for at least one of these" }
     });
+    let disk = json!({ "type": "object", "description": "The room for jobs' disks, where their inputs land and their outputs are written: free, less what is promised to jobs not given theirs yet, and in all; absent where no disk is made", "properties": { "free_bytes": { "type": "integer" }, "total_bytes": { "type": "integer" } } });
     let mut properties = json!({
         "driver": { "type": ["string", "null"], "description": "The accelerator driver's version, when there is one" },
         "observed_at": { "type": "string", "format": "date-time" }
     });
+    if at == Where::Root {
+        properties["disk"] = disk.clone();
+    }
     if at == Where::Workspace {
         device_properties["id"]["description"] =
             json!("Stable device id, the value a command names a device by: cloud/peer/device");
@@ -288,7 +292,8 @@ fn hardware_query(svc: Arc<dyn Service>, at: Where) -> QueryDef {
             "items": { "type": "object", "required": ["cloud", "peer", "endpoint", "state"], "properties": {
                 "cloud": { "type": "string" }, "peer": { "type": "string" }, "endpoint": { "type": "string", "description": "The member's own door" },
                 "state": { "type": "string", "enum": ["up", "joining", "unreachable"], "description": "up answers; joining has not admitted this cloud yet (its owner approves the code in the door's log); unreachable did not answer" },
-                "driver": { "type": ["string", "null"] }, "reason": { "type": "string", "description": "What the cloud saw, when unreachable" }
+                "driver": { "type": ["string", "null"] }, "reason": { "type": "string", "description": "What the cloud saw, when unreachable" },
+                "disk": disk
             } }
         });
     }
@@ -311,8 +316,8 @@ fn hardware_query(svc: Arc<dyn Service>, at: Where) -> QueryDef {
 
 fn workloads_query(peer: Arc<dyn Service>, at: Where) -> QueryDef {
     let description = match at {
-        Where::Root => "What this peer runs for you now: each deployment with its model, engine, device, the memory promised to it, its phase (starting, ready, ending); each job with its image, device and phase (running, stopping); queued, the orders of this peer's queue that wait for room, oldest first; and held_bytes, the device memory your workloads hold together on this door, against share_bytes, the most your credential may hold (null when no share was set). A credential approved for all sees every holder's workloads, with the holder. The ids here are what undeploy-model and stop-job name.",
-        Where::Workspace => "What this workspace runs for you now, across its clouds: each deployment with its cloud, the peer it is on, its model, engine, device (cloud/peer/device), the memory promised to it, its phase (starting, ready, ending); each job with its cloud, peer, image, device and phase (running, stopping); queued, the orders not started yet, oldest first, each with its id (what stop-job names while it waits), its cloud, image and memory, whether it waits or the peer it was sent to, its attempt and when it was queued; and held_bytes, the device memory your workloads hold together on this door, every workspace counted, orders that wait included, against share_bytes, the most your credential may hold (null when no share was set). A credential approved for all sees every holder's workloads, with the holder. The ids here are what undeploy-model and stop-job name.",
+        Where::Root => "What this peer runs for you now: each deployment with its model, engine, device, the memory promised to it, its phase (starting, ready, ending); each job with its image, device and phase (running, stopping, or storing: it exited and its outputs are being sent); queued, the orders of this peer's queue that wait for room, oldest first; and held_bytes, the device memory your workloads hold together on this door, against share_bytes, the most your credential may hold (null when no share was set). A credential approved for all sees every holder's workloads, with the holder. The ids here are what undeploy-model and stop-job name.",
+        Where::Workspace => "What this workspace runs for you now, across its clouds: each deployment with its cloud, the peer it is on, its model, engine, device (cloud/peer/device), the memory promised to it, its phase (starting, ready, ending); each job with its cloud, peer, image, device and phase (running, stopping, or storing: it exited and its outputs are being sent); queued, the orders not started yet, oldest first, each with its id (what stop-job names while it waits), its cloud, image and memory, whether it waits or the peer it was sent to, its attempt and when it was queued; and held_bytes, the device memory your workloads hold together on this door, every workspace counted, orders that wait included, against share_bytes, the most your credential may hold (null when no share was set). A credential approved for all sees every holder's workloads, with the holder. The ids here are what undeploy-model and stop-job name.",
     };
     let mut deployment = json!({
         "deployment": { "type": "string" }, "model": { "type": "string" }, "engine": { "type": "string", "enum": ["ollama", "vllm"] },
@@ -571,9 +576,9 @@ fn run_job(peer: Arc<dyn Service>, at: Where) -> CommandDef {
             json!({
                 "device": { "type": "string", "maxLength": 256, "description": "A device id from get-hardware-state, to pin the placement; refused without memory_bytes" },
                 "queue_seconds": { "type": "integer", "minimum": 1, "maximum": 604800, "description": "How long the order may wait for a device with its room, counted from JobQueued; at most seven days. Without it, an order with no room now is refused (INSUFFICIENT_MEMORY), as a cloud placing on this peer expects" },
-                "inputs": { "type": "array", "maxItems": 1000, "writeOnly": true, "description": "The files the job finds under /in when it starts, each fetched from a URL such as a cloud signs for its store (https), to a plain relative path; never recorded", "items": { "type": "object", "required": ["url", "path"], "properties": { "url": { "type": "string", "maxLength": 8192 }, "path": { "type": "string", "minLength": 1, "maxLength": 1024 } }, "additionalProperties": false } },
+                "inputs": { "type": "array", "maxItems": 1000, "writeOnly": true, "description": "The files the job finds under /in when it starts, each fetched from a URL such as a cloud signs for its store (https), to a plain relative path; never recorded", "items": { "type": "object", "required": ["url", "path"], "properties": { "url": { "type": "string", "maxLength": 8192 }, "path": { "type": "string", "minLength": 1, "maxLength": 1024 }, "bytes": { "type": "integer", "minimum": 0, "description": "Its size, when known: inputs that together exceed the disk are refused (INPUTS_EXCEED_DISK), and it bounds how long the fetch may take" } }, "additionalProperties": false } },
                 "outputs": { "type": "object", "writeOnly": true, "required": ["url", "key"], "description": "Where what the job leaves under /out goes when it exits, packed as one tar archive: a URL that takes a PUT (https), and the key it names; never recorded", "properties": { "url": { "type": "string", "maxLength": 8192 }, "key": { "type": "string", "minLength": 1, "maxLength": 1024 } }, "additionalProperties": false },
-                "disk_bytes": { "type": "integer", "minimum": 1, "description": "The size of the job's own disk, where its inputs land and its outputs are written, capped there; needed with inputs or outputs, and refused where this peer has not the room (INSUFFICIENT_DISK) or makes no disk (NO_DISK)" },
+                "disk_bytes": { "type": "integer", "minimum": 16777216, "description": "At least 16 MiB, the least a file system is made in. The size of the job's own disk, where its inputs land and its outputs are written, capped there; needed with inputs or outputs, and refused where this peer has not the room (INSUFFICIENT_DISK) or makes no disk (NO_DISK)" },
                 "deadline_seconds": { "type": "integer", "minimum": 1, "maximum": 2592000, "description": "How long the job may run before it is stopped, counted from JobStarted; at most thirty days; without it the job runs to its end" }
             }),
         ),
@@ -584,9 +589,9 @@ fn run_job(peer: Arc<dyn Service>, at: Where) -> CommandDef {
                 "device": { "type": "string", "maxLength": 256, "description": "A device id from this workspace's get-hardware-state, cloud/peer/device, to pin the placement; refused without memory_bytes" },
                 "queue_seconds": { "type": "integer", "minimum": 1, "maximum": 604800, "description": "How long the order may wait for room before it ends unplaced, counted from JobQueued; at most seven days; without it, a day (86400)" },
                 "deadline_seconds": { "type": "integer", "minimum": 1, "maximum": 2592000, "description": "How long the job may run before it is stopped, counted from JobStarted; at most thirty days; without it the job runs to its end" },
-                "inputs": { "type": "array", "maxItems": 1000, "description": "The files the job finds under /in when it starts, each a key in this workspace's store (get-store) and the plain relative path it lands at; fetched by the machine before JobStarted, InputsFetched telling it. Refused when the store holds no such key (NO_SUCH_INPUT) or there is no store (NO_STORE)", "items": { "type": "object", "required": ["key", "path"], "properties": { "key": { "type": "string", "minLength": 1, "maxLength": 1024 }, "path": { "type": "string", "minLength": 1, "maxLength": 1024 } }, "additionalProperties": false } },
+                "inputs": { "type": "array", "maxItems": 1000, "description": "The files the job finds under /in when it starts, each a key in this workspace's store (get-store) and the plain relative path it lands at; fetched by the machine before JobStarted, InputsFetched telling it. Refused when the store holds no such key (NO_SUCH_INPUT) or there is no store (NO_STORE), when two land at one path or one under another (INVALID_INPUT_PATH), and when together they exceed the disk (INPUTS_EXCEED_DISK). The store is the workspace's, and every credential that may run jobs here reads any key in it and writes under any prefix", "items": { "type": "object", "required": ["key", "path"], "properties": { "key": { "type": "string", "minLength": 1, "maxLength": 1024 }, "path": { "type": "string", "minLength": 1, "maxLength": 1024 } }, "additionalProperties": false } },
                 "outputs": { "type": "object", "required": ["prefix"], "description": "Where what the job leaves under /out goes when it exits: a key prefix in this workspace's store, under which one tar archive named for the order is put before JobFinished, OutputsStored naming its key and size; an upload that fails ends the job in JobFailed, its exit code kept. Needs deadline_seconds, six days at most (DEADLINE_NEEDED, TOO_LONG_FOR_THE_STORE)", "properties": { "prefix": { "type": "string", "minLength": 1, "maxLength": 512 } }, "additionalProperties": false },
-                "disk_bytes": { "type": "integer", "minimum": 1, "description": "The size of the job's own disk, where its inputs land and its outputs are written, capped there and removed with it: more than its size gives, or a disk for an order by memory_bytes; needed with inputs or outputs (DISK_NEEDED). It is placed only on a member with that disk free, and refused when no member could ever give it (NO_DISK_ROOM)" },
+                "disk_bytes": { "type": "integer", "minimum": 16777216, "description": "At least 16 MiB, the least a file system is made in. The size of the job's own disk, where its inputs land and its outputs are written, capped there and removed with it: more than its size gives, or a disk for an order by memory_bytes; needed with inputs or outputs (DISK_NEEDED). It is placed only on a member with that disk free, and refused when no member could ever give it (NO_DISK_ROOM)" },
                 "size": { "type": "string", "minLength": 1, "maxLength": 64, "description": "A size from the cloud's menu (get-menu), instead of memory_bytes and device: the job is placed on a device that meets the size's floors and takes it whole, and JobPlaced and JobStarted carry its receipt, in the size's terms: no device, GPU or MIG profile is named on what this door serves. Refused when the cloud has no such size (NO_SUCH_SIZE, with the sizes it has) or no device of its members meets it (NO_SOURCE_FOR_SIZE, with the sizes that are met); under the workspace's spending cap (set-spending-cap), when it sends no deadline_seconds (DEADLINE_NEEDED), when its cloud's menu prices in another currency (SPENDING_CAP_CURRENCY), or when what it may cost would pass the cap (SPENDING_CAP). get-usage reads what it used and cost" }
             }),
         ),
@@ -692,7 +697,7 @@ fn stop_job(peer: Arc<dyn Service>) -> CommandDef {
         schema: "stop-job".into(),
         version: "1.0".into(),
         command_type: "StopJob".into(),
-        description: "Stops a running job, or an order that waits or is not yet started, named by the id JobQueued gave it, which ends before it started: JobStopped under the order's own correlation id too (on a peer's own door, one already starting is refused, ALREADY_STARTING). Refused when no such job or order is there, or when another credential started it. The outcome is a JobStopped event with this command's correlation id. Needs the jobs scope.".into(),
+        description: "Stops a running job, or an order that waits or is not yet started, named by the id JobQueued gave it, which ends before it started: JobStopped under the order's own correlation id too (on a peer's own door, one already starting is refused, ALREADY_STARTING). Refused when no such job or order is there, when another credential started it, or when the job exited and its outputs are being sent (STORING_OUTPUTS), since its end follows. The outcome is a JobStopped event with this command's correlation id. Needs the jobs scope.".into(),
         data_schema: json!({
             "type": "object",
             "required": ["job"],
@@ -826,7 +831,7 @@ fn set_menu(ws: Arc<dyn Clouds>) -> CommandDef {
                 "host_memory_bytes": { "type": "integer", "minimum": 1, "description": "The least host memory of the machine its device is on" },
                 "share": { "type": "number", "exclusiveMinimum": 0, "maximum": 1, "description": "The share of a card's compute the size stands for, for the client to read: a MIG instance's fraction of its card, 1 for a whole card. Placement reads the floors, not this" },
                 "price_per_second": { "type": "number", "minimum": 0, "description": "What a second of it costs, in the menu's currency" },
-                "disk_bytes": { "type": "integer", "minimum": 1, "description": "The disk its job gets, where its inputs land and its outputs are written; an order may ask for more" }
+                "disk_bytes": { "type": "integer", "minimum": 16777216, "description": "At least 16 MiB, the least a file system is made in. The disk its job gets, where its inputs land and its outputs are written; an order may ask for more" }
             }, "additionalProperties": false } }
             },
             "additionalProperties": false
@@ -940,9 +945,9 @@ fn set_store(ws: Arc<dyn Clouds>) -> CommandDef {
         produces: vec!["StoreSetV1".into(), "CommandFailed".into()],
         completes: completes("SetStore"),
         impact: None,
-        admit: Some(Arc::new(move |cmd, who, _key| {
+        admit: Some(Arc::new(move |cmd, who, key| {
             let ws = admit.clone();
-            Box::pin(async move { ws.admit_set_store(cmd, &who) })
+            Box::pin(async move { ws.admit_set_store(cmd, &who, key) })
         })),
         handler: Arc::new(move |cmd, emitter| {
             let ws = ws.clone();
@@ -1342,7 +1347,8 @@ pub fn event_defs() -> Vec<EventDef> {
                 "instead_of": s("Queued again: the job the lost member peer was running for it"),
                 "cloud": s("On a workspace's door, the cloud that took it"),
                 "boxed": { "type": "boolean", "description": "On a peer's own door, true when its job runs in the closed box a credential with a share gets" },
-                "inputs": { "type": "array", "description": "Its inputs, each a key in the workspace's store and the path under /in", "items": { "type": "object" } },
+                "inputs": { "type": "array", "description": "Its inputs, each a key in the workspace's store, the path under /in, and its size as the store said", "items": { "type": "object" } },
+                "store": { "type": "object", "description": "The store its inputs were found in, endpoint and bucket: one set since fails the order when it is placed", "properties": { "endpoint": { "type": "string" }, "bucket": { "type": "string" } } },
                 "outputs": { "type": "object", "description": "The key prefix its outputs go under" },
                 "disk_bytes": { "type": "integer", "description": "The size of its disk" },
                 "size": { "type": "object", "description": "The size it ordered, as the cloud's menu had it then, with the menu's currency" }

@@ -69,12 +69,15 @@ pub fn queued_fact(o: &Order, attempt: u32, waiting: bool, reason: Option<String
         v["inputs"] = json!(io
             .inputs
             .iter()
-            .map(|(key, path)| json!({ "key": key, "path": path }))
+            .map(|i| json!({ "key": i.key, "path": i.path, "bytes": i.bytes }))
             .collect::<Vec<_>>());
         if let Some(prefix) = &io.outputs {
             v["outputs"] = json!({ "prefix": prefix });
         }
         v["disk_bytes"] = json!(io.disk_bytes);
+        if let Some((endpoint, bucket)) = &io.store {
+            v["store"] = json!({ "endpoint": endpoint, "bucket": bucket });
+        }
     }
     if let Some((size, currency)) = &o.size {
         let mut z = serde_json::to_value(size).unwrap_or(Value::Null);

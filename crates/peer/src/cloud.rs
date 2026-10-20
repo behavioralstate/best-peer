@@ -343,15 +343,34 @@ struct OutputPrefix {
 /// lives seven days at most; six days, with room for its image's pull and its upload.
 const MOST_SECONDS_WITH_OUTPUTS: u64 = 6 * 24 * 60 * 60;
 
+/// What a disk of `bytes` holds for files: its file system keeps about a twentieth for itself.
+pub(crate) fn usable(bytes: u64) -> u64 {
+    bytes - bytes / 20
+}
+
 /// `host` without the devices of the members that have not `needed` bytes free for a job's disk now, as `peers`
 /// (each member's row, with the room it says it has) tells; all of it for a job with no disk.
-fn with_disk_room(host: Host, peers: &[Value], cloud: &str, needed: Option<u64>) -> Host {
+fn with_disk_room(
+    host: Host,
+    peers: &[Value],
+    cloud: &str,
+    needed: Option<u64>,
+    promised: &HashMap<String, u64>,
+) -> Host {
     let Some(needed) = needed else {
         return host;
     };
     let roomy: Vec<String> = peers
         .iter()
-        .filter(|p| p["disk"]["free_bytes"].as_u64().is_some_and(|f| f >= needed))
+        .filter(|p| {
+            let held = promised
+                .get(p["peer"].as_str().unwrap_or_default())
+                .copied()
+                .unwrap_or(0);
+            p["disk"]["free_bytes"]
+                .as_u64()
+                .is_some_and(|f| f.saturating_sub(held) >= needed)
+        })
         .filter_map(|p| Some(format!("{cloud}/{}/", p["peer"].as_str()?)))
         .collect();
     Host {
@@ -597,6 +616,44 @@ impl Cloud {
         self.store.get().and_then(|s| s.lock().unwrap().clone())
     }
 
+    /// The disk each member is promised for orders on their way to it and not started there, by member: what the
+    /// free space it says does not count until it makes the disk. Read with the state held.
+    fn disk_promised(&self, s: &State) -> HashMap<String, u64> {
+        let mut out: HashMap<String, u64> = HashMap::new();
+        // The member a reservation names, from its device (cloud/peer/device).
+        let member_of = |id: &str| {
+            s.reserved
+                .values()
+                .find(|r| r.id == id)
+                .and_then(|r| r.device.as_ref())
+                .and_then(|d| d.0.split('/').nth(1))
+                .map(str::to_string)
+        };
+        // Taken and not started: where it was placed, or where its admission or a step is placing it.
+        for o in s.orders.values().filter(|o| o.job.is_none()) {
+            let Some(io) = &o.io else {
+                continue;
+            };
+            if let Some(peer) = o.placed.as_ref().map(|(p, _)| p.clone()).or_else(|| member_of(&o.id)) {
+                *out.entry(peer).or_default() += io.disk_bytes;
+            }
+        }
+        // Admitted and not yet taken: promised where its admission placed it.
+        let admitted = self.admitted_io.lock().unwrap();
+        for (key, r) in &s.reserved {
+            if s.orders.contains_key(&r.id) {
+                continue;
+            }
+            let (Some(device), Some(Some(io))) = (&r.device, admitted.get(key)) else {
+                continue;
+            };
+            if let Some(peer) = device.0.split('/').nth(1) {
+                *out.entry(peer.to_string()).or_default() += io.disk_bytes;
+            }
+        }
+        out
+    }
+
     /// An order's inputs, outputs and disk, checked against the workspace's store: each input there, each landing
     /// at a plain path, a disk given by the order or its size, an order with outputs bounded within what a signed URL
     /// outlives. None for an order with none of them.
@@ -639,6 +696,9 @@ impl Cloud {
                 );
             }
         }
+        if let Some((n, why)) = crate::lifecycle::path_clash(data.inputs.iter().map(|i| i.path.as_str())) {
+            return bad("INVALID_INPUT_PATH", &format!("inputs/{n}/path"), why);
+        }
         if let Some(o) = &data.outputs {
             if o.prefix.is_empty() || o.prefix.starts_with('/') {
                 return bad(
@@ -665,10 +725,11 @@ impl Cloud {
                 Some(_) => {}
             }
         }
+        let mut sizes = vec![];
         if let Some(store) = &store {
             for (n, i) in data.inputs.iter().enumerate() {
                 match store.size_of(&i.key).await {
-                    Ok(Some(_)) => {}
+                    Ok(Some(bytes)) => sizes.push(bytes),
                     Ok(None) => {
                         return bad(
                             "NO_SUCH_INPUT",
@@ -692,13 +753,37 @@ impl Cloud {
                 }
             }
         }
+        // The inputs land on the disk before the job starts: what cannot fit is refused now, not after the wait.
+        let inputs: u64 = sizes.iter().sum();
+        if inputs > usable(disk) {
+            return bad(
+                "INPUTS_EXCEED_DISK",
+                "disk_bytes",
+                format!(
+                    "the inputs are {inputs} bytes together, more than a disk of {disk} bytes holds once its file system takes its share ({} bytes): ask for more disk_bytes",
+                    disk - usable(disk)
+                ),
+            );
+        }
         Ok(Some(crate::state::OrderIo {
-            inputs: data.inputs.iter().map(|i| (i.key.clone(), i.path.clone())).collect(),
+            inputs: data
+                .inputs
+                .iter()
+                .zip(sizes.into_iter().map(Some).chain(std::iter::repeat(None)))
+                .map(|(i, bytes)| crate::state::OrderInput {
+                    key: i.key.clone(),
+                    path: i.path.clone(),
+                    bytes,
+                })
+                .collect(),
             outputs: data
                 .outputs
                 .as_ref()
                 .map(|o| o.prefix.trim_end_matches('/').to_string()),
             disk_bytes: disk,
+            store: store
+                .filter(|_| !data.inputs.is_empty() || data.outputs.is_some())
+                .map(|s| (s.endpoint, s.bucket)),
         }))
     }
 
@@ -1940,7 +2025,13 @@ impl Cloud {
                 } else {
                     isolated.clone()
                 };
-                let on = with_disk_room(on, &peers, &self.name, o.io.as_ref().map(|io| io.disk_bytes));
+                let on = with_disk_room(
+                    on,
+                    &peers,
+                    &self.name,
+                    o.io.as_ref().map(|io| io.disk_bytes),
+                    &self.disk_promised(&s),
+                );
                 let mut receipt = None;
                 let pick = match (&o.size, o.memory_bytes) {
                     (Some((size, currency)), _) => match size.place(&on, &host, &s, &taken) {
@@ -2005,6 +2096,35 @@ impl Cloud {
             }
             return;
         };
+        // Its store first: an order whose store was removed, or replaced, while it waited is not served from another.
+        let store = match &o.io {
+            Some(io) if !io.inputs.is_empty() || io.outputs.is_some() => match self.store_now() {
+                None => {
+                    fail(
+                        "the workspace has no store any more, where its inputs were".into(),
+                        "its owner sets one with set-store; then order it again",
+                        None,
+                    );
+                    return;
+                }
+                Some(s)
+                    if io
+                        .store
+                        .as_ref()
+                        .is_some_and(|(e, b)| (e, b) != (&s.endpoint, &s.bucket)) =>
+                {
+                    let (endpoint, bucket) = io.store.clone().unwrap_or_default();
+                    fail(
+                        format!("the workspace's store was replaced while the order waited: its inputs were found in bucket {bucket} at {endpoint}"),
+                        "order it again, naming keys in the store set now (get-store)",
+                        None,
+                    );
+                    return;
+                }
+                Some(s) => Some(s),
+            },
+            _ => None,
+        };
         let memory = o.memory_bytes.or(o.size.as_ref().map(|(z, _)| z.memory_bytes));
         let with_device = memory.is_some();
         let mut placed = json!({ "job": o.id, "peer": member.name, "device": with_device.then(|| device.0.clone()) });
@@ -2018,20 +2138,14 @@ impl Cloud {
             body["device"] = json!(member_device);
         }
         if let Some(io) = &o.io {
-            let Some(store) = self.store_now() else {
-                fail(
-                    "the workspace has no store any more, where its inputs were".into(),
-                    "its owner sets one with set-store; then order it again",
-                    None,
-                );
-                return;
-            };
-            let now = OffsetDateTime::now_utc();
             body["disk_bytes"] = json!(io.disk_bytes);
+        }
+        if let (Some(io), Some(store)) = (&o.io, &store) {
+            let now = OffsetDateTime::now_utc();
             body["inputs"] = json!(io
                 .inputs
                 .iter()
-                .map(|(key, path)| json!({ "url": store.presign("GET", key, 24 * 60 * 60, now), "path": path }))
+                .map(|i| json!({ "url": store.presign("GET", &i.key, 24 * 60 * 60, now), "path": i.path, "bytes": i.bytes }))
                 .collect::<Vec<_>>());
             if let Some(prefix) = &io.outputs {
                 let key = format!("{prefix}/{}.tar", o.id);
@@ -2466,11 +2580,9 @@ impl Service for Cloud {
         within_share(held.memory_bytes, &who, needed)?;
         within_count("job", held.jobs, who.grant.jobs)?;
         let taken = self.taken_whole(&state);
-        if io.is_some() {
-            self.admitted_io.lock().unwrap().insert(key.clone(), io.clone());
-        }
+        let promised = self.disk_promised(&state);
         if let Some((size, menu)) = &sized {
-            let roomy = with_disk_room(host.clone(), &peers, &self.name, disk);
+            let roomy = with_disk_room(host.clone(), &peers, &self.name, disk, &promised);
             let placement = match size.place(&roomy, &whole, &state, &taken) {
                 Ok(p) => Some(p),
                 // No device meeting its floors has its room now, where room can come free: it waits its turn.
@@ -2519,6 +2631,10 @@ impl Service for Cloud {
                     data.deadline_seconds,
                 ),
             );
+            // Kept only once the order is certain to be taken, so a refusal leaves nothing behind.
+            if io.is_some() {
+                self.admitted_io.lock().unwrap().insert(key.clone(), io.clone());
+            }
             state.reserved.insert(
                 key.clone(),
                 Reservation {
@@ -2534,7 +2650,7 @@ impl Service for Cloud {
         }
         // The devices a size holds whole take nothing else, though an order that waits may come to have them.
         let all = host.clone();
-        let host = Self::without(with_disk_room(host, &peers, &self.name, disk), &taken);
+        let host = Self::without(with_disk_room(host, &peers, &self.name, disk, &promised), &taken);
         let placement = match data.memory_bytes {
             Some(needed) => match place(
                 &host,
@@ -2586,6 +2702,9 @@ impl Service for Cloud {
         };
         if accelerators_only(&who) {
             self.held_to_accelerators.lock().unwrap().insert(key.clone());
+        }
+        if io.is_some() {
+            self.admitted_io.lock().unwrap().insert(key.clone(), io.clone());
         }
         state.reserved.insert(
             key.clone(),

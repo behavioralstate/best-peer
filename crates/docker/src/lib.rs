@@ -333,8 +333,8 @@ impl Runtime for DockerRuntime {
         Ok(())
     }
 
-    /// A container, or a user namespace when the engine runs rootless or remaps its users, as its own `info` says.
-    /// An engine that does not answer is still the one the peer confines every container in.
+    /// A file system of its own for the job `id`: an ext4 file of `bytes`, allocated whole so the room it takes is
+    /// taken now, on a loop device mounted under the disks' directory. Linux only, and the peer needs root to mount.
     async fn make_disk(&self, id: &str, bytes: u64) -> Result<std::path::PathBuf, RuntimeError> {
         let Some(dir) = self.disks.clone() else {
             return Err(RuntimeError::NoDisk(
@@ -352,11 +352,11 @@ impl Runtime for DockerRuntime {
                 .map_err(|e| RuntimeError::NoDisk(format!("cannot make {}: {e}", dir.display())))?;
             let image = dir.join(format!("{id}.img"));
             let mount = dir.join(&id);
-            let file = std::fs::File::create(&image)
+            std::fs::File::create(&image)
                 .map_err(|e| RuntimeError::NoDisk(format!("cannot make {}: {e}", image.display())))?;
-            file.set_len(bytes)
+            // Allocated, not sparse: the host's free space shrinks now, so two disks are never promised one room.
+            run("fallocate", &["-l", &bytes.to_string(), &image.to_string_lossy()])
                 .map_err(|e| RuntimeError::NoDisk(format!("no room for a disk of {bytes} bytes: {e}")))?;
-            drop(file);
             std::fs::create_dir_all(&mount).map_err(|e| RuntimeError::NoDisk(e.to_string()))?;
             let (img, mnt) = (image.to_string_lossy().to_string(), mount.to_string_lossy().to_string());
             run("mkfs.ext4", &["-q", "-F", &img])?;
@@ -389,6 +389,37 @@ impl Runtime for DockerRuntime {
         .map_err(|e| RuntimeError::NoDisk(e.to_string()))?
     }
 
+    fn disks(&self) -> Vec<String> {
+        let Some(dir) = self.disks.clone() else {
+            return vec![];
+        };
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().to_string_lossy().strip_suffix(".img").map(str::to_string))
+            .collect()
+    }
+
+    fn disk_at(&self, id: &str) -> Option<std::path::PathBuf> {
+        let mount = self.disks.clone()?.join(id);
+        // Mounted: its own file system, on another device than the directory it is in. After a reboot it is not.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let (here, above) = (
+                std::fs::metadata(&mount).ok()?,
+                std::fs::metadata(mount.parent()?).ok()?,
+            );
+            (here.dev() != above.dev()).then_some(mount)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = mount;
+            None
+        }
+    }
+
     fn disk_room(&self) -> Option<(u64, u64)> {
         let dir = self.disks.clone()?;
         if !cfg!(target_os = "linux") {
@@ -408,6 +439,8 @@ impl Runtime for DockerRuntime {
         Some((numbers.next()?, numbers.next()?))
     }
 
+    /// A container, or a user namespace when the engine runs rootless or remaps its users, as its own `info` says.
+    /// An engine that does not answer is still the one the peer confines every container in.
     async fn isolation(&self) -> Isolation {
         match self.docker.info().await {
             Ok(info) => Isolation::of_container_engine(&info.security_options.unwrap_or_default()),
