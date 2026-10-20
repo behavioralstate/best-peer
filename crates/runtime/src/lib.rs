@@ -252,6 +252,8 @@ pub struct Fake {
     tx: broadcast::Sender<Event>,
     /// When set, a pull waits for a permit: a test holds a workload between its pull and its start.
     gate: Mutex<Option<std::sync::Arc<tokio::sync::Semaphore>>>,
+    /// What the engine says when it refuses to start a container, when a test says it does.
+    refusal: Mutex<Option<String>>,
     /// What it says stands between its containers and the host: a container, unless a test says otherwise.
     isolation: Isolation,
 }
@@ -273,6 +275,7 @@ impl Fake {
             next: Mutex::new(0),
             tx,
             gate: Mutex::new(None),
+            refusal: Mutex::new(None),
             isolation: Isolation::Container,
         }
     }
@@ -310,6 +313,12 @@ impl Fake {
     pub fn without_jobs(mut self) -> Self {
         self.jobs = false;
         self
+    }
+
+    /// Makes every start from now on refused with the engine's own words, as Docker refuses a container its NVIDIA
+    /// toolkit will not hand a device to.
+    pub fn refuse_starts(&self, why: &str) {
+        *self.refusal.lock().unwrap() = Some(why.into());
     }
 
     /// A fake whose pull reports every percent from 0 to 100, as a real engine does.
@@ -390,6 +399,9 @@ impl Runtime for Fake {
     }
 
     async fn start(&self, spec: Spec) -> Result<Started, RuntimeError> {
+        if let Some(why) = self.refusal.lock().unwrap().clone() {
+            return Err(RuntimeError::Engine(why));
+        }
         if !self.local.lock().unwrap().contains(&spec.image) {
             return Err(RuntimeError::ImageNotFound(spec.image.0.clone()));
         }

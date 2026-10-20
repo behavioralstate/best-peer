@@ -1708,7 +1708,7 @@ fn fix_for_runtime(e: &RuntimeError) -> &'static str {
         RuntimeError::Unreachable(_) => "the container engine is not running on the host: start it",
         // The NVIDIA toolkit refuses an image built for a CUDA newer than the host's driver offers.
         RuntimeError::Engine(m) if m.contains("unsatisfied condition: cuda") => {
-            "the engine's image needs a newer NVIDIA driver than this host has (get-hardware-state says the CUDA version it offers): the host's operator updates the driver, or names a build of the engine for that CUDA with BEST_PEER_VLLM_IMAGE or BEST_PEER_OLLAMA_IMAGE"
+            "the image needs a newer NVIDIA driver than this host has (get-hardware-state says the CUDA version it offers): name an image built for that CUDA, or ask whoever runs the peer to update the driver; an engine's build is the operator's to name, with BEST_PEER_VLLM_IMAGE or BEST_PEER_OLLAMA_IMAGE"
         }
         RuntimeError::Engine(_) => "read the container engine's logs on the host",
     }

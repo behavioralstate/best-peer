@@ -4439,6 +4439,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_deploy_or_a_job_whose_image_needs_a_newer_driver_fails_with_the_driver_named() {
+        let bed = fresh().await;
+        bed.runtime.refuse_starts("the container did not start: Docker responded with status code 500: failed to create task for container: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: error during container init: error running prestart hook #0: exit status 1, stdout: , stderr: Auto-detected mode as 'legacy'\nnvidia-container-cli: requirement error: unsatisfied condition: cuda>=13.0, please update your driver to a newer version, or use an earlier cuda container: unknown");
+        let (s, b) = bed.deploy("d1", "llama3.2:3b", "vllm", 8).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let failed = bed.events_of("d1", "DeploymentFailed").await;
+        let fix = failed.last().unwrap().data["fix"].as_str().unwrap().to_string();
+        assert!(
+            fix.contains("newer NVIDIA driver") && fix.contains("BEST_PEER_VLLM_IMAGE"),
+            "{fix}"
+        );
+        let (s, b) = bed
+            .send(
+                "j1",
+                "RunJob",
+                "run-job",
+                json!({ "image": "busybox", "memory_bytes": GB }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let failed = bed.events_of("j1", "JobFailed").await;
+        let fix = failed.last().unwrap().data["fix"].as_str().unwrap().to_string();
+        assert!(fix.contains("name an image built for that CUDA"), "{fix}");
+    }
+
     #[test]
     fn a_span_of_time_reads_as_a_person_writes_it() {
         assert_eq!(parse_duration("8h").unwrap(), Duration::from_secs(8 * 3600));
