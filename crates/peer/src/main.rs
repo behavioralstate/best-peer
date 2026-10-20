@@ -2430,8 +2430,8 @@ mod tests {
         let (s, b) = bed.send("p1", "Prompt", "prompt", ask).await;
         assert_eq!(s, StatusCode::CREATED, "{b}");
         bed.events_of("p1", "PromptAnswered").await;
-        // The accepted commands' file cannot be replaced: the forget fails, and says to send it again.
-        let accepted = dir.path().join("accepted.jsonl");
+        // The accepted commands' file cannot be replaced: the forget fails, and says to send it again. On Unix a
+        // file is replaced through its folder, so the folder is what is made unwritable.
         let lock = |on: bool| {
             #[cfg(unix)]
             {
@@ -2441,6 +2441,7 @@ mod tests {
             }
             #[cfg(not(unix))]
             {
+                let accepted = dir.path().join("accepted.jsonl");
                 let mut p = std::fs::metadata(&accepted).unwrap().permissions();
                 p.set_readonly(on);
                 std::fs::set_permissions(&accepted, p).unwrap();
