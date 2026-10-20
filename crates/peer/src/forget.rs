@@ -1,7 +1,8 @@
 //! A holder's right to forget (behavioralstate/spec#68): `forget` removes the content of the holder's prompts, the
 //! messages it sent and the answers and engines' words it got, and keeps every event's envelope, so the fold, who
 //! owns which correlation, and what a prompt used are unchanged. What it names is one correlation, a deployment's
-//! prompts, or everything of the holder's told before a time; nothing else is touched, and nothing of another
+//! prompts, or the holder's answers told before a time (with a prompt's messages when every answer under its
+//! correlation came before it); nothing else is touched, and nothing of another
 //! holder's: a correlation the sender does not own is refused as a read of it is.
 
 use best_peer_door::auth::Credential;
@@ -87,7 +88,7 @@ pub fn scope_of(cmd: &Envelope) -> Result<Scope, BestError> {
         _ => {
             return Err(BestError::bad_request(
                 "FORGET_NAMES_ONE",
-                "name one of correlation (one command's prompts), deployment (every prompt of yours to it) or before (every prompt of yours told before that time)",
+                "name one of correlation (one command's prompts), deployment (every prompt of yours to it) or before (the answers told before that time, and a prompt's messages when every answer under its correlation came before it)",
             )
             .with_details(json!({ "fields": ["correlation", "deployment", "before"] })))
         }
