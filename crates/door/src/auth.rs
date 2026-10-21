@@ -890,12 +890,14 @@ impl Auth {
             grant: p.grant,
         };
         self.store(&credential);
+        // No `tenant_id`: a credential signed in here opens the root and the workspaces its identity belongs to, not
+        // one tenant, and a consumer expands a tenant id it is given into a tenant manifest (SPEC.md, Agent
+        // Registration). The host it once named here was no tenant, and on a host without a port it read as one.
         let mut answer = json!({
             "access_token": key,
             "token_type": "apikey",
             "auth_header": AUTH_HEADER,
             "name": name,
-            "tenant_id": host_of(&self.endpoint),
             "note": format!("{} This peer admitted you on the word of whoever controls the machine it runs on.", guidance::TOKEN_TEXT),
             "endpoint": self.endpoint,
             "manifest": format!("{}/.well-known/best", self.endpoint),
@@ -1140,6 +1142,10 @@ mod tests {
         assert!(key.starts_with("bp_"));
         assert_eq!(answer["name"], "my-peer");
         assert_eq!(answer["auth_header"], "X-Api-Key");
+        assert!(
+            answer.get("tenant_id").is_none(),
+            "a sign-in at the root opens no one tenant, and the host is no tenant id"
+        );
         assert!(answer["note"].as_str().unwrap().starts_with(guidance::TOKEN_TEXT));
         assert!(
             !answer["note"].as_str().unwrap().contains("revoke"),

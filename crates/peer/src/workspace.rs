@@ -380,7 +380,7 @@ async fn dispatch(
     let Some(ws) = ws else {
         return BestError::not_found(
             "NO_SUCH_WORKSPACE",
-            format!("no workspace {id} opens to this credential: get-workspaces at the root lists yours, and accept-invitation joins one you were invited into"),
+            format!("no workspace {id} opens to this credential: get-workspaces at the root lists yours, and accept-invitation joins one you were invited into. A workspace opens to the credential that created it and to its members' own; a sign-in is a new identity, a member of nothing"),
         )
         .with_details(json!({ "workspace": id }))
         .into_response();
