@@ -292,6 +292,36 @@ impl Catalogue {
 
     /// Validates a command's `data` against the catalogue's schema for its type. Every violation is reported, with
     /// its path, so a caller fixes them all at once.
+    /// The command `envelope` as the door records it: its data without the fields its schema marks `writeOnly`, a
+    /// secret its admission has taken and kept where it belongs, which no log, replay or handler ever sees again.
+    pub fn as_recorded(&self, envelope: &Envelope) -> Envelope {
+        let Some(c) = self.commands.iter().find(|c| c.def.command_type == envelope.r#type) else {
+            return envelope.clone();
+        };
+        let mut recorded = envelope.clone();
+        if let (Some(fields), Some(data)) = (
+            c.def.data_schema["properties"].as_object(),
+            recorded.data.as_object_mut(),
+        ) {
+            for (name, schema) in fields {
+                if schema["writeOnly"] == true {
+                    data.remove(name);
+                }
+            }
+        }
+        recorded
+    }
+
+    /// Whether commands of `type` may carry a field the door never records: one whose stored copy is then not the
+    /// command that was sent, and cannot be run again after a restart.
+    pub fn carries_write_only(&self, r#type: &str) -> bool {
+        self.commands
+            .iter()
+            .find(|c| c.def.command_type == r#type)
+            .and_then(|c| c.def.data_schema["properties"].as_object())
+            .is_some_and(|fields| fields.values().any(|f| f["writeOnly"] == true))
+    }
+
     pub fn validate_data(&self, r#type: &str, data: &Value) -> Result<(), BestError> {
         let c = self
             .commands
@@ -462,6 +492,32 @@ mod tests {
             admit: None,
             handler: noop(),
         }
+    }
+
+    #[test]
+    fn a_field_marked_write_only_is_not_recorded() {
+        let mut def = pull_image();
+        def.command_type = "SetStore".into();
+        def.data_schema = json!({
+            "type": "object",
+            "properties": { "bucket": { "type": "string" }, "secret": { "type": "string", "writeOnly": true } }
+        });
+        let c = Catalogue::new().command(def);
+        let sent = Envelope::event(
+            "s",
+            "SetStore",
+            json!({ "bucket": "b", "secret": "s3cr3t" }),
+            None,
+            None,
+        );
+        let recorded = c.as_recorded(&sent);
+        assert_eq!(recorded.data, json!({ "bucket": "b" }));
+        assert_eq!((recorded.id, recorded.r#type), (sent.id, sent.r#type));
+        // A command with no such field is recorded as it came.
+        let other = Envelope::event("s", "PullImage", json!({ "image": "x" }), None, None);
+        assert_eq!(c.as_recorded(&other).data, other.data);
+        assert!(c.carries_write_only("SetStore"));
+        assert!(!c.carries_write_only("PullImage") && !c.carries_write_only("Unknown"));
     }
 
     #[test]

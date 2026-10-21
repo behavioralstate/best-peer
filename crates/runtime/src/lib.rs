@@ -6,7 +6,7 @@
 //! adapter (Docker or containerd through bollard, a microVM later) is a separate crate that implements [`Runtime`]
 //! and is proven on a host by hand, never unit-tested.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -158,6 +158,9 @@ pub enum RuntimeError {
     Unreachable(String),
     #[error("the engine failed: {0}")]
     Engine(String),
+    /// A job's disk could not be made, or this runtime makes none: the words say which.
+    #[error("{0}")]
+    NoDisk(String),
 }
 
 /// What stands between a workload and the host and the other workloads on it, weakest first, so a workload that asks
@@ -245,6 +248,34 @@ pub trait Runtime: Send + Sync {
     async fn processes(&self) -> Option<Vec<u32>> {
         None
     }
+    /// A disk of `bytes` for the job `id`, capped at that size so the job cannot fill the host, and the directory on
+    /// the host where it is mounted (behavioralstate/spec#66). A runtime that makes none refuses, in words.
+    async fn make_disk(&self, _id: &str, _bytes: u64) -> Result<std::path::PathBuf, RuntimeError> {
+        Err(RuntimeError::NoDisk(
+            "this peer's container engine makes no disk for a job: a job with inputs or outputs runs where Docker does, on Linux".into(),
+        ))
+    }
+    /// Removes the job `id`'s disk and everything on it; one already gone is no error.
+    async fn remove_disk(&self, _id: &str) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+    /// Whether this runtime makes jobs' disks at all; answered at once, without asking the file system.
+    fn makes_disks(&self) -> bool {
+        false
+    }
+    /// The space free, and in all, where this runtime makes disks, the disks it made counted whole; none when it
+    /// makes none, or the file system did not say. It may take a while: call it off the executor.
+    fn disk_room(&self) -> Option<(u64, u64)> {
+        None
+    }
+    /// The jobs whose disks this runtime made and has not removed, as a restart finds them.
+    fn disks(&self) -> Vec<String> {
+        vec![]
+    }
+    /// Where the job `id`'s disk is mounted on the host, when it is.
+    fn disk_at(&self, _id: &str) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 /// An in-memory [`Runtime`] for tests: images the engine already holds, images a registry would serve, containers
@@ -277,6 +308,15 @@ pub struct Fake {
     /// The host's ids of the processes its containers run, as a test sets them; `None` for an engine that cannot
     /// tell.
     processes: Mutex<Option<Vec<u32>>>,
+    /// Where its jobs' disks are made, a directory of its own, and the room it says it has there.
+    disks: std::path::PathBuf,
+    disk_free: Mutex<u64>,
+    /// The disks it made, with their sizes: each takes its whole size from the room, as an allocated file does.
+    disks_made: Mutex<HashMap<String, u64>>,
+    /// Why the next disk fails once it is begun, as a file system that cannot be made on it fails.
+    broken_disk: Mutex<Option<String>>,
+    /// Whether its room can be read now: not, as a file system that does not answer.
+    room_unread: Mutex<bool>,
 }
 
 impl Fake {
@@ -298,8 +338,33 @@ impl Fake {
             gate: Mutex::new(None),
             refusal: Mutex::new(None),
             isolation: Isolation::Container,
+            disks: std::env::temp_dir().join("best-peer-fake-disks").join(uuid_like()),
+            disk_free: Mutex::new(1 << 40),
+            disks_made: Mutex::new(HashMap::new()),
+            broken_disk: Mutex::new(None),
             processes: Mutex::new(Some(Vec::new())),
+            room_unread: Mutex::new(false),
         }
+    }
+
+    /// From now on its room cannot be read, or can again.
+    pub fn room_unread(&self, unread: bool) {
+        *self.room_unread.lock().unwrap() = unread;
+    }
+
+    /// The next disk is begun, its directory made, and then fails with `why`.
+    pub fn break_next_disk(&self, why: &str) {
+        *self.broken_disk.lock().unwrap() = Some(why.to_string());
+    }
+
+    /// The room it says it has for disks from now on, before the disks it made.
+    pub fn set_disk_room(&self, free: u64) {
+        *self.disk_free.lock().unwrap() = free;
+    }
+
+    /// Where the job `id`'s disk is, made or not.
+    pub fn disk_of(&self, id: &str) -> std::path::PathBuf {
+        self.disks.join(id)
     }
 
     /// Sets the host's ids of the processes its containers run, or `None` for an engine that cannot tell.
@@ -413,6 +478,18 @@ impl Fake {
     }
 }
 
+/// A name no other fake in this process or another uses: the fake's disks of one test stay apart from another's.
+fn uuid_like() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::SeqCst);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("{}-{t}-{n}", std::process::id())
+}
+
 #[async_trait]
 impl Runtime for Fake {
     async fn pull(&self, image: &ImageRef, progress: Progress) -> Result<(), RuntimeError> {
@@ -495,6 +572,57 @@ impl Runtime for Fake {
 
     fn events(&self) -> broadcast::Receiver<Event> {
         self.tx.subscribe()
+    }
+
+    async fn make_disk(&self, id: &str, bytes: u64) -> Result<std::path::PathBuf, RuntimeError> {
+        if self.disk_room().is_some_and(|(free, _)| bytes > free) {
+            return Err(RuntimeError::NoDisk(format!(
+                "no room for a disk of {bytes} bytes on this host"
+            )));
+        }
+        let dir = self.disk_of(id);
+        std::fs::create_dir_all(&dir).map_err(|e| RuntimeError::NoDisk(e.to_string()))?;
+        if let Some(why) = self.broken_disk.lock().unwrap().take() {
+            return Err(RuntimeError::NoDisk(why));
+        }
+        self.disks_made.lock().unwrap().insert(id.to_string(), bytes);
+        Ok(dir)
+    }
+
+    async fn remove_disk(&self, id: &str) -> Result<(), RuntimeError> {
+        self.disks_made.lock().unwrap().remove(id);
+        match std::fs::remove_dir_all(self.disk_of(id)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(RuntimeError::NoDisk(e.to_string())),
+        }
+    }
+
+    fn makes_disks(&self) -> bool {
+        true
+    }
+
+    fn disk_room(&self) -> Option<(u64, u64)> {
+        if *self.room_unread.lock().unwrap() {
+            return None;
+        }
+        let free = *self.disk_free.lock().unwrap();
+        let made: u64 = self.disks_made.lock().unwrap().values().sum();
+        Some((free.saturating_sub(made), free.max(1 << 40)))
+    }
+
+    fn disks(&self) -> Vec<String> {
+        std::fs::read_dir(&self.disks)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect()
+    }
+
+    fn disk_at(&self, id: &str) -> Option<std::path::PathBuf> {
+        Some(self.disk_of(id)).filter(|d| d.is_dir())
     }
 
     fn runs_jobs(&self) -> bool {

@@ -39,6 +39,8 @@ pub struct DockerRuntime {
     /// engines there, every interface when the container engine is on another host (`BEST_PEER_ENGINE_HOST`).
     bind_ip: String,
     tx: broadcast::Sender<Event>,
+    /// Where jobs' disks are made: each a file system of its own on a loop device, capped at the size asked for.
+    disks: Option<std::path::PathBuf>,
 }
 
 impl DockerRuntime {
@@ -56,6 +58,7 @@ impl DockerRuntime {
             exited: Arc::new(Mutex::new(Exited::default())),
             bind_ip: bind_ip.into(),
             tx,
+            disks: None,
         };
         sweep(&me.docker, &me.exited).await;
         me.follow();
@@ -278,6 +281,34 @@ impl Layers {
     }
 }
 
+impl DockerRuntime {
+    /// The same engine, making jobs' disks under `dir`.
+    pub fn with_disks(mut self, dir: std::path::PathBuf) -> Self {
+        self.disks = Some(dir);
+        self
+    }
+}
+
+/// How many `df`s killed past their time have not ended: each counted until its own reaper sees it end, so the room
+/// stays unknown, and no other is started, while any is stuck.
+static DF_STUCK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Runs `program` with `args`, its failure in its own words.
+fn run(program: &str, args: &[&str]) -> Result<(), RuntimeError> {
+    let out = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|e| RuntimeError::NoDisk(format!("{program} could not run: {e}")))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(RuntimeError::NoDisk(format!(
+        "{program} {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr).trim()
+    )))
+}
+
 #[async_trait]
 impl Runtime for DockerRuntime {
     async fn pull(&self, image: &ImageRef, progress: Progress) -> Result<(), RuntimeError> {
@@ -305,6 +336,162 @@ impl Runtime for DockerRuntime {
             }
         }
         Ok(())
+    }
+
+    /// A file system of its own for the job `id`: an ext4 file of `bytes`, allocated whole so the room it takes is
+    /// taken now, on a loop device mounted under the disks' directory. It has no journal, which a disk that lives as
+    /// long as its job does not need, and keeps nothing for root, so the job has all of it. Linux only, and the peer
+    /// needs root to mount.
+    async fn make_disk(&self, id: &str, bytes: u64) -> Result<std::path::PathBuf, RuntimeError> {
+        let Some(dir) = self.disks.clone() else {
+            return Err(RuntimeError::NoDisk(
+                "this peer makes no disk for a job: it was started without a place for them".into(),
+            ));
+        };
+        if !cfg!(target_os = "linux") {
+            return Err(RuntimeError::NoDisk(
+                "a job's disk is a file system on a loop device, which this peer makes on Linux only".into(),
+            ));
+        }
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| RuntimeError::NoDisk(format!("cannot make {}: {e}", dir.display())))?;
+            let image = dir.join(format!("{id}.img"));
+            let mount = dir.join(&id);
+            std::fs::File::create(&image)
+                .map_err(|e| RuntimeError::NoDisk(format!("cannot make {}: {e}", image.display())))?;
+            // Allocated, not sparse: the host's free space shrinks now, so two disks are never promised one room.
+            run("fallocate", &["-l", &bytes.to_string(), &image.to_string_lossy()])
+                .map_err(|e| RuntimeError::NoDisk(format!("no room for a disk of {bytes} bytes: {e}")))?;
+            std::fs::create_dir_all(&mount).map_err(|e| RuntimeError::NoDisk(e.to_string()))?;
+            let (img, mnt) = (image.to_string_lossy().to_string(), mount.to_string_lossy().to_string());
+            run("mkfs.ext4", &["-q", "-F", "-m", "0", "-O", "^has_journal", &img])?;
+            run("mount", &["-o", "loop", &img, &mnt]).map_err(|e| {
+                RuntimeError::NoDisk(format!("{e}; a job's disk is mounted by the peer, which needs root"))
+            })?;
+            // Whoever the job's image runs as writes there.
+            run("chmod", &["0777", &mnt])?;
+            Ok(mount)
+        })
+        .await
+        .map_err(|e| RuntimeError::NoDisk(e.to_string()))?
+    }
+
+    async fn remove_disk(&self, id: &str) -> Result<(), RuntimeError> {
+        let Some(dir) = self.disks.clone() else {
+            return Ok(());
+        };
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mount = dir.join(&id);
+            if mount.exists() {
+                let _ = run("umount", &[&mount.to_string_lossy()]);
+                let _ = std::fs::remove_dir_all(&mount);
+            }
+            let _ = std::fs::remove_file(dir.join(format!("{id}.img")));
+            Ok(())
+        })
+        .await
+        .map_err(|e| RuntimeError::NoDisk(e.to_string()))?
+    }
+
+    fn makes_disks(&self) -> bool {
+        self.disks.is_some() && cfg!(target_os = "linux")
+    }
+
+    fn disks(&self) -> Vec<String> {
+        let Some(dir) = self.disks.clone() else {
+            return vec![];
+        };
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().to_string_lossy().strip_suffix(".img").map(str::to_string))
+            .collect()
+    }
+
+    fn disk_at(&self, id: &str) -> Option<std::path::PathBuf> {
+        let mount = self.disks.clone()?.join(id);
+        // Mounted: its own file system, on another device than the directory it is in. After a reboot it is not.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let (here, above) = (
+                std::fs::metadata(&mount).ok()?,
+                std::fs::metadata(mount.parent()?).ok()?,
+            );
+            (here.dev() != above.dev()).then_some(mount)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = mount;
+            None
+        }
+    }
+
+    fn disk_room(&self) -> Option<(u64, u64)> {
+        let dir = self.disks.clone()?;
+        if !cfg!(target_os = "linux") {
+            return None;
+        }
+        // While a df is stuck in the file system, the room is not known and no other is started: the dfs left behind
+        // are those that were already asking when it stopped answering, never one per question after.
+        if DF_STUCK.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            return None;
+        }
+        let failed = |why: String| {
+            tracing::warn!(dir = %dir.display(), %why, "the room for jobs' disks could not be read");
+            None
+        };
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            return failed(format!("the directory could not be made: {e}"));
+        }
+        // Asked for ten seconds at most: a file system that does not answer is one with no room known.
+        let mut df = match std::process::Command::new("df")
+            .args(["-B1", "--output=avail,size", &dir.to_string_lossy()])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(df) => df,
+            Err(e) => return failed(format!("df could not run: {e}")),
+        };
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match df.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() < until => {
+                    std::thread::sleep(std::time::Duration::from_millis(20))
+                }
+                _ => {
+                    // Killed, and left to a thread of its own to reap: one stuck in the file system may never end.
+                    let _ = df.kill();
+                    DF_STUCK.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::spawn(move || {
+                        let _ = df.wait();
+                        DF_STUCK.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    });
+                    return failed("df did not answer within ten seconds".into());
+                }
+            }
+        }
+        let mut text = String::new();
+        let _ = df
+            .stdout
+            .take()
+            .map(|mut out| std::io::Read::read_to_string(&mut out, &mut text));
+        let mut numbers = text
+            .lines()
+            .nth(1)
+            .unwrap_or_default()
+            .split_whitespace()
+            .filter_map(|n| n.parse::<u64>().ok());
+        match (numbers.next(), numbers.next()) {
+            (Some(free), Some(total)) => Some((free, total)),
+            _ => failed(format!("df answered what does not read as room: {text:?}")),
+        }
     }
 
     /// A container, or a user namespace when the engine runs rootless or remaps its users, as its own `info` says.

@@ -514,14 +514,16 @@ async fn ingest(
         }
         admitted?;
     }
+    // Recorded, and handled, without what its schema marks writeOnly: its admission kept that where it belongs.
+    let recorded = door.catalogue.as_recorded(&envelope);
     let accepted = door
         .log
-        .accept_command(&sender.hash, &envelope.id, &hash, &correlation, &envelope);
+        .accept_command(&sender.hash, &envelope.id, &hash, &correlation, &recorded);
     let answered = match accepted {
         Accept::Conflict => return Err(conflict()),
         Accept::Duplicate { correlation: original } => original,
         Accept::New => {
-            run(&door, def, &sender.hash, envelope.clone());
+            run(&door, def, &sender.hash, recorded);
             correlation
         }
     };
@@ -580,7 +582,11 @@ pub async fn resume(door: &Shared) {
         };
         // The stored command is believed only when it still matches its record and the catalogue of today.
         if door.log.hash_of(&owed.sender, &envelope.id) != Some(payload_hash(&envelope)) {
-            fail("the command was accepted before a restart and its stored copy no longer matches its record".into());
+            // A command that carried a secret was recorded without it, so its copy is not what was sent.
+            fail(match door.catalogue.carries_write_only(&envelope.r#type) {
+                true => "the command was accepted before a restart and carried what the door never records (a credential or a URL), so it cannot be run again: send it again".into(),
+                false => "the command was accepted before a restart and its stored copy no longer matches its record".into(),
+            });
             continue;
         }
         let Some(def) = door.catalogue.command_by_type(&envelope.r#type) else {
@@ -948,6 +954,18 @@ mod tests {
                         emitter.emit("ImagePulled", json!({ "image": cmd.data["image"] }));
                     })
                 }),
+            })
+            .command(CommandDef {
+                schema: "set-secret".into(),
+                version: "1.0".into(),
+                command_type: "SetSecret".into(),
+                description: "Keeps a secret, which is never recorded; its handler always dies before it completes.".into(),
+                data_schema: json!({ "type": "object", "required": ["name"], "properties": { "name": { "type": "string" }, "secret": { "type": "string", "writeOnly": true } }, "additionalProperties": false }),
+                produces: vec!["ImagePulled".into()],
+                completes: vec!["ImagePulled".into()],
+                impact: None,
+                admit: None,
+                handler: Arc::new(|_cmd, _emitter| Box::pin(async {})),
             })
             .event(EventDef {
                 schema: "image-pulled".into(),
@@ -1850,6 +1868,46 @@ mod tests {
         assert_eq!(t, "CommandFailed");
         assert!(r.contains("credential is gone"), "{r}");
         assert!(again.log.unfinished().is_empty(), "a failed command is finished");
+    }
+
+    #[tokio::test]
+    async fn a_command_that_carried_a_secret_is_recorded_without_it_and_failed_after_a_restart_not_run_without_it() {
+        let d = door();
+        let app = router(d.clone());
+        let key = sign_in(&app, "test", "my-peer").await;
+        let sent = json!({
+            "specversion": "1.0", "id": "sec-1", "source": "https://agent.test/claude", "type": "SetSecret",
+            "datacontenttype": "application/json", "dataschema": format!("{EP}/commands/set-secret/1.0"),
+            "time": "2026-10-12T10:30:00Z", "data": { "name": "store", "secret": "s3cr3t" }
+        });
+        let (s, _, b) = call(&app, post_json("/commands", &key, "application/json", sent.clone())).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let owed = d.log.unfinished();
+        assert_eq!(owed.len(), 1);
+        assert_eq!(
+            owed[0].envelope.data,
+            json!({ "name": "store" }),
+            "the secret is never recorded"
+        );
+        // The same command sent again is still the same command: its hash is of what was sent.
+        let (s, _, b) = call(&app, post_json("/commands", &key, "application/json", sent)).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        // The peer restarts before the handler completed it: it is not run without its secret.
+        let again = door_over_with(d.log.clone(), Some(d.auth.clone()));
+        resume(&again).await;
+        settle(&again, 1).await;
+        let (events, _) = again.log.list(&Filter::default());
+        let failed = events
+            .iter()
+            .find(|e| e.correlationid.as_deref() == Some("sec-1"))
+            .unwrap();
+        assert_eq!(failed.r#type, "CommandFailed");
+        let reason = failed.data["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("never records") && reason.contains("send it again"),
+            "{reason}"
+        );
+        assert!(again.log.unfinished().is_empty());
     }
 
     #[tokio::test]

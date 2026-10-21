@@ -21,6 +21,7 @@ mod menu;
 mod meter;
 mod queue;
 mod state;
+mod store;
 mod tls;
 mod transport;
 mod workspace;
@@ -197,6 +198,10 @@ pub async fn peer(
     }
     let p = Arc::new(p);
     p.register_holdings();
+    // A store on this machine, over plain http on loopback (a test's, or a developer's), only when the operator says.
+    if std::env::var("BEST_PEER_STORE_CLEARTEXT").as_deref() == Ok("loopback") {
+        p.allow_store_cleartext();
+    }
     p.rebuild().await;
     p.follow(events);
     p.watch_owner();
@@ -257,6 +262,7 @@ fn context(
             Pace::per_minute(per_minute),
             Streams::per_credential(streams),
         )),
+        store_cleartext: std::env::var("BEST_PEER_STORE_CLEARTEXT").as_deref() == Ok("loopback"),
     }
 }
 
@@ -370,7 +376,7 @@ pub fn model_store(text: Option<&str>, runtime: Option<&str>) -> Result<Option<S
 /// the Docker Engine on this host and refuses to start when it cannot; `native` deploys to engines already running
 /// on this host outside any container (an installed Ollama), with no jobs; `fake` serves the whole surface against
 /// the in-memory fakes, for CI and for a machine with no engine.
-async fn engines(bind_ip: &str, engine_host: &str) -> (Arc<dyn Runtime>, Arc<dyn Engine>) {
+async fn engines(bind_ip: &str, engine_host: &str, disks: PathBuf) -> (Arc<dyn Runtime>, Arc<dyn Engine>) {
     match std::env::var("BEST_PEER_RUNTIME").as_deref() {
         Ok("native") => (
             Arc::new(best_peer_native::NativeRuntime::new(engine_host)),
@@ -391,7 +397,11 @@ async fn engines(bind_ip: &str, engine_host: &str) -> (Arc<dyn Runtime>, Arc<dyn
                         "{e}; set BEST_PEER_RUNTIME=native to deploy to an engine already running here, or fake to serve without one"
                     ))
                 });
-            (Arc::new(docker), Arc::new(best_peer_engine_http::HttpEngine::new()))
+            // A job with inputs or outputs gets a disk of its own under the peer's data directory.
+            (
+                Arc::new(docker.with_disks(disks)),
+                Arc::new(best_peer_engine_http::HttpEngine::new()),
+            )
         }
         Ok(other) => fail(&format!(
             "BEST_PEER_RUNTIME must be docker, native or fake, not {other:?}"
@@ -511,7 +521,7 @@ async fn peer_app(
     } else {
         "0.0.0.0"
     };
-    let (runtime, engine) = engines(bind_ip, &engine_host).await;
+    let (runtime, engine) = engines(bind_ip, &engine_host, dir.join("disks")).await;
     let images = Images {
         ollama: std::env::var("BEST_PEER_OLLAMA_IMAGE").ok(),
         vllm: std::env::var("BEST_PEER_VLLM_IMAGE").ok(),
@@ -1151,6 +1161,10 @@ mod tests {
     #[derive(Default)]
     struct Switchboard {
         doors: std::sync::Mutex<std::collections::HashMap<String, (axum::Router, Arc<std::sync::atomic::AtomicBool>)>>,
+        /// The next command sent to an endpoint is refused with this code, as a member with no room refuses it.
+        refuse_next: std::sync::Mutex<std::collections::HashMap<String, String>>,
+        /// Commands sent to an endpoint wait for a permit, while it is held.
+        held: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>,
     }
 
     impl Switchboard {
@@ -1162,6 +1176,18 @@ mod tests {
                 .unwrap()
                 .insert(endpoint.into(), (router, down.clone()));
             down
+        }
+
+        /// Refuses the next command sent to `endpoint` with `code`.
+        fn refuse_next_command(&self, endpoint: &str, code: &str) {
+            self.refuse_next.lock().unwrap().insert(endpoint.into(), code.into());
+        }
+
+        /// Holds every command sent to `endpoint` until the permits answered are added.
+        fn hold_commands(&self, endpoint: &str) -> Arc<tokio::sync::Semaphore> {
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            self.held.lock().unwrap().insert(endpoint.into(), gate.clone());
+            gate
         }
     }
 
@@ -1176,6 +1202,26 @@ mod tests {
                 req.uri().authority().map(|a| a.as_str()).unwrap_or("")
             );
             let found = self.doors.lock().unwrap().get(&origin).cloned();
+            let command = req.method() == axum::http::Method::POST && req.uri().path().ends_with("/commands");
+            if command {
+                if let Some(code) = self.refuse_next.lock().unwrap().remove(&origin) {
+                    let body = json!({ "error": { "code": code, "message": "refused by the test" } }).to_string();
+                    return Box::pin(async move {
+                        Ok(axum::response::Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(body))
+                            .unwrap())
+                    });
+                }
+                let gate = self.held.lock().unwrap().get(&origin).cloned();
+                if let (Some(gate), Some((router, _))) = (gate, found.clone()) {
+                    return Box::pin(async move {
+                        let _permit = gate.acquire().await;
+                        transport::InProcess { router }.call(req).await
+                    });
+                }
+            }
             match found {
                 Some((_, down)) if down.load(std::sync::atomic::Ordering::SeqCst) => {
                     Box::pin(async { Err("connection refused".to_string()) })
@@ -1266,6 +1312,7 @@ mod tests {
                 holdings,
                 limits: Arc::new(Limits::default()),
                 cleartext: Cleartext::Loopback,
+                store_cleartext: true,
             }),
             log,
         );
@@ -2360,6 +2407,7 @@ mod tests {
                 holdings,
                 limits,
                 cleartext,
+                store_cleartext: true,
             }),
             log.clone(),
         );
@@ -6613,6 +6661,7 @@ mod tests {
                 holdings,
                 limits: Arc::new(Limits::default()),
                 cleartext: Cleartext::Loopback,
+                store_cleartext: true,
             }),
             log,
         );
@@ -9178,5 +9227,1005 @@ mod tests {
             "the deployment owed after the restart and the running job"
         );
         assert_eq!(again.query("get-workloads").await["deployments"][0]["model"], "owed:1b");
+    }
+
+    // ----- a job's inputs and outputs (behavioralstate/spec#66) ----------------------------------------------------
+
+    /// A secret no log, event or answer may hold: the store's, as its owner sets it.
+    const SECRET: &str = "wJalrXUtnFEMI-not-a-real-secret-K7MDENG";
+
+    /// An S3 store in this process over plain http on loopback, answering presigned URLs as a workspace's store does:
+    /// HEAD, GET and PUT of an object by bucket and key, kept in memory. It checks a signature was sent, not its value.
+    #[derive(Clone, Default)]
+    struct FakeS3 {
+        objects: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>,
+        /// Every request, its method and URL, oldest first.
+        asked: Arc<std::sync::Mutex<Vec<String>>>,
+        /// Answers 403 to every PUT from now on, as a store whose URL expired does.
+        refuse_puts: Arc<std::sync::atomic::AtomicBool>,
+        /// Held by a test, every PUT waits until it is let go.
+        hold: Arc<tokio::sync::Mutex<()>>,
+    }
+
+    impl FakeS3 {
+        /// A store listening on loopback; answers it and its endpoint.
+        async fn start() -> (FakeS3, String) {
+            let s3 = FakeS3::default();
+            let app = axum::Router::new()
+                .route("/:bucket/*key", axum::routing::any(fake_s3))
+                .with_state(s3.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            (s3, endpoint)
+        }
+
+        /// Puts `body` at `key` in the bucket the tests use.
+        fn put(&self, key: &str, body: &[u8]) {
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(format!("jobs/{key}"), body.to_vec());
+        }
+
+        fn get(&self, key: &str) -> Option<Vec<u8>> {
+            self.objects.lock().unwrap().get(&format!("jobs/{key}")).cloned()
+        }
+    }
+
+    async fn fake_s3(
+        axum::extract::State(s3): axum::extract::State<FakeS3>,
+        axum::extract::Path((bucket, key)): axum::extract::Path<(String, String)>,
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+        body: axum::body::Bytes,
+    ) -> axum::response::Response {
+        use axum::http::Method;
+        use axum::response::IntoResponse;
+        s3.asked.lock().unwrap().push(format!("{method} {uri}"));
+        if !uri.query().unwrap_or_default().contains("X-Amz-Signature=") {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        let name = format!("{bucket}/{}", key.trim_start_matches('/'));
+        match method {
+            Method::PUT if s3.refuse_puts.load(std::sync::atomic::Ordering::SeqCst) => {
+                StatusCode::FORBIDDEN.into_response()
+            }
+            Method::PUT => {
+                let _held = s3.hold.lock().await;
+                s3.objects.lock().unwrap().insert(name, body.to_vec());
+                StatusCode::OK.into_response()
+            }
+            Method::HEAD | Method::GET => {
+                let Some(object) = s3.objects.lock().unwrap().get(&name).cloned() else {
+                    return StatusCode::NOT_FOUND.into_response();
+                };
+                match method {
+                    Method::HEAD => {
+                        (StatusCode::OK, [(header::CONTENT_LENGTH, object.len().to_string())]).into_response()
+                    }
+                    _ => (StatusCode::OK, object).into_response(),
+                }
+            }
+            _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+        }
+    }
+
+    /// The files of an archive by path, with what each holds.
+    fn unpacked(archive: &[u8]) -> std::collections::BTreeMap<String, String> {
+        let mut out = std::collections::BTreeMap::new();
+        for entry in tar::Archive::new(archive).entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.header().entry_type().is_file() {
+                let path = entry.path().unwrap().to_string_lossy().replace('\\', "/");
+                let mut text = String::new();
+                std::io::Read::read_to_string(&mut entry, &mut text).unwrap();
+                out.insert(path, text);
+            }
+        }
+        out
+    }
+
+    /// Every file under `dir`, however deep.
+    fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = vec![];
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            match path.is_dir() {
+                true => out.extend(files_under(&path)),
+                false => out.push(path),
+            }
+        }
+        out
+    }
+
+    /// Polls until `done` holds, for what a spawned task finishes.
+    async fn until(what: &str, done: impl Fn() -> bool) {
+        for _ in 0..400 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("never: {what}");
+    }
+
+    /// `base` with each field of `more` set, or removed where it is null.
+    fn amended(base: &Value, more: Value) -> Value {
+        let mut data = base.clone();
+        for (k, v) in more.as_object().into_iter().flatten() {
+            match v.is_null() {
+                true => data.as_object_mut().unwrap().remove(k),
+                false => data.as_object_mut().unwrap().insert(k.clone(), v.clone()),
+            };
+        }
+        data
+    }
+
+    impl Site {
+        /// Sets the workspace's store, as its owner, to the store at `endpoint`, bucket `jobs`.
+        async fn store(&self, ws: &str, id: &str, endpoint: &str) -> (StatusCode, Value) {
+            self.send(
+                ws,
+                id,
+                "SetStore",
+                "set-store",
+                json!({ "endpoint": endpoint, "bucket": "jobs", "region": "fin-01", "access_key_id": "AKIDTESTONLY", "secret_access_key": SECRET }),
+            )
+            .await
+        }
+
+        /// The refusal of a job of 4 GiB in cloud `lab` with `more`: its code and the field it names.
+        async fn refused(&self, ws: &str, id: &str, more: Value) -> (String, String) {
+            let order = amended(
+                &json!({ "cloud": "lab", "image": "busybox", "memory_bytes": 4 * GB }),
+                more,
+            );
+            let (s, b) = self.send(ws, id, "RunJob", "run-job", order).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+            (
+                b["error"]["code"].as_str().unwrap_or_default().to_string(),
+                b["error"]["details"]["field"].as_str().unwrap_or_default().to_string(),
+            )
+        }
+    }
+
+    /// A store holding `inputs/scene.txt`, and a member that may fetch from it and send to it on loopback, its log
+    /// kept in the directory answered last, as on a host.
+    async fn member_and_store() -> (Bed, FakeS3, String, tempfile::TempDir) {
+        let (s3, endpoint) = FakeS3::start().await;
+        s3.put("inputs/scene.txt", b"the scene");
+        let logs = tempfile::tempdir().unwrap();
+        let a = bed(
+            card(),
+            Arc::new(EventLog::open(logs.path()).unwrap()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        a.peer.allow_store_cleartext();
+        (a, s3, endpoint, logs)
+    }
+
+    /// The files under `dir` holding `text`.
+    fn holding(dir: &std::path::Path, text: &str) -> Vec<std::path::PathBuf> {
+        files_under(dir)
+            .into_iter()
+            .filter(|f| String::from_utf8_lossy(&std::fs::read(f).unwrap()).contains(text))
+            .collect()
+    }
+
+    /// The member in a cloud `lab` of a workspace whose store is the fake: answers the site, the workspace and the
+    /// store.
+    async fn site_with_store() -> (Site, String, FakeS3, tempfile::TempDir) {
+        let (a, s3, endpoint, logs) = member_and_store().await;
+        let key_a = a.key.clone();
+        let site = site(vec![(A, a)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a)]).await;
+        let (s, b) = site.store(&ws, "st1", &endpoint).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "st1", "StoreSetV1").await;
+        (site, ws, s3, logs)
+    }
+
+    /// One input, outputs under `renders/shot-12`, a disk of 1 GiB and an hour to run.
+    fn with_io() -> Value {
+        json!({
+            "inputs": [{ "key": "inputs/scene.txt", "path": "scene/scene.txt" }],
+            "outputs": { "prefix": "renders/shot-12" },
+            "disk_bytes": GB,
+            "deadline_seconds": 3600
+        })
+    }
+
+    #[tokio::test]
+    async fn a_job_finds_its_inputs_under_in_and_what_it_leaves_under_out_is_in_the_store_before_its_end_is_told() {
+        let (a, s3, endpoint, logs) = member_and_store().await;
+        let key_a = a.key.clone();
+        let site = site(vec![(A, a)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a)]).await;
+
+        // No store yet: refused, with the owner's command named.
+        assert_eq!(
+            site.refused(&ws, "j0", with_io()).await,
+            ("NO_STORE".into(), "inputs".into())
+        );
+        assert!(site.query(&ws, "get-store").await["store"].is_null());
+
+        // The owner sets it: told without its credential, and shown without it.
+        let (s, b) = site.store(&ws, "st1", &endpoint).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let set = site.events(&ws, "st1", "StoreSetV1").await[0]["data"].clone();
+        assert_eq!(
+            set,
+            json!({ "workspace": ws, "endpoint": endpoint, "bucket": "jobs", "region": "fin-01" })
+        );
+        let shown = site.query(&ws, "get-store").await;
+        assert_eq!(
+            shown["store"],
+            json!({ "endpoint": endpoint, "bucket": "jobs", "region": "fin-01" })
+        );
+        // A store at an address that is not https, other than this machine's loopback in a test, is refused.
+        let (s, b) = site.store(&ws, "st2", "http://objects.example.com").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "INVALID_STORE");
+        assert_eq!(b["error"]["details"]["field"], "endpoint");
+        // Nor one that names a user before its host, which reaches the host after it.
+        let (_, b) = site.store(&ws, "st3", "http://127.0.0.1:1@objects.example.com").await;
+        assert_eq!(b["error"]["code"], "INVALID_STORE");
+
+        // What the order gets wrong is refused before anything is sent, naming the field.
+        let refusals = [
+            (json!({ "disk_bytes": null }), "DISK_NEEDED", "disk_bytes"),
+            (
+                json!({ "inputs": [{ "key": "inputs/none.txt", "path": "x" }] }),
+                "NO_SUCH_INPUT",
+                "inputs/0/key",
+            ),
+            (
+                json!({ "inputs": [{ "key": "inputs/scene.txt", "path": "../etc/passwd" }] }),
+                "INVALID_INPUT_PATH",
+                "inputs/0/path",
+            ),
+            (
+                json!({ "outputs": { "prefix": "/renders" } }),
+                "INVALID_OUTPUTS",
+                "outputs/prefix",
+            ),
+            (
+                json!({ "deadline_seconds": null }),
+                "DEADLINE_NEEDED",
+                "deadline_seconds",
+            ),
+            (
+                json!({ "deadline_seconds": 7 * 24 * 3600 }),
+                "TOO_LONG_FOR_THE_STORE",
+                "deadline_seconds",
+            ),
+            (json!({ "disk_bytes": 4u64 << 40 }), "NO_DISK_ROOM", "disk_bytes"),
+            (
+                json!({ "inputs": [{ "key": "inputs/scene.txt", "path": "a" }, { "key": "inputs/scene.txt", "path": "a" }] }),
+                "INVALID_INPUT_PATH",
+                "inputs/1/path",
+            ),
+            (
+                json!({ "inputs": [{ "key": "inputs/scene.txt", "path": "a" }, { "key": "inputs/scene.txt", "path": "a/b" }] }),
+                "INVALID_INPUT_PATH",
+                "inputs/1/path",
+            ),
+            (
+                json!({ "inputs": [{ "key": "inputs/big.bin", "path": "big" }], "disk_bytes": 16 << 20 }),
+                "INPUTS_EXCEED_DISK",
+                "disk_bytes",
+            ),
+        ];
+        s3.put("inputs/big.bin", &vec![0u8; 16 << 20]);
+        for (n, (more, code, field)) in refusals.into_iter().enumerate() {
+            let got = site.refused(&ws, &format!("r{n}"), amended(&with_io(), more)).await;
+            assert_eq!(got, (code.to_string(), field.to_string()), "refusal {n}");
+        }
+
+        // Ordered: the order says what it reads and where its outputs go, by key, never by URL.
+        let queued = site.order(&ws, "j1", 4, with_io()).await;
+        assert_eq!(
+            queued["inputs"],
+            json!([{ "key": "inputs/scene.txt", "path": "scene/scene.txt", "bytes": 9 }])
+        );
+        assert_eq!(queued["store"], json!({ "endpoint": endpoint, "bucket": "jobs" }));
+        assert_eq!(queued["outputs"], json!({ "prefix": "renders/shot-12" }));
+        assert_eq!(queued["disk_bytes"], GB);
+        let events = site.events(&ws, "j1", "JobStarted").await;
+        assert_eq!(
+            facts(&events),
+            ["JobQueued", "JobPlaced", "InputsFetched", "JobStarted"]
+        );
+        let fetched = &events.iter().find(|e| e["type"] == "InputsFetched").unwrap()["data"];
+        assert_eq!((&fetched["inputs"], &fetched["bytes"]), (&json!(1), &json!(9)));
+        let started = events.last().unwrap()["data"].clone();
+        let member = &site.members[0];
+        let disk = member.runtime.disk_of(started["job"].as_str().unwrap());
+        assert_eq!(std::fs::read(disk.join("in/scene/scene.txt")).unwrap(), b"the scene");
+        // Its disk is mounted: /in to read, /out to write.
+        let container = ContainerId(started["container"].as_str().unwrap().into());
+        let spec = member.runtime.spec_of(&container).unwrap();
+        let mount = |at: &str| spec.mounts.iter().find(|m| m.container == at).unwrap().clone();
+        assert!(mount("/in").read_only && mount("/in").host == disk.join("in").to_string_lossy());
+        assert!(!mount("/out").read_only && mount("/out").host == disk.join("out").to_string_lossy());
+        // The member records the order's command without the URLs it carried.
+        assert_eq!(
+            holding(logs.path(), "\"disk_bytes\""),
+            [logs.path().join("accepted.jsonl")]
+        );
+        assert!(holding(logs.path(), "X-Amz").is_empty());
+
+        // The job writes and exits: its outputs are in the store, one archive under the prefix named by the order,
+        // before its end is told; then its disk is gone.
+        std::fs::write(disk.join("out/frame-1.png"), b"frame one").unwrap();
+        std::fs::create_dir_all(disk.join("out/logs")).unwrap();
+        std::fs::write(disk.join("out/logs/render.log"), b"done").unwrap();
+        member.runtime.stop(&container).await.unwrap();
+        let events = site.events(&ws, "j1", "JobFinished").await;
+        assert_eq!(
+            facts(&events),
+            [
+                "JobQueued",
+                "JobPlaced",
+                "InputsFetched",
+                "JobStarted",
+                "OutputsStored",
+                "JobFinished"
+            ]
+        );
+        let key = format!("renders/shot-12/{}.tar", queued["job"].as_str().unwrap());
+        let stored = &events[events.len() - 2]["data"];
+        assert_eq!(stored["key"], key);
+        let archive = s3.get(&key).expect("the archive is in the store");
+        assert_eq!(stored["bytes"], archive.len());
+        assert_eq!(
+            unpacked(&archive),
+            [("frame-1.png", "frame one"), ("logs/render.log", "done")]
+                .map(|(p, t)| (p.to_string(), t.to_string()))
+                .into()
+        );
+        until("the job's disk is removed", || !disk.exists()).await;
+
+        // The member fetched and sent with what the cloud signed; nothing the store was set with, and no URL it
+        // signed, is in a log, an event or an answer: the credential is in the workspace's own file alone.
+        let asked = s3.asked.lock().unwrap().clone();
+        assert!(
+            asked.iter().any(|a| a.starts_with("GET /jobs/inputs/scene.txt?")),
+            "{asked:?}"
+        );
+        assert!(
+            asked.iter().any(|a| a.starts_with(&format!("PUT /jobs/{key}?"))),
+            "{asked:?}"
+        );
+        let (_, everything) = get_as(&site.app, &format!("/workspaces/{ws}"), &site.key, "/events?limit=500").await;
+        let (_, on_member) = get_as(&member.app, "", &member.key, "/events?limit=500").await;
+        for told in [everything.to_string(), on_member.to_string(), shown.to_string()] {
+            assert!(!told.contains(SECRET) && !told.contains("AKIDTESTONLY"), "{told}");
+            assert!(!told.contains("X-Amz-Signature"), "{told}");
+        }
+        let kept = holding(site.data.path(), SECRET);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert!(kept[0].ends_with("store.json"), "{kept:?}");
+        assert!(holding(site.data.path(), "X-Amz").is_empty());
+        assert!(holding(logs.path(), "X-Amz").is_empty() && holding(logs.path(), SECRET).is_empty());
+    }
+
+    #[tokio::test]
+    async fn outputs_the_store_does_not_take_fail_the_job_with_its_exit_code_and_no_stop_ends_it_while_they_are_sent() {
+        let (site, ws, s3, _logs) = site_with_store().await;
+        let member = &site.members[0];
+
+        // The job exits with 3 while the store holds its upload: a stop now is refused, on the member and through
+        // the cloud, and its end is told once, when the outputs are in.
+        let hold = s3.hold.clone().lock_owned().await;
+        let queued = site.order(&ws, "j1", 4, with_io()).await;
+        let started = site.events(&ws, "j1", "JobStarted").await.last().unwrap()["data"].clone();
+        let job = started["job"].as_str().unwrap().to_string();
+        let container = ContainerId(started["container"].as_str().unwrap().into());
+        member.runtime.exit(&container, 3, "rendered with warnings").unwrap();
+        for _ in 0..400 {
+            if member.query("get-workloads").await["jobs"][0]["phase"] == "storing" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(member.query("get-workloads").await["jobs"][0]["phase"], "storing");
+        let (s, b) = member.send("s1", "StopJob", "stop-job", json!({ "job": job })).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "STORING_OUTPUTS");
+        let (s, b) = site
+            .send(&ws, "s2", "StopJob", "stop-job", json!({ "job": queued["job"] }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let failed = site.events(&ws, "s2", "CommandFailed").await[0]["data"].clone();
+        let reason = failed["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("being stored") && !reason.contains("keeps running"),
+            "{reason}"
+        );
+        drop(hold);
+        let events = site.events(&ws, "j1", "JobFinished").await;
+        assert_eq!(events.last().unwrap()["data"]["exit_code"], 3);
+        let ends = facts(&events)
+            .into_iter()
+            .filter(|t| matches!(t.as_str(), "JobFinished" | "JobStopped" | "JobFailed"))
+            .count();
+        assert_eq!(ends, 1);
+
+        // The store refuses the next one's outputs: the job failed, its exit code kept, and its disk is gone.
+        s3.refuse_puts.store(true, std::sync::atomic::Ordering::SeqCst);
+        site.order(&ws, "j2", 4, with_io()).await;
+        let started = site.events(&ws, "j2", "JobStarted").await.last().unwrap()["data"].clone();
+        let disk = member.runtime.disk_of(started["job"].as_str().unwrap());
+        member
+            .runtime
+            .stop(&ContainerId(started["container"].as_str().unwrap().into()))
+            .await
+            .unwrap();
+        let events = site.events(&ws, "j2", "JobFailed").await;
+        assert_eq!(
+            facts(&events),
+            ["JobQueued", "JobPlaced", "InputsFetched", "JobStarted", "JobFailed"]
+        );
+        let failed = &events.last().unwrap()["data"];
+        assert_eq!(failed["exit_code"], 0);
+        let reason = failed["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("could not be stored") && reason.contains("403"),
+            "{failed}"
+        );
+        until("the failed job's disk is removed", || !disk.exists()).await;
+    }
+
+    #[tokio::test]
+    async fn a_size_names_the_disk_its_jobs_get_and_an_order_may_ask_for_its_own() {
+        let (site, ws, _s3, _logs) = site_with_store().await;
+        let mut menu = menu_of_three();
+        menu["cloud"] = json!("lab");
+        menu["sizes"][0]["disk_bytes"] = json!(2 * GB);
+        let (s, b) = site.send(&ws, "m1", "SetMenu", "set-menu", menu).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "m1", "MenuSetV1").await;
+        assert_eq!(
+            site.query(&ws, "get-menu").await["menus"][0]["sizes"][0]["disk_bytes"],
+            2 * GB
+        );
+        let by_size = |size: &str, disk: Option<u64>| {
+            let mut data = json!({ "cloud": "lab", "image": "busybox", "size": size, "outputs": { "prefix": "out" }, "deadline_seconds": 60 });
+            if let Some(d) = disk {
+                data["disk_bytes"] = json!(d);
+            }
+            data
+        };
+        let (s, b) = site.send(&ws, "j1", "RunJob", "run-job", by_size("small", None)).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        assert_eq!(
+            site.events(&ws, "j1", "JobQueued").await[0]["data"]["disk_bytes"],
+            2 * GB
+        );
+        let (s, b) = site
+            .send(&ws, "j2", "RunJob", "run-job", by_size("small", Some(3 * GB)))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        assert_eq!(
+            site.events(&ws, "j2", "JobQueued").await[0]["data"]["disk_bytes"],
+            3 * GB
+        );
+        // A size with no disk, ordered with none, has nowhere to keep what its job reads or writes.
+        let (s, b) = site.send(&ws, "j3", "RunJob", "run-job", by_size("large", None)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "DISK_NEEDED");
+    }
+
+    #[tokio::test]
+    async fn a_job_at_a_peer_s_own_door_reads_and_writes_by_the_urls_it_was_sent_and_keeps_none_of_them() {
+        let (s3, endpoint) = FakeS3::start().await;
+        s3.put("inputs/scene.txt", b"the scene");
+        let store = crate::store::Store {
+            endpoint,
+            bucket: "jobs".into(),
+            region: "fin-01".into(),
+            access_key_id: "AKIDTESTONLY".into(),
+            secret_access_key: SECRET.into(),
+        };
+        let now = time::OffsetDateTime::now_utc();
+        let job = json!({
+            "image": "busybox",
+            "memory_bytes": 4 * GB,
+            "inputs": [{ "url": store.presign("GET", "inputs/scene.txt", 600, now), "path": "scene.txt" }],
+            "outputs": { "url": store.presign("PUT", "renders/r1.tar", 600, now), "key": "renders/r1.tar" },
+            "disk_bytes": GB
+        });
+        let logs = tempfile::tempdir().unwrap();
+        let bed = bed(
+            card(),
+            Arc::new(EventLog::open(logs.path()).unwrap()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        let refused = |id: &'static str, data: Value| {
+            let bed = &bed;
+            async move {
+                let (s, b) = bed.send(id, "RunJob", "run-job", data).await;
+                assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+                (
+                    b["error"]["code"].as_str().unwrap_or_default().to_string(),
+                    b["error"]["details"]["field"].as_str().unwrap_or_default().to_string(),
+                )
+            }
+        };
+        let pair = |code: &str, field: &str| (code.to_string(), field.to_string());
+        // Plain http is fetched from nowhere unless whoever runs the peer allows its own loopback.
+        assert_eq!(
+            refused("r0", job.clone()).await,
+            pair("INVALID_STORE_URL", "inputs/0/url")
+        );
+        bed.peer.allow_store_cleartext();
+        let mut far = job.clone();
+        far["outputs"]["url"] = json!("http://10.0.0.7:9000/jobs/renders/r1.tar");
+        assert_eq!(refused("r1", far).await, pair("INVALID_STORE_URL", "outputs/url"));
+        assert_eq!(
+            refused("r2", amended(&job, json!({ "queue_seconds": 60 }))).await,
+            pair("IO_DOES_NOT_WAIT", "queue_seconds")
+        );
+        assert_eq!(
+            refused("r3", amended(&job, json!({ "disk_bytes": null }))).await,
+            pair("DISK_NEEDED", "disk_bytes")
+        );
+        let mut up = job.clone();
+        up["inputs"][0]["path"] = json!("/etc/passwd");
+        assert_eq!(refused("r4", up).await, pair("INVALID_INPUT_PATH", "inputs/0/path"));
+        bed.runtime.set_disk_room(GB / 2);
+        assert_eq!(
+            refused("r5", job.clone()).await,
+            pair("INSUFFICIENT_DISK", "disk_bytes")
+        );
+        bed.runtime.set_disk_room(1 << 40);
+        let get = job["inputs"][0]["url"].clone();
+        let mut clash = job.clone();
+        clash["inputs"] = json!([{ "url": get, "path": "a" }, { "url": get, "path": "a/b" }]);
+        assert_eq!(refused("r6", clash).await, pair("INVALID_INPUT_PATH", "inputs/1/path"));
+        let mut big = job.clone();
+        big["inputs"][0]["bytes"] = json!(2 * GB);
+        assert_eq!(refused("r7", big).await, pair("INPUTS_EXCEED_DISK", "disk_bytes"));
+        let (s, b) = bed
+            .send("r8", "RunJob", "run-job", amended(&job, json!({ "disk_bytes": 1 })))
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "SCHEMA_VALIDATION");
+
+        let (s, b) = bed.send("j1", "RunJob", "run-job", job.clone()).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let events = bed.events_of("j1", "JobStarted").await;
+        assert_eq!(
+            types(&events),
+            [
+                "ImagePulling",
+                "ImagePulling",
+                "ImagePulled",
+                "InputsFetched",
+                "JobStarted"
+            ]
+        );
+        let started = events.last().unwrap().data.clone();
+        let disk = bed.runtime.disk_of(started["job"].as_str().unwrap());
+        assert_eq!(std::fs::read(disk.join("in/scene.txt")).unwrap(), b"the scene");
+        // Recorded without its URLs: a restart fails it, rather than run it without them.
+        assert_eq!(
+            holding(logs.path(), "\"disk_bytes\""),
+            [logs.path().join("accepted.jsonl")]
+        );
+        assert!(holding(logs.path(), "X-Amz").is_empty());
+        std::fs::write(disk.join("out/result.txt"), b"42").unwrap();
+        bed.runtime
+            .stop(&ContainerId(started["container"].as_str().unwrap().into()))
+            .await
+            .unwrap();
+        let events = bed.events_of("j1", "JobFinished").await;
+        let stored = &events.iter().find(|e| e.r#type == "OutputsStored").unwrap().data;
+        assert_eq!(stored["key"], "renders/r1.tar");
+        assert_eq!(
+            unpacked(&s3.get("renders/r1.tar").unwrap()),
+            [("result.txt".to_string(), "42".to_string())].into()
+        );
+        until("the job's disk is removed", || !disk.exists()).await;
+        let (_, told) = get_as(&bed.app, "", &bed.key, "/events?limit=500").await;
+        assert!(!told.to_string().contains("X-Amz"), "{told}");
+        assert!(holding(logs.path(), "X-Amz").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_disk_is_promised_from_admission_so_two_jobs_never_share_one_room_and_one_that_fails_leaves_nothing() {
+        let bed = fresh().await;
+        bed.runtime.set_disk_room(GB + GB / 2);
+        let free = |hs: Value| hs["disk"]["free_bytes"].as_u64().unwrap();
+        let gate = bed.runtime.hold_pulls();
+        let job = json!({ "image": "busybox", "memory_bytes": 4 * GB, "disk_bytes": GB });
+        let (s, b) = bed.send("j1", "RunJob", "run-job", job.clone()).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        // Its image is still on its way and its disk not made: the room is promised all the same.
+        assert_eq!(free(bed.query("get-hardware-state").await), GB / 2);
+        let (s, b) = bed.send("j2", "RunJob", "run-job", job.clone()).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "INSUFFICIENT_DISK");
+        assert_eq!(b["error"]["details"]["free_bytes"], GB / 2);
+        gate.add_permits(100);
+        let started = bed.events_of("j1", "JobStarted").await.last().unwrap().data.clone();
+        // Made, it counts once, as made.
+        assert_eq!(free(bed.query("get-hardware-state").await), GB / 2);
+        bed.runtime
+            .stop(&ContainerId(started["container"].as_str().unwrap().into()))
+            .await
+            .unwrap();
+        bed.events_of("j1", "JobFinished").await;
+        let disk = bed.runtime.disk_of(started["job"].as_str().unwrap());
+        until("the job's disk is removed", || !disk.exists()).await;
+        assert_eq!(free(bed.query("get-hardware-state").await), GB + GB / 2);
+
+        // A disk that fails once it is begun leaves nothing of it behind, and no promise.
+        bed.runtime
+            .break_next_disk("mkfs.ext4 failed: the file system could not be made");
+        let (s, b) = bed.send("j3", "RunJob", "run-job", job).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let failed = bed.events_of("j3", "JobFailed").await.last().unwrap().data.clone();
+        assert!(failed["reason"].as_str().unwrap().contains("mkfs.ext4"), "{failed}");
+        assert!(!bed.runtime.disk_of(failed["job"].as_str().unwrap()).exists());
+        assert_eq!(free(bed.query("get-hardware-state").await), GB + GB / 2);
+    }
+
+    #[tokio::test]
+    async fn a_job_s_disk_outlives_a_restart_its_outputs_still_sent_and_a_disk_no_running_job_has_is_removed() {
+        let (s3, endpoint) = FakeS3::start().await;
+        let store = crate::store::Store {
+            endpoint,
+            bucket: "jobs".into(),
+            region: "fin-01".into(),
+            access_key_id: "AKIDTESTONLY".into(),
+            secret_access_key: SECRET.into(),
+        };
+        let now = time::OffsetDateTime::now_utc();
+        let job = |key: &str| json!({ "image": "busybox", "memory_bytes": 4 * GB, "disk_bytes": GB, "outputs": { "url": store.presign("PUT", key, 600, now), "key": key } });
+        let log = Arc::new(EventLog::ephemeral());
+        let runtime = Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![]));
+        let first = bed(card(), log.clone(), runtime.clone()).await;
+        first.peer.allow_store_cleartext();
+        let mut started = vec![];
+        for (id, key) in [("j1", "renders/r1.tar"), ("j2", "renders/r2.tar")] {
+            let (s, b) = first.send(id, "RunJob", "run-job", job(key)).await;
+            assert_eq!(s, StatusCode::CREATED, "{b}");
+            started.push(first.events_of(id, "JobStarted").await.last().unwrap().data.clone());
+        }
+        let disk = |n: usize| runtime.disk_of(started[n]["job"].as_str().unwrap());
+        let container = |n: usize| ContainerId(started[n]["container"].as_str().unwrap().into());
+        // A disk no job has: the disk of a job that never started, its peer gone before it removed it.
+        runtime.make_disk("job-stray", GB).await.unwrap();
+        // The peer dies; its jobs run on, and one of their disks loses its record.
+        first.peer.halt();
+        let credentials = first.door.auth.clone();
+        drop(first);
+        std::fs::remove_file(disk(1).join("job.json")).unwrap();
+        std::fs::write(disk(0).join("out/result.txt"), b"42").unwrap();
+        let again = bed_with(
+            card(),
+            log.clone(),
+            runtime.clone(),
+            Arc::new(best_peer_engine::Fake::new()),
+            "engines.local",
+            Some(credentials),
+        )
+        .await;
+        assert!(!runtime.disk_of("job-stray").exists(), "removed at start");
+        assert!(disk(0).exists() && disk(1).exists(), "the running jobs keep theirs");
+        // The first exits: its outputs go where its disk's record says, then its end is told.
+        runtime.stop(&container(0)).await.unwrap();
+        let events = again.events_of("j1", "JobFinished").await;
+        assert!(
+            types(&events).contains(&"OutputsStored".to_string()),
+            "{:?}",
+            types(&events)
+        );
+        assert_eq!(
+            unpacked(&s3.get("renders/r1.tar").unwrap()),
+            [("result.txt".to_string(), "42".to_string())].into()
+        );
+        // The second's record is gone, so where its outputs go is not known: its end says so, and is no finish.
+        runtime.stop(&container(1)).await.unwrap();
+        let failed = again.events_of("j2", "JobFailed").await.last().unwrap().data.clone();
+        assert!(failed["reason"].as_str().unwrap().contains("restarted"), "{failed}");
+        assert_eq!(failed["exit_code"], 0);
+        assert!(s3.get("renders/r2.tar").is_none());
+        until("both disks are removed", || !disk(0).exists() && !disk(1).exists()).await;
+    }
+
+    #[tokio::test]
+    async fn orders_whose_disks_fit_a_member_one_at_a_time_take_turns_and_the_member_says_its_room() {
+        let (site, ws, _s3, _logs) = site_with_store().await;
+        let member = &site.members[0];
+        member.runtime.set_disk_room(GB + GB / 2);
+        let first = site.order(&ws, "j1", 4, with_io()).await;
+        assert_eq!(first["waiting"], false, "{first}");
+        // The memory is there for both; the disk for one at a time.
+        let second = site.order(&ws, "j2", 4, with_io()).await;
+        assert_eq!(second["waiting"], true, "{second}");
+        let started = site.events(&ws, "j1", "JobStarted").await.last().unwrap()["data"].clone();
+        let hs = site.query(&ws, "get-hardware-state").await;
+        assert_eq!(hs["peers"][0]["disk"]["free_bytes"], GB / 2, "{hs}");
+        member
+            .runtime
+            .stop(&ContainerId(started["container"].as_str().unwrap().into()))
+            .await
+            .unwrap();
+        site.events(&ws, "j1", "JobFinished").await;
+        let disk = member.runtime.disk_of(started["job"].as_str().unwrap());
+        until("the first job's disk is removed", || !disk.exists()).await;
+        site.live_cloud(&ws, "lab").step(later(0)).await;
+        let events = site.events(&ws, "j2", "JobStarted").await;
+        assert_eq!(
+            facts(&events),
+            ["JobQueued", "JobPlaced", "InputsFetched", "JobStarted"]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_order_whose_store_was_replaced_while_it_waited_fails_when_its_turn_comes_rather_than_read_another() {
+        let (site, ws, _s3, _logs) = site_with_store().await;
+        site.order(&ws, "j1", 20, json!({ "args": ["sleep", "100"] })).await;
+        let started = site.events(&ws, "j1", "JobStarted").await.last().unwrap()["data"].clone();
+        let waits = site.order(&ws, "j2", 20, with_io()).await;
+        assert_eq!(waits["waiting"], true, "{waits}");
+        // The owner moves the workspace to another bucket while the order waits.
+        let endpoint = site.query(&ws, "get-store").await["store"]["endpoint"].clone();
+        let (s, b) = site
+            .send(
+                &ws,
+                "st2",
+                "SetStore",
+                "set-store",
+                json!({ "endpoint": endpoint, "bucket": "jobs-2", "region": "fin-01", "access_key_id": "AKIDTESTONLY", "secret_access_key": SECRET }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "st2", "StoreSetV1").await;
+        site.members[0]
+            .runtime
+            .stop(&ContainerId(started["container"].as_str().unwrap().into()))
+            .await
+            .unwrap();
+        site.events(&ws, "j1", "JobFinished").await;
+        site.live_cloud(&ws, "lab").step(later(0)).await;
+        let events = site.events(&ws, "j2", "JobFailed").await;
+        assert_eq!(
+            facts(&events),
+            ["JobQueued", "JobFailed"],
+            "failed before it was placed"
+        );
+        let reason = events.last().unwrap()["data"]["reason"].as_str().unwrap().to_string();
+        assert!(
+            reason.contains("replaced while the order waited") && reason.contains("bucket jobs "),
+            "{reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_admitted_is_set_only_when_its_command_runs_so_one_that_never_runs_changes_nothing() {
+        use crate::domain::Clouds;
+        let (site, ws, _s3, _logs) = site_with_store().await;
+        let before = site.query(&ws, "get-store").await;
+        let file = site.data.path().join("workspaces").join(&ws).join("store.json");
+        let kept = std::fs::read(&file).unwrap();
+        let owner = site
+            .auth
+            .credential_by_hash(&best_peer_door::auth::hash_key(&site.key))
+            .unwrap();
+        let cmd = Envelope::event(
+            "test",
+            "SetStore",
+            json!({ "endpoint": "https://objects.example.com", "bucket": "other", "region": "x", "access_key_id": "AKIDOTHER", "secret_access_key": "another-secret" }),
+            None,
+            None,
+        );
+        // Admitted, as a command is before the door records it; a restart then fails it before it runs.
+        site.workspaces
+            .get(&ws)
+            .unwrap()
+            .admit_set_store(cmd, &owner, "owner:never-run".into())
+            .unwrap();
+        assert_eq!(site.query(&ws, "get-store").await, before);
+        assert_eq!(std::fs::read(&file).unwrap(), kept);
+    }
+
+    #[tokio::test]
+    async fn a_disk_a_member_has_admitted_is_counted_once_so_the_room_beside_it_is_used() {
+        let (site, ws, _s3, _logs) = site_with_store().await;
+        let member = &site.members[0];
+        member.runtime.set_disk_room(3 * GB);
+        // The images do not arrive: every order stays admitted on the member, its disk promised and not made.
+        let _held = member.runtime.hold_pulls();
+        let free_on_member = || async {
+            member.query("get-hardware-state").await["disk"]["free_bytes"]
+                .as_u64()
+                .unwrap()
+        };
+        for (n, id) in ["j1", "j2", "j3"].into_iter().enumerate() {
+            let queued = site.order(&ws, id, 4, with_io()).await;
+            assert_eq!(queued["waiting"], false, "{id} has its room: {queued}");
+            let left = 3 * GB - (n as u64 + 1) * GB;
+            for _ in 0..400 {
+                if free_on_member().await == left {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(free_on_member().await, left, "the member promised {id}'s disk");
+        }
+        // The room is all promised now: the next one waits.
+        let fourth = site.order(&ws, "j4", 4, with_io()).await;
+        assert_eq!(fourth["waiting"], true, "{fourth}");
+    }
+
+    #[tokio::test]
+    async fn two_waiting_orders_one_step_releases_go_to_a_member_only_as_its_disk_room_allows() {
+        let (site, ws, _s3, _logs) = site_with_store().await;
+        let member = &site.members[0];
+        member.runtime.set_disk_room(GB + GB / 2);
+        // A job with no disk holds the card; two orders with a disk each wait for its memory.
+        site.order(&ws, "j0", 20, json!({ "args": ["sleep", "100"] })).await;
+        let blocker = site.events(&ws, "j0", "JobStarted").await.last().unwrap()["data"].clone();
+        for id in ["j1", "j2"] {
+            let queued = site.order(&ws, id, 10, with_io()).await;
+            assert_eq!(queued["waiting"], true, "{queued}");
+        }
+        // The card comes free: one step has memory for both, and disk room for one.
+        member
+            .runtime
+            .stop(&ContainerId(blocker["container"].as_str().unwrap().into()))
+            .await
+            .unwrap();
+        site.events(&ws, "j0", "JobFinished").await;
+        site.live_cloud(&ws, "lab").step(later(0)).await;
+        let first = site.events(&ws, "j1", "JobStarted").await;
+        assert_eq!(facts(&first), ["JobQueued", "JobPlaced", "InputsFetched", "JobStarted"]);
+        // The second was not sent to be refused: it waits as it was told, never placed, never queued again.
+        site.live_cloud(&ws, "lab").step(later(0)).await;
+        let (_, b) = get_as(
+            &site.app,
+            &format!("/workspaces/{ws}"),
+            &site.key,
+            "/events?correlationId=j2&limit=50",
+        )
+        .await;
+        let second = b["events"].as_array().cloned().unwrap_or_default();
+        assert_eq!(facts(&second), ["JobQueued"], "{second:?}");
+        // Its turn comes when the first's disk is gone.
+        let started = first.last().unwrap()["data"].clone();
+        member
+            .runtime
+            .stop(&ContainerId(started["container"].as_str().unwrap().into()))
+            .await
+            .unwrap();
+        site.events(&ws, "j1", "JobFinished").await;
+        let disk = member.runtime.disk_of(started["job"].as_str().unwrap());
+        until("the first job's disk is removed", || !disk.exists()).await;
+        site.live_cloud(&ws, "lab").step(later(0)).await;
+        site.events(&ws, "j2", "JobStarted").await;
+    }
+
+    #[tokio::test]
+    async fn an_order_sent_again_counts_its_disk_until_the_member_answers_this_time() {
+        let (site, ws, _s3, _logs) = site_with_store().await;
+        let lab = site.live_cloud(&ws, "lab");
+        // The member refuses the order once, for its disk, as one whose room was taken meanwhile does.
+        site.switchboard.refuse_next_command(A, "INSUFFICIENT_DISK");
+        site.order(&ws, "j1", 4, with_io()).await;
+        let queued = site.events_n(&ws, "j1", "JobQueued", 2).await;
+        assert_eq!(
+            queued.iter().rfind(|e| e["type"] == "JobQueued").unwrap()["data"]["waiting"],
+            true
+        );
+        // Sent again, and held on its way: the member has not counted it, so the cloud does.
+        let gate = site.switchboard.hold_commands(A);
+        let stepping = tokio::spawn({
+            let lab = lab.clone();
+            async move { lab.step(later(0)).await }
+        });
+        site.events_n(&ws, "j1", "JobPlaced", 2).await;
+        assert_eq!(lab.disk_counted(std::time::Instant::now()).get("a"), Some(&GB));
+        gate.add_permits(100);
+        stepping.await.unwrap();
+        site.events(&ws, "j1", "JobStarted").await;
+        // Answered and started: the member counts it now, as made.
+        assert_eq!(lab.disk_counted(std::time::Instant::now()).get("a"), None);
+    }
+
+    #[tokio::test]
+    async fn a_disk_claimed_for_a_job_refused_after_it_or_abandoned_is_let_go_and_two_claims_never_share_one_room() {
+        let bed = fresh().await;
+        bed.runtime.set_disk_room(GB + GB / 2);
+        let free = || async {
+            bed.query("get-hardware-state").await["disk"]["free_bytes"]
+                .as_u64()
+                .unwrap()
+        };
+        // Refused for its memory once its disk was claimed: the claim is let go.
+        let (s, b) = bed
+            .send(
+                "j1",
+                "RunJob",
+                "run-job",
+                json!({ "image": "busybox", "memory_bytes": 30 * GB, "disk_bytes": GB }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_ne!(b["error"]["code"], "INSUFFICIENT_DISK", "{b}");
+        assert_eq!(free().await, GB + GB / 2);
+        // A claim abandoned while the room is read is let go too, once the reading ends.
+        {
+            let claim = bed.peer.claim_disk("job-abandoned", GB);
+            tokio::pin!(claim);
+            let _ = futures::poll!(&mut claim);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..400 {
+            if free().await == GB + GB / 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(free().await, GB + GB / 2);
+        // Two at once, with room for one: one is admitted, the other told the room left.
+        let _gate = bed.runtime.hold_pulls();
+        let job = json!({ "image": "busybox", "memory_bytes": 4 * GB, "disk_bytes": GB });
+        let (a, b) = tokio::join!(
+            bed.send("c1", "RunJob", "run-job", job.clone()),
+            bed.send("c2", "RunJob", "run-job", job.clone())
+        );
+        let admitted = [&a, &b].iter().filter(|r| r.0 == StatusCode::CREATED).count();
+        assert_eq!(admitted, 1, "{a:?} {b:?}");
+        let refused = if a.0 == StatusCode::CREATED { &b.1 } else { &a.1 };
+        assert_eq!(refused["error"]["code"], "INSUFFICIENT_DISK", "{refused}");
+        assert_eq!(refused["error"]["details"]["free_bytes"], GB / 2);
+    }
+
+    #[tokio::test]
+    async fn a_room_its_file_system_does_not_say_is_told_as_such_and_never_as_a_peer_that_makes_no_disk() {
+        let bed = fresh().await;
+        bed.runtime.room_unread(true);
+        let job = json!({ "image": "busybox", "memory_bytes": 4 * GB, "disk_bytes": GB });
+        let (s, b) = bed.send("j1", "RunJob", "run-job", job.clone()).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        // No room now, which a cloud places again later: not a peer that makes none.
+        assert_eq!(b["error"]["code"], "INSUFFICIENT_DISK", "{b}");
+        assert!(
+            b["error"]["message"].as_str().unwrap().contains("could not read"),
+            "{b}"
+        );
+        // It still says it makes disks, its room not known just now.
+        let disk = bed.query("get-hardware-state").await["disk"].clone();
+        assert_eq!(disk, json!({ "free_bytes": null, "total_bytes": null }));
+        bed.runtime.room_unread(false);
+        let (s, b) = bed.send("j2", "RunJob", "run-job", job).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+    }
+
+    #[tokio::test]
+    async fn an_order_on_a_cloud_whose_member_room_was_not_read_waits_for_it_rather_than_being_refused() {
+        let (site, ws, _s3, _logs) = site_with_store().await;
+        let member = &site.members[0];
+        member.runtime.room_unread(true);
+        let queued = site.order(&ws, "j1", 4, with_io()).await;
+        assert_eq!(queued["waiting"], true, "{queued}");
+        let hs = site.query(&ws, "get-hardware-state").await;
+        assert_eq!(
+            hs["peers"][0]["disk"],
+            json!({ "free_bytes": null, "total_bytes": null })
+        );
+        // The room is read again: the order is placed.
+        member.runtime.room_unread(false);
+        site.live_cloud(&ws, "lab").step(later(0)).await;
+        site.events(&ws, "j1", "JobStarted").await;
     }
 }

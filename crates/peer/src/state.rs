@@ -44,6 +44,8 @@ pub enum JobPhase {
     Running,
     /// A stop is in progress; the exit is expected.
     Stopping,
+    /// It exited, and what it left under /out is being stored: its end, JobFinished or JobFailed, follows.
+    Storing,
 }
 
 #[derive(Clone, Debug)]
@@ -114,8 +116,56 @@ pub struct Order {
     /// Whether its job runs in the closed box a credential with a share gets, where the door that runs it decides
     /// (a peer's own queue); a cloud's member decides for the cloud's orders.
     pub boxed: bool,
+    /// Its inputs, where its outputs go and its disk, by reference into the workspace's store; none for a job
+    /// with none.
+    pub io: Option<OrderIo>,
     /// What it got, as `JobPlaced` told it, in the size's terms: the size, its price and the currency.
     pub receipt: Option<Value>,
+}
+
+/// An order's inputs, the key prefix its outputs go under, the size of its disk, and the store it was taken for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OrderIo {
+    pub inputs: Vec<OrderInput>,
+    pub outputs: Option<String>,
+    pub disk_bytes: u64,
+    /// The store its inputs were found in, endpoint and bucket: one set since is not the store it was taken for.
+    pub store: Option<(String, String)>,
+}
+
+/// One input of an order: its key in the workspace's store, the path under /in it lands at, and its size as the
+/// store said when the order was taken.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OrderInput {
+    pub key: String,
+    pub path: String,
+    pub bytes: Option<u64>,
+}
+
+impl OrderIo {
+    /// From `JobQueued`'s data, when it names a disk.
+    pub fn read(data: &Value) -> Option<Self> {
+        Some(Self {
+            inputs: data["inputs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|i| {
+                    Some(OrderInput {
+                        key: i["key"].as_str()?.to_string(),
+                        path: i["path"].as_str()?.to_string(),
+                        bytes: i["bytes"].as_u64(),
+                    })
+                })
+                .collect(),
+            outputs: data["outputs"]["prefix"].as_str().map(str::to_string),
+            disk_bytes: data["disk_bytes"].as_u64()?,
+            store: data["store"]["endpoint"]
+                .as_str()
+                .zip(data["store"]["bucket"].as_str())
+                .map(|(e, b)| (e.to_string(), b.to_string())),
+        })
+    }
 }
 
 impl Order {
@@ -356,6 +406,7 @@ impl State {
                         deadline_seconds: data["deadline_seconds"].as_u64(),
                         accelerators_only: data["accelerators_only"].as_bool().unwrap_or(false),
                         boxed: data["boxed"].as_bool().unwrap_or(false),
+                        io: OrderIo::read(data),
                         isolation: serde_json::from_value(data["isolation"].clone()).ok(),
                         attempt,
                         queued_at,

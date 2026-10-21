@@ -18,7 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use best_peer_door::auth::{hash_key, holder_of_hash, Credential};
@@ -218,6 +218,13 @@ pub struct Cloud {
     /// The workspace's spending, which an order by size is checked against when it is taken; none for a cloud no
     /// workspace counts.
     purse: std::sync::OnceLock<Arc<crate::meter::Purse>>,
+    /// The workspace's store, where its orders' inputs come from and their outputs go.
+    store: std::sync::OnceLock<Arc<Mutex<Option<crate::store::Store>>>>,
+    /// The inputs, outputs and disk admission read for an order, until its handler tells it.
+    admitted_io: Mutex<HashMap<String, Option<crate::state::OrderIo>>>,
+    /// When each order sent to a member was answered, by order, until it starts or ends: from then the member counts
+    /// its disk in the room it says.
+    answered_at: Mutex<HashMap<String, Instant>>,
 }
 
 /// `text` with the hardware it names put in the size's terms, for an order by size (behavioralstate/spec#64, decision
@@ -314,6 +321,74 @@ struct RunJobData {
     isolation: Option<Isolation>,
     #[serde(default)]
     size: Option<String>,
+    #[serde(default)]
+    inputs: Vec<InputKey>,
+    #[serde(default)]
+    outputs: Option<OutputPrefix>,
+    #[serde(default)]
+    disk_bytes: Option<u64>,
+}
+
+/// An input of an order: a key in the workspace's store, and the path under /in it lands at.
+#[derive(Deserialize)]
+struct InputKey {
+    key: String,
+    path: String,
+}
+
+/// Where an order's outputs go: a key prefix in the workspace's store.
+#[derive(Deserialize)]
+struct OutputPrefix {
+    prefix: String,
+}
+
+/// The longest an order with outputs may run: the URL its outputs are sent with must outlive it, and a signed URL
+/// lives seven days at most; six days, with room for its image's pull and its upload.
+const MOST_SECONDS_WITH_OUTPUTS: u64 = 6 * 24 * 60 * 60;
+
+/// What a disk of `bytes` holds for files. Its file system, ext4 with no journal and nothing kept for root, keeps up
+/// to 6.5% of a disk under 512 MiB and under 2% of a larger one (measured with mkfs.ext4 1.47 from 16 MiB to 4 GiB):
+/// a tenth, and a twentieth, leave room for the blocks files round up to.
+pub(crate) fn usable(bytes: u64) -> u64 {
+    match bytes < 512 << 20 {
+        true => bytes - bytes / 10,
+        false => bytes - bytes / 20,
+    }
+}
+
+/// `host` without the devices of the members that have not `needed` bytes free for a job's disk now, as `peers`
+/// (each member's row, with the room it says it has) tells; all of it for a job with no disk.
+fn with_disk_room(
+    host: Host,
+    peers: &[Value],
+    cloud: &str,
+    needed: Option<u64>,
+    promised: &HashMap<String, u64>,
+) -> Host {
+    let Some(needed) = needed else {
+        return host;
+    };
+    let roomy: Vec<String> = peers
+        .iter()
+        .filter(|p| {
+            let held = promised
+                .get(p["peer"].as_str().unwrap_or_default())
+                .copied()
+                .unwrap_or(0);
+            p["disk"]["free_bytes"]
+                .as_u64()
+                .is_some_and(|f| f.saturating_sub(held) >= needed)
+        })
+        .filter_map(|p| Some(format!("{cloud}/{}/", p["peer"].as_str()?)))
+        .collect();
+    Host {
+        devices: host
+            .devices
+            .into_iter()
+            .filter(|d| roomy.iter().any(|m| d.id.0.starts_with(m)))
+            .collect(),
+        ..host
+    }
 }
 
 impl Cloud {
@@ -357,6 +432,9 @@ impl Cloud {
             whole: Mutex::new(HashMap::new()),
             admitted_sizes: Mutex::new(HashMap::new()),
             purse: std::sync::OnceLock::new(),
+            store: std::sync::OnceLock::new(),
+            admitted_io: Mutex::new(HashMap::new()),
+            answered_at: Mutex::new(HashMap::new()),
             name: name.into(),
             workspace: workspace.into(),
             log,
@@ -535,6 +613,205 @@ impl Cloud {
     /// Sets the sizes this cloud sells by; none for a cloud with no menu.
     pub fn set_menu(&self, menu: Option<Menu>) {
         *self.menu.lock().unwrap() = menu;
+    }
+
+    /// Reads its orders' inputs from, and sends their outputs to, the workspace's `store`; set once.
+    pub fn set_store(&self, store: Arc<Mutex<Option<crate::store::Store>>>) {
+        let _ = self.store.set(store);
+    }
+
+    /// The workspace's store, as it is set now.
+    fn store_now(&self) -> Option<crate::store::Store> {
+        self.store.get().and_then(|s| s.lock().unwrap().clone())
+    }
+
+    /// The disk each member is promised for orders on their way to it that the room it said, read at `read`, does
+    /// not count yet, by member: an order chosen for it, one sent and not answered, and one answered after `read`.
+    /// Once the member has admitted an order it counts its disk itself, as promised or as made, so a disk is counted
+    /// once. Read with the state held.
+    fn disk_promised(&self, s: &State, read: Instant) -> HashMap<String, u64> {
+        let mut out: HashMap<String, u64> = HashMap::new();
+        // The member a reservation names, from its device (cloud/peer/device).
+        let member_of = |id: &str| {
+            s.reserved
+                .values()
+                .find(|r| r.id == id)
+                .and_then(|r| r.device.as_ref())
+                .and_then(|d| d.0.split('/').nth(1))
+                .map(str::to_string)
+        };
+        let mut answered = self.answered_at.lock().unwrap();
+        answered.retain(|order, _| s.orders.get(order).is_some_and(|o| o.job.is_none()));
+        for o in s.orders.values().filter(|o| o.job.is_none()) {
+            let Some(io) = &o.io else {
+                continue;
+            };
+            let peer = match &o.placed {
+                // Chosen, and not sent yet: where its admission or a step is placing it.
+                None => member_of(&o.id),
+                // Sent: until the member's answer is older than the room read.
+                Some((peer, _)) if answered.get(&o.id).is_none_or(|at| *at >= read) => Some(peer.clone()),
+                Some(_) => None,
+            };
+            if let Some(peer) = peer {
+                *out.entry(peer).or_default() += io.disk_bytes;
+            }
+        }
+        // Admitted and not yet taken: promised where its admission placed it.
+        let admitted = self.admitted_io.lock().unwrap();
+        for (key, r) in &s.reserved {
+            if s.orders.contains_key(&r.id) {
+                continue;
+            }
+            let (Some(device), Some(Some(io))) = (&r.device, admitted.get(key)) else {
+                continue;
+            };
+            if let Some(peer) = device.0.split('/').nth(1) {
+                *out.entry(peer.to_string()).or_default() += io.disk_bytes;
+            }
+        }
+        out
+    }
+
+    /// An order's inputs, outputs and disk, checked against the workspace's store: each input there, each landing
+    /// at a plain path, a disk given by the order or its size, an order with outputs bounded within what a signed URL
+    /// outlives. None for an order with none of them.
+    async fn admit_io(
+        &self,
+        data: &RunJobData,
+        size: Option<&crate::menu::Size>,
+    ) -> Result<Option<crate::state::OrderIo>, BestError> {
+        if data.inputs.is_empty() && data.outputs.is_none() && data.disk_bytes.is_none() {
+            return Ok(None);
+        }
+        let bad = |code: &'static str, field: &str, message: String| {
+            Err(BestError::bad_request(code, message).with_details(json!({ "field": field })))
+        };
+        let Some(disk) = data.disk_bytes.or(size.and_then(|z| z.disk_bytes)) else {
+            return bad(
+                "DISK_NEEDED",
+                "disk_bytes",
+                "a job with inputs or outputs needs a disk of its own, where they are kept: send disk_bytes, or order a size that names one".into(),
+            );
+        };
+        let store = self.store_now();
+        if store.is_none() && (!data.inputs.is_empty() || data.outputs.is_some()) {
+            return bad(
+                "NO_STORE",
+                "inputs",
+                "this workspace has no store for its jobs' inputs and outputs: its owner sets one with set-store"
+                    .into(),
+            );
+        }
+        for (n, i) in data.inputs.iter().enumerate() {
+            if !crate::lifecycle::is_relative(&i.path) {
+                return bad(
+                    "INVALID_INPUT_PATH",
+                    &format!("inputs/{n}/path"),
+                    format!(
+                        "input path {:?} is not a plain relative path under /in: no leading /, no .., no empty part",
+                        i.path
+                    ),
+                );
+            }
+        }
+        if let Some((n, why)) = crate::lifecycle::path_clash(data.inputs.iter().map(|i| i.path.as_str())) {
+            return bad("INVALID_INPUT_PATH", &format!("inputs/{n}/path"), why);
+        }
+        if let Some(o) = &data.outputs {
+            if o.prefix.is_empty() || o.prefix.starts_with('/') {
+                return bad(
+                    "INVALID_OUTPUTS",
+                    "outputs/prefix",
+                    "outputs/prefix is a key prefix in the store, such as renders/shot-12, with no leading /".into(),
+                );
+            }
+            match data.deadline_seconds {
+                None => {
+                    return bad(
+                        "DEADLINE_NEEDED",
+                        "deadline_seconds",
+                        format!("a job with outputs sends them with a URL the store honours for a limited time: send deadline_seconds, {MOST_SECONDS_WITH_OUTPUTS} at most"),
+                    )
+                }
+                Some(d) if d > MOST_SECONDS_WITH_OUTPUTS => {
+                    return bad(
+                        "TOO_LONG_FOR_THE_STORE",
+                        "deadline_seconds",
+                        format!("a job with outputs may run {MOST_SECONDS_WITH_OUTPUTS} seconds at most, six days: the URL its outputs are sent with lives seven days at most"),
+                    )
+                }
+                Some(_) => {}
+            }
+        }
+        let mut sizes = vec![];
+        if let Some(store) = &store {
+            for (n, i) in data.inputs.iter().enumerate() {
+                match store.size_of(&i.key).await {
+                    Ok(Some(bytes)) => sizes.push(bytes),
+                    Ok(None) => {
+                        return bad(
+                            "NO_SUCH_INPUT",
+                            &format!("inputs/{n}/key"),
+                            format!(
+                                "the workspace's store holds no {}: put it in bucket {} first, then order again",
+                                i.key, store.bucket
+                            ),
+                        )
+                    }
+                    Err(why) => {
+                        return bad(
+                            "STORE_UNREACHABLE",
+                            &format!("inputs/{n}/key"),
+                            format!(
+                                "the workspace's store could not say whether it holds {}: {why}; try again",
+                                i.key
+                            ),
+                        )
+                    }
+                }
+            }
+        }
+        // The inputs land on the disk before the job starts: what cannot fit is refused now, not after the wait.
+        let inputs: u64 = sizes.iter().sum();
+        if inputs > usable(disk) {
+            return bad(
+                "INPUTS_EXCEED_DISK",
+                "disk_bytes",
+                format!(
+                    "the inputs are {inputs} bytes together, more than a disk of {disk} bytes holds once its file system takes its share ({} bytes): ask for more disk_bytes",
+                    disk - usable(disk)
+                ),
+            );
+        }
+        Ok(Some(crate::state::OrderIo {
+            inputs: data
+                .inputs
+                .iter()
+                .zip(sizes.into_iter().map(Some).chain(std::iter::repeat(None)))
+                .map(|(i, bytes)| crate::state::OrderInput {
+                    key: i.key.clone(),
+                    path: i.path.clone(),
+                    bytes,
+                })
+                .collect(),
+            outputs: data
+                .outputs
+                .as_ref()
+                .map(|o| o.prefix.trim_end_matches('/').to_string()),
+            disk_bytes: disk,
+            store: store
+                .filter(|_| !data.inputs.is_empty() || data.outputs.is_some())
+                .map(|s| (s.endpoint, s.bucket)),
+        }))
+    }
+
+    /// The disk counted on each member for orders on their way to it, as a placement that read the room at `read`
+    /// sees it.
+    #[cfg(test)]
+    pub fn disk_counted(&self, read: Instant) -> HashMap<String, u64> {
+        let s = self.state.lock().unwrap();
+        self.disk_promised(&s, read)
     }
 
     /// Counts this cloud's orders by size against `purse`, the workspace's spending; set once.
@@ -804,6 +1081,9 @@ impl Cloud {
                         }
                     };
                     up["driver"] = json!(seen.driver);
+                    if hs["disk"].is_object() {
+                        up["disk"] = hs["disk"].clone();
+                    }
                     peers.push(up);
                     // What each device offers, as the member says; a member that says nothing offers nothing more
                     // than a process.
@@ -1764,6 +2044,10 @@ impl Cloud {
                 )
                 .await;
             if let Err(e) = stopped {
+                // It exited, and its outputs are being stored: the member tells its end.
+                if e.details["code"] == "STORING_OUTPUTS" {
+                    continue;
+                }
                 tracing::warn!(cloud = %self.name, peer = %m.name, %job, why = %e.message, "a job past its deadline could not be stopped; trying again at the next tick");
                 if let Some(j) = self.state.lock().unwrap().jobs.get_mut(&job) {
                     j.phase = JobPhase::Running;
@@ -1774,7 +2058,8 @@ impl Cloud {
         if waiting.is_empty() {
             return;
         }
-        let (host, _, isolations) = self.combined().await;
+        let read = Instant::now();
+        let (host, peers, isolations) = self.combined().await;
         for o in waiting {
             let device = {
                 let mut s = self.state.lock().unwrap();
@@ -1789,6 +2074,13 @@ impl Cloud {
                 } else {
                     isolated.clone()
                 };
+                let on = with_disk_room(
+                    on,
+                    &peers,
+                    &self.name,
+                    o.io.as_ref().map(|io| io.disk_bytes),
+                    &self.disk_promised(&s, read),
+                );
                 let mut receipt = None;
                 let pick = match (&o.size, o.memory_bytes) {
                     (Some((size, currency)), _) => match size.place(&on, &host, &s, &taken) {
@@ -1853,17 +2145,65 @@ impl Cloud {
             }
             return;
         };
+        // Its store first: an order whose store was removed, or replaced, while it waited is not served from another.
+        let store = match &o.io {
+            Some(io) if !io.inputs.is_empty() || io.outputs.is_some() => match self.store_now() {
+                None => {
+                    fail(
+                        "the workspace has no store any more, where its inputs were".into(),
+                        "its owner sets one with set-store; then order it again",
+                        None,
+                    );
+                    return;
+                }
+                Some(s)
+                    if io
+                        .store
+                        .as_ref()
+                        .is_some_and(|(e, b)| (e, b) != (&s.endpoint, &s.bucket)) =>
+                {
+                    let (endpoint, bucket) = io.store.clone().unwrap_or_default();
+                    fail(
+                        format!("the workspace's store was replaced while the order waited: its inputs were found in bucket {bucket} at {endpoint}"),
+                        "order it again, naming keys in the store set now (get-store)",
+                        None,
+                    );
+                    return;
+                }
+                Some(s) => Some(s),
+            },
+            _ => None,
+        };
         let memory = o.memory_bytes.or(o.size.as_ref().map(|(z, _)| z.memory_bytes));
         let with_device = memory.is_some();
         let mut placed = json!({ "job": o.id, "peer": member.name, "device": with_device.then(|| device.0.clone()) });
         if let Some(r) = receipt {
             placed["receipt"] = r;
         }
+        // Sent again, it is counted again until the member answers this time.
+        self.answered_at.lock().unwrap().remove(&o.id);
         self.tell(&em, "JobPlaced", placed);
         let mut body = json!({ "image": o.image, "args": o.args });
         if let Some(m) = memory {
             body["memory_bytes"] = json!(m);
             body["device"] = json!(member_device);
+        }
+        if let Some(io) = &o.io {
+            body["disk_bytes"] = json!(io.disk_bytes);
+        }
+        if let (Some(io), Some(store)) = (&o.io, &store) {
+            let now = OffsetDateTime::now_utc();
+            body["inputs"] = json!(io
+                .inputs
+                .iter()
+                .map(|i| json!({ "url": store.presign("GET", &i.key, 24 * 60 * 60, now), "path": i.path, "bytes": i.bytes }))
+                .collect::<Vec<_>>());
+            if let Some(prefix) = &io.outputs {
+                let key = format!("{prefix}/{}.tar", o.id);
+                // Signed to outlive the job's deadline, its image's pull and its upload.
+                let lives = o.deadline_seconds.unwrap_or(0) + 6 * 60 * 60;
+                body["outputs"] = json!({ "url": store.presign("PUT", &key, lives, now), "key": key });
+            }
         }
         // The member checks the ask against its own engine as it is now, which may have changed since it was read.
         // Only above process: a member older than isolation takes nothing more, and refuses a field it does not know.
@@ -1874,7 +2214,9 @@ impl Cloud {
         let base = member.schema_base().await;
         let envelope = self.to_member_as(&base, &mc, "RunJob", "run-job", body);
         self.listen_order(&member.name, &mc, &em, &o.id);
-        let Err(e) = member.send(&envelope).await else {
+        let sent = member.send(&envelope).await;
+        self.answered_at.lock().unwrap().insert(o.id.clone(), Instant::now());
+        let Err(e) = sent else {
             return;
         };
         self.issued.lock().unwrap().remove(&(member.name.clone(), mc));
@@ -1882,7 +2224,8 @@ impl Cloud {
         let room = match &e {
             Refusal::Unreachable(_) => true,
             Refusal::Refused { body, .. } => {
-                crate::queue::waits_for(body["error"]["code"].as_str().unwrap_or_default())
+                let code = body["error"]["code"].as_str().unwrap_or_default();
+                crate::queue::waits_for(code) || code == "INSUFFICIENT_DISK"
             }
         };
         let refused = e.relayed(&member.name);
@@ -2240,7 +2583,30 @@ impl Service for Cloud {
         if self.already_placed(&key).is_some() || self.state.lock().unwrap().orders.contains_key(&order_id(&key)) {
             return Ok(());
         }
+        let io = self.admit_io(&data, sized.as_ref().map(|(z, _)| z)).await?;
+        let disk = io.as_ref().map(|io| io.disk_bytes);
+        let read = Instant::now();
         let (host, peers, isolations) = self.combined().await;
+        if let Some(needed) = disk {
+            // A disk no member could ever give is refused now; one no member has the room for yet waits, and so does
+            // one a member that makes disks may give once its room is read again.
+            if !peers
+                .iter()
+                .any(|p| p["disk"].is_object() && p["disk"]["total_bytes"].as_u64().is_none_or(|t| t >= needed))
+            {
+                return Err(Self::with_peers(
+                    BestError::bad_request(
+                        "NO_DISK_ROOM",
+                        format!(
+                            "no member of cloud {} that answers makes a disk of {needed} bytes for a job: ask for less disk_bytes, or add a member peer (Docker on Linux) with the room",
+                            self.name
+                        ),
+                    )
+                    .with_details(json!({ "field": "disk_bytes" })),
+                    peers,
+                ));
+            }
+        }
         // A size's floors read every device of the members that answer: the host memory of a device's machine is
         // its CPU's, which a credential held to the accelerators is not shown.
         let whole = host.clone();
@@ -2267,11 +2633,15 @@ impl Service for Cloud {
         within_share(held.memory_bytes, &who, needed)?;
         within_count("job", held.jobs, who.grant.jobs)?;
         let taken = self.taken_whole(&state);
+        let promised = self.disk_promised(&state, read);
         if let Some((size, menu)) = &sized {
-            let placement = match size.place(&host, &whole, &state, &taken) {
+            let roomy = with_disk_room(host.clone(), &peers, &self.name, disk, &promised);
+            let placement = match size.place(&roomy, &whole, &state, &taken) {
                 Ok(p) => Some(p),
                 // No device meeting its floors has its room now, where room can come free: it waits its turn.
                 Err(NotPlaced::Busy) => None,
+                // Its floors are met, by a member with no disk room for it yet: it waits for that room.
+                Err(NotPlaced::Never) if size.place(&host, &whole, &state, &taken) != Err(NotPlaced::Never) => None,
                 Err(NotPlaced::Never) => {
                     let met: Vec<&str> = menu
                         .sizes
@@ -2314,6 +2684,10 @@ impl Service for Cloud {
                     data.deadline_seconds,
                 ),
             );
+            // Kept only once the order is certain to be taken, so a refusal leaves nothing behind.
+            if io.is_some() {
+                self.admitted_io.lock().unwrap().insert(key.clone(), io.clone());
+            }
             state.reserved.insert(
                 key.clone(),
                 Reservation {
@@ -2329,7 +2703,7 @@ impl Service for Cloud {
         }
         // The devices a size holds whole take nothing else, though an order that waits may come to have them.
         let all = host.clone();
-        let host = Self::without(host, &taken);
+        let host = Self::without(with_disk_room(host, &peers, &self.name, disk, &promised), &taken);
         let placement = match data.memory_bytes {
             Some(needed) => match place(
                 &host,
@@ -2381,6 +2755,9 @@ impl Service for Cloud {
         };
         if accelerators_only(&who) {
             self.held_to_accelerators.lock().unwrap().insert(key.clone());
+        }
+        if io.is_some() {
+            self.admitted_io.lock().unwrap().insert(key.clone(), io.clone());
         }
         state.reserved.insert(
             key.clone(),
@@ -2467,6 +2844,7 @@ impl Service for Cloud {
             started_at: None,
             size,
             receipt: None,
+            io: self.admitted_io.lock().unwrap().remove(&key).flatten(),
         };
         let reason = waiting.then(|| match &order.size {
             Some((z, _)) => format!(
@@ -2560,11 +2938,11 @@ impl Service for Cloud {
             if let Some(j) = self.state.lock().unwrap().jobs.get_mut(&id) {
                 j.phase = JobPhase::Running;
             }
-            self.tell(
-                &em,
-                "CommandFailed",
-                json!({ "type": cmd.r#type, "reason": format!("{}; the job keeps running", e.message) }),
-            );
+            let reason = match e.details["code"] == "STORING_OUTPUTS" {
+                true => e.message,
+                false => format!("{}; the job keeps running", e.message),
+            };
+            self.tell(&em, "CommandFailed", json!({ "type": cmd.r#type, "reason": reason }));
         }
     }
 
