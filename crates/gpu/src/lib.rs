@@ -122,6 +122,10 @@ pub struct Device {
     pub power_w: Option<f32>,
     /// Compute utilisation in percent, where the adapter can read it.
     pub utilisation_pct: Option<u8>,
+    /// Joules the device has used since its driver loaded, where the adapter can read it: a count that only goes
+    /// up, so what a workload used is the difference, which no sampled power reading gives.
+    #[serde(default)]
+    pub energy_j: Option<f64>,
     /// Whether it is a whole card or one MIG instance of a card; a peer that does not say reports whole cards.
     #[serde(default)]
     pub slicing: Slicing,
@@ -261,6 +265,7 @@ impl Fake {
             temperature_c: None,
             power_w: None,
             utilisation_pct: None,
+            energy_j: None,
             slicing: Slicing::None,
             availability: Availability::Free,
         }
@@ -281,6 +286,7 @@ impl Fake {
             temperature_c: Some(40.0),
             power_w: Some(30.0),
             utilisation_pct: Some(0),
+            energy_j: Some(1000.0),
             slicing: Slicing::None,
             availability: Availability::Free,
         }
@@ -302,6 +308,7 @@ impl Fake {
             temperature_c: None,
             power_w: None,
             utilisation_pct: None,
+            energy_j: None,
             slicing: Slicing::Mig,
             availability: Availability::Free,
         }
@@ -381,6 +388,7 @@ mod tests {
                 temperature_c: None,
                 power_w: None,
                 utilisation_pct: None,
+                energy_j: None,
                 slicing: Slicing::None,
                 availability: Availability::Free,
             })

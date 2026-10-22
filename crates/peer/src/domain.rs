@@ -226,6 +226,16 @@ pub const MEMBERSHIP_EVENTS: &[&str] = &[
 /// The commands that change a workspace's membership, whose failures are their sender's alone to read.
 pub const MEMBERSHIP_COMMANDS: &[&str] = &["CreateWorkspace", "InviteMember", "AcceptInvitation", "LeaveWorkspace"];
 
+/// A fact about a workspace's membership, which at the root only the identities it names read.
+pub fn is_membership_fact(r#type: &str) -> bool {
+    MEMBERSHIP_EVENTS.contains(&r#type)
+}
+
+/// The failure of a membership command, which at the root only its sender reads.
+pub fn is_membership_failure(r#type: &str, data: &serde_json::Value) -> bool {
+    r#type == "CommandFailed" && MEMBERSHIP_COMMANDS.contains(&data["type"].as_str().unwrap_or_default())
+}
+
 /// The facts that are a workspace's own, which every member of it reads whatever their grant: its membership, its
 /// clouds and its peers. What a workload's holder alone reads stays the lifecycle's rule.
 pub const WORKSPACE_EVENTS: &[&str] = &[
@@ -243,10 +253,11 @@ pub const WORKSPACE_EVENTS: &[&str] = &[
 ];
 
 /// What a credential may be approved for: `deploy` models (pull, deploy, undeploy), run `jobs` (run, stop), `prompt`
-/// a ready deployment; `all` is every scope and every holder's workloads, what a credential approved with nothing
-/// said is. Reading the hardware and its own workloads and events is every credential's, as is creating a workspace
-/// and acting in the ones it belongs to.
-pub const SCOPES: &[&str] = &["deploy", "jobs", "prompt"];
+/// a ready deployment, read the whole door's `metrics` (every holder's workloads among them, and the door's own
+/// counts) and do nothing else, which is what a collector is approved for; `all` is every scope and every holder's
+/// workloads, what a credential approved with nothing said is. Reading the hardware and its own workloads and
+/// events is every credential's, as is creating a workspace and acting in the ones it belongs to.
+pub const SCOPES: &[&str] = &["deploy", "jobs", "prompt", best_peer_door::metrics::METRICS_SCOPE];
 
 /// `^[a-z0-9][a-z0-9-]{0,63}$`: the shape of a cloud's name and a peer's name in a cloud, so that each composes
 /// into a device id (`cloud/peer/device`) and into the connection name a cloud signs in to its members under.
@@ -260,8 +271,8 @@ pub const NAME_SHAPE: &str =
 
 fn hardware_query(svc: Arc<dyn Service>, at: Where) -> QueryDef {
     let description = match at {
-        Where::Root => "The accelerators on this host right now: each device's compute APIs with their versions, its memory total and free, temperature, power and utilisation, the isolation a workload on it gets, its availability (busy while its owner is using it or holds it), and the driver. Read it before deploying: a model needs an API the device offers, memory it has free and the device free; get-workloads says what already holds memory.",
-        Where::Workspace => "The accelerators of this workspace's clouds right now: every device of every peer that answers in a cloud that is not archived, named cloud/peer/device, with the cloud and the peer on each, its compute APIs with their versions, its memory total and free (less what the peer has promised), temperature, power and utilisation, the isolation a workload on it gets as its peer says (process for a peer that says nothing), and its availability as its peer says (busy while the peer's owner is using it or holds it); and peers, every member of every cloud with whether it answers (up), has not admitted the cloud yet (joining) or does not answer (unreachable). Read it before deploying: a model needs an API a device offers, memory it has free and the device free; get-workloads says what already holds memory.",
+        Where::Root => "The accelerators on this host right now: each device's compute APIs with their versions, its memory total and free, temperature, power, utilisation and the energy it has used, the isolation a workload on it gets, its availability (busy while its owner is using it or holds it), and the driver. Read it before deploying: a model needs an API the device offers, memory it has free and the device free; get-workloads says what already holds memory.",
+        Where::Workspace => "The accelerators of this workspace's clouds right now: every device of every peer that answers in a cloud that is not archived, named cloud/peer/device, with the cloud and the peer on each, its compute APIs with their versions, its memory total and free (less what the peer has promised), temperature, power, utilisation and the energy it has used, the isolation a workload on it gets as its peer says (process for a peer that says nothing), and its availability as its peer says (busy while the peer's owner is using it or holds it); and peers, every member of every cloud with whether it answers (up), has not admitted the cloud yet (joining) or does not answer (unreachable). Read it before deploying: a model needs an API a device offers, memory it has free and the device free; get-workloads says what already holds memory.",
     };
     let mut device_properties = json!({
         "id": { "type": "string", "description": "Stable device id, the value a command names a device by" },
@@ -272,6 +283,7 @@ fn hardware_query(svc: Arc<dyn Service>, at: Where) -> QueryDef {
         "temperature_c": { "type": ["number", "null"] },
         "power_w": { "type": ["number", "null"] },
         "utilisation_pct": { "type": ["integer", "null"] },
+        "energy_j": { "type": ["number", "null"], "description": "Joules the device has used since its driver loaded, where it says; what a workload used is the difference between two readings" },
         "slicing": { "type": "string", "enum": ["none", "mig"], "description": "What the device is of its card: none, a whole card; mig, one instance of a card MIG splits in hardware, with its own memory, compute and cache, listed in place of the card. Either way it runs one workload of a size at a time" },
         "availability": { "type": "object", "required": ["state"], "description": "Whether the device takes new work now: free; or busy, while its owner is using it or holds it, with until, when it frees, where the peer knows (a hold's end; never while the owner is using it), and reason, where the owner gave one. A busy device takes no new work: deploy-model and run-job are refused there with DEVICE_BUSY, and a run-job with queue_seconds waits for it; what already runs on it runs on", "properties": { "state": { "type": "string", "enum": ["free", "busy"] }, "until": { "type": "string", "format": "date-time" }, "reason": { "type": "string" } } },
         "isolation": { "type": "string", "enum": ["process", "container", "user-namespace", "vm"], "description": "What stands between a workload on this device and the host and the other workloads, weakest first: process (an engine installed on the host), container (no capability, no new privilege, a ceiling on tasks, a tenant's job in a closed box), user-namespace (the same in a rootless or user-remapped container engine, so root in the container is nobody on the host), vm (a virtual machine; no peer offers it yet). deploy-model and run-job may ask for at least one of these" }
@@ -319,19 +331,29 @@ fn hardware_query(svc: Arc<dyn Service>, at: Where) -> QueryDef {
 
 fn workloads_query(peer: Arc<dyn Service>, at: Where) -> QueryDef {
     let description = match at {
-        Where::Root => "What this peer runs for you now: each deployment with its model, engine, device, the memory promised to it, its phase (starting, ready, ending); each job with its image, device and phase (running, stopping, or storing: it exited and its outputs are being sent); queued, the orders of this peer's queue that wait for room, oldest first; and held_bytes, the device memory your workloads hold together on this door, against share_bytes, the most your credential may hold (null when no share was set). A credential approved for all sees every holder's workloads, with the holder. The ids here are what undeploy-model and stop-job name.",
-        Where::Workspace => "What this workspace runs for you now, across its clouds: each deployment with its cloud, the peer it is on, its model, engine, device (cloud/peer/device), the memory promised to it, its phase (starting, ready, ending); each job with its cloud, peer, image, device and phase (running, stopping, or storing: it exited and its outputs are being sent); queued, the orders not started yet, oldest first, each with its id (what stop-job names while it waits), its cloud, image and memory, whether it waits or the peer it was sent to, its attempt and when it was queued; and held_bytes, the device memory your workloads hold together on this door, every workspace counted, orders that wait included, against share_bytes, the most your credential may hold (null when no share was set). A credential approved for all sees every holder's workloads, with the holder. The ids here are what undeploy-model and stop-job name.",
+        Where::Root => "What this peer runs for you now: each deployment with its model, engine, device, the memory promised to it, its phase (starting, ready, ending) and its prompts so far (answered and failed, and the tokens the engine counted for the answered ones); each job with its image, device and phase (running, stopping, or storing: it exited and its outputs are being sent); queued, the orders of this peer's queue that wait for room, oldest first; and held_bytes, the device memory your workloads hold together on this door, against share_bytes, the most your credential may hold (null when no share was set). A credential approved for all sees every holder's workloads, with the holder. The ids here are what undeploy-model and stop-job name.",
+        Where::Workspace => "What this workspace runs for you now, across its clouds: each deployment with its cloud, the peer it is on, its model, engine, device (cloud/peer/device), the memory promised to it, its phase (starting, ready, ending) and its prompts so far (answered and failed, and the tokens the engine counted for the answered ones); each job with its cloud, peer, image, device and phase (running, stopping, or storing: it exited and its outputs are being sent); queued, the orders not started yet, oldest first, each with its id (what stop-job names while it waits), its cloud, image and memory, whether it waits or the peer it was sent to, its attempt and when it was queued; and held_bytes, the device memory your workloads hold together on this door, every workspace counted, orders that wait included, against share_bytes, the most your credential may hold (null when no share was set). A credential approved for all sees every holder's workloads, with the holder. The ids here are what undeploy-model and stop-job name.",
     };
     let mut deployment = json!({
         "deployment": { "type": "string" }, "model": { "type": "string" }, "engine": { "type": "string", "enum": ["ollama", "vllm"] },
         "device": { "type": "string" }, "memory_bytes": { "type": "integer" }, "holder": { "type": "string", "description": "The credential that deployed it, an opaque id" },
-        "phase": { "type": "string", "enum": ["starting", "ready", "ending"] }
+        "phase": { "type": "string", "enum": ["starting", "ready", "ending"] },
+        "prompts": { "type": "object", "description": "Its prompts so far: answered and failed, and the tokens the engine counted for the answered ones",
+            "properties": { "answered": { "type": "integer" }, "failed": { "type": "integer" }, "prompt_tokens": { "type": "integer" }, "completion_tokens": { "type": "integer" } } }
     });
     let mut job = json!({
         "job": { "type": "string" }, "image": { "type": "string" }, "device": { "type": ["string", "null"] },
         "memory_bytes": { "type": "integer" }, "holder": { "type": "string" }, "phase": { "type": "string", "enum": ["running", "stopping", "storing"] }
     });
-    let mut required_deployment = vec!["deployment", "model", "engine", "device", "memory_bytes", "phase"];
+    let mut required_deployment = vec![
+        "deployment",
+        "model",
+        "engine",
+        "device",
+        "memory_bytes",
+        "phase",
+        "prompts",
+    ];
     let mut required_job = vec!["job", "image", "phase"];
     if at == Where::Workspace {
         for row in [&mut deployment, &mut job] {
@@ -1566,6 +1588,7 @@ pub fn host_state(host: &Host) -> Value {
                 "temperature_c": d.temperature_c,
                 "power_w": d.power_w,
                 "utilisation_pct": d.utilisation_pct,
+                "energy_j": d.energy_j,
                 "slicing": d.slicing,
                 "availability": d.availability
             })

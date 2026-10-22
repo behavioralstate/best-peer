@@ -53,4 +53,5 @@ rustix = { version = "1", features = ["event", "process"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
+prometheus-parse = "0.2"
 tempfile = "3"

@@ -29,9 +29,7 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use crate::cloud::Cloud;
-use crate::domain::{
-    self, Clouds, Membership, Service, MEMBERSHIP_COMMANDS, MEMBERSHIP_EVENTS, NAME_SHAPE, WORKSPACE_EVENTS,
-};
+use crate::domain::{self, Clouds, Membership, Service, MEMBERSHIP_EVENTS, NAME_SHAPE, WORKSPACE_EVENTS};
 use crate::holdings::Holdings;
 use crate::lifecycle::{list, new_id, require};
 use crate::menu::{Menu, Size};
@@ -194,14 +192,12 @@ impl Workspaces {
     pub fn root_partition(log: Arc<EventLog>) -> Partition {
         Arc::new(move |who: &Credential, s: &Stored| {
             let e = &s.envelope;
-            if MEMBERSHIP_EVENTS.contains(&e.r#type.as_str()) {
+            if crate::domain::is_membership_fact(&e.r#type) {
                 let me = who.holder();
                 let names = |field: &str| e.data[field].as_str() == Some(me.as_str());
                 return Some(names("identity") || names("owner") || names("invited_by"));
             }
-            let failed_membership = e.r#type == "CommandFailed"
-                && MEMBERSHIP_COMMANDS.contains(&e.data["type"].as_str().unwrap_or_default());
-            failed_membership.then(|| log.visible_to(Some(&who.hash), s))
+            crate::domain::is_membership_failure(&e.r#type, &e.data).then(|| log.visible_to(Some(&who.hash), s))
         })
     }
 

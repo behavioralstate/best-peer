@@ -75,6 +75,7 @@ impl Gpu for NvmlGpu {
                         temperature_c: None,
                         power_w: None,
                         utilisation_pct: None,
+                        energy_j: None,
                         slicing: Slicing::Mig,
                         availability: Availability::Free,
                     });
@@ -97,6 +98,8 @@ impl Gpu for NvmlGpu {
                 temperature_c: d.temperature(TemperatureSensor::Gpu).ok().map(|t| t as f32),
                 power_w: d.power_usage().ok().map(|mw| mw as f32 / 1000.0),
                 utilisation_pct: d.utilization_rates().ok().map(|u| u.gpu.min(100) as u8),
+                // Millijoules since the driver loaded, on Volta and later.
+                energy_j: d.total_energy_consumption().ok().map(|mj| mj as f64 / 1000.0),
                 slicing: Slicing::None,
                 availability: Availability::Free,
             });

@@ -9,7 +9,7 @@
 //! files in name order, each line by line, are the log in its order. An `events.jsonl` left by an older peer is read
 //! before them and never written again.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -126,6 +126,8 @@ pub struct EventLog {
     /// Where the accepted commands are kept, for a log on disk: what a redaction rewrites.
     accepted_path: Mutex<Option<PathBuf>>,
     tx: broadcast::Sender<Stored>,
+    /// How many of the log's events were counted, and by type: what [`EventLog::counts_by_type`] adds to.
+    type_counts: Mutex<(usize, BTreeMap<String, u64>)>,
 }
 
 /// A command the log accepted, as `redact_commands` found it: its id, its correlation, and its data as it is now.
@@ -250,6 +252,7 @@ impl EventLog {
             accepted_file: Mutex::new(None),
             accepted_path: Mutex::new(None),
             tx,
+            type_counts: Mutex::new((0, BTreeMap::new())),
         }
     }
 
@@ -703,6 +706,28 @@ impl EventLog {
         match events.iter().position(|s| s.envelope.id == id) {
             Some(i) => events[i + 1..].to_vec(),
             None => Vec::new(),
+        }
+    }
+
+    /// How many events of each type the log holds that `counted` keeps, from its first line: a count that survives
+    /// a restart, since the log does. Each call counts only what was appended since the last, a few thousand events
+    /// at a time so a large log never holds its lock long; the log never loses an event. `counted` is the same on
+    /// every call: the counts kept are what it kept.
+    pub fn counts_by_type(&self, counted: impl Fn(&Stored) -> bool) -> BTreeMap<String, u64> {
+        const CHUNK: usize = 4096;
+        let mut counts = self.type_counts.lock().unwrap();
+        loop {
+            let events = self.events.lock().unwrap();
+            let (seen, by_type) = &mut *counts;
+            let from = (*seen).min(events.len());
+            let to = (from + CHUNK).min(events.len());
+            for s in events[from..to].iter().filter(|s| counted(s)) {
+                *by_type.entry(s.envelope.r#type.clone()).or_default() += 1;
+            }
+            *seen = to;
+            if to == events.len() {
+                return by_type.clone();
+            }
         }
     }
 
@@ -1270,5 +1295,39 @@ mod tests {
         let got = rx.recv().await.unwrap();
         assert_eq!(got.envelope.r#type, "After");
         assert_eq!(got.seq, 2);
+    }
+
+    #[test]
+    fn counts_by_type_count_each_event_once_keep_what_the_filter_keeps_and_survive_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = EventLog::open(dir.path()).unwrap();
+        let tell = |log: &EventLog, t: &str| {
+            log.append(Envelope::event("io.best.agents", t, json!({}), Some("c".into()), None));
+        };
+        for t in ["A", "B", "A", "Private"] {
+            tell(&log, t);
+        }
+        let kept = |s: &Stored| s.envelope.r#type != "Private";
+        assert_eq!(
+            log.counts_by_type(kept),
+            BTreeMap::from([("A".into(), 2), ("B".into(), 1)])
+        );
+        tell(&log, "B");
+        assert_eq!(
+            log.counts_by_type(kept)["B"],
+            2,
+            "only what came since is counted again"
+        );
+        drop(log);
+        let again = EventLog::open(dir.path()).unwrap();
+        assert_eq!(
+            again.counts_by_type(kept),
+            BTreeMap::from([("A".into(), 2), ("B".into(), 2)])
+        );
+        // A log longer than one hold of its lock counts is counted whole, each event once.
+        for _ in 0..5000 {
+            tell(&again, "A");
+        }
+        assert_eq!(again.counts_by_type(kept)["A"], 5002);
     }
 }

@@ -2824,7 +2824,11 @@ pub(crate) fn workloads_view(s: &State, who: &Credential, cloud: Option<&str>) -
             with_cloud(json!({
                 "deployment": d.id, "model": d.model, "engine": d.engine, "device": d.device.0,
                 "memory_bytes": d.memory_bytes, "holder": d.holder, "peer": d.peer,
-                "phase": match d.phase { Phase::Starting => "starting", Phase::Ready => "ready", Phase::Ending => "ending" }
+                "phase": d.phase.name(),
+                "prompts": {
+                    "answered": d.prompts.answered, "failed": d.prompts.failed,
+                    "prompt_tokens": d.prompts.prompt_tokens, "completion_tokens": d.prompts.completion_tokens
+                }
             }))
         })
         .collect();
@@ -2836,7 +2840,7 @@ pub(crate) fn workloads_view(s: &State, who: &Credential, cloud: Option<&str>) -
             with_cloud(json!({
                 "job": j.id, "image": j.image.0, "device": j.device.as_ref().map(|d| d.0.clone()),
                 "memory_bytes": j.memory_bytes, "holder": j.holder, "peer": j.peer,
-                "phase": match j.phase { JobPhase::Running => "running", JobPhase::Stopping => "stopping", JobPhase::Storing => "storing" }
+                "phase": j.phase.name()
             }))
         })
         .collect();

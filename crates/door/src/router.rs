@@ -50,7 +50,16 @@ pub fn router(door: Shared) -> Router {
         .route("/auth/verify", get(verify))
         .route("/auth/approve", post(approve))
         .route("/auth/revoke", post(revoke));
-    shaped(public.merge(protected(&door)), door, MAX_BODY)
+    let mut routes = public.merge(protected(&door));
+    // Telemetry, when the service gives it: the root's alone, since a workspace's door fronts other machines.
+    if door.metrics.is_some() {
+        routes = routes.merge(
+            Router::new()
+                .route("/metrics", get(metrics))
+                .layer(middleware::from_fn_with_state(door.clone(), require_key_or_bearer)),
+        );
+    }
+    shaped(routes, door, MAX_BODY)
 }
 
 /// The routes of a tenant's door: the four capabilities behind the credential, and nothing public. The host mounts
@@ -143,19 +152,84 @@ impl Drop for Line {
     }
 }
 
-async fn require_key(State(door): State<Shared>, mut req: Request, next: Next) -> Response {
-    let key = req
-        .headers()
-        .get(AUTH_HEADER)
+async fn require_key(State(door): State<Shared>, req: Request, next: Next) -> Response {
+    let key = header_value(&req, AUTH_HEADER).unwrap_or_default();
+    // A collector's key opens /metrics and nothing else: no command, no query, no stream. Should it leak from where
+    // a collector keeps it, it opens nothing more.
+    if let Some(c) = door.auth.authenticate(&key) {
+        if crate::metrics::reads_only(&c.grant) {
+            return BestError::bad_request(
+                "FORBIDDEN",
+                "this credential was approved to read /metrics and nothing else: it sends no command and reads no query or event. Ask whoever controls the machine for a credential that may (best-peer approve <code> --may deploy, for one)",
+            )
+            .into_response();
+        }
+    }
+    admit(&door, key, req, next).await
+}
+
+/// The same, taking the credential as `Authorization: Bearer` too: what a collector sends with the key in its
+/// configuration, where it cannot name a header of its own.
+async fn require_key_or_bearer(State(door): State<Shared>, req: Request, next: Next) -> Response {
+    let key = header_value(&req, AUTH_HEADER)
+        .or_else(|| {
+            header_value(&req, header::AUTHORIZATION.as_str()).and_then(|v| {
+                // The scheme is case-insensitive (RFC 9110); the credential after it is not.
+                let (scheme, credential) = v.split_once(' ')?;
+                scheme
+                    .eq_ignore_ascii_case("bearer")
+                    .then(|| credential.trim().to_string())
+            })
+        })
+        .unwrap_or_default();
+    admit(&door, key, req, next).await
+}
+
+fn header_value(req: &Request, name: &str) -> Option<String> {
+    req.headers()
+        .get(name)
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
-        .unwrap_or("");
-    let Some(credential) = (!key.is_empty()).then(|| door.auth.authenticate(key)).flatten() else {
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+async fn admit(door: &Shared, key: String, mut req: Request, next: Next) -> Response {
+    let Some(credential) = (!key.is_empty()).then(|| door.auth.authenticate(&key)).flatten() else {
         return BestError::unauthorized().into_response();
     };
     Answered::record(&req, &credential);
     req.extensions_mut().insert(credential);
     next.run(req).await
+}
+
+/// `GET /metrics`: the door's telemetry as text a collector reads (see [`crate::metrics`]). The service's series
+/// as the credential may read them; the whole door's besides, for a credential approved for all or for the
+/// metrics scope alone.
+async fn metrics(State(door): State<Shared>, Extension(who): Extension<Credential>, headers: HeaderMap) -> Response {
+    use crate::metrics::{door_families, render, Format, METRICS_SCOPE};
+    let format = Format::from_accept(headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()));
+    let mut families = match &door.metrics {
+        Some(source) => source(who.clone()).await,
+        None => Vec::new(),
+    };
+    if who.grant.allows(METRICS_SCOPE) {
+        let accepted = door.accepted.lock().unwrap().clone();
+        let events = door
+            .log
+            .counts_by_type(|s| door.counts(&s.envelope.r#type, &s.envelope.data));
+        families.extend(door_families(
+            &accepted,
+            &door.refusals,
+            &events,
+            door.open_streams.now(),
+        ));
+    }
+    (
+        [(header::CONTENT_TYPE, format.content_type())],
+        render(&families, format),
+    )
+        .into_response()
 }
 
 async fn unknown_route(req: Request) -> BestError {
@@ -394,11 +468,40 @@ async fn command_document(
         .into_response())
 }
 
+/// Takes a command, counting a refusal by its type and code for `/metrics`: a refusal is told to its sender alone.
 async fn ingest(
     State(door): State<Shared>,
     Extension(sender): Extension<Credential>,
     headers: HeaderMap,
     body: Bytes,
+) -> Result<Response, BestError> {
+    let answer = take_command(&door, sender, headers, &body).await;
+    // A refusal is an error, or the pace's 429, which carries its Retry-After and so is answered as it is.
+    let code = match &answer {
+        Err(refusal) => Some(refusal.code),
+        Ok(res) if res.status() == StatusCode::TOO_MANY_REQUESTS => Some("TOO_MANY_COMMANDS"),
+        Ok(_) => None,
+    };
+    if let Some(code) = code {
+        // The type as the catalogue knows it, so what a sender writes cannot grow the series without bound.
+        let named = serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|v| v["type"].as_str().map(str::to_string));
+        let command = named
+            .filter(|t| door.catalogue.command_by_type(t).is_some())
+            .unwrap_or_else(|| "unknown".into());
+        if door.counts(&command, &Value::Null) {
+            door.refusals.count(&command, code);
+        }
+    }
+    answer
+}
+
+async fn take_command(
+    door: &Shared,
+    sender: Credential,
+    headers: HeaderMap,
+    body: &Bytes,
 ) -> Result<Response, BestError> {
     let ct = headers
         .get(header::CONTENT_TYPE)
@@ -412,7 +515,7 @@ async fn ingest(
             format!("Content-Type must be application/cloudevents+json or application/json, not {mime}"),
         ));
     }
-    let value: Value = serde_json::from_slice(&body)
+    let value: Value = serde_json::from_slice(body)
         .map_err(|e| BestError::bad_request("INVALID_JSON", format!("the body is not JSON: {e}")))?;
     let envelope: Envelope = serde_json::from_value(value)
         .map_err(|e| BestError::bad_request("INVALID_ENVELOPE", format!("the body is not a BEST envelope: {e}")))?;
@@ -535,7 +638,15 @@ async fn ingest(
         Accept::Conflict => return Err(conflict()),
         Accept::Duplicate { correlation: original } => original,
         Accept::New => {
-            run(&door, def, &sender.hash, recorded);
+            if door.counts(&recorded.r#type, &Value::Null) {
+                *door
+                    .accepted
+                    .lock()
+                    .unwrap()
+                    .entry(recorded.r#type.clone())
+                    .or_default() += 1;
+            }
+            run(door, def, &sender.hash, recorded);
             correlation
         }
     };
@@ -734,6 +845,7 @@ async fn stream_events(
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    let open = door.open_streams.hold();
     let (rx, seen_up_to) = door.log.subscribe();
     let replay = match last {
         Some(id) => door.log.since_id(&id),
@@ -796,7 +908,7 @@ async fn stream_events(
         .filter_map(futures::future::ready)
         .take_until(gave_way)
         .map(move |s| {
-            let _held = &slot;
+            let _held = (&slot, &open);
             Ok(SseEvent::default()
                 .id(s.envelope.id.clone())
                 .data(serde_json::to_string(&door3.served(&s.envelope)).unwrap_or_default()))
@@ -1230,6 +1342,14 @@ mod tests {
         let wait = b["error"]["details"]["retry_after_seconds"].as_u64().unwrap();
         assert!((1..=60).contains(&wait), "{b}");
         assert_eq!(h[header::RETRY_AFTER].to_str().unwrap(), wait.to_string());
+        // The refusal is counted for /metrics, the two that were not whole beside it.
+        let refused = d.refusals.snapshot();
+        assert_eq!(
+            refused.get(&("PullImage".to_string(), "TOO_MANY_COMMANDS")),
+            Some(&1),
+            "{refused:?}"
+        );
+        assert_eq!(refused.values().sum::<u64>(), 3, "{refused:?}");
         let message = b["error"]["message"].as_str().unwrap();
         assert!(
             message.contains("was not accepted") && message.contains(&format!("again in {wait} s")),

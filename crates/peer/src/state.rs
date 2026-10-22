@@ -19,6 +19,19 @@ pub enum Phase {
     Ending,
 }
 
+impl Phase {
+    pub const ALL: [Phase; 3] = [Phase::Starting, Phase::Ready, Phase::Ending];
+
+    /// Its name, as `get-workloads` and `/metrics` say it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Phase::Starting => "starting",
+            Phase::Ready => "ready",
+            Phase::Ending => "ending",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Deployment {
     pub id: String,
@@ -37,6 +50,17 @@ pub struct Deployment {
     pub phase: Phase,
     /// On a cloud, the member peer it was placed on, as `peer` in DeploymentStarted.
     pub peer: Option<String>,
+    /// What its prompts came to, as PromptAnswered and PromptFailed told it.
+    pub prompts: Prompts,
+}
+
+/// A deployment's prompts so far: answered, failed, and the tokens the engine reported for the answered ones.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Prompts {
+    pub answered: u64,
+    pub failed: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +71,19 @@ pub enum JobPhase {
     /// It exited, and what it left under /out is being stored: its end follows, JobFinished or JobFailed, or
     /// JobStopped when a stop cuts the sending.
     Storing,
+}
+
+impl JobPhase {
+    pub const ALL: [JobPhase; 3] = [JobPhase::Running, JobPhase::Stopping, JobPhase::Storing];
+
+    /// Its name, as `get-workloads` and `/metrics` say it.
+    pub fn name(self) -> &'static str {
+        match self {
+            JobPhase::Running => "running",
+            JobPhase::Stopping => "stopping",
+            JobPhase::Storing => "storing",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -359,6 +396,7 @@ impl State {
                         correlation,
                         phase: Phase::Starting,
                         peer: data["peer"].as_str().map(str::to_string),
+                        prompts: Prompts::default(),
                     },
                 );
             }
@@ -366,6 +404,18 @@ impl State {
                 if let Some(d) = self.deployments.get_mut(&text("deployment")) {
                     d.ready = true;
                     d.phase = Phase::Ready;
+                }
+            }
+            "PromptAnswered" => {
+                if let Some(d) = self.deployments.get_mut(&text("deployment")) {
+                    d.prompts.answered += 1;
+                    d.prompts.prompt_tokens += data["prompt_tokens"].as_u64().unwrap_or(0);
+                    d.prompts.completion_tokens += data["completion_tokens"].as_u64().unwrap_or(0);
+                }
+            }
+            "PromptFailed" => {
+                if let Some(d) = self.deployments.get_mut(&text("deployment")) {
+                    d.prompts.failed += 1;
                 }
             }
             "DeploymentFailed" | "DeploymentEnded" | "Undeployed" | "OutOfMemory" => {
@@ -622,5 +672,45 @@ mod tests {
         s.apply(&ev("DeploymentFailed", "wf", json!({ "deployment": "dep-2" })));
         assert!(s.reserved.is_empty());
         assert_eq!(s.reserved_on(&"gpu-0".into()), 8);
+    }
+
+    #[test]
+    fn a_deployments_prompts_are_the_fold_of_its_answers_and_failures() {
+        let mut s = State::default();
+        s.apply(&ev(
+            "DeploymentStarted",
+            "c1",
+            json!({ "deployment": "dep-1", "model": "m", "engine": "ollama", "device": "gpu-0", "memory_bytes": 8, "container": "k-1", "port": 41434 }),
+        ));
+        s.apply(&ev(
+            "PromptAnswered",
+            "p1",
+            json!({ "deployment": "dep-1", "prompt_tokens": 7, "completion_tokens": 30 }),
+        ));
+        s.apply(&ev(
+            "PromptAnswered",
+            "p2",
+            json!({ "deployment": "dep-1", "prompt_tokens": 3, "completion_tokens": 5 }),
+        ));
+        s.apply(&ev(
+            "PromptFailed",
+            "p3",
+            json!({ "deployment": "dep-1", "reason": "x" }),
+        ));
+        // A failure for a deployment that is gone changes nothing here.
+        s.apply(&ev(
+            "PromptFailed",
+            "p4",
+            json!({ "deployment": "dep-gone", "reason": "x" }),
+        ));
+        assert_eq!(
+            s.deployments["dep-1"].prompts,
+            Prompts {
+                answered: 2,
+                failed: 1,
+                prompt_tokens: 10,
+                completion_tokens: 35
+            }
+        );
     }
 }

@@ -58,6 +58,7 @@ impl Gpu for HostCpu {
                 temperature_c: None,
                 power_w: None,
                 utilisation_pct: Some(utilisation),
+                energy_j: None,
                 slicing: best_peer_gpu::Slicing::None,
                 availability: best_peer_gpu::Availability::Free,
             }],
