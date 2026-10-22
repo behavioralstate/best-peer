@@ -1699,8 +1699,6 @@ impl Cloud {
                             .and_then(|s| s.key.clone())
                     });
                     let m = Arc::new(Member::new(name, endpoint, key, self.transport.clone()));
-                    // The name now stands for another machine, or for this one renamed: no series of before.
-                    self.series.lock().unwrap().remove(name);
                     if let Some(k) = kept {
                         let mut cursors = self.cursors.lock().unwrap();
                         if let Some(c) = cursors.remove(&k.name) {
@@ -1718,6 +1716,11 @@ impl Cloud {
             .cloned()
             .collect();
         *self.members.lock().unwrap() = after;
+        // After the swap, so a scrape of the machine a name stood for before cannot write its series back: the name
+        // now stands for another machine, or for this one renamed, and has no series of before.
+        for m in &added {
+            self.series.lock().unwrap().remove(&m.name);
+        }
         {
             let mut tasks = self.tasks.lock().unwrap();
             for g in &gone {
@@ -1920,9 +1923,10 @@ impl Cloud {
                     .collect();
                 // The member may have been removed, re-pointed or have stopped admitting this cloud while it
                 // answered: what it said then is no longer this name's to show.
-                let still = m.admitted() && self.members().iter().any(|now| Arc::ptr_eq(now, m));
-                if still {
-                    self.series.lock().unwrap().insert(m.name.clone(), kept);
+                // Checked and written under the one lock `reconfigure` clears it under, after its swap.
+                let mut series = self.series.lock().unwrap();
+                if m.admitted() && self.members().iter().any(|now| Arc::ptr_eq(now, m)) {
+                    series.insert(m.name.clone(), kept);
                 }
             }
             Err(why) => {
