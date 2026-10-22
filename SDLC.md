@@ -11,14 +11,16 @@
   spec follow-ups issue, never a silent patch and never a spec change up front.
 - Ambiguity is resolved by reading the spec and the running code, never by guessing.
 - The board's Status says where each issue is:
+  - **Backlog** until its first change.
   - **In progress** from the first change, before it is made, until its code is in a release: while the work is
     built, while its pull requests are open, and after they merge until the release that carries them.
   - **In review** once its code is in a release, when all that is left is the proof on a host or the owner's
     acceptance.
   - **Done** when the issue closes, every "Done when" ticked. An issue with nothing to prove on a host or for the
     owner to accept closes when its last pull request merges, and goes from In progress to Done.
-  - An epic is **In progress** as soon as any of its issues is In progress, In review or Done, and **Backlog**
-    before that; Ready is not a status an epic or a slice holds.
+  - An epic is **Backlog** until any of its issues is In progress, In review or Done, **In progress** from then
+    until it closes, and **Done** when it closes, which is when its last issue does. Ready is not a status an epic
+    or a slice holds.
 
 ## 2. Design rules every change is held to
 
