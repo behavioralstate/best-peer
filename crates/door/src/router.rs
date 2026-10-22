@@ -338,13 +338,22 @@ struct RevokeForm {
     /// The connection name or the holder id of the credential to take back.
     name: String,
     proof: String,
+    /// `true` leaves its waiting orders and running work as they are; they end with it otherwise.
+    #[serde(default)]
+    keep_running: Option<String>,
 }
 
 /// The person at the machine takes a credential back, with the same proof the approval takes: every live credential
-/// by that name is taken at once, and the answer says which.
+/// by that name is taken at once, its work ended with it unless `keep_running` says otherwise, and the answer says
+/// which.
 async fn revoke(State(door): State<Shared>, headers: HeaderMap, body: Bytes) -> Result<Response, OAuthError> {
     let f: RevokeForm = form(&headers, &body)?;
-    let taken = door.auth.revoke(&f.name, f.proof.trim()).await?;
+    let ends = f.keep_running.as_deref().map(str::trim) != Some("true");
+    let taken = door.auth.revoke(&f.name, f.proof.trim(), ends).await?;
+    let left = match ends {
+        true => door.auth.end_work(&taken).await,
+        false => Vec::new(),
+    };
     let revoked: Vec<Value> = taken
         .iter()
         .map(|c| {
@@ -354,7 +363,10 @@ async fn revoke(State(door): State<Shared>, headers: HeaderMap, body: Bytes) -> 
             })
         })
         .collect();
-    Ok(Json(json!({ "revoked": revoked })).into_response())
+    Ok(
+        Json(json!({ "revoked": revoked, "work_ended": ends && left.is_empty(), "not_ended_yet": left }))
+            .into_response(),
+    )
 }
 
 // ----- commands ----------------------------------------------------------------------------------------------------

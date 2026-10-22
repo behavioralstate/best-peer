@@ -303,6 +303,8 @@ pub struct Fake {
     gate: Mutex<Option<std::sync::Arc<tokio::sync::Semaphore>>>,
     /// What the engine says when it refuses to start a container, when a test says it does.
     refusal: Mutex<Option<String>>,
+    /// What the engine says when it fails to stop a container, while a test says it does.
+    stop_refusal: Mutex<Option<String>>,
     /// What it says stands between its containers and the host: a container, unless a test says otherwise.
     isolation: Isolation,
     /// The host's ids of the processes its containers run, as a test sets them; `None` for an engine that cannot
@@ -337,6 +339,7 @@ impl Fake {
             tx,
             gate: Mutex::new(None),
             refusal: Mutex::new(None),
+            stop_refusal: Mutex::new(None),
             isolation: Isolation::Container,
             disks: std::env::temp_dir().join("best-peer-fake-disks").join(uuid_like()),
             disk_free: Mutex::new(1 << 40),
@@ -411,6 +414,11 @@ impl Fake {
     /// toolkit will not hand a device to.
     pub fn refuse_starts(&self, why: &str) {
         *self.refusal.lock().unwrap() = Some(why.into());
+    }
+
+    /// Makes every stop from now on fail with `why`, as an engine that does not answer, or stops that when `None`.
+    pub fn refuse_stops(&self, why: Option<&str>) {
+        *self.stop_refusal.lock().unwrap() = why.map(str::to_string);
     }
 
     /// A fake whose pull reports every percent from 0 to 100, as a real engine does.
@@ -553,6 +561,9 @@ impl Runtime for Fake {
     }
 
     async fn stop(&self, id: &ContainerId) -> Result<(), RuntimeError> {
+        if let Some(why) = self.stop_refusal.lock().unwrap().clone() {
+            return Err(RuntimeError::Engine(why));
+        }
         self.containers
             .lock()
             .unwrap()

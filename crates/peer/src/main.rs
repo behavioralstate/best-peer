@@ -211,6 +211,12 @@ pub async fn peer(
 /// The root door of this peer: the machine's own hardware and lifecycle, and the workspaces it hosts.
 pub fn door(peer: Arc<Peer>, workspaces: Arc<workspace::Workspaces>, auth: Arc<Auth>) -> Door {
     let ctx = workspaces.ctx.clone();
+    let ends = peer.clone();
+    auth.when_taken_back(Arc::new(move |holders| {
+        let ends = ends.clone();
+        Box::pin(async move { ends.end_work_of(&holders).await })
+    }));
+    peer.taken_back_before(auth.work_ended());
     Door::new(
         &ctx.endpoint,
         SERVICE,
@@ -730,11 +736,17 @@ fn as_the_authority(path: &str, mut form: Vec<(&str, String)>) -> (u16, serde_js
 /// `best-peer revoke <name>`: takes back every live credential by that connection name or holder id, at once, with
 /// this machine's admin token as the proof, the way `approve` admits.
 fn revoke(args: &[String]) {
-    const USAGE: &str = "usage: best-peer revoke <name>: the connection name the agent signed in under, or the holder id get-workloads and the events show";
-    let (Some(name), None) = (args.first(), args.get(1)) else {
-        fail(USAGE)
+    const USAGE: &str = "usage: best-peer revoke <name> [--keep-running]: the connection name the agent signed in under, or the holder id get-workloads and the events show; its orders that wait, its jobs and its deployments end with it, unless --keep-running leaves them as they are";
+    let (name, keep_running) = match args {
+        [name] if !name.starts_with("--") => (name.clone(), false),
+        [name, flag] | [flag, name] if flag == "--keep-running" && !name.starts_with("--") => (name.clone(), true),
+        _ => fail(USAGE),
     };
-    let (status, answer) = as_the_authority("/auth/revoke", vec![("name", name.clone())]);
+    let mut form = vec![("name", name)];
+    if keep_running {
+        form.push(("keep_running", "true".to_string()));
+    }
+    let (status, answer) = as_the_authority("/auth/revoke", form);
     if status != 200 {
         fail(&format!(
             "the peer refused ({status}): {}",
@@ -747,10 +759,18 @@ fn revoke(args: &[String]) {
             None => c["client_id"].as_str().unwrap_or("?").to_string(),
         };
         println!(
-            "revoked the credential of {who} as connection {} (holder {}), issued {}: it opens nothing from now on",
+            "revoked the credential of {who} as connection {} (holder {}), issued {}: it opens nothing from now on, and {}",
             c["name"].as_str().unwrap_or("?"),
             c["holder"].as_str().unwrap_or("?"),
-            c["issued_at"].as_str().unwrap_or("?")
+            c["issued_at"].as_str().unwrap_or("?"),
+            match (answer["work_ended"].as_bool(), answer["not_ended_yet"].as_array()) {
+                (Some(false), Some(left)) if !left.is_empty() => format!(
+                    "what it ran or had waiting is ended but for {}, which the container engine did not stop yet: the peer tries again until it does",
+                    left.iter().filter_map(|l| l.as_str()).collect::<Vec<_>>().join(", ")
+                ),
+                (Some(false), _) => "what it runs or has waiting is left as it is".to_string(),
+                _ => "what it ran or had waiting is ended".to_string(),
+            }
         );
     }
 }
@@ -1609,6 +1629,337 @@ mod tests {
             data[k] = v.clone();
         }
         bed.send(id, "RunJob", "run-job", data).await
+    }
+
+    async fn revoke_by_operator(bed: &Bed, key: &str, keep_running: bool) -> Value {
+        let holder = best_peer_door::auth::holder_of_hash(&best_peer_door::auth::hash_key(key));
+        let mut fields = vec![("name", holder.as_str()), ("proof", "ok")];
+        if keep_running {
+            fields.push(("keep_running", "true"));
+        }
+        let req = Request::post("/auth/revoke")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(serde_urlencoded::to_string(&fields).unwrap()))
+            .unwrap();
+        let res = bed.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        body(res).await
+    }
+
+    #[tokio::test]
+    async fn a_credential_the_operator_takes_back_ends_its_work_and_one_it_ends_itself_or_kept_running_does_not() {
+        let bed = bed(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        let job = |gb: u64, more: Value| {
+            let mut d = json!({ "image": "busybox", "memory_bytes": gb * GB });
+            for (k, v) in more.as_object().into_iter().flatten() {
+                d[k] = v.clone();
+            }
+            d
+        };
+        let taken = key_with(&bed.app, Some("jobs"), None).await;
+        let (s, b) = send_as(&bed.app, "", &taken, "t1", "RunJob", "run-job", job(16, json!({}))).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let t1 = bed.events_of("t1", "JobStarted").await.last().unwrap().data["job"].clone();
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &taken,
+            "t2",
+            "RunJob",
+            "run-job",
+            job(10, json!({ "queue_seconds": 600 })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let t2 = bed.events_of("t2", "JobQueued").await[0].data["job"].clone();
+        let (s, b) = run_on(&bed, "o1", 2, json!({})).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        bed.events_of("o1", "JobStarted").await;
+
+        let answer = revoke_by_operator(&bed, &taken, false).await;
+        assert_eq!(answer["work_ended"], true, "{answer}");
+        let stopped = bed.events_of("t1", "JobStopped").await;
+        assert_eq!(
+            stopped.last().unwrap().data,
+            json!({ "job": t1, "reason": lifecycle::TAKEN_BACK })
+        );
+        let unwaited = bed.events_of("t2", "JobStopped").await;
+        assert_eq!(
+            unwaited.last().unwrap().data,
+            json!({ "job": t2, "reason": lifecycle::TAKEN_BACK })
+        );
+        assert!(
+            types(&unwaited).iter().all(|t| t != "JobStarted"),
+            "it never started: {:?}",
+            types(&unwaited)
+        );
+        let w = bed.query("get-workloads").await;
+        assert_eq!(w["queued"], json!([]), "{w}");
+        assert_eq!(
+            w["jobs"].as_array().unwrap().len(),
+            1,
+            "another holder's job runs on: {w}"
+        );
+
+        let kept = key_with(&bed.app, Some("jobs"), None).await;
+        let (s, b) = send_as(&bed.app, "", &kept, "k1", "RunJob", "run-job", job(2, json!({}))).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        bed.events_of("k1", "JobStarted").await;
+        let answer = revoke_by_operator(&bed, &kept, true).await;
+        assert_eq!(answer["work_ended"], false, "{answer}");
+        let own = key_with(&bed.app, Some("jobs"), None).await;
+        let (s, b) = send_as(&bed.app, "", &own, "a1", "RunJob", "run-job", job(2, json!({}))).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        bed.events_of("a1", "JobStarted").await;
+        let (s, b) = send_as(&bed.app, "", &own, "a2", "RevokeAgent", "revoke-agent", json!({})).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        bed.events_of("a2", "AgentRevokedV1").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        for c in ["k1", "a1"] {
+            assert!(
+                types(&bed.log_of(c)).iter().all(|t| t != "JobStopped"),
+                "{c} runs on: {:?}",
+                types(&bed.log_of(c))
+            );
+        }
+        assert_eq!(bed.query("get-workloads").await["jobs"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_credential_taken_back_ends_its_deployments_ready_or_starting_and_leaves_another_s() {
+        let bed = bed(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        let deploy = json!({ "model": "qwen3:0.6b", "engine": "ollama", "memory_bytes": 2 * GB });
+        let taken = key_with(&bed.app, Some("deploy"), None).await;
+        let other = key_with(&bed.app, Some("deploy"), None).await;
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &taken,
+            "d1",
+            "DeployModel",
+            "deploy-model",
+            deploy.clone(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let d1 = bed.events_of("d1", "DeploymentReady").await.last().unwrap().data["deployment"].clone();
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &other,
+            "o1",
+            "DeployModel",
+            "deploy-model",
+            deploy.clone(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        bed.events_of("o1", "DeploymentReady").await;
+        let gate = bed.runtime.hold_pulls();
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &taken,
+            "d2",
+            "DeployModel",
+            "deploy-model",
+            json!({ "model": "qwen3:1.7b", "engine": "ollama", "memory_bytes": 2 * GB }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+
+        assert_eq!(revoke_by_operator(&bed, &taken, false).await["work_ended"], true);
+        let ended = bed
+            .events_of("d1", "DeploymentEnded")
+            .await
+            .last()
+            .unwrap()
+            .data
+            .clone();
+        assert_eq!(
+            (&ended["deployment"], ended["reason"].as_str()),
+            (&d1, Some(lifecycle::TAKEN_BACK))
+        );
+        gate.add_permits(100);
+        let starting = bed.events_of("d2", "DeploymentEnded").await;
+        assert!(
+            types(&starting).contains(&"DeploymentStarted".to_string()),
+            "{:?}",
+            types(&starting)
+        );
+        assert!(
+            !types(&starting).contains(&"DeploymentReady".to_string()),
+            "never served: {:?}",
+            types(&starting)
+        );
+        assert_eq!(starting.last().unwrap().data["reason"], lifecycle::TAKEN_BACK);
+        assert!(
+            types(&bed.log_of("o1")).iter().all(|t| t != "DeploymentEnded"),
+            "another key's deployment serves on"
+        );
+        assert_eq!(
+            bed.query("get-workloads").await["deployments"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_the_engine_does_not_stop_when_its_credential_is_taken_back_is_named_and_stopped_at_a_later_step() {
+        let bed = bed(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        let taken = key_with(&bed.app, Some("jobs"), None).await;
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &taken,
+            "j1",
+            "RunJob",
+            "run-job",
+            json!({ "image": "busybox", "memory_bytes": 2 * GB }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let job = bed.events_of("j1", "JobStarted").await.last().unwrap().data["job"].clone();
+        bed.runtime.refuse_stops(Some("the engine does not answer"));
+        let answer = revoke_by_operator(&bed, &taken, false).await;
+        assert_eq!(answer["work_ended"], false, "{answer}");
+        assert_eq!(answer["not_ended_yet"], json!([job]), "{answer}");
+        assert!(types(&bed.log_of("j1")).iter().all(|t| t != "JobStopped"));
+        assert_eq!(
+            bed.query("get-workloads").await["jobs"][0]["job"],
+            job,
+            "left as it was, running"
+        );
+        bed.runtime.refuse_stops(None);
+        bed.peer.step(time::OffsetDateTime::now_utc()).await;
+        let stopped = bed.events_of("j1", "JobStopped").await;
+        assert_eq!(
+            stopped.last().unwrap().data,
+            json!({ "job": job, "reason": lifecycle::TAKEN_BACK })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_another_stop_is_ending_at_the_revoke_is_answered_not_ended_yet_and_ended_if_that_stop_fails() {
+        let bed = bed(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        let taken = key_with(&bed.app, Some("jobs"), None).await;
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &taken,
+            "j1",
+            "RunJob",
+            "run-job",
+            json!({ "image": "busybox", "memory_bytes": 2 * GB }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let job = bed.events_of("j1", "JobStarted").await.last().unwrap().data["job"].clone();
+        let id = job.as_str().unwrap().to_string();
+        bed.peer.state.lock().unwrap().jobs.get_mut(&id).unwrap().phase = state::JobPhase::Stopping;
+        let answer = revoke_by_operator(&bed, &taken, false).await;
+        assert_eq!(answer["work_ended"], false, "{answer}");
+        assert_eq!(answer["not_ended_yet"], json!([job]), "{answer}");
+        // That stop failed: the job runs again, and the next step ends it.
+        bed.peer.state.lock().unwrap().jobs.get_mut(&id).unwrap().phase = state::JobPhase::Running;
+        bed.peer.step(time::OffsetDateTime::now_utc()).await;
+        let stopped = bed.events_of("j1", "JobStopped").await;
+        assert_eq!(
+            stopped.last().unwrap().data,
+            json!({ "job": job, "reason": lifecycle::TAKEN_BACK })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_the_engine_did_not_stop_at_the_revoke_is_stopped_after_a_restart() {
+        let log = Arc::new(EventLog::ephemeral());
+        let runtime = Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![]));
+        let bed = bed(card(), log.clone(), runtime.clone()).await;
+        let taken = key_with(&bed.app, Some("jobs"), None).await;
+        let kept = key_with(&bed.app, Some("jobs"), None).await;
+        let data = json!({ "image": "busybox", "memory_bytes": 2 * GB });
+        let (s, b) = send_as(&bed.app, "", &taken, "j1", "RunJob", "run-job", data.clone()).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let (s, b) = send_as(&bed.app, "", &kept, "j2", "RunJob", "run-job", data.clone()).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let job = bed.events_of("j1", "JobStarted").await.last().unwrap().data["job"].clone();
+        bed.events_of("j2", "JobStarted").await;
+        // Kept back with its key: a revoke that leaves the work leaves it after a restart too.
+        let kept_answer = revoke_by_operator(&bed, &kept, true).await;
+        assert_eq!(kept_answer["work_ended"], false, "{kept_answer}");
+        runtime.refuse_stops(Some("the engine does not answer"));
+        let answer = revoke_by_operator(&bed, &taken, false).await;
+        assert_eq!(answer["not_ended_yet"], json!([job]), "{answer}");
+        runtime.refuse_stops(None);
+        let auth = bed.door.auth.clone();
+        drop(bed);
+        let again = bed_with(
+            card(),
+            log,
+            runtime,
+            Arc::new(best_peer_engine::Fake::new()),
+            "engines.local",
+            Some(auth),
+        )
+        .await;
+        again.peer.step(time::OffsetDateTime::now_utc()).await;
+        let stopped = again.events_of("j1", "JobStopped").await;
+        assert_eq!(
+            stopped.last().unwrap().data,
+            json!({ "job": job, "reason": lifecycle::TAKEN_BACK })
+        );
+        let jobs = again.query("get-workloads").await["jobs"].clone();
+        assert_eq!(jobs.as_array().unwrap().len(), 1, "{jobs}");
+        assert_ne!(jobs[0]["job"], job, "the job of the key kept back runs on");
+    }
+
+    #[tokio::test]
+    async fn a_job_starting_when_its_credential_is_taken_back_is_stopped_once_it_is_told_started() {
+        let bed = bed(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        let gate = bed.runtime.hold_pulls();
+        let taken = key_with(&bed.app, Some("jobs"), None).await;
+        let data = json!({ "image": "busybox", "memory_bytes": 2 * GB });
+        let (s, b) = send_as(&bed.app, "", &taken, "s1", "RunJob", "run-job", data).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        assert_eq!(revoke_by_operator(&bed, &taken, false).await["work_ended"], true);
+        gate.add_permits(100);
+        let told = bed.events_of("s1", "JobStopped").await;
+        let started = told
+            .iter()
+            .find(|e| e.r#type == "JobStarted")
+            .expect("told started first");
+        assert_eq!(
+            told.last().unwrap().data,
+            json!({ "job": started.data["job"], "reason": lifecycle::TAKEN_BACK })
+        );
+        assert_eq!(bed.query("get-workloads").await["jobs"], json!([]));
     }
 
     #[tokio::test]

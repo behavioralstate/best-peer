@@ -10,7 +10,7 @@ use std::io::Write;
 use std::net::{IpAddr, Ipv6Addr};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -96,6 +96,9 @@ pub struct Credential {
     /// When the person took it back; a revoked credential opens nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked_at: Option<String>,
+    /// Taken back by the person at the machine with its work: a restart ends again what of it still runs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub work_ended: bool,
     /// What the credential may do and how much it may hold, as the person set it at the approval.
     #[serde(default, flatten)]
     pub grant: Grant,
@@ -398,7 +401,13 @@ pub struct Auth {
     pending: Mutex<HashMap<String, Pending>>,
     /// The scopes this door has, named by the service: what an approval may grant.
     scopes: Vec<String>,
+    /// What ends the work of the holders whose credentials the person at the machine takes back, when the service
+    /// says.
+    ends_work: Mutex<Option<EndsWork>>,
 }
+
+/// Ends the work of the holders named, once their credentials are taken back, and answers what it could not end yet.
+pub type EndsWork = Arc<dyn Fn(Vec<String>) -> futures::future::BoxFuture<'static, Vec<String>> + Send + Sync>;
 
 /// Where a registration from `from` is counted: an IPv4 address alone, an IPv6 address by its /64 (one client holds
 /// a whole /64), every registration whose address the transport did not name in one place together, and loopback,
@@ -424,6 +433,37 @@ impl Auth {
             revocations: AtomicU64::new(0),
             pending: Mutex::new(HashMap::new()),
             scopes: Vec::new(),
+            ends_work: Mutex::new(None),
+        }
+    }
+
+    /// What ends a holder's work when the person at the machine takes its credential back: the service's waiting
+    /// orders, jobs and deployments of that holder.
+    pub fn when_taken_back(&self, ends: EndsWork) {
+        *self.ends_work.lock().unwrap() = Some(ends);
+    }
+
+    /// The holders whose credentials the person at the machine took back with their work, this run or before it.
+    pub fn work_ended(&self) -> Vec<String> {
+        self.credentials
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.work_ended)
+            .map(Credential::holder)
+            .collect()
+    }
+
+    /// Ends the work of the credentials `taken`, as the service said with [`Auth::when_taken_back`], and answers what
+    /// it could not end yet. The ending runs as a task of its own, so a caller that goes away before it is done (a
+    /// request dropped with its connection) never leaves work claimed for an ending that stopped half way.
+    pub async fn end_work(&self, taken: &[Credential]) -> Vec<String> {
+        let ends = self.ends_work.lock().unwrap().clone();
+        match ends {
+            Some(ends) => tokio::spawn(ends(taken.iter().map(Credential::holder).collect()))
+                .await
+                .unwrap_or_default(),
+            None => Vec::new(),
         }
     }
 
@@ -513,37 +553,50 @@ impl Auth {
 
     /// Takes back every live credential `name` names, by its connection name or its holder id, on the authority's
     /// word: each is written again with `revoked_at` set, so a restart reads it back taken, and opens nothing from
-    /// now on. No live credential by that name is refused with the live names; one the disk did not take is closed
-    /// now and said so (500), and a revoke again writes it.
-    pub async fn revoke(&self, name: &str, proof: &str) -> Result<Vec<Credential>, OAuthError> {
+    /// now on. With `ends_work`, the line says its work ended with it, so a restart ends again what of it still runs.
+    /// No live credential by that name is refused with the live names; one the disk did not take is closed now, its
+    /// work ended all the same with `ends_work`, and said so (500), and a revoke again writes it.
+    pub async fn revoke(&self, name: &str, proof: &str, ends_work: bool) -> Result<Vec<Credential>, OAuthError> {
         self.approver.attest(proof).await?;
         let name = name.trim();
-        self.take_back(|c| c.name == name || holder_of_hash(&c.hash) == name)
-            .map_err(|why| match why {
-                TakeBack::NoneLive(live) => OAuthError::invalid_request(format!(
-                    "no live credential is named {name}: the live ones are {}",
-                    if live.is_empty() {
-                        "none".to_string()
-                    } else {
-                        live.join(", ")
-                    }
-                )),
-                TakeBack::Unwritten(e) => OAuthError {
+        match self.take_back(|c| c.name == name || holder_of_hash(&c.hash) == name, ends_work) {
+            Ok(taken) => Ok(taken),
+            Err(TakeBack::NoneLive(live)) => Err(OAuthError::invalid_request(format!(
+                "no live credential is named {name}: the live ones are {}",
+                if live.is_empty() {
+                    "none".to_string()
+                } else {
+                    live.join(", ")
+                }
+            ))),
+            Err(TakeBack::Unwritten(e, taken)) => {
+                let work = match ends_work {
+                    false => "its work runs on, as asked".to_string(),
+                    true => match self.end_work(&taken).await {
+                        left if left.is_empty() => "its work is ended".to_string(),
+                        left => format!(
+                            "its work is ended but for {}, tried again at every step",
+                            left.join(", ")
+                        ),
+                    },
+                };
+                Err(OAuthError {
                     status: 500,
                     error: "server_error",
                     description: format!(
-                        "{name} is taken back now, but the line that keeps it taken was not written ({e}): it would open again after a restart; free the disk and revoke {name} again"
+                        "{name} is taken back now and {work}, but the line that keeps it taken was not written ({e}): it would open again after a restart; free the disk and revoke {name} again"
                     ),
-                },
-            })
+                })
+            }
+        }
     }
 
     /// Takes back the credential with this hash, on its own word (the agent's revoke-agent command).
     pub fn revoke_own(&self, hash: &str) -> Result<Credential, String> {
-        match self.take_back(|c| c.hash == hash) {
+        match self.take_back(|c| c.hash == hash, false) {
             Ok(mut taken) => Ok(taken.remove(0)),
             Err(TakeBack::NoneLive(_)) => Err("this credential is not live".into()),
-            Err(TakeBack::Unwritten(e)) => Err(format!(
+            Err(TakeBack::Unwritten(e, _)) => Err(format!(
                 "taken back now, but the line that keeps it taken was not written ({e}): it would open again after a restart until its owner revokes it again"
             )),
         }
@@ -557,7 +610,7 @@ impl Auth {
 
     /// Marks every live credential `select` picks taken back, in memory first, so it opens nothing at once, then on
     /// disk, a line each; one whose line did not reach the disk stays pickable, so the next revoke writes it.
-    fn take_back(&self, select: impl Fn(&Credential) -> bool) -> Result<Vec<Credential>, TakeBack> {
+    fn take_back(&self, select: impl Fn(&Credential) -> bool, ends_work: bool) -> Result<Vec<Credential>, TakeBack> {
         let now = OffsetDateTime::now_utc();
         let taken: Vec<Credential> = {
             let mut credentials = self.credentials.lock().unwrap();
@@ -570,6 +623,7 @@ impl Auth {
                 if c.revoked_at.is_none() {
                     c.revoked_at = Some(now_rfc3339());
                 }
+                c.work_ended |= ends_work;
                 taken.push(c.clone());
             }
             if taken.is_empty() {
@@ -599,7 +653,7 @@ impl Auth {
         }
         match failed {
             None => Ok(taken),
-            Some(e) => Err(TakeBack::Unwritten(e)),
+            Some(e) => Err(TakeBack::Unwritten(e, taken)),
         }
     }
 
@@ -893,6 +947,7 @@ impl Auth {
             issued_at: now_rfc3339(),
             expires_at: expires_at.clone(),
             revoked_at: None,
+            work_ended: false,
             grant: p.grant,
         };
         self.store(&credential);
@@ -1032,8 +1087,8 @@ fn rfc3339_in(d: Duration) -> String {
 enum TakeBack {
     /// No live credential was picked; the live ones, by name and holder.
     NoneLive(Vec<String>),
-    /// Taken in memory, not written: the disk's error.
-    Unwritten(String),
+    /// Taken in memory, not written: the disk's error, and what was taken.
+    Unwritten(String, Vec<Credential>),
 }
 
 /// How long a credential lasts: what the person said at the approval, which the approval held to the session
@@ -1238,6 +1293,7 @@ mod tests {
             issued_at: "2020-01-01T00:00:00Z".into(),
             expires_at: Some("2020-01-01T08:00:00.5Z".into()),
             revoked_at: None,
+            work_ended: false,
             grant: Grant::default(),
         });
         assert!(
@@ -1304,10 +1360,13 @@ mod tests {
             .to_string();
         let holder = auth.authenticate(&key).unwrap().holder();
         // The authority's word, or nothing happens.
-        assert_eq!(auth.revoke("team", "wrong").await.unwrap_err().error, "access_denied");
+        assert_eq!(
+            auth.revoke("team", "wrong", true).await.unwrap_err().error,
+            "access_denied"
+        );
         assert!(auth.authenticate(&key).is_some());
         // By name: taken at once, and the other is untouched.
-        let taken = auth.revoke("team", "ok").await.unwrap();
+        let taken = auth.revoke("team", "ok", true).await.unwrap();
         assert_eq!(taken.len(), 1);
         assert_eq!(taken[0].name, "team");
         assert!(taken[0].revoked_at.is_some());
@@ -1318,7 +1377,7 @@ mod tests {
         );
         assert!(auth.authenticate(&other).is_some());
         // A name with no live credential is refused with the live ones, and a taken one is not live.
-        let err = auth.revoke("team", "ok").await.unwrap_err();
+        let err = auth.revoke("team", "ok", true).await.unwrap_err();
         assert_eq!(err.error, "invalid_request");
         assert!(
             err.description.contains("other (") && !err.description.contains("team ("),
@@ -1328,7 +1387,7 @@ mod tests {
         // By holder id too.
         let other_holder = auth.authenticate(&other).unwrap().holder();
         assert_ne!(other_holder, holder);
-        assert_eq!(auth.revoke(&other_holder, "ok").await.unwrap().len(), 1);
+        assert_eq!(auth.revoke(&other_holder, "ok", true).await.unwrap().len(), 1);
         assert!(auth.authenticate(&other).is_none());
         // On disk as one more line each, read back taken.
         let file = std::fs::read_to_string(dir.path().join("credentials.jsonl")).unwrap();
@@ -1343,7 +1402,48 @@ mod tests {
         .unwrap();
         assert!(again.authenticate(&key).is_none() && again.authenticate(&other).is_none());
         assert_eq!(again.credentials().len(), 2, "one record per credential, as it stands");
-        assert_eq!(again.revoke("team", "ok").await.unwrap_err().error, "invalid_request");
+        let mut ended = again.work_ended();
+        ended.sort();
+        let mut both = vec![holder.clone(), other_holder.clone()];
+        both.sort();
+        assert_eq!(ended, both, "a revoke that ended the work says so after a restart");
+        assert_eq!(
+            again.revoke("team", "ok", true).await.unwrap_err().error,
+            "invalid_request"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ending_whose_caller_went_away_runs_to_its_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = Auth::open(
+            dir.path(),
+            "http://peer.test",
+            Box::new(FakeApprover { proof: "ok".into() }),
+        )
+        .unwrap();
+        let a = start(&auth, Some("team"));
+        auth.approve(&a.user_code, "ok", Grant::default(), None).await.unwrap();
+        poll(&auth, &a.device_code).unwrap();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = done.clone();
+        auth.when_taken_back(std::sync::Arc::new(move |_| {
+            let flag = flag.clone();
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Vec::new()
+            })
+        }));
+        let taken = auth.revoke("team", "ok", true).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), auth.end_work(&taken))
+                .await
+                .is_err(),
+            "the caller gives up before the ending is done"
+        );
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst), "the ending ran on");
     }
 
     #[tokio::test]
@@ -1365,6 +1465,13 @@ mod tests {
             .unwrap()
             .to_string();
         let before = auth.revocations();
+        let holder = auth.authenticate(&key).unwrap().holder();
+        let ended = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = ended.clone();
+        auth.when_taken_back(std::sync::Arc::new(move |holders| {
+            seen.lock().unwrap().extend(holders);
+            Box::pin(async { Vec::new() })
+        }));
         // The disk refuses the line: the revoke says so, and the key is closed now all the same.
         let file = dir.path().join("credentials.jsonl");
         let writable = auth
@@ -1372,18 +1479,23 @@ mod tests {
             .lock()
             .unwrap()
             .replace(std::fs::File::open(&file).unwrap());
-        let err = auth.revoke("team", "ok").await.unwrap_err();
+        let err = auth.revoke("team", "ok", true).await.unwrap_err();
         assert_eq!((err.status, err.error), (500, "server_error"));
         assert!(err.description.contains("revoke team again"), "{}", err.description);
+        assert!(err.description.contains("its work is ended"), "{}", err.description);
+        assert_eq!(*ended.lock().unwrap(), vec![holder], "its work ended all the same");
         assert!(auth.authenticate(&key).is_none(), "closed at once");
         assert!(auth.revocations() > before, "an open stream looks again");
         // Read back from what the disk holds, it would open again: that is what the 500 said.
         assert!(open().authenticate(&key).is_some());
         // The disk takes lines again: the same revoke writes it, though it is no longer live.
         *auth.credentials_file.lock().unwrap() = writable;
-        assert_eq!(auth.revoke("team", "ok").await.unwrap().len(), 1);
+        assert_eq!(auth.revoke("team", "ok", true).await.unwrap().len(), 1);
         assert!(open().authenticate(&key).is_none(), "taken for good");
-        assert_eq!(auth.revoke("team", "ok").await.unwrap_err().error, "invalid_request");
+        assert_eq!(
+            auth.revoke("team", "ok", true).await.unwrap_err().error,
+            "invalid_request"
+        );
         // The agent's own revoke: by the hash alone.
         let b = start(&auth, Some("own"));
         auth.approve(&b.user_code, "ok", Grant::default(), None).await.unwrap();

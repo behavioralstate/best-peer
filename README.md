@@ -120,8 +120,9 @@ ends without anyone remembering to take it back. To take a key back sooner, at y
 best-peer revoke <name>
 ```
 
-with the name it was approved under: every request carrying it is refused from then on, and an event stream it holds
-open ends within seconds. The agent can also give its key back itself, with the `revoke-agent` command.
+with the name it was approved under: every request carrying it is refused from then on, an event stream it holds
+open ends within seconds, and what it ran or had waiting on this peer ends with it (`--keep-running` leaves that as it
+is). The agent can also give its key back itself, with the `revoke-agent` command, which leaves its work running.
 `--accelerators-only` holds a key to the accelerators, never the host's CPU.
 
 **Your own use of the card comes first.** When you use the card yourself (a game, a render, a CUDA script), the
@@ -388,7 +389,7 @@ The facts follow on the event stream under the command's correlation id, in orde
 `DeploymentStarted`, `WeightsLoading`, then `DeploymentReady`, or `DeploymentFailed`. While an image is pulled,
 `ImagePulling` says 99 at most and may fall back, since the engine learns of more to fetch as it goes; 100 comes with
 the pull's end, just before `ImagePulled`. What the engine does on its own
-later (`OutOfMemory`, `DeploymentEnded`) is told under the same correlation id. An engine whose container exits before
+later (`OutOfMemory`, `DeploymentEnded`), and its end when you take its key back, is told under the same correlation id. An engine whose container exits before
 its model is ready fails the deploy: `DeploymentFailed` carries its exit code and the last lines it wrote. `prompt` names a ready deployment and
 the conversation so far, and `PromptAnswered` follows under its own correlation id with the answer whole, or
 `PromptFailed` with the reason and the fix. `run-job` runs an image once, a tenant's in a closed box, and tells
@@ -404,7 +405,7 @@ the cloud places orders first come, first served, as soon as a member has the me
 fit yet holds back none that does. `JobPlaced` names the member it was sent to, then the member's facts follow, and
 `JobStarted` names the order. `queue_seconds` bounds the wait, a day when the order names none (past it, `JobFailed`
 says it was never placed), and `deadline_seconds` the run from `JobStarted` (past it, the job is stopped and
-`JobStopped` says why); both are counted from the facts' own times, so a restart neither resets nor extends them. `stop-job` names a waiting order by its id,
+`JobStopped` says why, as it does for a job or an order whose key you took back); both are counted from the facts' own times, so a restart neither resets nor extends them. `stop-job` names a waiting order by its id,
 and it ends in `JobStopped` before it started. A member lost under an order queues it again once, `JobQueued`
 telling `attempt: 2`, and fails it the second time. `get-workloads` lists the orders not started yet as `queued`,
 oldest first. An order that waits counts against its credential's share and its count of jobs, as an admitted one
@@ -580,8 +581,8 @@ Every command of this peer follows one pattern, and nothing else is needed to dr
 2. Everything that happens is an event carrying that correlation id, in the order it happened. The command's
    schema document lists what it `produces` and, among those, what `completes` it: the events after which the
    command's outcome is known (`DeploymentReady` for a deploy, or `DeploymentFailed`, `DeploymentEnded` or
-   `OutOfMemory` when it ended before it was ready; `JobStarted` or `JobFailed` for a job, and on a workspace's door
-   also `JobStopped`, for an order stopped before it started), so a consumer stops
+   `OutOfMemory` when it ended before it was ready; `JobStarted` or `JobFailed` for a job, and also
+   `JobStopped`, for an order stopped before it started), so a consumer stops
    waiting for the command and a restart does not run it again; the others are
    progress on the way (`ImagePulling`, `WeightsLoading`, with `progress_pct` where the engine says).
    `CommandFailed` completes any command.
@@ -648,9 +649,18 @@ that long (`8h`, `30m`, `2d`, or seconds; 366 days at most, and 8 hours at most 
 agent asks for when it cannot keep a secret: more is refused, never cut). `best-peer revoke <name>` takes a key back
 at once, by the connection name the agent signed in under or the holder id the events show, with the peer running
 and the same admin token; an agent takes back its own with the `revoke-agent` command, sent under it. Either way the
-key opens nothing from then on, on this door and every workspace door here, an event stream open under it ends
-within seconds, as one does when a key runs out, and what the key left running is the owner's to end. A revoke the
-disk did not keep says so: the key is closed until the peer restarts, and running the revoke again writes it. Every command document says which
+key opens nothing from then on, on this door and every workspace door here, and an event stream open under it ends
+within seconds, as one does when a key runs out. A key you take back takes its work on this peer's own door with it:
+its orders that wait end before they start, its jobs are stopped and its deployments ended, each told with the reason
+that its credential was taken back, and one that was starting or queuing meanwhile is ended as soon as it is told.
+One the container engine does not stop is named in what `revoke` prints and tried again until it stops, across a
+restart too: the credential's line on disk says its work ended with it. Orders on a
+workspace's cloud are the cloud's and are not ended by it. `best-peer revoke <name> --keep-running` leaves the work as
+it is. A key that runs out, or one the agent gave back
+itself, leaves its work running, as an agent that ends its session after ordering a long run expects; what it left is
+the owner's to end. A revoke the
+disk did not keep says so: the key is closed until the peer restarts, its work is ended all the same, and running the
+revoke again writes it. Every command document says which
 scope it needs. A command the key may not send is refused at ingest with `FORBIDDEN` and what it was approved for;
 a deploy or a job past the share with `SHARE_EXCEEDED`, what is held and the room left; a workload another key
 started, by name, whether a command, a prompt or the events are asked for, and a refusal names only what the key may
