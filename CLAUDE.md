@@ -6,7 +6,8 @@ before changing anything, and keep it the current rule when a change moves the p
 - Starting on an issue, move it to In progress on the Behavioralstate board first (project 4 of Amarcode-Studios, its
   Status field: `gh project item-edit`, or the board itself), and its epic to In progress if it was not; once its code is
   in a release, with only a host proof or the owner's acceptance left, move it to In review (SDLC.md
-  section 1).
+  section 1). An issue carries its one epic's label (`best-peer-01`, `windlet-02`), the label the epic carries
+  beside `epic`, and no other epic's.
 - Every change is made on `main` and pushed there, the owner's and every maintainer's; no branch and no pull request
   is needed. The subject is one plain sentence saying what changed and why, with no type prefix (`feat:`, `fix:`);
   the one prefix is `Review:` on a commit that answers the review, as the history has it. Open work is an issue on
