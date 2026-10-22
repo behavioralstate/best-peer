@@ -10,6 +10,7 @@
 //! identity creates one, invites others, and configures clouds in it, named pools of peers the same binary fronts and
 //! places on.
 
+mod availability;
 mod cloud;
 mod domain;
 mod forget;
@@ -175,24 +176,27 @@ pub async fn peer(
     patience: Patience,
     holdings: Arc<holdings::Holdings>,
     confine: Confine,
+    owner_use: Option<availability::Thresholds>,
 ) -> Arc<Peer> {
     // Subscribed before the rebuild, so an exit told while the state is being rebuilt is not lost.
     let events = runtime.events();
-    let p = Arc::new(
-        Peer::new(
-            endpoint,
-            engine_host,
-            SERVICE,
-            gpu,
-            runtime,
-            engine,
-            log,
-            images,
-            patience,
-            confine,
-        )
-        .with_holdings(holdings),
-    );
+    let mut p = Peer::new(
+        endpoint,
+        engine_host,
+        SERVICE,
+        gpu,
+        runtime,
+        engine,
+        log,
+        images,
+        patience,
+        confine,
+    )
+    .with_holdings(holdings);
+    if let Some(t) = owner_use {
+        p = p.with_owner_use(t);
+    }
+    let p = Arc::new(p);
     p.register_holdings();
     // A store on this machine, over plain http on loopback (a test's, or a developer's), only when the operator says.
     if std::env::var("BEST_PEER_STORE_CLEARTEXT").as_deref() == Ok("loopback") {
@@ -200,6 +204,7 @@ pub async fn peer(
     }
     p.rebuild().await;
     p.follow(events);
+    p.watch_owner();
     p
 }
 
@@ -308,10 +313,12 @@ fn main() {
         None => serve(),
         Some("approve") => approve(&args[1..]),
         Some("revoke") => revoke(&args[1..]),
+        Some("hold") => hold(&args[1..]),
+        Some("release") => release(&args[1..]),
         Some("--version" | "-V" | "version") => println!("best-peer {}", env!("CARGO_PKG_VERSION")),
         Some(other) => {
             eprintln!(
-                "unknown command {other:?}: run with no arguments to serve, `best-peer approve <code>`, `best-peer revoke <name>`, or `best-peer --version`"
+                "unknown command {other:?}: run with no arguments to serve, `best-peer approve <code>`, `best-peer revoke <name>`, `best-peer hold`, `best-peer release`, or `best-peer --version`"
             );
             std::process::exit(2);
         }
@@ -548,6 +555,24 @@ async fn peer_app(
         std::env::var("BEST_PEER_ENGINE_PIDS").ok().as_deref(),
     )
     .unwrap_or_else(|why| fail(&why));
+    let owner_use = availability::thresholds(
+        std::env::var("BEST_PEER_BUSY").ok().as_deref(),
+        std::env::var("BEST_PEER_BUSY_MEMORY").ok().as_deref(),
+        std::env::var("BEST_PEER_BUSY_UTILISATION").ok().as_deref(),
+        std::env::var("BEST_PEER_BUSY_AFTER").ok().as_deref(),
+        std::env::var("BEST_PEER_FREE_AFTER").ok().as_deref(),
+    )
+    .unwrap_or_else(|why| fail(&why));
+    match &owner_use {
+        Some(t) => tracing::info!(
+            memory_bytes = t.memory_bytes,
+            utilisation_pct = t.utilisation_pct,
+            busy_after_s = t.busy_after.as_secs(),
+            free_after_s = t.free_after.as_secs(),
+            "a card the owner uses takes no new work: busy once processes not the peer's hold more than memory_bytes of it or more than utilisation_pct of its compute for busy_after_s, free after free_after_s under both; BEST_PEER_BUSY=off turns this off"
+        ),
+        None => tracing::info!("BEST_PEER_BUSY=off: the owner's own use of a card is not watched, and only a hold makes it busy"),
+    }
     let peer = peer(
         endpoint,
         &engine_host,
@@ -559,6 +584,7 @@ async fn peer_app(
         patience,
         holdings.clone(),
         confine,
+        owner_use,
     )
     .await;
     let ctx = Arc::new(context(endpoint, dir, auth.clone(), holdings, cleartext));
@@ -578,7 +604,11 @@ async fn peer_app(
             "this door hosts workspaces: their clouds follow their members"
         );
     }
-    logged(best_peer_door::router(door).merge(workspaces.router()))
+    logged(
+        best_peer_door::router(door)
+            .merge(workspaces.router())
+            .merge(availability::router(peer, auth)),
+    )
 }
 
 /// Every request to the door, the workspaces' included, is one line in the log, as it arrived.
@@ -723,6 +753,225 @@ fn revoke(args: &[String]) {
             c["issued_at"].as_str().unwrap_or("?")
         );
     }
+}
+
+/// How long a hold by `--while` lasts at most when the owner names no end: a closed terminal or a sleeping machine
+/// never holds the card for good.
+const WHILE_AT_MOST: Duration = Duration::from_secs(12 * 3600);
+
+/// `best-peer hold`: the person at the machine takes its devices back from new work, every one or those named,
+/// until a time, for a span, while one of their processes runs, or until `best-peer release`; with `--now`, what
+/// runs on them ends too. With `--while`, this command stays and releases the hold when the process exits or on
+/// Ctrl-C: the peer never learns the process.
+fn hold(args: &[String]) {
+    const USAGE: &str = "usage: best-peer hold [--device <id>]... [--for 2h | --until <time>] [--while <pid>] [--now] [--reason <text>]: the devices to hold, as get-hardware-state names them (every one, the CPU included, when none is named); how long, or until when (RFC 3339), with no end until best-peer release when neither is said; while a process of yours runs, staying here and releasing when it exits or on Ctrl-C, twelve hours at most unless --for or --until says otherwise; --now ends what runs on them as well, each told to its holder; a reason, one line, read by every approved client";
+    let (mut devices, mut until, mut pid, mut now, mut reason) =
+        (Vec::<String>::new(), None::<String>, None::<i32>, false, None::<String>);
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        let mut value = |what: &str| {
+            rest.next()
+                .cloned()
+                .unwrap_or_else(|| fail(&format!("{arg} needs {what}. {USAGE}")))
+        };
+        match arg.as_str() {
+            "--device" => devices.push(value("a device id, as get-hardware-state names it")),
+            "--for" => {
+                let span = parse_duration(&value("a span of time, such as 2h or 30m")).unwrap_or_else(|why| fail(&why));
+                until = Some(rfc3339_after(span));
+            }
+            "--until" => {
+                let t = value("a time, RFC 3339, such as 2026-10-20T22:00:00Z");
+                if time::OffsetDateTime::parse(&t, &time::format_description::well_known::Rfc3339).is_err() {
+                    fail(&format!(
+                        "--until {t:?} is not a time: write it RFC 3339, such as 2026-10-20T22:00:00Z"
+                    ));
+                }
+                until = Some(t);
+            }
+            "--while" => {
+                let p = value("the id of a process of yours");
+                pid = Some(match p.trim().parse::<i32>() {
+                    Ok(n) if n > 0 => n,
+                    _ => fail(&format!("--while {p:?} is not a process id")),
+                });
+            }
+            "--now" => now = true,
+            "--reason" => {
+                reason = Some(availability::reason(&value("the words")).unwrap_or_else(|why| fail(&why)));
+            }
+            other => fail(&format!("unknown argument {other:?}. {USAGE}")),
+        }
+    }
+    let watched = pid.map(watch_process);
+    if pid.is_some() && until.is_none() {
+        until = Some(rfc3339_after(WHILE_AT_MOST));
+    }
+    let mut form = vec![];
+    if !devices.is_empty() {
+        form.push(("devices", devices.join(",")));
+    }
+    if let Some(u) = &until {
+        form.push(("until", u.clone()));
+    }
+    if let Some(r) = &reason {
+        form.push(("reason", r.clone()));
+    }
+    if now {
+        form.push(("now", "true".to_string()));
+    }
+    let (status, answer) = as_the_authority("/owner/hold", form);
+    if status != 200 {
+        fail(&refusal(status, &answer));
+    }
+    let held: Vec<String> = answer["held"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|d| d.as_str().map(str::to_string))
+        .collect();
+    let end = match answer["until"].as_str() {
+        Some(u) => format!("until {u}"),
+        None => "until best-peer release".to_string(),
+    };
+    println!("held {} {end}: they take no new work", held.join(", "));
+    for e in answer["ended"].as_array().into_iter().flatten() {
+        let what = match (e["job"].as_str(), e["deployment"].as_str()) {
+            (Some(j), _) => format!("job {j}"),
+            (_, Some(d)) => format!("deployment {d}"),
+            _ => continue,
+        };
+        match e["error"].as_str() {
+            Some(why) => println!("{what} could not be ended and runs on: {why}"),
+            None => println!("ended {what}, told to its holder"),
+        }
+    }
+    let Some(watched) = watched else { return };
+    println!(
+        "holding while process {} runs; Ctrl-C releases now, and {end} at most",
+        pid.unwrap_or_default()
+    );
+    let why = until_either(async { tokio::signal::ctrl_c().await.map(drop) }, watched);
+    let hold = answer["hold"].as_str().unwrap_or_default().to_string();
+    let (status, answer) = as_the_authority("/owner/release", vec![("devices", held.join(",")), ("hold", hold)]);
+    if status != 200 {
+        fail(&format!(
+            "{why}, and the release was refused: {}",
+            refusal(status, &answer)
+        ));
+    }
+    let named = |k: &str| -> Vec<String> {
+        answer[k]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|d| d.as_str().map(str::to_string))
+            .collect()
+    };
+    let (released, kept) = (named("released"), named("kept"));
+    if !released.is_empty() {
+        println!("{why}: released {}", released.join(", "));
+    }
+    if !kept.is_empty() {
+        println!("{why}: {} held since by another hold, left held", kept.join(", "));
+    }
+}
+
+/// `best-peer release`: the devices take work again, every one held or those named.
+fn release(args: &[String]) {
+    const USAGE: &str =
+        "usage: best-peer release [--device <id>]...: the devices to release, every one held when none is named";
+    let mut devices = Vec::<String>::new();
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--device" => devices.push(
+                rest.next()
+                    .cloned()
+                    .unwrap_or_else(|| fail(&format!("--device needs a device id. {USAGE}"))),
+            ),
+            other => fail(&format!("unknown argument {other:?}. {USAGE}")),
+        }
+    }
+    let form = match devices.is_empty() {
+        true => vec![],
+        false => vec![("devices", devices.join(","))],
+    };
+    let (status, answer) = as_the_authority("/owner/release", form);
+    if status != 200 {
+        fail(&refusal(status, &answer));
+    }
+    let released: Vec<&str> = answer["released"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|d| d.as_str())
+        .collect();
+    println!("released {}: they take work again", released.join(", "));
+}
+
+/// What the peer said when it refused the person at the machine, whichever shape its refusal took.
+fn refusal(status: u16, answer: &serde_json::Value) -> String {
+    let said = answer["error"]["message"]
+        .as_str()
+        .or(answer["error_description"].as_str())
+        .unwrap_or("no reason given");
+    format!("the peer refused ({status}): {said}")
+}
+
+/// The time `span` from now, RFC 3339.
+fn rfc3339_after(span: Duration) -> String {
+    (time::OffsetDateTime::now_utc() + span)
+        .replace_nanosecond(0)
+        .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|e| fail(&format!("cannot write the time: {e}")))
+}
+
+/// Waits until `stop` or the watched process ends, and says which: "Ctrl-C" or "the process exited". A watch still
+/// blocked when `stop` comes is left behind rather than waited for, so the release is posted at once.
+fn until_either(
+    stop: impl std::future::Future<Output = std::io::Result<()>>,
+    watched: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+) -> &'static str {
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| fail(&format!("cannot start: {e}")));
+    let why = runtime.block_on(async move {
+        tokio::select! {
+            _ = stop => "Ctrl-C",
+            _ = watched => "the process exited",
+        }
+    });
+    runtime.shutdown_background();
+    why
+}
+
+/// What ends when process `pid` exits, watched through a pidfd, so a process id used again by another is never taken
+/// for it. Refused for a process that is not running, and where there are no pidfds.
+#[cfg(target_os = "linux")]
+fn watch_process(pid: i32) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    use rustix::event::{poll, PollFd, PollFlags};
+    use rustix::process::{pidfd_open, Pid, PidfdFlags};
+    let fd = Pid::from_raw(pid)
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+        .and_then(|p| pidfd_open(p, PidfdFlags::empty()).map_err(std::io::Error::from))
+        .unwrap_or_else(|e| fail(&format!("--while {pid}: no such process to watch ({e})")));
+    Box::pin(async move {
+        let _ = tokio::task::spawn_blocking(move || loop {
+            let mut fds = [PollFd::new(&fd, PollFlags::IN)];
+            match poll(&mut fds, None) {
+                Err(rustix::io::Errno::INTR) => continue,
+                _ => break,
+            }
+        })
+        .await;
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn watch_process(pid: i32) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    fail(&format!(
+        "--while {pid}: watching a process needs Linux; hold with --for or --until and release with best-peer release"
+    ))
 }
 
 /// `best-peer approve <code>`: presents this machine's admin token to the peer running on it, for the code the
@@ -1031,6 +1280,21 @@ mod tests {
         auth: Option<Arc<Auth>>,
         images: Images,
     ) -> Bed {
+        bed_owned(gpu, log, runtime, engine, engine_host, auth, images, None).await
+    }
+
+    /// The same, finding when the owner uses a card with these thresholds.
+    #[allow(clippy::too_many_arguments)]
+    async fn bed_owned(
+        gpu: Arc<best_peer_gpu::Fake>,
+        log: Arc<EventLog>,
+        runtime: Arc<best_peer_runtime::Fake>,
+        engine: Arc<best_peer_engine::Fake>,
+        engine_host: &str,
+        auth: Option<Arc<Auth>>,
+        images: Images,
+        owner_use: Option<availability::Thresholds>,
+    ) -> Bed {
         for image in [
             best_peer_engine::OLLAMA_IMAGE,
             best_peer_engine::VLLM_IMAGE,
@@ -1056,6 +1320,7 @@ mod tests {
             },
             holdings.clone(),
             Confine::default(),
+            owner_use,
         )
         .await;
         let auth = auth.unwrap_or_else(|| {
@@ -1078,7 +1343,9 @@ mod tests {
         );
         let door = Arc::new(super::door(peer.clone(), workspaces.clone(), auth.clone()));
         best_peer_door::resume(&door).await;
-        let app = best_peer_door::router(door.clone()).merge(workspaces.router());
+        let app = best_peer_door::router(door.clone())
+            .merge(workspaces.router())
+            .merge(availability::router(peer.clone(), auth.clone()));
         let key = key(&app).await;
         Bed {
             door,
@@ -1461,6 +1728,554 @@ mod tests {
         assert_eq!(bed.query("get-workloads").await["queued"], json!([]));
     }
 
+    // ----- the owner's use and hold --------------------------------------------------------------------------------
+
+    /// Owner use found at once and freed at once, so a test reads each change on the next sample.
+    fn at_once() -> availability::Thresholds {
+        availability::Thresholds {
+            busy_after: Duration::ZERO,
+            free_after: Duration::ZERO,
+            ..availability::Thresholds::default()
+        }
+    }
+
+    /// A peer over the card that finds when its owner uses it.
+    async fn watched() -> Bed {
+        bed_owned(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+            Arc::new(best_peer_engine::Fake::new()),
+            "engines.local",
+            None,
+            Images::default(),
+            Some(at_once()),
+        )
+        .await
+    }
+
+    /// The owner's processes on the bed's card: each `(pid, GiB, percent)`.
+    fn owner_runs(bed: &Bed, processes: &[(u32, u64, u8)]) {
+        let ps = processes
+            .iter()
+            .map(|&(pid, gb, pct)| best_peer_gpu::Process {
+                pid,
+                memory_bytes: Some(gb * GB),
+                utilisation_pct: Some(pct),
+            })
+            .collect();
+        bed.gpu.set_usage(&"gpu-0".into(), ps).unwrap();
+    }
+
+    /// What the person at the machine posts to `path` with `fields` and the admin token `ok`, as `best-peer hold` and
+    /// `release` do.
+    async fn as_owner(app: &axum::Router, path: &str, fields: &[(&str, &str)]) -> (StatusCode, Value) {
+        as_owner_proving(app, path, "ok", fields).await
+    }
+
+    async fn as_owner_proving(
+        app: &axum::Router,
+        path: &str,
+        proof: &str,
+        fields: &[(&str, &str)],
+    ) -> (StatusCode, Value) {
+        let mut form = vec![("proof", proof)];
+        form.extend_from_slice(fields);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post(path)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(serde_urlencoded::to_string(&form).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        (status, body(res).await)
+    }
+
+    fn availability_of(hs: &Value, device: &str) -> Value {
+        hs["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["id"] == device)
+            .unwrap()["availability"]
+            .clone()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn hold_while_wakes_when_the_watched_process_exits_and_not_before() {
+        let mut child = std::process::Command::new("sleep").arg("0.3").spawn().unwrap();
+        let mut watched = super::watch_process(child.id() as i32);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut watched)
+                .await
+                .is_err(),
+            "it waits while the process runs"
+        );
+        tokio::time::timeout(Duration::from_secs(5), watched)
+            .await
+            .expect("it wakes once the process exits");
+        child.wait().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hold_while_stopped_by_ctrl_c_answers_at_once_while_the_watched_process_runs_on() {
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let watched = super::watch_process(child.id() as i32);
+        let began = std::time::Instant::now();
+        let why = super::until_either(async { Ok(()) }, watched);
+        let took = began.elapsed();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(why, "Ctrl-C");
+        assert!(
+            took < Duration::from_secs(2),
+            "it waited {took:?} for the watched process"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_card_its_owner_uses_is_busy_for_every_approved_client_takes_no_new_work_and_an_order_that_waits_starts_once_it_frees(
+    ) {
+        let bed = watched().await;
+        let tenant = key_with(&bed.app, Some("deploy,jobs"), Some(24 * GB)).await;
+        let hs = |key: String| {
+            let app = bed.app.clone();
+            async move { get_as(&app, "", &key, "/queries/get-hardware-state").await }
+        };
+        assert_eq!(
+            availability_of(&hs(tenant.clone()).await.1, "gpu-0"),
+            json!({ "state": "free" })
+        );
+        // The desktop alone: a compositor's few hundred MiB and a trickle of compute.
+        owner_runs(&bed, &[(100, 0, 2)]);
+        bed.peer.sample().await;
+        assert_eq!(
+            availability_of(&hs(tenant.clone()).await.1, "gpu-0"),
+            json!({ "state": "free" })
+        );
+        // The owner starts a game: busy, with no end and no reason, for the tenant as for the owner's key.
+        owner_runs(&bed, &[(100, 0, 2), (7000, 8, 60)]);
+        bed.peer.sample().await;
+        for key in [tenant.clone(), bed.key.clone()] {
+            assert_eq!(availability_of(&hs(key).await.1, "gpu-0"), json!({ "state": "busy" }));
+        }
+        let (s, _) = get_as(&bed.app, "", "not-a-key", "/queries/get-hardware-state").await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "a stranger reads nothing of it");
+        // New work is refused with the device named, or waits when it asked to.
+        let (s, e) = send_as(
+            &bed.app,
+            "",
+            &tenant,
+            "d1",
+            "DeployModel",
+            "deploy-model",
+            json!({ "model": "qwen3:0.6b", "engine": "ollama", "memory_bytes": 4 * GB }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "DEVICE_BUSY");
+        assert_eq!(e["error"]["details"]["devices"][0]["id"], "gpu-0");
+        assert!(e["error"]["message"].as_str().unwrap().contains("queue_seconds"), "{e}");
+        let (s, e) = send_as(
+            &bed.app,
+            "",
+            &tenant,
+            "j1",
+            "RunJob",
+            "run-job",
+            json!({ "image": "busybox", "memory_bytes": 4 * GB }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "DEVICE_BUSY");
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &tenant,
+            "j2",
+            "RunJob",
+            "run-job",
+            json!({ "image": "busybox", "memory_bytes": 4 * GB, "queue_seconds": 600 }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let queued = bed.events_of("j2", "JobQueued").await;
+        assert_eq!(queued[0].data["waiting"], true);
+        // The owner is done: the card frees and the order that waited starts on it.
+        owner_runs(&bed, &[(100, 0, 2)]);
+        bed.peer.sample().await;
+        let started = bed.events_of("j2", "JobStarted").await;
+        assert_eq!(started.last().unwrap().data["device"], "gpu-0");
+        assert_eq!(
+            availability_of(&hs(tenant).await.1, "gpu-0"),
+            json!({ "state": "free" })
+        );
+        // The owner's use is never told: the log keeps no record of when they used their machine.
+        let all = bed
+            .door
+            .log
+            .list(&Filter {
+                limit: Some(500),
+                ..Default::default()
+            })
+            .0;
+        assert!(all.iter().all(|e| !e.r#type.starts_with("Device")), "{:?}", types(&all));
+    }
+
+    #[tokio::test]
+    async fn the_peers_own_workloads_are_never_its_owners_use_and_what_runs_runs_on_when_the_owner_comes() {
+        let bed = watched().await;
+        let (s, b) = run_on(&bed, "j1", 20, json!({})).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let job = bed.events_of("j1", "JobStarted").await.last().unwrap().data["job"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // The job's own process holds 20 GiB at full use: the peer's, not the owner's.
+        bed.runtime.set_processes(Some(vec![4120]));
+        owner_runs(&bed, &[(4120, 20, 100)]);
+        bed.peer.sample().await;
+        assert_eq!(
+            availability_of(&bed.query("get-hardware-state").await, "gpu-0"),
+            json!({ "state": "free" })
+        );
+        // An engine that cannot name its processes leaves a card it runs on unread rather than calling it the owner's.
+        bed.runtime.set_processes(None);
+        bed.peer.sample().await;
+        assert_eq!(
+            availability_of(&bed.query("get-hardware-state").await, "gpu-0"),
+            json!({ "state": "free" })
+        );
+        // The owner comes: busy, and the job runs on.
+        bed.runtime.set_processes(Some(vec![4120]));
+        owner_runs(&bed, &[(4120, 20, 60), (7000, 3, 40)]);
+        bed.peer.sample().await;
+        assert_eq!(
+            availability_of(&bed.query("get-hardware-state").await, "gpu-0"),
+            json!({ "state": "busy" })
+        );
+        assert_eq!(bed.query("get-workloads").await["jobs"][0]["job"], job.as_str());
+        assert!(types(&bed.log_of("j1")).iter().all(|t| t != "JobStopped"));
+    }
+
+    #[tokio::test]
+    async fn the_owner_holds_and_releases_at_the_machine_and_only_a_key_approved_for_all_reads_the_hold_on_the_stream()
+    {
+        let log = Arc::new(EventLog::ephemeral());
+        let bed = bed(
+            card(),
+            log.clone(),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        let tenant = key_with(&bed.app, Some("jobs"), Some(8 * GB)).await;
+        // No credential reaches it: only the admin token.
+        let (s, _) = as_owner_proving(&bed.app, "/owner/hold", &bed.key, &[]).await;
+        assert!(s.is_client_error(), "{s}");
+        assert_eq!(
+            availability_of(&bed.query("get-hardware-state").await, "gpu-0"),
+            json!({ "state": "free" })
+        );
+        let (s, e) = as_owner(&bed.app, "/owner/hold", &[("devices", "gpu-9")]).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "NO_SUCH_DEVICE");
+        let (s, e) = as_owner(&bed.app, "/owner/hold", &[("until", "2020-01-01T00:00:00Z")]).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "an end that has come: {e}");
+        let (s, e) = as_owner(&bed.app, "/owner/hold", &[("reason", &"x".repeat(81))]).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        let (s, e) = as_owner(&bed.app, "/owner/release", &[]).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "NOT_HELD");
+        // Held: busy with its end and its reason for every approved client.
+        let (s, b) = as_owner(
+            &bed.app,
+            "/owner/hold",
+            &[
+                ("devices", "gpu-0"),
+                ("until", "2099-01-01T00:00:00Z"),
+                ("reason", "maintenance"),
+            ],
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["held"], json!(["gpu-0"]));
+        let busy = json!({ "state": "busy", "until": "2099-01-01T00:00:00Z", "reason": "maintenance" });
+        assert_eq!(
+            availability_of(
+                &get_as(&bed.app, "", &tenant, "/queries/get-hardware-state").await.1,
+                "gpu-0"
+            ),
+            busy
+        );
+        let (s, e) = send_as(
+            &bed.app,
+            "",
+            &tenant,
+            "j1",
+            "RunJob",
+            "run-job",
+            json!({ "image": "busybox", "memory_bytes": 4 * GB }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "DEVICE_BUSY");
+        assert_eq!(e["error"]["details"]["devices"][0]["until"], "2099-01-01T00:00:00Z");
+        assert_eq!(e["error"]["details"]["devices"][0]["reason"], "maintenance");
+        // The hold is the owner's act, told and kept; a tenant does not read it on the stream, the owner's key does.
+        let read = |key: String| {
+            let app = bed.app.clone();
+            async move {
+                type_names(
+                    get_as(&app, "", &key, "/events?type=DeviceHeldV1").await.1["events"]
+                        .as_array()
+                        .unwrap(),
+                )
+            }
+        };
+        assert_eq!(read(bed.key.clone()).await, ["DeviceHeldV1"]);
+        assert!(read(tenant.clone()).await.is_empty());
+        // A restart over the same log holds it still.
+        let again = bed_with(
+            card(),
+            log.clone(),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+            Arc::new(best_peer_engine::Fake::new()),
+            "engines.local",
+            Some(bed.door.auth.clone()),
+        )
+        .await;
+        assert_eq!(availability_of(&again.query("get-hardware-state").await, "gpu-0"), busy);
+        // Released: free, and told.
+        let (s, b) = as_owner(&again.app, "/owner/release", &[]).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["released"], json!(["gpu-0"]));
+        assert_eq!(
+            availability_of(&again.query("get-hardware-state").await, "gpu-0"),
+            json!({ "state": "free" })
+        );
+        assert_eq!(
+            type_names(
+                get_as(&again.app, "", &again.key, "/events?type=DeviceReleasedV1")
+                    .await
+                    .1["events"]
+                    .as_array()
+                    .unwrap()
+            ),
+            ["DeviceReleasedV1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hold_with_no_device_holds_the_whole_machine_and_one_whose_end_has_come_holds_nothing() {
+        let host = Arc::new(
+            best_peer_gpu::Fake::new()
+                .with_driver("fake 1.0")
+                .with_device(best_peer_gpu::Fake::cuda_card("gpu-0", "Card A", 24, "12.4"))
+                .with_device(best_peer_gpu::Fake::host_cpu("cpu", 64)),
+        );
+        let bed = bed(
+            host,
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        let until = (time::OffsetDateTime::now_utc() + Duration::from_secs(1))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let (s, b) = as_owner(&bed.app, "/owner/hold", &[("until", &until)]).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["held"], json!(["cpu", "gpu-0"]));
+        let hs = bed.query("get-hardware-state").await;
+        assert_eq!(availability_of(&hs, "cpu")["state"], "busy");
+        assert_eq!(availability_of(&hs, "gpu-0")["state"], "busy");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let hs = bed.query("get-hardware-state").await;
+        assert_eq!(availability_of(&hs, "gpu-0"), json!({ "state": "free" }));
+        assert_eq!(availability_of(&hs, "cpu"), json!({ "state": "free" }));
+    }
+
+    #[tokio::test]
+    async fn a_hold_now_ends_what_runs_on_the_card_told_to_each_holder_and_an_order_that_waits_starts_on_the_release() {
+        let bed = fresh().await;
+        let dep = bed.deployed("d1", "qwen3:0.6b", 4).await;
+        let (s, b) = run_on(&bed, "j1", 4, json!({})).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let job = bed.events_of("j1", "JobStarted").await.last().unwrap().data["job"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (s, b) = as_owner(&bed.app, "/owner/hold", &[("now", "true")]).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["ended"], json!([{ "job": job }, { "deployment": dep }]));
+        let stopped = bed.events_of("j1", "JobStopped").await;
+        assert_eq!(stopped.last().unwrap().data["reason"], availability::HELD_REASON);
+        let ended = bed.events_of("d1", "DeploymentEnded").await;
+        assert_eq!(ended.last().unwrap().data["reason"], availability::HELD_REASON);
+        assert!(
+            bed.runtime.running().await.unwrap().is_empty(),
+            "nothing runs on the card"
+        );
+        let w = bed.query("get-workloads").await;
+        assert_eq!((w["jobs"].clone(), w["deployments"].clone()), (json!([]), json!([])));
+        // An order that waits stays queued through the hold, and starts on the release.
+        let (s, b) = run_on(&bed, "j2", 4, json!({ "queue_seconds": 600 })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        assert_eq!(bed.events_of("j2", "JobQueued").await[0].data["waiting"], true);
+        let (s, b) = as_owner(&bed.app, "/owner/release", &[]).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        bed.events_of("j2", "JobStarted").await;
+    }
+
+    #[tokio::test]
+    async fn a_hold_now_ends_what_was_starting_on_the_card_as_soon_as_it_starts_with_the_owners_reason() {
+        let bed = fresh().await;
+        let gate = bed.runtime.hold_pulls();
+        let (s, b) = run_on(&bed, "j1", 4, json!({})).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let (s, b) = bed.deploy("d1", "qwen3:0.6b", "ollama", 4).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let (s, b) = as_owner(&bed.app, "/owner/hold", &[("now", "true"), ("reason", "maintenance")]).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["ended"], json!([]), "nothing had started yet");
+        gate.add_permits(100);
+        let told = "held by its owner: maintenance";
+        let stopped = bed.events_of("j1", "JobStopped").await;
+        assert_eq!(stopped.last().unwrap().data["reason"], told);
+        let ended = bed.events_of("d1", "DeploymentEnded").await;
+        assert_eq!(ended.last().unwrap().data["reason"], told);
+        until("nothing runs on the card", || {
+            bed.peer.state.lock().unwrap().jobs.is_empty() && bed.peer.state.lock().unwrap().deployments.is_empty()
+        })
+        .await;
+        assert!(bed.runtime.running().await.unwrap().is_empty());
+        assert!(bed.peer.cleared.lock().unwrap().is_empty(), "nothing is left to end");
+    }
+
+    #[tokio::test]
+    async fn a_workload_a_hold_now_found_starting_runs_once_the_owner_released_the_card() {
+        let bed = fresh().await;
+        let gate = bed.runtime.hold_pulls();
+        let (s, b) = run_on(&bed, "j1", 4, json!({})).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let (s, b) = as_owner(&bed.app, "/owner/hold", &[("now", "true")]).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let (s, b) = as_owner(&bed.app, "/owner/release", &[]).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert!(bed.peer.cleared.lock().unwrap().is_empty(), "the release forgets it");
+        gate.add_permits(100);
+        bed.events_of("j1", "JobStarted").await;
+        bed.peer.step(time::OffsetDateTime::now_utc()).await;
+        assert!(types(&bed.log_of("j1")).iter().all(|t| t != "JobStopped"));
+        assert_eq!(bed.query("get-workloads").await["jobs"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_release_that_names_its_hold_leaves_a_device_a_later_hold_took_over() {
+        let bed = fresh().await;
+        let (s, first) = as_owner(&bed.app, "/owner/hold", &[("devices", "gpu-0")]).await;
+        assert_eq!(s, StatusCode::OK, "{first}");
+        let (s, b) = as_owner(&bed.app, "/owner/hold", &[("devices", "gpu-0"), ("reason", "mine now")]).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let id = first["hold"].as_str().unwrap();
+        let (s, b) = as_owner(&bed.app, "/owner/release", &[("devices", "gpu-0"), ("hold", id)]).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(
+            (b["released"].clone(), b["kept"].clone()),
+            (json!([]), json!(["gpu-0"]))
+        );
+        let a = availability_of(&bed.query("get-hardware-state").await, "gpu-0");
+        assert_eq!(
+            (a["state"].clone(), a["reason"].clone()),
+            (json!("busy"), json!("mine now"))
+        );
+        let (s, b) = as_owner(&bed.app, "/owner/release", &[("hold", b["kept"][0].as_str().unwrap())]).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["kept"], json!(["gpu-0"]), "a name that is no hold releases nothing");
+        let (s, b) = as_owner(&bed.app, "/owner/release", &[]).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["released"], json!(["gpu-0"]));
+    }
+
+    #[tokio::test]
+    async fn a_held_cpu_takes_no_job_with_no_device_and_a_hold_now_ends_one() {
+        let host = Arc::new(
+            best_peer_gpu::Fake::new()
+                .with_driver("fake 1.0")
+                .with_device(best_peer_gpu::Fake::cuda_card("gpu-0", "Card A", 24, "12.4"))
+                .with_device(best_peer_gpu::Fake::host_cpu("cpu", 64)),
+        );
+        let bed = bed(
+            host,
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        let plain = json!({ "image": "busybox" });
+        let (s, b) = bed.send("j1", "RunJob", "run-job", plain.clone()).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let job = bed.events_of("j1", "JobStarted").await.last().unwrap().data["job"].clone();
+        let (s, b) = as_owner(&bed.app, "/owner/hold", &[("devices", "cpu"), ("now", "true")]).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["ended"], json!([{ "job": job }]));
+        let (s, b) = bed.send("j2", "RunJob", "run-job", plain).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "DEVICE_BUSY");
+        assert!(
+            !b["error"]["message"].as_str().unwrap().contains("queue_seconds"),
+            "{b}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cloud_places_on_the_member_whose_card_is_free_and_queues_again_an_order_whose_job_a_hold_stopped() {
+        let (a, b) = two_members().await;
+        let (key_a, key_b) = (a.key.clone(), b.key.clone());
+        let site = site(vec![(A, a), (B, b)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a), ("b", B, &key_b)])
+            .await;
+        let lab = site.live_cloud(&ws, "lab");
+        // a has the most room and its owner holds it: the order goes to b.
+        let (s, h) = as_owner(&site.members[0].app, "/owner/hold", &[]).await;
+        assert_eq!(s, StatusCode::OK, "{h}");
+        let hs = site.query(&ws, "get-hardware-state").await;
+        assert_eq!(availability_of(&hs, "lab/a/gpu-0")["state"], "busy");
+        assert_eq!(availability_of(&hs, "lab/b/gpu-0")["state"], "free");
+        site.order(&ws, "j1", 4, json!({})).await;
+        let started = site.events(&ws, "j1", "JobStarted").await;
+        assert_eq!(started.last().unwrap()["data"]["peer"], "b");
+        // Released, a takes the next; then a's owner takes it back from under that job: the order waits again and
+        // runs on b, with nothing asked of the client.
+        let (s, r) = as_owner(&site.members[0].app, "/owner/release", &[]).await;
+        assert_eq!(s, StatusCode::OK, "{r}");
+        let order = site.order(&ws, "j2", 4, json!({})).await;
+        let first = site.events(&ws, "j2", "JobStarted").await.last().unwrap()["data"].clone();
+        assert_eq!(first["peer"], "a");
+        let (s, h) = as_owner(&site.members[0].app, "/owner/hold", &[("now", "true")]).await;
+        assert_eq!(s, StatusCode::OK, "{h}");
+        let events = site.events_n(&ws, "j2", "JobQueued", 2).await;
+        let again = events.iter().filter(|e| e["type"] == "JobQueued").nth(1).unwrap()["data"].clone();
+        assert_eq!(again["job"], order["job"]);
+        assert_eq!(again["attempt"], 2);
+        assert_eq!(again["instead_of"], first["job"]);
+        assert!(again["reason"].as_str().unwrap().contains("owner of peer a"), "{again}");
+        assert!(
+            !events.iter().any(|e| e["type"] == "JobStopped"),
+            "{:?}",
+            type_names(&events)
+        );
+        lab.step(later(0)).await;
+        let events = site.events_n(&ws, "j2", "JobStarted", 2).await;
+        let second = events.iter().filter(|e| e["type"] == "JobStarted").nth(1).unwrap()["data"].clone();
+        assert_eq!(second["peer"], "b");
+    }
+
     #[tokio::test]
     async fn a_peers_queue_ends_a_wait_past_queue_seconds_stops_a_run_past_its_deadline_and_a_waiting_order_on_request()
     {
@@ -1787,6 +2602,7 @@ mod tests {
             Patience::default(),
             holdings.clone(),
             Confine::default(),
+            None,
         )
         .await;
         let auth = auth.unwrap_or_else(|| {
@@ -2036,6 +2852,48 @@ mod tests {
                 { "name": "huge", "memory_bytes": 100 * GB, "compute": { "api": "cuda", "version": "12" }, "share": 1.0, "price_per_second": 0.01 }
             ]
         })
+    }
+
+    #[tokio::test]
+    async fn a_size_is_not_available_now_while_its_only_card_is_its_owners_and_its_order_waits_for_the_release() {
+        let a = member_with("Card A", 24, "12.4", best_peer_gpu::Slicing::None).await;
+        let key_a = a.key.clone();
+        let site = site(vec![(A, a)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a)]).await;
+        let mut data = menu_of_three();
+        data["cloud"] = json!("lab");
+        let (s, b) = site.send(&ws, "m1", "SetMenu", "set-menu", data).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "m1", "MenuSetV1").await;
+        let small_now = |menus: &Value| {
+            menus["menus"][0]["sizes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|z| z["name"] == "small")
+                .unwrap()["available_now"]
+                .clone()
+        };
+        assert_eq!(small_now(&site.query(&ws, "get-menu").await), true);
+        let (s, h) = as_owner(&site.members[0].app, "/owner/hold", &[]).await;
+        assert_eq!(s, StatusCode::OK, "{h}");
+        assert_eq!(small_now(&site.query(&ws, "get-menu").await), false);
+        let (s, b) = site
+            .send(
+                &ws,
+                "j1",
+                "RunJob",
+                "run-job",
+                json!({ "cloud": "lab", "image": "busybox", "size": "small" }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        assert_eq!(site.events(&ws, "j1", "JobQueued").await[0]["data"]["waiting"], true);
+        let (s, r) = as_owner(&site.members[0].app, "/owner/release", &[]).await;
+        assert_eq!(s, StatusCode::OK, "{r}");
+        site.live_cloud(&ws, "lab").step(later(0)).await;
+        site.events(&ws, "j1", "JobStarted").await;
     }
 
     #[tokio::test]
@@ -6001,6 +6859,7 @@ mod tests {
             Patience::default(),
             holdings.clone(),
             Confine::default(),
+            None,
         )
         .await;
         let auth = Arc::new(Auth::ephemeral(

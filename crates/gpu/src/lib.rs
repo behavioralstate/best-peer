@@ -70,6 +70,44 @@ pub enum Slicing {
     Mig,
 }
 
+/// Whether a device takes new work now: free, or busy because its owner is using it or holds it. The hardware does
+/// not know this: the peer sets it on what it reports, and a cloud reads it from its members. `until` is when a busy
+/// device frees, where the peer knows it; `reason` is what the owner said, where they said anything.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum Availability {
+    #[default]
+    Free,
+    Busy {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+}
+
+impl Availability {
+    pub fn is_free(&self) -> bool {
+        *self == Availability::Free
+    }
+}
+
+/// One process on a device, as the driver reports it: its id on this host, the device memory it holds and its
+/// share of the device's compute in percent, each where the driver can say.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Process {
+    pub pid: u32,
+    pub memory_bytes: Option<u64>,
+    pub utilisation_pct: Option<u8>,
+}
+
+/// The processes on one device right now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Usage {
+    pub device: DeviceId,
+    pub processes: Vec<Process>,
+}
+
 /// One accelerator as the peer sees it at `Host::observed_at`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Device {
@@ -87,6 +125,9 @@ pub struct Device {
     /// Whether it is a whole card or one MIG instance of a card; a peer that does not say reports whole cards.
     #[serde(default)]
     pub slicing: Slicing,
+    /// Whether it takes new work now; free unless the peer says otherwise.
+    #[serde(default)]
+    pub availability: Availability,
 }
 
 /// Everything the hardware says about itself, taken at one instant.
@@ -172,9 +213,15 @@ pub enum GpuError {
     Invalid { field: &'static str, why: String },
 }
 
-/// What the door needs from the hardware. One method, because the door only ever asks for the whole picture.
+/// What the door needs from the hardware: the whole picture, and who is using each device.
 pub trait Gpu: Send + Sync {
     fn snapshot(&self) -> Result<Host, GpuError>;
+
+    /// The processes on each device, for telling the owner's use of a card from the peer's own. An adapter that
+    /// cannot tell reports none, and its devices are never found in use.
+    fn usage(&self) -> Result<Vec<Usage>, GpuError> {
+        Ok(Vec::new())
+    }
 }
 
 /// An in-memory [`Gpu`] for tests: whatever devices the test says are there, with memory the test can move.
@@ -182,6 +229,7 @@ pub trait Gpu: Send + Sync {
 pub struct Fake {
     devices: Mutex<BTreeMap<DeviceId, Device>>,
     driver: Option<String>,
+    usage: Mutex<BTreeMap<DeviceId, Vec<Process>>>,
 }
 
 impl Fake {
@@ -214,6 +262,7 @@ impl Fake {
             power_w: None,
             utilisation_pct: None,
             slicing: Slicing::None,
+            availability: Availability::Free,
         }
     }
 
@@ -233,6 +282,7 @@ impl Fake {
             power_w: Some(30.0),
             utilisation_pct: Some(0),
             slicing: Slicing::None,
+            availability: Availability::Free,
         }
     }
 
@@ -253,6 +303,7 @@ impl Fake {
             power_w: None,
             utilisation_pct: None,
             slicing: Slicing::Mig,
+            availability: Availability::Free,
         }
     }
 
@@ -272,6 +323,16 @@ impl Fake {
         d.memory.free_bytes = free_bytes;
         Ok(())
     }
+
+    /// Sets the processes on a device, as the owner starting or ending their own work would. An unknown device is
+    /// refused by name.
+    pub fn set_usage(&self, id: &DeviceId, processes: Vec<Process>) -> Result<(), GpuError> {
+        if !self.devices.lock().unwrap().contains_key(id) {
+            return Err(GpuError::NoSuchDevice(id.0.clone()));
+        }
+        self.usage.lock().unwrap().insert(id.clone(), processes);
+        Ok(())
+    }
 }
 
 impl Gpu for Fake {
@@ -281,6 +342,19 @@ impl Gpu for Fake {
             devices: self.devices.lock().unwrap().values().cloned().collect(),
             observed_at: SystemTime::now(),
         })
+    }
+
+    fn usage(&self) -> Result<Vec<Usage>, GpuError> {
+        Ok(self
+            .usage
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(device, processes)| Usage {
+                device: device.clone(),
+                processes: processes.clone(),
+            })
+            .collect())
     }
 }
 
@@ -308,6 +382,7 @@ mod tests {
                 power_w: None,
                 utilisation_pct: None,
                 slicing: Slicing::None,
+                availability: Availability::Free,
             })
     }
 

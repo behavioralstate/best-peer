@@ -37,8 +37,14 @@ pub fn past(since: Option<&str>, seconds: Option<u64>, now: OffsetDateTime) -> b
     }
 }
 
-/// Whether a device of `host` that runs a job could hold `needed` once nothing else held it there: an order that
-/// fits nowhere now waits only when room can come free.
+/// Whether a refusal with this code is one an order that asked to wait waits out: no room now, or a device its owner
+/// is using.
+pub fn waits_for(code: &str) -> bool {
+    code == "INSUFFICIENT_MEMORY" || code == "DEVICE_BUSY"
+}
+
+/// Whether a device of `host` that runs a job could hold `needed` once nothing else held it there and its owner was
+/// done with it: an order that fits nowhere now waits only when room can come free.
 pub fn could_ever_hold(host: &Host, needed: u64, pinned: Option<&str>) -> bool {
     let empty = Host {
         devices: host
@@ -47,6 +53,7 @@ pub fn could_ever_hold(host: &Host, needed: u64, pinned: Option<&str>) -> bool {
             .cloned()
             .map(|mut d| {
                 d.memory.free_bytes = d.memory.total_bytes;
+                d.availability = best_peer_gpu::Availability::Free;
                 d
             })
             .collect(),

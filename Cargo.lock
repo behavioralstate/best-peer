@@ -219,6 +219,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "rcgen",
+ "rustix",
  "rustls",
  "rustls-pki-types",
  "serde",

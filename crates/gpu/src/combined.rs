@@ -5,7 +5,7 @@
 
 use std::time::SystemTime;
 
-use crate::{Gpu, GpuError, Host};
+use crate::{Gpu, GpuError, Host, Usage};
 
 pub struct Combined {
     adapters: Vec<Box<dyn Gpu>>,
@@ -34,6 +34,14 @@ impl Gpu for Combined {
             observed_at: SystemTime::now(),
         })
     }
+
+    fn usage(&self) -> Result<Vec<Usage>, GpuError> {
+        let mut all = Vec::new();
+        for adapter in &self.adapters {
+            all.extend(adapter.usage()?);
+        }
+        Ok(all)
+    }
 }
 
 #[cfg(test)]
@@ -55,6 +63,7 @@ mod tests {
             power_w: None,
             utilisation_pct: Some(3),
             slicing: crate::Slicing::None,
+            availability: crate::Availability::Free,
         }
     }
 

@@ -124,6 +124,30 @@ with the name it was approved under: every request carrying it is refused from t
 open ends within seconds. The agent can also give its key back itself, with the `revoke-agent` command.
 `--accelerators-only` holds a key to the accelerators, never the host's CPU.
 
+**Your own use of the card comes first.** When you use the card yourself (a game, a render, a CUDA script), the
+peer sees it through the driver and takes no new work on it: once processes that are not its own hold more than
+2 GiB of the card or more than 30% of its compute for 30 seconds, `get-hardware-state` says the card is `busy`, a
+deploy or a job sent to it is refused with `DEVICE_BUSY`, and a job that asked to wait (`queue_seconds`) waits; five
+minutes after you stop, it is `free` again and what waited starts. Your desktop alone stays under that. What already
+runs on the card runs on. Clients read `busy`, never what you run, and the peer keeps no record of when you used it:
+your use is read live and never written to its log. To take the machine back yourself, at your machine:
+
+```bash
+best-peer hold --for 2h               # every device, the CPU included, takes no new work for two hours
+best-peer hold --while 4242           # while process 4242 runs; stays in the terminal, Ctrl-C releases
+best-peer hold --device <id> --now    # one device, and what runs on it ends now, each holder told
+best-peer release                     # every device takes work again
+```
+
+`--until 2026-10-20T22:00:00Z` names the end instead, and with neither a hold lasts until `best-peer release`; one by
+`--while` ends after twelve hours at most unless you say otherwise, and needs Linux: elsewhere hold with `--for` or
+`--until` and end it with `best-peer release`. When it ends it releases only its own hold: a device you held again
+meanwhile stays held. `--reason maintenance` is one line every approved
+client reads, and with `--now` the holders whose work ended read it after `held by its owner`; a hold needs none.
+A held CPU takes no job with no device either, and `--now` on it ends one. `--now` also ends what was starting on the device, its image still pulling, as soon as it starts if the hold still
+holds then. A hold is kept
+across a restart.
+
 A code waits ten minutes for you; the door holds at most five waiting from one client, sixteen from one address and 64 in all, and past that
 answers 503 with how long until the oldest expires. An IPv6 address is counted by its /64, which one client holds
 whole, and a connection whose address is not known is counted with every other such one. Loopback is not counted at
@@ -167,10 +191,10 @@ the terminal output of the peer, whatever happened: the release notes say what i
 | `crates/gpu` | The accelerator abstraction: a vendor-neutral snapshot of the host's devices (`Gpu`), each naming the compute APIs it offers (CUDA, ROCm, oneAPI, Metal, Vulkan, CPU) so a workload asks for an API and memory, never for a vendor. Ships the `Fake` tests run against. |
 | `crates/runtime` | The container runtime abstraction (`Runtime`): pull with progress, start with devices handed over by id and the ports published, stop, observe, and what the engine does on its own told as events. Ships the `Fake`. |
 | `crates/engine` | The inference engine abstraction (`Engine`): which engines serve a model (Ollama, vLLM), what to run for each, how a served model is made ready, with progress, and how it is asked to answer a conversation. Ships the `Fake`. |
-| `crates/peer` | The `best-peer` binary: the door over the three abstractions, with the peer's own commands, queries and events, its state folded from the events it told; the workspaces it hosts, each a tenant door with its clouds of peers, folded from their own logs; and `best-peer approve` and `best-peer revoke`, the operator's side of sign-in. |
+| `crates/peer` | The `best-peer` binary: the door over the three abstractions, with the peer's own commands, queries and events, its state folded from the events it told; the workspaces it hosts, each a tenant door with its clouds of peers, folded from their own logs; `best-peer approve` and `best-peer revoke`, the operator's side of sign-in; and `best-peer hold` and `release`, the owner taking the machine back. |
 | `crates/host` | The host itself as a device: a `Gpu` adapter reporting the CPU and system memory, so a peer with no accelerator serves the whole lifecycle. |
-| `crates/nvml` | The `Gpu` adapter for NVIDIA cards through NVML: memory, temperature, power, utilisation and the CUDA version, read live; the peer refuses to start without the driver unless told the host has none. |
-| `crates/docker` | The `Runtime` adapter over the Docker Engine API: NVIDIA devices handed over through the container toolkit by their NVML UUID. |
+| `crates/nvml` | The `Gpu` adapter for NVIDIA cards through NVML: memory, temperature, power, utilisation and the CUDA version, read live, and the processes on each card, so the peer tells its owner's use from its own; the peer refuses to start without the driver unless told the host has none. |
+| `crates/docker` | The `Runtime` adapter over the Docker Engine API: NVIDIA devices handed over through the container toolkit by their NVML UUID, and the processes of its containers as the engine's `top` lists them. |
 | `crates/native` | The `Runtime` adapter for engines already running on the host outside any container (an installed Ollama): a deploy binds to the engine's own port; jobs need Docker. |
 | `crates/engine-http` | The `Engine` adapter over the engines' own HTTP APIs. |
 
@@ -323,6 +347,23 @@ as `isolation`: the workload is placed only on a device offering at least that, 
 (`ISOLATION_UNAVAILABLE`, with what is offered and the fix) where none does. On a workspace's cloud each device says
 what its member says, a member that says nothing counting as `process`, and an order that asks for a level waits only
 for a device that offers it.
+
+A device takes new work only while its owner is not using it, and `get-hardware-state` says so as `availability`:
+`free`, or `busy` with `until` where the peer knows when it frees and `reason` where the owner gave one. The peer
+reads each card's processes through the driver every five seconds, the peer's own containers set aside by the
+container engine's `top`: processes not the peer's that hold more than `BEST_PEER_BUSY_MEMORY` (default `2G`) of the
+card or more than `BEST_PEER_BUSY_UTILISATION` percent (default 30) of its compute for `BEST_PEER_BUSY_AFTER` (default
+`30s`) make it busy, and `BEST_PEER_FREE_AFTER` (default `5m`) under both frees it; the start-up line says them.
+`BEST_PEER_BUSY=off` turns this off, for a server that runs another GPU service of its own; the other four are
+still checked at start. An engine installed on the
+host (`BEST_PEER_RUNTIME=native`) cannot name its processes, so a card it serves on is not read while it does. The
+owner's use is never an event: the log would otherwise become a dated record of when the owner sits at their own
+machine. `best-peer hold` and `best-peer release` are the owner's own act, with the admin token as `approve` and
+`revoke` take it, told as `DeviceHeldV1` and `DeviceReleasedV1`, which only a credential approved for all reads on the
+stream. A busy device is refused at ingest with `DEVICE_BUSY` (`until` and `reason` in the details where known); a
+`run-job` with `queue_seconds` waits for it; a cloud places on another member, a size on its menu is not
+`available_now` while every device that meets it is busy, and an order whose job a member's `hold --now` stopped
+waits again, once, as for a member lost.
 
 `BEST_PEER_MODEL_STORE` names a store of models beside the registry: Ollama's library (`blobs/` and `manifests/`,
 what `OLLAMA_MODELS` holds after an `ollama pull`). A deploy on Ollama of a model the store holds is served from it,

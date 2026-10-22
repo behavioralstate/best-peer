@@ -505,6 +505,12 @@ impl Auth {
             .cloned()
     }
 
+    /// Whether `proof` is the authority's word, as an approval or a revoke takes it: what the host asks of the person
+    /// at the machine for an act of its own.
+    pub async fn attest(&self, proof: &str) -> Result<(), OAuthError> {
+        self.approver.attest(proof.trim()).await
+    }
+
     /// Takes back every live credential `name` names, by its connection name or its holder id, on the authority's
     /// word: each is written again with `revoked_at` set, so a restart reads it back taken, and opens nothing from
     /// now on. No live credential by that name is refused with the live names; one the disk did not take is closed

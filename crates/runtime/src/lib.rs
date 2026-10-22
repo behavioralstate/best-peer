@@ -243,6 +243,11 @@ pub trait Runtime: Send + Sync {
     async fn isolation(&self) -> Isolation {
         Isolation::Process
     }
+    /// The host's ids of the processes this engine runs for the peer, so the peer tells its own use of a device from
+    /// its owner's. An engine that cannot tell says `None`.
+    async fn processes(&self) -> Option<Vec<u32>> {
+        None
+    }
     /// A disk of `bytes` for the job `id`, capped at that size so the job cannot fill the host, and the directory on
     /// the host where it is mounted (behavioralstate/spec#66). A runtime that makes none refuses, in words.
     async fn make_disk(&self, _id: &str, _bytes: u64) -> Result<std::path::PathBuf, RuntimeError> {
@@ -300,6 +305,9 @@ pub struct Fake {
     refusal: Mutex<Option<String>>,
     /// What it says stands between its containers and the host: a container, unless a test says otherwise.
     isolation: Isolation,
+    /// The host's ids of the processes its containers run, as a test sets them; `None` for an engine that cannot
+    /// tell.
+    processes: Mutex<Option<Vec<u32>>>,
     /// Where its jobs' disks are made, a directory of its own, and the room it says it has there.
     disks: std::path::PathBuf,
     disk_free: Mutex<u64>,
@@ -334,6 +342,7 @@ impl Fake {
             disk_free: Mutex::new(1 << 40),
             disks_made: Mutex::new(HashMap::new()),
             broken_disk: Mutex::new(None),
+            processes: Mutex::new(Some(Vec::new())),
             room_unread: Mutex::new(false),
         }
     }
@@ -356,6 +365,11 @@ impl Fake {
     /// Where the job `id`'s disk is, made or not.
     pub fn disk_of(&self, id: &str) -> std::path::PathBuf {
         self.disks.join(id)
+    }
+
+    /// Sets the host's ids of the processes its containers run, or `None` for an engine that cannot tell.
+    pub fn set_processes(&self, pids: Option<Vec<u32>>) {
+        *self.processes.lock().unwrap() = pids;
     }
 
     /// An engine that offers `isolation`, as a rootless one offers a user namespace.
@@ -617,6 +631,10 @@ impl Runtime for Fake {
 
     async fn isolation(&self) -> Isolation {
         self.isolation
+    }
+
+    async fn processes(&self) -> Option<Vec<u32>> {
+        self.processes.lock().unwrap().clone()
     }
 }
 

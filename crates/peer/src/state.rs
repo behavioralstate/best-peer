@@ -194,6 +194,8 @@ pub struct State {
     pub orders: BTreeMap<String, Order>,
     /// How many orders were ever queued: the next one's place in the order of arrival.
     arrivals: u64,
+    /// The holds the owner placed, by device: what `DeviceHeld` told and `DeviceReleased` has not ended.
+    pub holds: HashMap<String, crate::availability::Hold>,
 }
 
 impl State {
@@ -308,6 +310,33 @@ impl State {
         let text = |k: &str| data[k].as_str().unwrap_or_default().to_string();
         let correlation = e.effective_correlation();
         match e.r#type.as_str() {
+            "DeviceHeldV1" => {
+                for d in data["devices"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                {
+                    self.holds.insert(
+                        d.to_string(),
+                        crate::availability::Hold {
+                            id: correlation.clone(),
+                            until: data["until"].as_str().map(str::to_string),
+                            reason: data["reason"].as_str().map(str::to_string),
+                        },
+                    );
+                }
+            }
+            "DeviceReleasedV1" => {
+                for d in data["devices"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                {
+                    self.holds.remove(d);
+                }
+            }
             "DeploymentStarted" => {
                 let engine: Kind = match serde_json::from_value(data["engine"].clone()) {
                     Ok(k) => k,

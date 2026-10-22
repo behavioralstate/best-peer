@@ -4,12 +4,18 @@
 //! says the latter). Every snapshot reads the cards live: memory, temperature, power, utilisation, and the CUDA
 //! version the driver offers, which is what a workload asks for. A card the operator split with MIG is reported as
 //! its instances, each a device of its own with its `MIG-…` UUID and its own memory, and not as the card: the card
-//! runs nothing outside them. Thin; proven on a GPU host by hand, never unit-tested.
+//! runs nothing outside them. It also lists the processes on each whole card, with the memory and the share of its
+//! compute each holds, so the peer can tell its owner's use of the card from its own. Thin; proven on a GPU host by
+//! hand, never unit-tested.
 
-use std::time::SystemTime;
+use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use best_peer_gpu::{Compute, Device, DeviceId, Gpu, GpuError, Host, Memory, Slicing, Vendor};
+use best_peer_gpu::{
+    Availability, Compute, Device, DeviceId, Gpu, GpuError, Host, Memory, Process, Slicing, Usage, Vendor,
+};
 use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
+use nvml_wrapper::enums::device::UsedGpuMemory;
 use nvml_wrapper::error::NvmlError;
 use nvml_wrapper::{cuda_driver_version_major, cuda_driver_version_minor, Nvml};
 
@@ -70,6 +76,7 @@ impl Gpu for NvmlGpu {
                         power_w: None,
                         utilisation_pct: None,
                         slicing: Slicing::Mig,
+                        availability: Availability::Free,
                     });
                 }
                 continue;
@@ -91,6 +98,7 @@ impl Gpu for NvmlGpu {
                 power_w: d.power_usage().ok().map(|mw| mw as f32 / 1000.0),
                 utilisation_pct: d.utilization_rates().ok().map(|u| u.gpu.min(100) as u8),
                 slicing: Slicing::None,
+                availability: Availability::Free,
             });
         }
         Ok(Host {
@@ -98,5 +106,77 @@ impl Gpu for NvmlGpu {
             devices,
             observed_at: SystemTime::now(),
         })
+    }
+
+    /// The processes on each whole card. A card split with MIG is a data-centre card no owner sits at: it reports
+    /// none, and its instances are never found in use. A card whose driver does not list its processes is left out,
+    /// so it is read as unused and the other cards are still read.
+    fn usage(&self) -> Result<Vec<Usage>, GpuError> {
+        let lib = |e: NvmlError| GpuError::Library(e.to_string());
+        let count = self.nvml.device_count().map_err(lib)?;
+        let mut usage = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let d = self.nvml.device_by_index(index).map_err(lib)?;
+            if d.mig_mode().is_ok_and(|m| m.current == 1) {
+                continue;
+            }
+            let Ok(processes) = self.processes(&d) else {
+                continue;
+            };
+            usage.push(Usage {
+                device: DeviceId(d.uuid().map_err(lib)?),
+                processes,
+            });
+        }
+        Ok(usage)
+    }
+}
+
+/// How far back a process's share of a card's compute is read: the driver keeps samples of the last seconds, and the
+/// highest in this window is the process's share.
+const UTILISATION_WINDOW: Duration = Duration::from_secs(5);
+
+impl NvmlGpu {
+    /// The processes on one whole card: those running compute and those drawing (a game, the desktop), each once,
+    /// with the memory the driver says it holds and its highest share of the compute in the last seconds.
+    fn processes(&self, d: &nvml_wrapper::Device) -> Result<Vec<Process>, NvmlError> {
+        let mut memory: BTreeMap<u32, Option<u64>> = BTreeMap::new();
+        for p in d
+            .running_compute_processes()?
+            .into_iter()
+            .chain(d.running_graphics_processes()?)
+        {
+            let held = match p.used_gpu_memory {
+                UsedGpuMemory::Used(bytes) => Some(bytes),
+                UsedGpuMemory::Unavailable => None,
+            };
+            let entry = memory.entry(p.pid).or_insert(held);
+            *entry = match (*entry, held) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+        }
+        let since = SystemTime::now()
+            .checked_sub(UTILISATION_WINDOW)
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|t| t.as_micros() as u64)
+            .unwrap_or(0);
+        let mut share: BTreeMap<u32, u8> = BTreeMap::new();
+        // No sample in the window is a card nobody computed on: NotFound, not a failure.
+        if let Ok(samples) = d.process_utilization_stats(since) {
+            for s in samples {
+                let pct = s.sm_util.min(100) as u8;
+                let entry = share.entry(s.pid).or_insert(0);
+                *entry = (*entry).max(pct);
+            }
+        }
+        Ok(memory
+            .into_iter()
+            .map(|(pid, memory_bytes)| Process {
+                pid,
+                memory_bytes,
+                utilisation_pct: Some(share.get(&pid).copied().unwrap_or(0)),
+            })
+            .collect())
     }
 }

@@ -59,6 +59,7 @@ impl Gpu for HostCpu {
                 power_w: None,
                 utilisation_pct: Some(utilisation),
                 slicing: best_peer_gpu::Slicing::None,
+                availability: best_peer_gpu::Availability::Free,
             }],
             observed_at: SystemTime::now(),
         })

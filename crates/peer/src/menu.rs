@@ -161,9 +161,9 @@ impl Size {
     }
 
     /// Whether `d` has this size's room now. A size takes its device whole, a card or a MIG instance alike, so the
-    /// device must hold nothing of this cloud's and have the size's memory free.
+    /// device must hold nothing of this cloud's, have the size's memory free, and not be in its owner's use.
     fn room_on(&self, d: &Device, state: &State, taken: &HashSet<String>) -> bool {
-        if taken.contains(&d.id.0) {
+        if taken.contains(&d.id.0) || !d.availability.is_free() {
             return false;
         }
         let reserved = state.reserved_on(&d.id);

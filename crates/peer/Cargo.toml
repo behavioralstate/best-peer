@@ -48,6 +48,9 @@ webpki-roots = "1"
 
 tower = { version = "0.5", features = ["util"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", features = ["event", "process"] }
+
 [dev-dependencies]
 http-body-util = "0.1"
 tempfile = "3"

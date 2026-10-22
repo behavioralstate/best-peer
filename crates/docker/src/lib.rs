@@ -18,7 +18,8 @@ use best_peer_runtime::{
     ContainerId, Event, ImageRef, Isolation, Network, Progress, Published, Runtime, RuntimeError, Spec, Started,
 };
 use bollard::models::{
-    ContainerCreateBody, DeviceRequest, EventMessageTypeEnum, HostConfig, Mount, MountType, PortBinding,
+    ContainerCreateBody, ContainerTopResponse, DeviceRequest, EventMessageTypeEnum, HostConfig, Mount, MountType,
+    PortBinding,
 };
 use bollard::query_parameters::{
     CreateImageOptionsBuilder, EventsOptionsBuilder, ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
@@ -513,6 +514,27 @@ impl Runtime for DockerRuntime {
         }
     }
 
+    /// The processes of the peer's containers, as the engine's `top` lists them: ids in the engine's own view of
+    /// the host, which is the host's for an engine that does not put its containers in a process namespace of its
+    /// own. A container gone between the listing and its `top` runs nothing; any other failure is an engine that
+    /// cannot tell.
+    async fn processes(&self) -> Option<Vec<u32>> {
+        let mut pids = Vec::new();
+        for id in self.running().await.ok()? {
+            match self.docker.top_processes(&id.0, None).await {
+                Ok(top) => pids.extend(pids_of(&top)),
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404 | 409, ..
+                }) => {}
+                Err(e) => {
+                    tracing::warn!(container = %id.0, error = %e, "the container engine did not list a container's processes");
+                    return None;
+                }
+            }
+        }
+        Some(pids)
+    }
+
     async fn holds(&self, image: &ImageRef) -> Result<bool, RuntimeError> {
         match self.docker.inspect_image(&image.0).await {
             Ok(_) => Ok(true),
@@ -692,6 +714,18 @@ impl Runtime for DockerRuntime {
     }
 }
 
+/// The process ids in a container's `top`: the column titled PID, whatever else the engine lists beside it.
+fn pids_of(top: &ContainerTopResponse) -> Vec<u32> {
+    let Some(column) = top.titles.iter().flatten().position(|t| t == "PID") else {
+        return Vec::new();
+    };
+    top.processes
+        .iter()
+        .flatten()
+        .filter_map(|row| row.get(column)?.parse().ok())
+        .collect()
+}
+
 /// What the NVIDIA container toolkit is asked for to hand device `id` to a container: a whole card by its `GPU-`
 /// UUID, or one MIG instance by its `MIG-` UUID. Any other id is not an NVIDIA device this adapter can hand over.
 fn handed_over(id: &str) -> Result<DeviceRequest, RuntimeError> {
@@ -710,6 +744,24 @@ fn handed_over(id: &str) -> Result<DeviceRequest, RuntimeError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_containers_processes_are_read_from_its_pid_column_wherever_it_stands() {
+        let top = ContainerTopResponse {
+            titles: Some(vec!["UID".into(), "PID".into(), "CMD".into()]),
+            processes: Some(vec![
+                vec!["root".into(), "4120".into(), "ollama serve".into()],
+                vec!["root".into(), "not-a-pid".into(), "sh".into()],
+                vec!["root".into(), "4188".into(), "ollama runner".into()],
+            ]),
+        };
+        assert_eq!(pids_of(&top), vec![4120, 4188]);
+        let untitled = ContainerTopResponse {
+            titles: Some(vec!["UID".into(), "CMD".into()]),
+            processes: Some(vec![vec!["root".into(), "sh".into()]]),
+        };
+        assert!(pids_of(&untitled).is_empty());
+    }
+
     use super::*;
     use std::time::Duration;
 
