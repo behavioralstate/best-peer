@@ -7,16 +7,18 @@ before changing anything, and keep it the current rule when a change moves the p
   Status field: `gh project item-edit`, or the board itself), and its epic to In progress if it was not; once its code is
   merged and released, with only a host proof or the owner's acceptance left, move it to In review (SDLC.md
   section 1).
-- Every change is a branch and a pull request to `main`, squash-merged as one commit, the owner's included. The
-  subject is one plain sentence saying what changed and why, with no type prefix (`feat:`, `fix:`); the one prefix
-  is `Review:` on a commit that answers the review, as the history has it. Open work is an issue on the
-  Behavioralstate board, never a plan file or a `TODO`.
-- Before the push, the local proof: `scripts/gate.sh all` (`pwsh scripts/gate.ps1 all` on Windows) must end in
-  `GATE GREEN`. CI runs the same script, so what passes here passes there.
-- Once the pull request is open, its review: `/best-review` runs `.claude/skills/best-reviewer` on a separate worker
-  with the model that skill pins, posts the findings on the pull request, and this session answers every one on its
-  thread with a fix and a test, or the reason it stands. The owner merges.
+- Every change is made on `main` and pushed there, the owner's and every maintainer's; no branch and no pull request
+  is needed. The subject is one plain sentence saying what changed and why, with no type prefix (`feat:`, `fix:`);
+  the one prefix is `Review:` on a commit that answers the review, as the history has it. Open work is an issue on
+  the Behavioralstate board, never a plan file or a `TODO`. `git pull --rebase` before the gates.
+- Two gates before every push, both mandatory. First the local proof: `scripts/gate.sh all` (`pwsh scripts/gate.ps1
+  all` on Windows) must end in `GATE GREEN`; CI runs the same script on the push. Then the review: `/best-review`
+  always runs `.claude/skills/best-reviewer` on a separate worker with the model that skill pins, on what `main`
+  holds that `origin/main` does not, and this session fixes every finding on `main` with a test, in a `Review:`
+  commit that names them, or sets it aside with its reason in that message. Nothing is pushed until both are done.
+- A contributor without write access sends a pull request from a fork; `/best-review <number>` reviews it the same
+  way and posts the findings there, and a maintainer merges it once they are answered and CI is green.
 - A behaviour the spec does not ask for is an entry on the spec follow-ups issue, behavioralstate/spec#37, before it
-  is a pull request. An adapter is proven on a host by hand, with the proof on the slice's issue.
+  is code. An adapter is proven on a host by hand, with the proof on the slice's issue.
 - The README's "Try it on your machine" and Run sections move in the same commit as the variable, the check at start,
   the command or the sign-in they describe.

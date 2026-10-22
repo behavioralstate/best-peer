@@ -13,11 +13,11 @@
 - The board's Status says where each issue is:
   - **Backlog** until its first change.
   - **In progress** from the first change, before it is made, until its code is in a release: while the work is
-    built, while its pull requests are open, and after they merge until the release that carries them.
+    built, and after it is pushed until the release that carries it.
   - **In review** once its code is in a release, when all that is left is the proof on a host or the owner's
     acceptance.
   - **Done** when the issue closes, every "Done when" ticked. An issue with nothing to prove on a host or for the
-    owner to accept closes when its last pull request merges, and goes from In progress to Done.
+    owner to accept closes when its last change is pushed, and goes from In progress to Done.
   - An epic is **Backlog** until any of its issues is In progress, In review or Done, **In progress** from then
     until it closes, and **Done** when it closes, which is when its last issue does. Ready is not a status an epic
     or a slice holds.
@@ -54,26 +54,29 @@
 
 ## 4. Ship
 
-- **Every change is a pull request to `main`, the owner's included.** `main` is protected: a pull request with `ci`
-  green is the only way onto it, nothing is force-pushed, and the one exception is the release commit below, which
-  the owner's bypass of the protection lets through. A piece of work is a branch, and lands as one commit on `main`
-  (a squash merge), the subject saying what changed and why, ending with the assistant's attribution line.
-- **Three gates, in this order; nothing moves on while one is open.**
-  1. **The local proof**, before the branch is pushed: section 3 on the maintainer's machine, `scripts/gate.sh all`
-     (`pwsh scripts/gate.ps1 all` on Windows) ending in `GATE GREEN`; a change that touches a host is proven on that
-     host by hand, with the proof on the issue.
-  2. **CI** on the pull request: the same script, on the fakes; a red check blocks the merge.
-  3. **The review**: `/best-review` on the branch, run by the author's assistant once the pull request is open. It is
-     the repository's own skill (`.claude/skills/best-review`, in every checkout): a reviewer that has not seen the
-     conversation, on a separate worker with the model `.claude/skills/best-reviewer` pins (Sonnet 5.5, high effort),
-     reads the pull request and posts its findings as a comment-only review; the author's session verifies each one
-     and answers it on its thread with a fix and a test, or the reason it stands; nothing is dropped silently. A push
-     after that is reviewed again, for what is new. The owner merges.
-- **The merge is what runs.** A host run by the owner builds `main` and runs it; the sha is its version.
+- **Every change is made on `main` and pushed there.** A maintainer commits on `main`, one commit per piece of work
+  (or a few, when they are told apart better that way), the subject saying what changed and why, ending with the
+  assistant's attribution line; the one prefix is `Review:` on a commit that answers the review. No branch and no
+  pull request is needed; a contributor without write access sends a pull request (section 5).
+- **Two gates before every push, in this order, both mandatory; nothing is pushed while one is open.**
+  1. **The local proof**: section 3 on the maintainer's machine, `scripts/gate.sh all` (`pwsh scripts/gate.ps1 all`
+     on Windows) ending in `GATE GREEN`; a change that touches a host is proven on that host by hand, with the proof
+     on the issue.
+  2. **The review**: `/best-review`, run by the author's assistant on what `main` holds that `origin/main` does not.
+     It is the repository's own skill (`.claude/skills/best-review`, in every checkout), and it always runs the
+     `best-reviewer` skill (`.claude/skills/best-reviewer`): a reviewer that has not seen the conversation, on a
+     separate worker with the model that skill pins (Sonnet 5.5, high effort). The author's session verifies each
+     finding and fixes it on `main` with a test, in a `Review:` commit whose message names the findings, or sets it
+     aside with its reason in that message; nothing is dropped silently. A finding's fix is proven by the local gate
+     again, and what the fix itself changed is reviewed again before the push.
+- **Pull first.** The push lands on top of what others pushed: `git pull --rebase` before the gates, and again before
+  the push if `origin/main` moved meanwhile, with the gates run again when what arrived touches the same code.
+- **CI runs on the push**: the same script, on the fakes. A red `main` is fixed before anything else is pushed.
+- **The push is what runs.** A host run by the owner builds `main` and runs it; the sha is its version.
 - **A release is a tag.** `scripts/release.sh <version> -m "<what it is>"` runs only on a clean `main` level with
   origin, so everything it releases has passed the gates; it bumps the one version in `Cargo.toml` (every crate
   inherits it), commits `Release <version>`, which holds nothing but the version and is the one commit that skips the
-  gates and goes onto `main` directly, by the owner, tags `v<version>` with the message and pushes both. The `release` workflow refuses a tag that is
+  gates, tags `v<version>` with the message and pushes both. The `release` workflow refuses a tag that is
   not on `main`, not on a `Release <version>` commit or not equal to `Cargo.toml`, waits for `ci` to pass on that
   commit, runs the checks on the locked tree, builds the binary for Linux x86_64 (glibc 2.35 or newer: the driver's
   library is loaded at run time, which a static binary cannot do), Windows x86_64 and macOS Apple silicon, checks
@@ -85,18 +88,25 @@
   with a fix. A change to the workflow is tried with its `workflow_dispatch`, which builds and keeps the archives as
   run artifacts and publishes nothing, whatever ref it is started from.
 
-## 5. A change from another maintainer
+## 5. A change from another maintainer, or from a contributor
 
-- **The same pull request, from a branch of this repository**: a maintainer has write access and branches here; one
-  without it forks. One per need the implementation proved, held to sections 2, 3 and 4 as any change is. Its
-  description names the spec text it satisfies or the entry it adds to the spec follow-ups issue; a behaviour the
-  spec does not ask for is that entry first, so the spec and every implementation of it move together, and never a
-  surface of this implementation alone.
+- **A maintainer works as the owner does**: on `main`, with write access, the two gates before every push. One change
+  per need the implementation proved, held to sections 2, 3 and 4 as any change is. Its commit names the spec text it
+  satisfies or the entry it adds to the spec follow-ups issue; a behaviour the spec does not ask for is that entry
+  first, so the spec and every implementation of it move together, and never a surface of this implementation alone.
+- **A contributor without write access sends a pull request from a fork**, held to the same sections. A maintainer
+  runs `/best-review <number>` on it, which runs the `best-reviewer` skill the same way, posts the findings on the pull
+  request and leaves them for the contributor to answer; the maintainer runs the local gate on its head and merges it
+  as one commit once the findings are answered and CI is green. A fork's first workflow run waits for a maintainer's
+  approval on the Actions tab.
 - **A checkout that runs ahead of `main` on a host is that host's owner's to run**; what the spec promises of it is
   only what `main` proves.
 
 ## 6. What we do not do
 
-- No release of a commit the gates have not passed, the release commit itself excepted; no tag made by hand.
-- No push to `main` but the release commit; no force-push; no merge with an unanswered review finding or a red check.
+- No push without `GATE GREEN` and the review: `/best-review` and its `best-reviewer` run on what is pushed, every
+  finding fixed or set aside with its reason; the release commit alone skips them.
+- No release of a commit the gates have not passed; no tag made by hand.
+- No force-push to `main`; no push on top of a red `main`; no merge of a pull request with an unanswered finding or a
+  red check.
 - No plan file, no `TODO`, no dated narrative: open work is an issue.
