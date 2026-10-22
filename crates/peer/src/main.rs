@@ -8943,6 +8943,55 @@ mod tests {
             .await;
         assert_eq!(s, StatusCode::CREATED, "{b}");
         site.events(&ws, "z1", "CloudArchivedV1").await;
+        // Run by hand from here, as the door runs them: a command at the root, sent by `hash`, and what it was told.
+        let at_root = |id: &str, hash: &str| {
+            best_peer_door::Emitter::new(log.clone(), SERVICE, id, Arc::new(std::collections::HashMap::new()))
+                .with_key(&format!("{hash}:{id}"))
+        };
+        let command = |base: &str, id: &str, r#type: &str, schema: &str, data: Value| {
+            serde_json::from_str::<best_peer_door::Envelope>(&envelope(base, id, r#type, schema, data)).unwrap()
+        };
+        let told_under = |on: &EventLog, correlation: &str| {
+            let mut told = Vec::new();
+            on.replay(|e| {
+                if e.effective_correlation() == correlation {
+                    told.push((
+                        e.r#type.clone(),
+                        e.data["reason"].as_str().unwrap_or_default().to_string(),
+                    ));
+                }
+            });
+            told
+        };
+        let hash_of = |key: &str| site.auth.authenticate(key).unwrap().hash;
+        // A cloud configured after an archive was admitted is seen as it runs: it fails, and the workspace stays.
+        let archive_ws = command(
+            EP,
+            "x8",
+            "ArchiveWorkspace",
+            "archive-workspace",
+            json!({ "workspace": ws }),
+        );
+        let who = site.auth.authenticate(&owner).unwrap();
+        <workspace::Workspaces as domain::Membership>::admit_archive(&site.workspaces, archive_ws.clone(), &who)
+            .unwrap();
+        site.cloud(&ws, "k2", "lab", &[("a", A, &key_a)]).await;
+        <workspace::Workspaces as domain::Membership>::archive(
+            site.workspaces.clone(),
+            archive_ws,
+            at_root("x8", &hash_of(&owner)),
+        )
+        .await;
+        let told = told_under(&log, "x8");
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert_eq!(told[0].0, "CommandFailed");
+        assert!(told[0].1.contains("live cloud(s) lab"), "{told:?}");
+        assert!(site.workspaces.get(&ws).is_some());
+        let (s, b) = site
+            .send(&ws, "z2", "ArchiveCloud", "archive-cloud", json!({ "cloud": "lab" }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "z2", "CloudArchivedV1").await;
         let members_file = data
             .path()
             .join("workspaces")
@@ -8988,47 +9037,84 @@ mod tests {
         let (_, w) = get_as(&site.app, "", &carol, "/queries/get-workspaces").await;
         assert_eq!(w["invitations"], json!([]), "an invitation into it goes with it");
         // A command admitted before the archive and run after it changes nothing, and fails saying why.
-        let invite = serde_json::from_str::<best_peer_door::Envelope>(&envelope(
-            EP,
-            "i9",
-            "InviteMember",
-            "invite-member",
-            json!({ "workspace": ws, "identity": carol_id }),
-        ))
-        .unwrap();
-        let owner_hash = site.auth.authenticate(&owner).unwrap().hash;
-        let at_root =
-            best_peer_door::Emitter::new(log.clone(), SERVICE, "i9", Arc::new(std::collections::HashMap::new()))
-                .with_key(&format!("{owner_hash}:i9"));
-        <workspace::Workspaces as domain::Membership>::invite(site.workspaces.clone(), invite, at_root).await;
-        let configure = serde_json::from_str::<best_peer_door::Envelope>(&envelope(
-            &p,
-            "k9",
-            "ConfigureCloud",
-            "configure-cloud",
-            json!({ "cloud": "lab", "members": [{ "peer": "a", "endpoint": A }] }),
-        ))
-        .unwrap();
+        let membership = site.workspaces.clone();
+        <workspace::Workspaces as domain::Membership>::invite(
+            membership.clone(),
+            command(
+                EP,
+                "i9",
+                "InviteMember",
+                "invite-member",
+                json!({ "workspace": ws, "identity": carol_id }),
+            ),
+            at_root("i9", &hash_of(&owner)),
+        )
+        .await;
+        <workspace::Workspaces as domain::Membership>::accept(
+            membership.clone(),
+            command(
+                EP,
+                "a9",
+                "AcceptInvitation",
+                "accept-invitation",
+                json!({ "workspace": ws }),
+            ),
+            at_root("a9", &hash_of(&carol)),
+        )
+        .await;
+        <workspace::Workspaces as domain::Membership>::leave(
+            membership.clone(),
+            command(
+                EP,
+                "l9",
+                "LeaveWorkspace",
+                "leave-workspace",
+                json!({ "workspace": ws }),
+            ),
+            at_root("l9", &hash_of(&bob)),
+        )
+        .await;
+        <workspace::Workspaces as domain::Membership>::archive(
+            membership,
+            command(
+                EP,
+                "x9",
+                "ArchiveWorkspace",
+                "archive-workspace",
+                json!({ "workspace": ws }),
+            ),
+            at_root("x9", &hash_of(&owner)),
+        )
+        .await;
         let on_ws = best_peer_door::Emitter::new(
             strong.log.clone(),
             SERVICE,
             "k9",
             Arc::new(std::collections::HashMap::new()),
         );
-        <workspace::Workspace as domain::Clouds>::configure(strong.clone(), configure, on_ws).await;
-        for (on, correlation) in [(&log, "i9"), (&strong.log, "k9")] {
-            let mut told = Vec::new();
-            on.replay(|e| {
-                if e.effective_correlation() == correlation {
-                    told.push((
-                        e.r#type.clone(),
-                        e.data["reason"].as_str().unwrap_or_default().to_string(),
-                    ));
-                }
-            });
-            assert_eq!(told.len(), 1, "{told:?}");
-            assert_eq!(told[0].0, "CommandFailed");
-            assert!(told[0].1.contains("archived before this ran"), "{told:?}");
+        <workspace::Workspace as domain::Clouds>::configure(
+            strong.clone(),
+            command(
+                &p,
+                "k9",
+                "ConfigureCloud",
+                "configure-cloud",
+                json!({ "cloud": "lab", "members": [{ "peer": "a", "endpoint": A }] }),
+            ),
+            on_ws,
+        )
+        .await;
+        for (on, correlation, why) in [
+            (&log, "i9", "archived before this ran"),
+            (&log, "a9", "archived before this ran"),
+            (&log, "l9", "archived before this ran"),
+            (&log, "x9", "archived already"),
+            (&strong.log, "k9", "archived before this ran"),
+        ] {
+            let told = told_under(on, correlation);
+            assert_eq!(told.len(), 1, "{correlation}: {told:?}");
+            assert_eq!(told[0].0, "CommandFailed", "{correlation}");
+            assert!(told[0].1.contains(why), "{correlation}: {told:?}");
         }
         assert!(!members_file.exists());
         drop(strong);
@@ -9060,29 +9146,21 @@ mod tests {
 
         // A create its credential was taken back before it ran makes nothing.
         let gone = key(&site.app).await;
-        let gone_hash = site.auth.authenticate(&gone).unwrap().hash;
+        let gone_hash = hash_of(&gone);
         site.auth.revoke_own(&gone_hash).unwrap();
-        let create = serde_json::from_str::<best_peer_door::Envelope>(&envelope(
-            EP,
-            "w9",
-            "CreateWorkspace",
-            "create-workspace",
-            json!({ "name": "Late" }),
-        ))
-        .unwrap();
-        let at_root =
-            best_peer_door::Emitter::new(log.clone(), SERVICE, "w9", Arc::new(std::collections::HashMap::new()))
-                .with_key(&format!("{gone_hash}:w9"));
-        <workspace::Workspaces as domain::Membership>::create(site.workspaces.clone(), create, at_root).await;
-        let mut told = Vec::new();
-        log.replay(|e| {
-            if e.effective_correlation() == "w9" {
-                told.push((
-                    e.r#type.clone(),
-                    e.data["reason"].as_str().unwrap_or_default().to_string(),
-                ));
-            }
-        });
+        <workspace::Workspaces as domain::Membership>::create(
+            site.workspaces.clone(),
+            command(
+                EP,
+                "w9",
+                "CreateWorkspace",
+                "create-workspace",
+                json!({ "name": "Late" }),
+            ),
+            at_root("w9", &gone_hash),
+        )
+        .await;
+        let told = told_under(&log, "w9");
         assert_eq!(told.len(), 1, "{told:?}");
         assert_eq!(told[0].0, "CommandFailed");
         assert!(told[0].1.contains("taken back"), "{told:?}");
