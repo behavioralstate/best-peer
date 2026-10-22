@@ -267,9 +267,9 @@ kept deleted, and it no longer counts against the owner's), `invite-member` (the
 the opaque id of their credential that `get-workspaces` shows them), `accept-invitation` and `leave-workspace`
 (refused while one still holds a workload there); owner and member are the only roles, and the owner stays. The
 root's events tell a credential the membership facts addressed to it by identity (the workspace it made, the
-invitations it received or sent, its own joins and leaves) and nothing of another workspace, whatever its grant;
-a workspace's own stream tells its members its membership, its clouds and its peers, and each holder its own
-workloads. In a workspace: `configure-cloud` names a **cloud**, a
+invitations it received or sent, its own joins and leaves, and the archive of a workspace it owned) and nothing of
+another workspace, whatever its grant; a workspace's own stream tells its members its membership, its clouds and its
+peers, and each holder its own workloads, and ends when the workspace is archived. In a workspace: `configure-cloud` names a **cloud**, a
 pool of peers as `peer` and `endpoint`, and makes or changes it (one machine serves one cloud per workspace, and a
 peer still holding a workload is not removed); `archive-cloud` retires an empty one, and `get-clouds` lists them
 with each peer's state. The cloud signs in to each member by the device flow and logs the code to approve there;
