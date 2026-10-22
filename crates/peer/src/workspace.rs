@@ -350,7 +350,7 @@ async fn tenant_manifest(State(reg): State<Arc<Workspaces>>, UrlPath(id): UrlPat
         None => BestError::not_found(
             "NO_SUCH_WORKSPACE",
             format!(
-                "no workspace {id} on this door. A credential opens the workspaces it belongs to: sign in at the root manifest's deviceAuthorizationUrl, then get-workspaces at the root lists yours with each one's manifest, and create-workspace makes one"
+                "no workspace {id} on this door. A credential opens the workspaces it created or joined: get-workspaces at the root, with that credential, lists them with each one's manifest, and create-workspace makes one. A new sign-in at the root manifest's deviceAuthorizationUrl is a new identity, a member of none until it creates or joins one"
             ),
         )
         .into_response(),
@@ -380,7 +380,7 @@ async fn dispatch(
     let Some(ws) = ws else {
         return BestError::not_found(
             "NO_SUCH_WORKSPACE",
-            format!("no workspace {id} opens to this credential: get-workspaces at the root lists yours, and accept-invitation joins one you were invited into. A workspace opens to the credential that created it and to its members' own; a sign-in is a new identity, a member of nothing"),
+            format!("no workspace {id} opens to this credential: get-workspaces at the root lists yours, and accept-invitation joins one you were invited into. Only the credential that created a workspace, and those that joined it, open it; a new sign-in is a new identity, so act with the credential that made or joined the workspace"),
         )
         .with_details(json!({ "workspace": id }))
         .into_response();

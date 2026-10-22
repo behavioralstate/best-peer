@@ -4591,7 +4591,12 @@ mod tests {
         let (s, e) = get_as(&site.app, &p1, &bob, "/queries/get-clouds").await;
         assert_eq!(s, StatusCode::NOT_FOUND, "{e}");
         assert_eq!(e["error"]["code"], "NO_SUCH_WORKSPACE");
-        assert!(e["error"]["message"].as_str().unwrap().contains("get-workspaces"));
+        let said = e["error"]["message"].as_str().unwrap();
+        assert!(said.contains("get-workspaces"), "{said}");
+        assert!(
+            said.contains("a new sign-in is a new identity") && said.contains("the credential that made or joined"),
+            "a stranger is told to act with the credential that made or joined the workspace: {said}"
+        );
         let (s, _) = get_as(&site.app, &p1, "", "/queries/get-clouds").await;
         assert_eq!(s, StatusCode::UNAUTHORIZED, "no credential: the door's 401 first");
         let (s, e) = send_as(

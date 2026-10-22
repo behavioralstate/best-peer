@@ -136,7 +136,7 @@ its own device then serves nothing real, and the clouds are what the door is for
 person says "create a workspace called research, then configure a cloud called lab in it with the peers
 a=https://<machine a>:7777 and b=https://<machine b>:7777". The agent sends `create-workspace` at the root, reads
 the workspace's endpoint from `get-workspaces`, and sends `configure-cloud` there, with the credential it signed in
-with: a new sign-in is a new identity, and no member (through best-mcp, the workspace is the connection
+with: a new sign-in is a new identity, and no member (through best-mcp 2.6.0 or later, the workspace is the connection
 `<name>/<workspace id>`). The door signs in to each
 machine as any agent would and logs the code for its owner: `to admit cloud lab of workspace ws-… on a, run on that
 machine: best-peer approve <code>`. Once admitted, the machine is `up` in the workspace's `get-clouds` and its
