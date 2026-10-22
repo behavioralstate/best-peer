@@ -1797,30 +1797,40 @@ impl Peer {
     /// Ends the work of `holders`, whose credentials whoever runs this peer took back: their orders that wait end
     /// before they start, their jobs are stopped and their deployments ended, each told under its own correlation
     /// with [`TAKEN_BACK`] as the reason. One the engine cannot stop now is left as it was, logged and answered, and
-    /// every step of the queue tries again, as it does for what started or queued after the take-back.
+    /// every step of the queue tries again, as it does for what started or queued after the take-back. One another
+    /// stop is already ending is answered too, as not ended yet, since that stop may still fail.
     pub async fn end_work_of(&self, holders: &[String]) -> Vec<String> {
         let mut left = Vec::new();
         self.taken_back.lock().unwrap().extend(holders.iter().cloned());
         let theirs = |h: &str| holders.iter().any(|x| x == h);
         let (orders, jobs, deployments) = {
             let mut s = self.state.lock().unwrap();
-            let orders: Vec<crate::state::Order> = s
-                .waiting()
-                .into_iter()
-                .filter(|o| theirs(&o.holder) && self.claim_end(&o.id).is_ok())
-                .collect();
+            let mut orders = Vec::new();
+            for o in s.waiting().into_iter().filter(|o| theirs(&o.holder)) {
+                match self.claim_end(&o.id) {
+                    Ok(()) => orders.push(o),
+                    Err(_) => left.push(o.id),
+                }
+            }
             let mut jobs = Vec::new();
-            for j in s.jobs.values_mut() {
-                if theirs(&j.holder) && j.phase == JobPhase::Running {
-                    j.phase = JobPhase::Stopping;
-                    jobs.push(j.clone());
+            for j in s.jobs.values_mut().filter(|j| theirs(&j.holder)) {
+                match j.phase {
+                    JobPhase::Running => {
+                        j.phase = JobPhase::Stopping;
+                        jobs.push(j.clone());
+                    }
+                    JobPhase::Stopping => left.push(j.id.clone()),
+                    _ => {}
                 }
             }
             let mut deployments = Vec::new();
-            for d in s.deployments.values_mut() {
-                if theirs(&d.holder) && d.phase != Phase::Ending {
-                    d.phase = Phase::Ending;
-                    deployments.push(d.clone());
+            for d in s.deployments.values_mut().filter(|d| theirs(&d.holder)) {
+                match d.phase {
+                    Phase::Ending => left.push(d.id.clone()),
+                    _ => {
+                        d.phase = Phase::Ending;
+                        deployments.push(d.clone());
+                    }
                 }
             }
             (orders, jobs, deployments)

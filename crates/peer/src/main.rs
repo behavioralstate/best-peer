@@ -1590,6 +1590,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_job_another_stop_is_ending_at_the_revoke_is_answered_not_ended_yet_and_ended_if_that_stop_fails() {
+        let bed = bed(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        let taken = key_with(&bed.app, Some("jobs"), None).await;
+        let (s, b) = send_as(
+            &bed.app,
+            "",
+            &taken,
+            "j1",
+            "RunJob",
+            "run-job",
+            json!({ "image": "busybox", "memory_bytes": 2 * GB }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let job = bed.events_of("j1", "JobStarted").await.last().unwrap().data["job"].clone();
+        let id = job.as_str().unwrap().to_string();
+        bed.peer.state.lock().unwrap().jobs.get_mut(&id).unwrap().phase = state::JobPhase::Stopping;
+        let answer = revoke_by_operator(&bed, &taken, false).await;
+        assert_eq!(answer["work_ended"], false, "{answer}");
+        assert_eq!(answer["not_ended_yet"], json!([job]), "{answer}");
+        // That stop failed: the job runs again, and the next step ends it.
+        bed.peer.state.lock().unwrap().jobs.get_mut(&id).unwrap().phase = state::JobPhase::Running;
+        bed.peer.step(time::OffsetDateTime::now_utc()).await;
+        let stopped = bed.events_of("j1", "JobStopped").await;
+        assert_eq!(
+            stopped.last().unwrap().data,
+            json!({ "job": job, "reason": lifecycle::TAKEN_BACK })
+        );
+    }
+
+    #[tokio::test]
     async fn a_job_the_engine_did_not_stop_at_the_revoke_is_stopped_after_a_restart() {
         let log = Arc::new(EventLog::ephemeral());
         let runtime = Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![]));

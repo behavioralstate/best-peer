@@ -455,11 +455,14 @@ impl Auth {
     }
 
     /// Ends the work of the credentials `taken`, as the service said with [`Auth::when_taken_back`], and answers what
-    /// it could not end yet.
+    /// it could not end yet. The ending runs as a task of its own, so a caller that goes away before it is done (a
+    /// request dropped with its connection) never leaves work claimed for an ending that stopped half way.
     pub async fn end_work(&self, taken: &[Credential]) -> Vec<String> {
         let ends = self.ends_work.lock().unwrap().clone();
         match ends {
-            Some(ends) => ends(taken.iter().map(Credential::holder).collect()).await,
+            Some(ends) => tokio::spawn(ends(taken.iter().map(Credential::holder).collect()))
+                .await
+                .unwrap_or_default(),
             None => Vec::new(),
         }
     }
@@ -545,29 +548,41 @@ impl Auth {
     /// Takes back every live credential `name` names, by its connection name or its holder id, on the authority's
     /// word: each is written again with `revoked_at` set, so a restart reads it back taken, and opens nothing from
     /// now on. With `ends_work`, the line says its work ended with it, so a restart ends again what of it still runs.
-    /// No live credential by that name is refused with the live names; one the disk did not take is closed now and
-    /// said so (500), and a revoke again writes it.
+    /// No live credential by that name is refused with the live names; one the disk did not take is closed now, its
+    /// work ended all the same with `ends_work`, and said so (500), and a revoke again writes it.
     pub async fn revoke(&self, name: &str, proof: &str, ends_work: bool) -> Result<Vec<Credential>, OAuthError> {
         self.approver.attest(proof).await?;
         let name = name.trim();
-        self.take_back(|c| c.name == name || holder_of_hash(&c.hash) == name, ends_work)
-            .map_err(|why| match why {
-                TakeBack::NoneLive(live) => OAuthError::invalid_request(format!(
-                    "no live credential is named {name}: the live ones are {}",
-                    if live.is_empty() {
-                        "none".to_string()
-                    } else {
-                        live.join(", ")
-                    }
-                )),
-                TakeBack::Unwritten(e) => OAuthError {
+        match self.take_back(|c| c.name == name || holder_of_hash(&c.hash) == name, ends_work) {
+            Ok(taken) => Ok(taken),
+            Err(TakeBack::NoneLive(live)) => Err(OAuthError::invalid_request(format!(
+                "no live credential is named {name}: the live ones are {}",
+                if live.is_empty() {
+                    "none".to_string()
+                } else {
+                    live.join(", ")
+                }
+            ))),
+            Err(TakeBack::Unwritten(e, taken)) => {
+                let work = match ends_work {
+                    false => "its work runs on, as asked".to_string(),
+                    true => match self.end_work(&taken).await {
+                        left if left.is_empty() => "its work is ended".to_string(),
+                        left => format!(
+                            "its work is ended but for {}, tried again at every step",
+                            left.join(", ")
+                        ),
+                    },
+                };
+                Err(OAuthError {
                     status: 500,
                     error: "server_error",
                     description: format!(
-                        "{name} is taken back now, but the line that keeps it taken was not written ({e}): it would open again after a restart; free the disk and revoke {name} again"
+                        "{name} is taken back now and {work}, but the line that keeps it taken was not written ({e}): it would open again after a restart; free the disk and revoke {name} again"
                     ),
-                },
-            })
+                })
+            }
+        }
     }
 
     /// Takes back the credential with this hash, on its own word (the agent's revoke-agent command).
@@ -575,7 +590,7 @@ impl Auth {
         match self.take_back(|c| c.hash == hash, false) {
             Ok(mut taken) => Ok(taken.remove(0)),
             Err(TakeBack::NoneLive(_)) => Err("this credential is not live".into()),
-            Err(TakeBack::Unwritten(e)) => Err(format!(
+            Err(TakeBack::Unwritten(e, _)) => Err(format!(
                 "taken back now, but the line that keeps it taken was not written ({e}): it would open again after a restart until its owner revokes it again"
             )),
         }
@@ -632,7 +647,7 @@ impl Auth {
         }
         match failed {
             None => Ok(taken),
-            Some(e) => Err(TakeBack::Unwritten(e)),
+            Some(e) => Err(TakeBack::Unwritten(e, taken)),
         }
     }
 
@@ -1064,8 +1079,8 @@ fn rfc3339_in(d: Duration) -> String {
 enum TakeBack {
     /// No live credential was picked; the live ones, by name and holder.
     NoneLive(Vec<String>),
-    /// Taken in memory, not written: the disk's error.
-    Unwritten(String),
+    /// Taken in memory, not written: the disk's error, and what was taken.
+    Unwritten(String, Vec<Credential>),
 }
 
 /// How long a credential lasts: what the person said at the approval, which the approval held to the session
@@ -1387,6 +1402,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_ending_whose_caller_went_away_runs_to_its_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = Auth::open(
+            dir.path(),
+            "http://peer.test",
+            Box::new(FakeApprover { proof: "ok".into() }),
+        )
+        .unwrap();
+        let a = start(&auth, Some("team"));
+        auth.approve(&a.user_code, "ok", Grant::default(), None).await.unwrap();
+        poll(&auth, &a.device_code).unwrap();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = done.clone();
+        auth.when_taken_back(std::sync::Arc::new(move |_| {
+            let flag = flag.clone();
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Vec::new()
+            })
+        }));
+        let taken = auth.revoke("team", "ok", true).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), auth.end_work(&taken))
+                .await
+                .is_err(),
+            "the caller gives up before the ending is done"
+        );
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst), "the ending ran on");
+    }
+
+    #[tokio::test]
     async fn a_revocation_the_disk_did_not_take_is_said_closes_at_once_and_is_written_by_the_next() {
         let dir = tempfile::tempdir().unwrap();
         let open = || {
@@ -1405,6 +1453,13 @@ mod tests {
             .unwrap()
             .to_string();
         let before = auth.revocations();
+        let holder = auth.authenticate(&key).unwrap().holder();
+        let ended = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = ended.clone();
+        auth.when_taken_back(std::sync::Arc::new(move |holders| {
+            seen.lock().unwrap().extend(holders);
+            Box::pin(async { Vec::new() })
+        }));
         // The disk refuses the line: the revoke says so, and the key is closed now all the same.
         let file = dir.path().join("credentials.jsonl");
         let writable = auth
@@ -1415,6 +1470,8 @@ mod tests {
         let err = auth.revoke("team", "ok", true).await.unwrap_err();
         assert_eq!((err.status, err.error), (500, "server_error"));
         assert!(err.description.contains("revoke team again"), "{}", err.description);
+        assert!(err.description.contains("its work is ended"), "{}", err.description);
+        assert_eq!(*ended.lock().unwrap(), vec![holder], "its work ended all the same");
         assert!(auth.authenticate(&key).is_none(), "closed at once");
         assert!(auth.revocations() > before, "an open stream looks again");
         // Read back from what the disk holds, it would open again: that is what the 500 said.

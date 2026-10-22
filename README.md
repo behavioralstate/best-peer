@@ -606,7 +606,8 @@ workspace's cloud are the cloud's and are not ended by it. `best-peer revoke <na
 it is. A key that runs out, or one the agent gave back
 itself, leaves its work running, as an agent that ends its session after ordering a long run expects; what it left is
 the owner's to end. A revoke the
-disk did not keep says so: the key is closed until the peer restarts, and running the revoke again writes it. Every command document says which
+disk did not keep says so: the key is closed until the peer restarts, its work is ended all the same, and running the
+revoke again writes it. Every command document says which
 scope it needs. A command the key may not send is refused at ingest with `FORBIDDEN` and what it was approved for;
 a deploy or a job past the share with `SHARE_EXCEEDED`, what is held and the room left; a workload another key
 started, by name, whether a command, a prompt or the events are asked for, and a refusal names only what the key may
