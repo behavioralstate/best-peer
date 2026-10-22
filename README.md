@@ -600,7 +600,8 @@ key opens nothing from then on, on this door and every workspace door here, and 
 within seconds, as one does when a key runs out. A key you take back takes its work on this peer's own door with it:
 its orders that wait end before they start, its jobs are stopped and its deployments ended, each told with the reason
 that its credential was taken back, and one that was starting or queuing meanwhile is ended as soon as it is told.
-One the container engine does not stop is named in what `revoke` prints and tried again until it stops. Orders on a
+One the container engine does not stop is named in what `revoke` prints and tried again until it stops, across a
+restart too: the credential's line on disk says its work ended with it. Orders on a
 workspace's cloud are the cloud's and are not ended by it. `best-peer revoke <name> --keep-running` leaves the work as
 it is. A key that runs out, or one the agent gave back
 itself, leaves its work running, as an agent that ends its session after ordering a long run expects; what it left is

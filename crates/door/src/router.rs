@@ -348,8 +348,8 @@ struct RevokeForm {
 /// which.
 async fn revoke(State(door): State<Shared>, headers: HeaderMap, body: Bytes) -> Result<Response, OAuthError> {
     let f: RevokeForm = form(&headers, &body)?;
-    let taken = door.auth.revoke(&f.name, f.proof.trim()).await?;
     let ends = f.keep_running.as_deref().map(str::trim) != Some("true");
+    let taken = door.auth.revoke(&f.name, f.proof.trim(), ends).await?;
     let left = match ends {
         true => door.auth.end_work(&taken).await,
         false => Vec::new(),

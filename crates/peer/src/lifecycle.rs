@@ -1784,6 +1784,16 @@ impl Peer {
 
     // ----- a credential taken back ------------------------------------------------------------------------------------
 
+    /// The holders whose credentials were taken back with their work before this start: the first step ends what of
+    /// theirs the log folds back as running or waiting, as the revoke would have, had the engine stopped it then.
+    pub fn taken_back_before(&self, holders: Vec<String>) {
+        if holders.is_empty() {
+            return;
+        }
+        self.taken_back.lock().unwrap().extend(holders);
+        self.kick();
+    }
+
     /// Ends the work of `holders`, whose credentials whoever runs this peer took back: their orders that wait end
     /// before they start, their jobs are stopped and their deployments ended, each told under its own correlation
     /// with [`TAKEN_BACK`] as the reason. One the engine cannot stop now is left as it was, logged and answered, and

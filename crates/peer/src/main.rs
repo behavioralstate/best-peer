@@ -211,6 +211,7 @@ pub fn door(peer: Arc<Peer>, workspaces: Arc<workspace::Workspaces>, auth: Arc<A
         let ends = ends.clone();
         Box::pin(async move { ends.end_work_of(&holders).await })
     }));
+    peer.taken_back_before(auth.work_ended());
     Door::new(
         &ctx.endpoint,
         SERVICE,
@@ -1586,6 +1587,49 @@ mod tests {
             stopped.last().unwrap().data,
             json!({ "job": job, "reason": lifecycle::TAKEN_BACK })
         );
+    }
+
+    #[tokio::test]
+    async fn a_job_the_engine_did_not_stop_at_the_revoke_is_stopped_after_a_restart() {
+        let log = Arc::new(EventLog::ephemeral());
+        let runtime = Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![]));
+        let bed = bed(card(), log.clone(), runtime.clone()).await;
+        let taken = key_with(&bed.app, Some("jobs"), None).await;
+        let kept = key_with(&bed.app, Some("jobs"), None).await;
+        let data = json!({ "image": "busybox", "memory_bytes": 2 * GB });
+        let (s, b) = send_as(&bed.app, "", &taken, "j1", "RunJob", "run-job", data.clone()).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let (s, b) = send_as(&bed.app, "", &kept, "j2", "RunJob", "run-job", data.clone()).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let job = bed.events_of("j1", "JobStarted").await.last().unwrap().data["job"].clone();
+        bed.events_of("j2", "JobStarted").await;
+        // Kept back with its key: a revoke that leaves the work leaves it after a restart too.
+        let kept_answer = revoke_by_operator(&bed, &kept, true).await;
+        assert_eq!(kept_answer["work_ended"], false, "{kept_answer}");
+        runtime.refuse_stops(Some("the engine does not answer"));
+        let answer = revoke_by_operator(&bed, &taken, false).await;
+        assert_eq!(answer["not_ended_yet"], json!([job]), "{answer}");
+        runtime.refuse_stops(None);
+        let auth = bed.door.auth.clone();
+        drop(bed);
+        let again = bed_with(
+            card(),
+            log,
+            runtime,
+            Arc::new(best_peer_engine::Fake::new()),
+            "engines.local",
+            Some(auth),
+        )
+        .await;
+        again.peer.step(time::OffsetDateTime::now_utc()).await;
+        let stopped = again.events_of("j1", "JobStopped").await;
+        assert_eq!(
+            stopped.last().unwrap().data,
+            json!({ "job": job, "reason": lifecycle::TAKEN_BACK })
+        );
+        let jobs = again.query("get-workloads").await["jobs"].clone();
+        assert_eq!(jobs.as_array().unwrap().len(), 1, "{jobs}");
+        assert_ne!(jobs[0]["job"], job, "the job of the key kept back runs on");
     }
 
     #[tokio::test]
