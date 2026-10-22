@@ -11,7 +11,8 @@ before changing anything, and keep it the current rule when a change moves the p
   is needed. The subject is one plain sentence saying what changed and why, with no type prefix (`feat:`, `fix:`);
   the one prefix is `Review:` on a commit that answers the review, as the history has it. Open work is an issue on
   the Behavioralstate board, never a plan file or a `TODO`. `git pull --rebase` before the gates; after a rebase
-  that brought commits in, the local gate runs again on the new head. A red `main` is fixed before anything else is
+  that brought commits in, the local gate runs again on the new head, and the review runs again when the rebase
+  changed one's own commits (a conflict resolved). A red `main` is fixed before anything else is
   pushed.
 - Two gates before every push, both mandatory. First the local proof: `scripts/gate.sh all` (`pwsh scripts/gate.ps1
   all` on Windows) must end in `GATE GREEN`; CI runs the same script on the push. Then the review: `/best-review`

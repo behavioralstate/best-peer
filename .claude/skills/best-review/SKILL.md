@@ -10,7 +10,8 @@ effort: high
 The review gate of best-peer, mandatory before every push to `main` (SDLC.md section 4). The findings always come
 from the `best-reviewer` skill: a reviewer that has not seen this conversation, on the model it pins. This session
 verifies, fixes and answers them. Nothing here pushes, approves or merges: the push follows once the gate is passed,
-and a contributor's pull request is merged by a maintainer once its findings are answered and CI is green.
+and a contributor's pull request is merged by a maintainer once its findings are answered, the local gate is green
+on its head and CI is green.
 
 `$ARGUMENTS` empty: review `main` (section A). A number: review that pull request (section B).
 

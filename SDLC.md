@@ -112,6 +112,6 @@
 - No push without `GATE GREEN` and the review: `/best-review` and its `best-reviewer` run on what is pushed, every
   finding fixed or set aside with its reason; the release commit alone skips them.
 - No release of a commit the gates have not passed; no tag made by hand.
-- No force-push to `main`; no push on top of a red `main`; no merge of a pull request with an unanswered finding or a
-  red check.
+- No force-push to `main`; no push on top of a red `main`; no merge of a pull request with an unanswered finding, without
+  the local gate green on its head, or with a red check.
 - No plan file, no `TODO`, no dated narrative: open work is an issue.
