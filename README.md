@@ -151,11 +151,11 @@ door, not the process.
 
 **5. What the agent does from there.** Reads the hardware state (a card shows its memory, temperature, power,
 utilisation and the CUDA version; the host CPU is listed after it), deploys a model on it, follows the events to
-`DeploymentReady`, sends it a `prompt` and reads `PromptAnswered`, runs a job, undeploys. The run as recorded the
-first time it passed is [acceptance/lifecycle-from-the-manifest.md](acceptance/lifecycle-from-the-manifest.md); it
-prompted an inference endpoint the door no longer has, and the run with the prompt as a command is recorded again on
-a GPU host under behavioralstate/spec#54. Send back the terminal output of the peer, whatever happened: the release
-notes say what is proven and what is not yet.
+`DeploymentReady`, sends it a `prompt` and reads `PromptAnswered`, runs a job, undeploys. The run on a GPU host, in a
+workspace with a cloud, the prompt as a command, is recorded in
+[acceptance/workspace-from-the-manifest.md](acceptance/workspace-from-the-manifest.md); the first run, before
+workspaces, in [acceptance/lifecycle-from-the-manifest.md](acceptance/lifecycle-from-the-manifest.md). Send back
+the terminal output of the peer, whatever happened: the release notes say what is proven and what is not yet.
 
 ## Layout
 
