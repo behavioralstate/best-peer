@@ -8749,8 +8749,8 @@ mod tests {
     }
 
     /// What `key` was answered for each of the commands `ids` it sent at the root: the type of the fact that
-    /// completed it, `WorkspaceCreatedV1` or `CommandFailed`, once each has one.
-    async fn created_or_failed(app: &axum::Router, key: &str, ids: &[&str]) -> Vec<String> {
+    /// completed it, `done` or `CommandFailed`, once each has one.
+    async fn done_or_failed(app: &axum::Router, key: &str, ids: &[&str], done: &str) -> Vec<String> {
         let mut out = Vec::new();
         for id in ids {
             let mut ended = None;
@@ -8758,9 +8758,7 @@ mod tests {
                 let (_, b) = get_as(app, "", key, &format!("/events?correlationId={id}")).await;
                 ended = b["events"].as_array().into_iter().flatten().find_map(|e| {
                     let t = e["type"].as_str()?;
-                    ["WorkspaceCreatedV1", "CommandFailed"]
-                        .contains(&t)
-                        .then(|| t.to_string())
+                    [done, "CommandFailed"].contains(&t).then(|| t.to_string())
                 });
                 if ended.is_some() {
                     break;
@@ -8832,7 +8830,7 @@ mod tests {
         let mut ended = Vec::new();
         for ((s, b), id) in [(first, "w1"), (second, "w2")] {
             match s {
-                StatusCode::CREATED => ended.extend(created_or_failed(&site.app, &one, &[id]).await),
+                StatusCode::CREATED => ended.extend(done_or_failed(&site.app, &one, &[id], "WorkspaceCreatedV1").await),
                 _ => {
                     assert_eq!(b["error"]["code"], "WORKSPACES_EXCEEDED", "{b}");
                     ended.push("refused".into());
@@ -8982,6 +8980,81 @@ mod tests {
         assert_eq!(w["workspaces"], json!([]));
         let (s, _) = get_as(&again.app, &p, &owner, "/queries/get-clouds").await;
         assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_store_set_admitted_before_its_workspace_is_archived_is_not_kept_and_two_archives_at_once_end_it_once() {
+        let (a, _s3, endpoint, _logs) = member_and_store().await;
+        let key_a = a.key.clone();
+        let data = Arc::new(tempfile::tempdir().unwrap());
+        let site = site_over(
+            vec![(A, a)],
+            data.clone(),
+            Arc::new(EventLog::ephemeral()),
+            None,
+            Arc::new(Limits::default()),
+        )
+        .await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a)]).await;
+        let (s, b) = site.store(&ws, "st1", &endpoint).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "st1", "StoreSetV1").await;
+        let (s, b) = site
+            .send(&ws, "z1", "ArchiveCloud", "archive-cloud", json!({ "cloud": "lab" }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "z1", "CloudArchivedV1").await;
+        let held = site.workspaces.get(&ws).unwrap();
+        let door = held.door().unwrap();
+        let who = site.auth.authenticate(&site.key).unwrap();
+        let cmd: best_peer_door::Envelope = serde_json::from_str(&envelope(
+            &format!("{EP}/workspaces/{ws}"),
+            "st2",
+            "SetStore",
+            "set-store",
+            json!({ "endpoint": endpoint, "bucket": "jobs", "region": "fin-01", "access_key_id": "AKIDTESTONLY", "secret_access_key": SECRET }),
+        ))
+        .unwrap();
+        let key = format!("{}:st2", who.hash);
+        <workspace::Workspace as domain::Clouds>::admit_set_store(&held, cmd.clone(), &who, key.clone()).unwrap();
+        let archive = |id: &'static str| {
+            let (app, key, ws) = (site.app.clone(), site.key.clone(), ws.clone());
+            async move {
+                send_as(
+                    &app,
+                    "",
+                    &key,
+                    id,
+                    "ArchiveWorkspace",
+                    "archive-workspace",
+                    json!({ "workspace": ws }),
+                )
+                .await
+            }
+        };
+        let (first, second) = tokio::join!(archive("x1"), archive("x2"));
+        let mut archived = Vec::new();
+        for ((s, b), id) in [(first, "x1"), (second, "x2")] {
+            match s {
+                StatusCode::CREATED => {
+                    archived.extend(done_or_failed(&site.app, &site.key, &[id], "WorkspaceArchivedV1").await)
+                }
+                _ => assert_eq!(b["error"]["code"], "NO_SUCH_WORKSPACE", "{b}"),
+            }
+        }
+        assert_eq!(
+            archived.iter().filter(|t| *t == "WorkspaceArchivedV1").count(),
+            1,
+            "ended once: {archived:?}"
+        );
+        // The set-store admitted before the archive runs after it: it keeps nothing.
+        <workspace::Workspace as domain::Clouds>::set_store(held.clone(), cmd, door.emitter("st2").with_key(&key))
+            .await;
+        assert!(
+            !data.path().join("workspaces").join(&ws).join("store.json").exists(),
+            "an archived workspace keeps no store credential"
+        );
     }
 
     #[tokio::test]

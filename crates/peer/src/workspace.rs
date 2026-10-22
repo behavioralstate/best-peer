@@ -119,9 +119,9 @@ pub struct Workspaces {
     live: Mutex<BTreeMap<String, Arc<Workspace>>>,
     /// The workspaces their owners archived: never opened again and never listed.
     archived: Mutex<HashSet<String>>,
-    /// Held while a create counts what its owner owns and tells the workspace made, so two creates at once cannot
-    /// both pass the count.
-    counting: Mutex<()>,
+    /// Held while a create counts what its owner owns and tells the workspace made, and while an archive checks the
+    /// workspace is there and tells it ended, so two at once cannot both pass.
+    deciding: Mutex<()>,
 }
 
 impl Workspaces {
@@ -133,7 +133,7 @@ impl Workspaces {
             records: Mutex::new(BTreeMap::new()),
             live: Mutex::new(BTreeMap::new()),
             archived: Mutex::new(HashSet::new()),
-            counting: Mutex::new(()),
+            deciding: Mutex::new(()),
         });
         let mut facts = Vec::new();
         log.replay(|e| facts.push(e.clone()));
@@ -567,7 +567,7 @@ impl Membership for Workspaces {
         let owner = best_peer_door::auth::holder_of_hash(&sender);
         // Counted again with what its owner owns now, under the one lock: another create admitted at the same time
         // may have taken the last place.
-        let _counting = self.counting.lock().unwrap();
+        let _deciding = self.deciding.lock().unwrap();
         let refused = match self.ctx.auth.credential_by_hash(&sender) {
             Some(who) => self.may_create(&who).err().map(|e| e.message),
             None => Some("the credential that sent it was taken back or ended before the workspace was made".into()),
@@ -734,13 +734,21 @@ impl Membership for Workspaces {
             .split_once(':')
             .map(|(sender, _)| best_peer_door::auth::holder_of_hash(sender))
             .unwrap_or_default();
-        // A cloud configured since the admission is seen here, and none can be made live once this passed.
+        // Another archive admitted at the same time may have ended it; a cloud configured since the admission is
+        // seen here, and none can be made live once this passed.
+        let _deciding = self.deciding.lock().unwrap();
+        let failed = |reason: String| {
+            em.emit("CommandFailed", json!({ "type": cmd.r#type, "reason": reason }));
+        };
+        if !self.records.lock().unwrap().contains_key(&id) {
+            failed(format!(
+                "workspace {id} was archived already: get-workspaces lists yours"
+            ));
+            return;
+        }
         if let Some(ws) = self.get(&id) {
             if let Err(live) = ws.close_to_clouds() {
-                em.emit(
-                    "CommandFailed",
-                    json!({ "type": cmd.r#type, "reason": Self::has_clouds(&ws, &live).message }),
-                );
+                failed(Self::has_clouds(&ws, &live).message);
                 return;
             }
         }
@@ -975,7 +983,9 @@ impl Workspace {
         }
         self.door.lock().unwrap().take();
         self.router.lock().unwrap().take();
-        self.store.lock().unwrap().take();
+        self.pending_store.lock().unwrap().clear();
+        let mut store = self.store.lock().unwrap();
+        store.take();
         delete_credentials(&self.dir);
     }
 
@@ -1487,6 +1497,13 @@ impl Clouds for Workspace {
             failed("the store's credential is no longer held here: send set-store again".into());
             return;
         };
+        // Under the lock an archive takes to unset the store and delete its file: once it closed, nothing is kept.
+        let mut current = self.store.lock().unwrap();
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            drop(current);
+            failed("the workspace was archived before the store was set: nothing was kept".into());
+            return;
+        }
         let kept = std::fs::create_dir_all(&self.dir).and_then(|_| {
             crate::tls::write_private(
                 &self.dir.join("store.json"),
@@ -1494,12 +1511,14 @@ impl Clouds for Workspace {
             )
         });
         if let Err(e) = kept {
+            drop(current);
             failed(format!("the store could not be kept: {e}; the store before it stays"));
             return;
         }
         let told =
             json!({ "workspace": self.id, "endpoint": store.endpoint, "bucket": store.bucket, "region": store.region });
-        *self.store.lock().unwrap() = Some(store);
+        *current = Some(store);
+        drop(current);
         self.tell(&em, "StoreSetV1", told);
     }
 
