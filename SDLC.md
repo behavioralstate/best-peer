@@ -88,8 +88,8 @@
   pinning, and under a name without the version that `releases/latest/download` resolves, so the README's commands
   name no version; with checksums, a build provenance attestation and notes made from the release commit's message
   and the commits since the previous release. A release is cut when someone other than the owner will run the
-  binary, or when a slice's issue says a host needs it; before 1.0 the minor goes up with a capability and the patch
-  with a fix. A change to the workflow is tried with its `workflow_dispatch`, which builds and keeps the archives as
+  binary, or when a slice's issue says a host needs it, and it is a patch: the minor or the major goes up only when the
+  owner asks for it. A change to the workflow is tried with its `workflow_dispatch`, which builds and keeps the archives as
   run artifacts and publishes nothing, whatever ref it is started from.
 
 ## 5. A change from another maintainer, or from a contributor
