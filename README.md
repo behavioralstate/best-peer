@@ -20,8 +20,10 @@ The plan is the epic [behavioralstate/spec#27](https://github.com/behavioralstat
 here. How the work is made and shipped is [SDLC.md](SDLC.md).
 
 Done means `best-validate` green on the served manifest and an agent running the whole lifecycle from the manifest
-alone, with the transcript kept in this repository: [acceptance/lifecycle-from-the-manifest.md](acceptance/lifecycle-from-the-manifest.md)
-is that record, made with the published connector and a client that had nothing but the person's sentence.
+alone, with the transcript kept in this repository: [acceptance/workspace-from-the-manifest.md](acceptance/workspace-from-the-manifest.md)
+is that record, a workspace with a GPU cloud driven on a rented host, made with the published connector and a client
+that had nothing but the person's sentence; [acceptance/lifecycle-from-the-manifest.md](acceptance/lifecycle-from-the-manifest.md)
+is the first run, before workspaces.
 
 ## Try it on your machine
 

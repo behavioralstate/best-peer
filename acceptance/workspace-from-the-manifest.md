@@ -22,7 +22,8 @@ transcript. The run before workspaces and the `prompt` command is
   `@behavioralstate/best-mcp` 2.6.0, with no connection configured, `BEST_MCP_ALLOW_LOCAL=true` because the door was
   on loopback, and its credential file in a scratch folder deleted afterwards. The client's built-in GitHub servers
   were disabled; the owner's connectors to other services stayed loaded and none was called. Every call in the
-  transcript is to a `best-*` tool of the connector, or the client's own tool search.
+  transcript is to a `best-*` tool of the connector, the client's own tool search, or its `ask_user`, the two
+  questions it put to the person.
 - **Nothing written for the agent**: the person's sentence at the top of the transcript is all it got. It read both
   catalogues at the root and in the workspace, and five schema documents, and never saw this repository.
 - **The person's part**: two approvals at the machine and two answers to the client. The agent's code, `7V8R-2ZF8`,
@@ -30,8 +31,8 @@ transcript. The run before workspaces and the `prompt` command is
   waited for the person's answer until 12:46:08. The cloud's sign-in to the member, whose code the door logged at
   12:46:25 (`to admit cloud lab of workspace ws-a8efdd1655d9 on gpu, run on that machine: best-peer approve
   5M9L-83J2`), was approved at the member in the same second, and the door logged the member's admission at 12:46:30,
-  on its next poll. Both approvals were made over SSH from the owner's session, each before the client asked for
-  it; the person answered the client's two questions ("approved?") in its terminal.
+  on its next poll. Both approvals were made over SSH from the owner's session: the agent's six seconds after the
+  client showed its code, the member's before the client asked for it; the person answered the client's two questions ("approved?") in its terminal.
 - **The validator**: the door, through the same tunnel, passed `best-validate` 0.4.2 (BEST 0.9.17, conformant, 0
   failures, 0 warnings) anonymous after the run.
 
@@ -42,7 +43,8 @@ transcript. The run before workspaces and the `prompt` command is
   the hardware state with the V100 as `lab/gpu/GPU-eeeeb51b-…` and the host CPU; the deploy; the `prompt` command and
   `PromptAnswered`; a job run to `JobFinished`; the undeploy. Afterwards `docker ps -a` on the member listed no
   container.
-- Every fact on the workspace's stream named the cloud, and every one a member told named the peer too:
+- Every fact on the workspace's stream from `CloudConfiguredV1` on named the cloud, and every one a member told
+  named the peer too:
   `PeerJoined`, the image pull, the deployment's start, load and readiness, the prompt's answer, the job's placement,
   start and end, the undeploy. The job's order, `JobQueued`, names the cloud alone, since no peer holds it yet.
 - The prompt was a command on the door like any other: `PromptAnswered` came back on the workspace's stream under
@@ -65,8 +67,9 @@ transcript. The run before workspaces and the `prompt` command is
 - The agent followed the deploy on the stream, `sample_event_stream` filtered by the command's correlation id and
   then by `DeploymentReady`, read the prompt's answer with `get_events`, and waited for the job's `JobFinished` on the
   stream.
-- 31 tool calls in the transcript; 25 model turns and 6 minutes 20 seconds from the client's own log, 2 minutes 37
-  seconds of them waiting for the person.
+- 31 tool calls in the transcript, the client's two questions to the person among them; 25 model turns. From the
+  client's own log, 6 minutes 2 seconds from the person's sentence to the agent's last answer, 2 minutes 37 seconds
+  of them waiting for the person (6 minutes 20 seconds from the client's start).
 
 ## The transcript
 
