@@ -109,7 +109,8 @@ impl Gpu for NvmlGpu {
     }
 
     /// The processes on each whole card. A card split with MIG is a data-centre card no owner sits at: it reports
-    /// none, and its instances are never found in use.
+    /// none, and its instances are never found in use. A card whose driver does not list its processes is left out,
+    /// so it is read as unused and the other cards are still read.
     fn usage(&self) -> Result<Vec<Usage>, GpuError> {
         let lib = |e: NvmlError| GpuError::Library(e.to_string());
         let count = self.nvml.device_count().map_err(lib)?;
@@ -119,9 +120,12 @@ impl Gpu for NvmlGpu {
             if d.mig_mode().is_ok_and(|m| m.current == 1) {
                 continue;
             }
+            let Ok(processes) = self.processes(&d) else {
+                continue;
+            };
             usage.push(Usage {
                 device: DeviceId(d.uuid().map_err(lib)?),
-                processes: self.processes(&d).map_err(lib)?,
+                processes,
             });
         }
         Ok(usage)

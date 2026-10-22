@@ -131,16 +131,19 @@ runs on the card runs on. Clients read `busy`, never what you run, and the peer 
 your use is read live and never written to its log. To take the machine back yourself, at your machine:
 
 ```bash
-best-peer hold --for 2h               # every device takes no new work for two hours
+best-peer hold --for 2h               # every device, the CPU included, takes no new work for two hours
 best-peer hold --while 4242           # while process 4242 runs; stays in the terminal, Ctrl-C releases
 best-peer hold --device <id> --now    # one device, and what runs on it ends now, each holder told
 best-peer release                     # every device takes work again
 ```
 
 `--until 2026-10-20T22:00:00Z` names the end instead, and with neither a hold lasts until `best-peer release`; one by
-`--while` ends after twelve hours at most unless you say otherwise. `--reason maintenance` is one line every approved
+`--while` ends after twelve hours at most unless you say otherwise, and needs Linux: elsewhere hold with `--for` or
+`--until` and end it with `best-peer release`. When it ends it releases only its own hold: a device you held again
+meanwhile stays held. `--reason maintenance` is one line every approved
 client reads, and with `--now` the holders whose work ended read it after `held by its owner`; a hold needs none.
-`--now` also ends what was starting on the device, its image still pulling, as soon as it starts. A hold is kept
+A held CPU takes no job with no device either, and `--now` on it ends one. `--now` also ends what was starting on the device, its image still pulling, as soon as it starts if the hold still
+holds then. A hold is kept
 across a restart.
 
 A code waits ten minutes for you; the door holds at most five waiting from one client, sixteen from one address and 64 in all, and past that

@@ -207,6 +207,8 @@ impl Watch {
 /// A hold the owner placed on a device, as `DeviceHeld` told it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hold {
+    /// The correlation `DeviceHeld` was told under: which hold this is, so a release can name it.
+    pub id: String,
     pub until: Option<String>,
     pub reason: Option<String>,
 }
@@ -276,6 +278,8 @@ struct ReleaseForm {
     proof: String,
     #[serde(default)]
     devices: Option<String>,
+    #[serde(default)]
+    hold: Option<String>,
 }
 
 type Owner = (Arc<crate::lifecycle::Peer>, Arc<Auth>);
@@ -313,7 +317,7 @@ async fn release(State((peer, auth)): State<Owner>, Form(f): Form<ReleaseForm>) 
     if let Err(e) = auth.attest(&f.proof).await {
         return e.into_response();
     }
-    match peer.release(named(f.devices)) {
+    match peer.release(named(f.devices), f.hold) {
         Ok(v) => Json(v).into_response(),
         Err(e) => e.into_response(),
     }
@@ -438,6 +442,7 @@ mod tests {
             (
                 "gpu-0".to_string(),
                 Hold {
+                    id: "hold-1".into(),
                     until: Some("2026-10-20T13:00:00Z".into()),
                     reason: Some("maintenance".into()),
                 },
@@ -445,6 +450,7 @@ mod tests {
             (
                 "cpu".to_string(),
                 Hold {
+                    id: "hold-2".into(),
                     until: Some("2026-10-20T11:00:00Z".into()),
                     reason: None,
                 },
@@ -482,6 +488,7 @@ mod tests {
         let both = HashMap::from([(
             "gpu-1".to_string(),
             Hold {
+                id: "hold-3".into(),
                 until: Some("2026-10-20T13:00:00Z".into()),
                 reason: None,
             },

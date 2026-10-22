@@ -852,14 +852,29 @@ fn hold(args: &[String]) {
         pid.unwrap_or_default()
     );
     let why = until_either(async { tokio::signal::ctrl_c().await.map(drop) }, watched);
-    let (status, answer) = as_the_authority("/owner/release", vec![("devices", held.join(","))]);
+    let hold = answer["hold"].as_str().unwrap_or_default().to_string();
+    let (status, answer) = as_the_authority("/owner/release", vec![("devices", held.join(",")), ("hold", hold)]);
     if status != 200 {
         fail(&format!(
             "{why}, and the release was refused: {}",
             refusal(status, &answer)
         ));
     }
-    println!("{why}: released {}", held.join(", "));
+    let named = |k: &str| -> Vec<String> {
+        answer[k]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|d| d.as_str().map(str::to_string))
+            .collect()
+    };
+    let (released, kept) = (named("released"), named("kept"));
+    if !released.is_empty() {
+        println!("{why}: released {}", released.join(", "));
+    }
+    if !kept.is_empty() {
+        println!("{why}: {} held since by another hold, left held", kept.join(", "));
+    }
 }
 
 /// `best-peer release`: the devices take work again, every one held or those named.
@@ -913,8 +928,6 @@ fn rfc3339_after(span: Duration) -> String {
         .unwrap_or_else(|e| fail(&format!("cannot write the time: {e}")))
 }
 
-/// What ends when process `pid` exits, watched through a pidfd, so a process id used again by another is never taken
-/// for it. Refused for a process that is not running, and where there are no pidfds.
 /// Waits until `stop` or the watched process ends, and says which: "Ctrl-C" or "the process exited". A watch still
 /// blocked when `stop` comes is left behind rather than waited for, so the release is posted at once.
 fn until_either(
@@ -932,6 +945,8 @@ fn until_either(
     why
 }
 
+/// What ends when process `pid` exits, watched through a pidfd, so a process id used again by another is never taken
+/// for it. Refused for a process that is not running, and where there are no pidfds.
 #[cfg(target_os = "linux")]
 fn watch_process(pid: i32) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
     use rustix::event::{poll, PollFd, PollFlags};
@@ -2071,6 +2086,81 @@ mod tests {
         .await;
         assert!(bed.runtime.running().await.unwrap().is_empty());
         assert!(bed.peer.cleared.lock().unwrap().is_empty(), "nothing is left to end");
+    }
+
+    #[tokio::test]
+    async fn a_workload_a_hold_now_found_starting_runs_once_the_owner_released_the_card() {
+        let bed = fresh().await;
+        let gate = bed.runtime.hold_pulls();
+        let (s, b) = run_on(&bed, "j1", 4, json!({})).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let (s, b) = as_owner(&bed.app, "/owner/hold", &[("now", "true")]).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let (s, b) = as_owner(&bed.app, "/owner/release", &[]).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert!(bed.peer.cleared.lock().unwrap().is_empty(), "the release forgets it");
+        gate.add_permits(100);
+        bed.events_of("j1", "JobStarted").await;
+        bed.peer.step(time::OffsetDateTime::now_utc()).await;
+        assert!(types(&bed.log_of("j1")).iter().all(|t| t != "JobStopped"));
+        assert_eq!(bed.query("get-workloads").await["jobs"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_release_that_names_its_hold_leaves_a_device_a_later_hold_took_over() {
+        let bed = fresh().await;
+        let (s, first) = as_owner(&bed.app, "/owner/hold", &[("devices", "gpu-0")]).await;
+        assert_eq!(s, StatusCode::OK, "{first}");
+        let (s, b) = as_owner(&bed.app, "/owner/hold", &[("devices", "gpu-0"), ("reason", "mine now")]).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let id = first["hold"].as_str().unwrap();
+        let (s, b) = as_owner(&bed.app, "/owner/release", &[("devices", "gpu-0"), ("hold", id)]).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(
+            (b["released"].clone(), b["kept"].clone()),
+            (json!([]), json!(["gpu-0"]))
+        );
+        let a = availability_of(&bed.query("get-hardware-state").await, "gpu-0");
+        assert_eq!(
+            (a["state"].clone(), a["reason"].clone()),
+            (json!("busy"), json!("mine now"))
+        );
+        let (s, b) = as_owner(&bed.app, "/owner/release", &[("hold", b["kept"][0].as_str().unwrap())]).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["kept"], json!(["gpu-0"]), "a name that is no hold releases nothing");
+        let (s, b) = as_owner(&bed.app, "/owner/release", &[]).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["released"], json!(["gpu-0"]));
+    }
+
+    #[tokio::test]
+    async fn a_held_cpu_takes_no_job_with_no_device_and_a_hold_now_ends_one() {
+        let host = Arc::new(
+            best_peer_gpu::Fake::new()
+                .with_driver("fake 1.0")
+                .with_device(best_peer_gpu::Fake::cuda_card("gpu-0", "Card A", 24, "12.4"))
+                .with_device(best_peer_gpu::Fake::host_cpu("cpu", 64)),
+        );
+        let bed = bed(
+            host,
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        let plain = json!({ "image": "busybox" });
+        let (s, b) = bed.send("j1", "RunJob", "run-job", plain.clone()).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let job = bed.events_of("j1", "JobStarted").await.last().unwrap().data["job"].clone();
+        let (s, b) = as_owner(&bed.app, "/owner/hold", &[("devices", "cpu"), ("now", "true")]).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["ended"], json!([{ "job": job }]));
+        let (s, b) = bed.send("j2", "RunJob", "run-job", plain).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "DEVICE_BUSY");
+        assert!(
+            !b["error"]["message"].as_str().unwrap().contains("queue_seconds"),
+            "{b}"
+        );
     }
 
     #[tokio::test]

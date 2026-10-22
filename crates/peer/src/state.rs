@@ -319,6 +319,7 @@ impl State {
                     self.holds.insert(
                         d.to_string(),
                         crate::availability::Hold {
+                            id: correlation.clone(),
                             until: data["until"].as_str().map(str::to_string),
                             reason: data["reason"].as_str().map(str::to_string),
                         },
