@@ -73,7 +73,9 @@ On Windows x86_64 the archive is `best-peer-x86_64-pc-windows-msvc.zip`, on macO
 holds the same archives under names that carry the version, for pinning one, with `SHA256SUMS` to check them against.
 
 It prints one line, `best-peer is serving its door`, with where it listens and its data folder, and then waits:
-nothing else appears until a client talks to it. If it exits instead, the message names what is missing (the
+nothing else appears until a client talks to it. On Linux, a peer run without root (or the capability to mount and
+the loop devices) prints one more first, `this peer makes no disk for a job`: it runs every other job, and refuses one
+inputs or outputs, which it refuses (`NO_DISK`), since a job's disk is one it mounts. If it exits instead, the message names what is missing (the
 driver, Docker) and the variable that serves without it. `http://127.0.0.1:7777/.well-known/best` in a browser is
 the manifest, the one document an agent needs.
 
