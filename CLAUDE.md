@@ -21,8 +21,7 @@ before changing anything, and keep it the current rule when a change moves the p
   commit that names them, or sets it aside with its reason in that message (an empty commit when nothing changed).
   The local gate then runs on the head that is pushed. Nothing is pushed until both are done.
 - A contributor without write access sends a pull request from a fork; `/best-review <number>` reviews it the same
-  way and posts the findings there. A maintainer merges it once they are answered, the local gate is green on its
-  head (run only after its diff has been read, since it runs the contributor's code) and CI is green.
+  way and posts the findings there. A maintainer merges it once they are answered, the local gate is green on what would land, its head squashed onto `main` (run only after its diff has been read, since it runs the contributor's code) and CI is green.
 - A behaviour the spec does not ask for is an entry on the spec follow-ups issue, behavioralstate/spec#37, before it
   is code. An adapter is proven on a host by hand, with the proof on the slice's issue.
 - The README's "Try it on your machine" and Run sections move in the same commit as the variable, the check at start,

@@ -11,7 +11,7 @@ The review gate of best-peer, mandatory before every push to `main` (SDLC.md sec
 from the `best-reviewer` skill: a reviewer that has not seen this conversation, on the model it pins. This session
 verifies, fixes and answers them. Nothing here pushes, approves or merges: the push follows once the gate is passed,
 and a contributor's pull request is merged by a maintainer once its findings are answered, the local gate is green
-on its head and CI is green.
+on what would land and CI is green.
 
 `$ARGUMENTS` empty: review `main` (section A). A number: review that pull request (section B).
 
@@ -137,14 +137,17 @@ and no comments. The event is always `COMMENT`; never `APPROVE` or `REQUEST_CHAN
 The fixes are the contributor's, on their branch. A later push of theirs is reviewed again by the same command, and
 that run reviews only what is new, because step 1 passes the reported findings along.
 
-### 4. The local gate on its head, before a merge
+### 4. The local gate on what would land, before a merge
 
 Only once every finding is answered and the maintainer has read the diff, since the gate builds and runs the
 contributor's code on this machine. The gate runs on what would land, the pull request squashed onto the current
-`main`: `git fetch origin`, remove a leftover `<scratch>/pr-<n>` worktree, then
+`main`. First `git fetch origin +refs/pull/<n>/head:refs/review/pr-<n>` again and compare
+`git rev-parse refs/review/pr-<n>` with the head the review ran on (the sha in its `**best-review** on <sha>`): when
+the contributor pushed since, stop and go back to step 1, since the new commits are reviewed before they are gated. Then `git fetch origin`,
+`git worktree remove --force <scratch>/pr-<n>` for a leftover one, then
 `git worktree add --detach <scratch>/pr-<n> origin/main` and, in it, `git merge --squash refs/review/pr-<n>` (a
 conflict is the contributor's to resolve, so it is reported and the gate does not run), then `scripts/gate.sh all`
-(`pwsh scripts/gate.ps1 all` on Windows), and the worktree removed. Until then the report says the gate has not run.
+(`pwsh scripts/gate.ps1 all` on Windows), and the worktree removed (`git worktree remove --force <scratch>/pr-<n>`, since the squash leaves it staged). Until then the report says the gate has not run.
 
 ### 5. Report
 
@@ -156,8 +159,8 @@ In chat, one block and nothing longer:
 - question: <the question>
 - owner's call: <what needs a decision>
 posted: <review url>
-gate on the head: GREEN | RED (<the step>) on <sha> | not run yet (findings open)
+gate on what would land: GREEN | RED (<the step>) on <head sha> squashed onto <origin/main sha> | not run yet (findings open)
 ```
 
 `no findings` when the reviewer reported none. Approve nothing; merge nothing: a maintainer merges once every finding
-is answered, the local gate is green on the pull request's head, and CI is green.
+is answered, the local gate is green on what would land, and CI is green.
