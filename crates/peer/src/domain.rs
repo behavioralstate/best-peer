@@ -69,7 +69,7 @@ pub trait Clouds: Service {
     async fn set_cap(self: Arc<Self>, cmd: Envelope, em: Emitter);
 }
 
-/// What the root knows of its workspaces: which exist, who is in each, and the four commands that change that.
+/// What the root knows of its workspaces: which exist, who is in each, and the five commands that change that.
 #[async_trait]
 pub trait Membership: Send + Sync + 'static {
     fn workspaces(&self, who: &Credential) -> Result<Value, BestError>;
@@ -81,6 +81,8 @@ pub trait Membership: Send + Sync + 'static {
     async fn accept(self: Arc<Self>, cmd: Envelope, em: Emitter);
     fn admit_leave(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError>;
     async fn leave(self: Arc<Self>, cmd: Envelope, em: Emitter);
+    fn admit_archive(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError>;
+    async fn archive(self: Arc<Self>, cmd: Envelope, em: Emitter);
 }
 
 /// Which surface a schema is written for: the machine's own devices at the root, or a workspace's clouds.
@@ -97,7 +99,8 @@ pub fn catalogue(svc: Arc<dyn Service>, membership: Arc<dyn Membership>, auth: A
         .command(create_workspace(membership.clone()))
         .command(invite_member(membership.clone()))
         .command(accept_invitation(membership.clone()))
-        .command(leave_workspace(membership))
+        .command(leave_workspace(membership.clone()))
+        .command(archive_workspace(membership))
         .command(revoke_agent(auth));
     for e in event_defs()
         .into_iter()
@@ -166,6 +169,7 @@ pub fn completions() -> HashMap<String, HashSet<String>> {
         ("InviteMember".to_string(), set(&["MemberInvitedV1"])),
         ("AcceptInvitation".to_string(), set(&["MemberJoinedV1"])),
         ("LeaveWorkspace".to_string(), set(&["MemberLeftV1"])),
+        ("ArchiveWorkspace".to_string(), set(&["WorkspaceArchivedV1"])),
         ("ConfigureCloud".to_string(), set(&["CloudConfiguredV1"])),
         ("ArchiveCloud".to_string(), set(&["CloudArchivedV1"])),
         ("SetMenu".to_string(), set(&["MenuSetV1"])),
@@ -221,10 +225,17 @@ pub const MEMBERSHIP_EVENTS: &[&str] = &[
     "MemberInvitedV1",
     "MemberJoinedV1",
     "MemberLeftV1",
+    "WorkspaceArchivedV1",
 ];
 
 /// The commands that change a workspace's membership, whose failures are their sender's alone to read.
-pub const MEMBERSHIP_COMMANDS: &[&str] = &["CreateWorkspace", "InviteMember", "AcceptInvitation", "LeaveWorkspace"];
+pub const MEMBERSHIP_COMMANDS: &[&str] = &[
+    "CreateWorkspace",
+    "InviteMember",
+    "AcceptInvitation",
+    "LeaveWorkspace",
+    "ArchiveWorkspace",
+];
 
 /// A fact about a workspace's membership, which at the root only the identities it names read.
 pub fn is_membership_fact(r#type: &str) -> bool {
@@ -243,6 +254,7 @@ pub const WORKSPACE_EVENTS: &[&str] = &[
     "MemberInvitedV1",
     "MemberJoinedV1",
     "MemberLeftV1",
+    "WorkspaceArchivedV1",
     "CloudConfiguredV1",
     "CloudArchivedV1",
     "MenuSetV1",
@@ -253,11 +265,18 @@ pub const WORKSPACE_EVENTS: &[&str] = &[
 ];
 
 /// What a credential may be approved for: `deploy` models (pull, deploy, undeploy), run `jobs` (run, stop), `prompt`
-/// a ready deployment, read the whole door's `metrics` (every holder's workloads among them, and the door's own
-/// counts) and do nothing else, which is what a collector is approved for; `all` is every scope and every holder's
-/// workloads, what a credential approved with nothing said is. Reading the hardware and its own workloads and
-/// events is every credential's, as is creating a workspace and acting in the ones it belongs to.
-pub const SCOPES: &[&str] = &["deploy", "jobs", "prompt", best_peer_door::metrics::METRICS_SCOPE];
+/// a ready deployment, create `workspaces`, read the whole door's `metrics` (every holder's workloads among them, and
+/// the door's own counts) and do nothing else, which is what a collector is approved for; `all` is every scope and
+/// every holder's workloads, what a credential approved with nothing said is. Reading the hardware and its own
+/// workloads and events is every credential's, as is acting in the workspaces it belongs to and archiving the ones
+/// it owns.
+pub const SCOPES: &[&str] = &[
+    "deploy",
+    "jobs",
+    "prompt",
+    "workspaces",
+    best_peer_door::metrics::METRICS_SCOPE,
+];
 
 /// `^[a-z0-9][a-z0-9-]{0,63}$`: the shape of a cloud's name and a peer's name in a cloud, so that each composes
 /// into a device id (`cloud/peer/device`) and into the connection name a cloud signs in to its members under.
@@ -1017,7 +1036,7 @@ fn create_workspace(m: Arc<dyn Membership>) -> CommandDef {
         schema: "create-workspace".into(),
         version: "1.0".into(),
         command_type: "CreateWorkspace".into(),
-        description: "Makes a workspace, the organization or team that holds clouds and admits the identities who may use them, with you as its owner. The outcome is a WorkspaceCreatedV1 event with this command's correlation id, naming the new workspace's id; get-workspaces then lists it with the endpoint of its own door, where configure-cloud makes its first cloud. Any credential may create a workspace.".into(),
+        description: "Makes a workspace, the organization or team that holds clouds and admits the identities who may use them, with you as its owner. The outcome is a WorkspaceCreatedV1 event with this command's correlation id, naming the new workspace's id; get-workspaces then lists it with the endpoint of its own door, where configure-cloud makes its first cloud. Needs the workspaces scope (FORBIDDEN without, naming it); refused when the credential already owns as many workspaces as its approver allowed, 8 when not said, a workspace archived not counted (WORKSPACES_EXCEEDED, with the ones it owns: archive-workspace ends one).".into(),
         data_schema: json!({
             "type": "object",
             "required": ["name"],
@@ -1124,6 +1143,35 @@ fn leave_workspace(m: Arc<dyn Membership>) -> CommandDef {
         handler: Arc::new(move |cmd, emitter| {
             let m = m.clone();
             Box::pin(async move { m.leave(cmd, emitter).await })
+        }),
+    }
+}
+
+fn archive_workspace(m: Arc<dyn Membership>) -> CommandDef {
+    let admit = m.clone();
+    CommandDef {
+        schema: "archive-workspace".into(),
+        version: "1.0".into(),
+        command_type: "ArchiveWorkspace".into(),
+        description: "Ends a workspace you own, for good: from then its manifest and its door answer as for no workspace, to every member, an event stream held open there ends, get-workspaces lists it neither as a workspace nor as an invitation, and it no longer counts against how many workspaces your credential may own. Its log is kept; the credentials it kept, its store's and its clouds' keys to their members, are deleted. The outcome is a WorkspaceArchivedV1 event with this command's correlation id. Refused when you are a member and not its owner (FORBIDDEN), or while a cloud of it is live (WORKSPACE_HAS_CLOUDS, naming them: archive-cloud each first, once nothing runs in it).".into(),
+        data_schema: json!({
+            "type": "object",
+            "required": ["workspace"],
+            "properties": {
+                "workspace": { "type": "string", "minLength": 1, "maxLength": 128, "description": "The workspace id from get-workspaces" }
+            },
+            "additionalProperties": false
+        }),
+        produces: vec!["WorkspaceArchivedV1".into(), "CommandFailed".into()],
+        completes: completes("ArchiveWorkspace"),
+        impact: None,
+        admit: Some(Arc::new(move |cmd, who, _key| {
+            let m = admit.clone();
+            Box::pin(async move { m.admit_archive(cmd, &who) })
+        })),
+        handler: Arc::new(move |cmd, emitter| {
+            let m = m.clone();
+            Box::pin(async move { m.archive(cmd, emitter).await })
         }),
     }
 }
@@ -1471,7 +1519,7 @@ pub fn event_defs() -> Vec<EventDef> {
     ]
 }
 
-/// What the root tells about its workspaces: made, and who joined, was invited, left.
+/// What the root tells about its workspaces: made, who joined, was invited, left, and ended.
 pub fn membership_event_defs() -> Vec<EventDef> {
     let s = |d: &str| json!({ "type": "string", "description": d });
     let role = json!({ "type": "string", "enum": ["owner", "member"] });
@@ -1503,6 +1551,13 @@ pub fn membership_event_defs() -> Vec<EventDef> {
             "An identity left a workspace: its door closes to their credential.",
             &["workspace", "identity"],
             json!({ "workspace": s("The workspace"), "identity": s("The identity that left") }),
+        ),
+        event(
+            "workspace-archived",
+            "WorkspaceArchivedV1",
+            "A workspace ended, for good, by its owner: its door is closed to every member and it no longer counts against how many workspaces its owner may own.",
+            &["workspace", "owner"],
+            json!({ "workspace": s("The workspace"), "owner": s("The identity that owned it and ended it") }),
         ),
     ]
 }

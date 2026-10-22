@@ -11,8 +11,8 @@
 //! command names.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use axum::body::Body;
@@ -21,7 +21,7 @@ use axum::http::Uri;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Json, Router};
-use best_peer_door::auth::Credential;
+use best_peer_door::auth::{Credential, Grant};
 use best_peer_door::{Auth, BestError, Door, Emitter, Envelope, EventLog, Limits, Partition, Stored, View};
 use futures::StreamExt;
 use serde::Deserialize;
@@ -117,6 +117,11 @@ pub struct Workspaces {
     pub ctx: Arc<Context>,
     records: Mutex<BTreeMap<String, Record>>,
     live: Mutex<BTreeMap<String, Arc<Workspace>>>,
+    /// The workspaces their owners archived: never opened again and never listed.
+    archived: Mutex<HashSet<String>>,
+    /// Held while a create counts what its owner owns and tells the workspace made, so two creates at once cannot
+    /// both pass the count.
+    counting: Mutex<()>,
 }
 
 impl Workspaces {
@@ -127,9 +132,19 @@ impl Workspaces {
             ctx,
             records: Mutex::new(BTreeMap::new()),
             live: Mutex::new(BTreeMap::new()),
+            archived: Mutex::new(HashSet::new()),
+            counting: Mutex::new(()),
         });
         let mut facts = Vec::new();
         log.replay(|e| facts.push(e.clone()));
+        // A workspace archived is known before its making is folded, so it is never opened, and the credentials an
+        // archive could not delete then are deleted now.
+        for e in facts.iter().filter(|e| e.r#type == "WorkspaceArchivedV1") {
+            if let Some(id) = e.data["workspace"].as_str() {
+                me.archived.lock().unwrap().insert(id.to_string());
+                delete_credentials(&Workspace::dir(&me.ctx, id));
+            }
+        }
         for e in &facts {
             me.apply(e);
         }
@@ -194,7 +209,9 @@ impl Workspaces {
     /// Follows every cloud's members, and from here on a workspace or a cloud made later starts at once.
     pub async fn start(&self) {
         for ws in self.all() {
-            best_peer_door::resume(ws.door()).await;
+            if let Some(door) = ws.door() {
+                best_peer_door::resume(&door).await;
+            }
             ws.start();
         }
     }
@@ -203,8 +220,15 @@ impl Workspaces {
     /// workspace's own stream, where its members hear it.
     fn tell(&self, em: &Emitter, r#type: &str, data: Value) -> Envelope {
         let e = em.emit(r#type, data);
+        let id = e.data["workspace"].as_str().unwrap_or_default();
+        // An archive is heard on the workspace's stream before the fold closes it.
+        if e.r#type == "WorkspaceArchivedV1" {
+            if let Some(ws) = self.get(id) {
+                ws.hear(&e);
+            }
+        }
         self.apply(&e);
-        if let Some(ws) = e.data["workspace"].as_str().and_then(|id| self.get(id)) {
+        if let Some(ws) = self.get(id) {
             ws.hear(&e);
         }
         e
@@ -265,7 +289,7 @@ impl Workspaces {
         match e.r#type.as_str() {
             "WorkspaceCreatedV1" => {
                 let owner = text("owner");
-                if self.records.lock().unwrap().contains_key(&id) {
+                if self.records.lock().unwrap().contains_key(&id) || self.archived.lock().unwrap().contains(&id) {
                     return;
                 }
                 let mut r = Record {
@@ -312,6 +336,14 @@ impl Workspaces {
                     }
                 }
             }
+            "WorkspaceArchivedV1" => {
+                self.archived.lock().unwrap().insert(id.clone());
+                self.records.lock().unwrap().remove(&id);
+                let ws = self.live.lock().unwrap().remove(&id);
+                if let Some(ws) = ws {
+                    ws.close();
+                }
+            }
             _ => {}
         }
     }
@@ -350,6 +382,47 @@ impl Workspaces {
         Ok(r.clone())
     }
 
+    /// Whether `who` may create one more workspace: it has the workspaces scope, and owns fewer than its approver
+    /// allowed, a workspace archived not counted.
+    fn may_create(&self, who: &Credential) -> Result<(), BestError> {
+        require(who, "workspaces")?;
+        let holder = who.holder();
+        let ceiling = who.grant.workspaces.unwrap_or(Grant::DEFAULT_WORKSPACES);
+        let owned: Vec<String> = self
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, r)| r.owner() == Some(holder.as_str()))
+            .map(|(id, _)| id.clone())
+            .collect();
+        if owned.len() < ceiling as usize {
+            return Ok(());
+        }
+        Err(BestError::bad_request(
+            "WORKSPACES_EXCEEDED",
+            format!(
+                "this credential may own {ceiling} workspace(s) at once and owns {}: {}; archive-workspace ends one no longer used, once its clouds are archived, or ask whoever approved it for more (best-peer approve <code> --workspaces N)",
+                owned.len(),
+                list(owned.iter())
+            ),
+        )
+        .with_details(json!({ "ceiling": ceiling, "owned": owned })))
+    }
+
+    /// The refusal of an archive while `ws` has a live cloud, naming them.
+    fn has_clouds(ws: &Workspace, live: &[String]) -> BestError {
+        BestError::bad_request(
+            "WORKSPACE_HAS_CLOUDS",
+            format!(
+                "workspace {} still has the live cloud(s) {}: archive-cloud each at its door first, once nothing runs in it; get-clouds lists them",
+                ws.id,
+                list(live.iter())
+            ),
+        )
+        .with_details(json!({ "workspace": ws.id, "clouds": live }))
+    }
+
     /// The routes the root mounts for its workspaces: each workspace's manifest, public like the root's, and its
     /// door under `/workspaces/<id>`, open to a member's credential and to no one else.
     pub fn router(self: &Arc<Self>) -> Router {
@@ -363,10 +436,10 @@ impl Workspaces {
 }
 
 async fn tenant_manifest(State(reg): State<Arc<Workspaces>>, UrlPath(id): UrlPath<String>) -> Response {
-    match reg.get(&id) {
-        Some(ws) => (
+    match reg.get(&id).and_then(|ws| ws.door()) {
+        Some(door) => (
             [(axum::http::header::CONTENT_TYPE, "application/json")],
-            Json(best_peer_door::manifest::manifest(ws.door())),
+            Json(best_peer_door::manifest::manifest(&door)),
         )
             .into_response(),
         None => BestError::not_found(
@@ -398,8 +471,11 @@ async fn dispatch(
         return BestError::unauthorized().into_response();
     };
     best_peer_door::router::Answered::record(&req, &who);
-    let ws = reg.get(&id).filter(|ws| ws.is_member(&who.holder()));
-    let Some(ws) = ws else {
+    let open = reg
+        .get(&id)
+        .filter(|ws| ws.is_member(&who.holder()))
+        .and_then(|ws| ws.router().map(|router| (ws, router)));
+    let Some((ws, router)) = open else {
         return BestError::not_found(
             "NO_SUCH_WORKSPACE",
             format!("no workspace {id} opens to this credential: get-workspaces at the root lists yours, and accept-invitation joins one you were invited into. Only the credential that created a workspace, and those that joined it, open it; a new sign-in is a new identity, so act with the credential that made or joined the workspace"),
@@ -430,7 +506,7 @@ async fn dispatch(
     parts.extensions.clear();
     let streaming = rest.starts_with("/events/stream");
     let req = Request::from_parts(parts, body);
-    let res = match ws.router().clone().oneshot(req).await {
+    let res = match router.oneshot(req).await {
         Ok(res) => res,
         Err(never) => match never {},
     };
@@ -477,17 +553,29 @@ impl Membership for Workspaces {
         Ok(json!({ "identity": holder, "workspaces": workspaces, "invitations": invitations }))
     }
 
-    fn admit_create(&self, _cmd: Envelope, _who: &Credential) -> Result<(), BestError> {
-        Ok(())
+    fn admit_create(&self, _cmd: Envelope, who: &Credential) -> Result<(), BestError> {
+        self.may_create(who)
     }
 
     async fn create(self: Arc<Self>, cmd: Envelope, em: Emitter) {
         let id = new_id("ws");
-        let owner = em
+        let sender = em
             .command_key()
             .split_once(':')
-            .map(|(sender, _)| best_peer_door::auth::holder_of_hash(sender))
+            .map(|(sender, _)| sender.to_string())
             .unwrap_or_default();
+        let owner = best_peer_door::auth::holder_of_hash(&sender);
+        // Counted again with what its owner owns now, under the one lock: another create admitted at the same time
+        // may have taken the last place.
+        let _counting = self.counting.lock().unwrap();
+        let refused = match self.ctx.auth.credential_by_hash(&sender) {
+            Some(who) => self.may_create(&who).err().map(|e| e.message),
+            None => Some("the credential that sent it was taken back or ended before the workspace was made".into()),
+        };
+        if let Some(reason) = refused {
+            em.emit("CommandFailed", json!({ "type": cmd.r#type, "reason": reason }));
+            return;
+        }
         // The workspace's place on disk is made before the fact is told: a fact told is a workspace that exists.
         if let Err(e) = EventLog::open(&Workspace::dir(&self.ctx, &id)) {
             em.emit(
@@ -622,6 +710,61 @@ impl Membership for Workspaces {
             json!({ "workspace": cmd.data["workspace"], "identity": who }),
         );
     }
+
+    fn admit_archive(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError> {
+        let id = cmd.data["workspace"].as_str().unwrap_or_default();
+        self.record_for(id, who, Role::Owner)?;
+        match self.get(id) {
+            Some(ws) => {
+                let live = ws.live_cloud_names();
+                if live.is_empty() {
+                    Ok(())
+                } else {
+                    Err(Self::has_clouds(&ws, &live))
+                }
+            }
+            None => Ok(()),
+        }
+    }
+
+    async fn archive(self: Arc<Self>, cmd: Envelope, em: Emitter) {
+        let id = cmd.data["workspace"].as_str().unwrap_or_default().to_string();
+        let owner = em
+            .command_key()
+            .split_once(':')
+            .map(|(sender, _)| best_peer_door::auth::holder_of_hash(sender))
+            .unwrap_or_default();
+        // A cloud configured since the admission is seen here, and none can be made live once this passed.
+        if let Some(ws) = self.get(&id) {
+            if let Err(live) = ws.close_to_clouds() {
+                em.emit(
+                    "CommandFailed",
+                    json!({ "type": cmd.r#type, "reason": Self::has_clouds(&ws, &live).message }),
+                );
+                return;
+            }
+        }
+        self.tell(&em, "WorkspaceArchivedV1", json!({ "workspace": id, "owner": owner }));
+    }
+}
+
+/// Deletes the credentials the workspace in `dir` kept, its store's and its clouds' keys to their members: an
+/// archived workspace has no use for them. One already gone is nothing to delete; one that cannot be is logged, and
+/// deleted at the next start.
+fn delete_credentials(dir: &Path) {
+    let mut files = vec![dir.join("store.json")];
+    if let Ok(clouds) = std::fs::read_dir(dir.join("clouds")) {
+        files.extend(clouds.flatten().map(|c| c.path().join("members.json")));
+    }
+    for file in files {
+        match std::fs::remove_file(&file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(file = %file.display(), error = %e, "a credential an archived workspace kept cannot be deleted; the next start tries again")
+            }
+        }
+    }
 }
 
 // ----- one workspace --------------------------------------------------------------------------------------------------
@@ -656,9 +799,13 @@ pub struct Workspace {
     /// A store admitted and not yet set, by its command's key: set by the handler that tells StoreSetV1, so what the
     /// workspace uses is what its log says, and a command refused after admission changes nothing.
     pending_store: Mutex<HashMap<String, Store>>,
-    door: OnceLock<Arc<Door>>,
-    router: OnceLock<Router>,
+    /// Its door and its routes, until it is archived: they hold the workspace, so it is dropped, its log's files
+    /// closed, once they go.
+    door: Mutex<Option<Arc<Door>>>,
+    router: Mutex<Option<Router>>,
     started: std::sync::atomic::AtomicBool,
+    /// Set once an archive passed: no cloud is made live from then.
+    closed: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Deserialize)]
@@ -730,9 +877,10 @@ impl Workspace {
             purse: Arc::new(Purse::new(log.clone())),
             store: Arc::new(Mutex::new(store)),
             pending_store: Mutex::new(HashMap::new()),
-            door: OnceLock::new(),
-            router: OnceLock::new(),
+            door: Mutex::new(None),
+            router: Mutex::new(None),
             started: std::sync::atomic::AtomicBool::new(false),
+            closed: std::sync::atomic::AtomicBool::new(false),
         });
         let mut facts = Vec::new();
         log.replay(|e| facts.push(e.clone()));
@@ -754,8 +902,8 @@ impl Workspace {
             .with_limits(ctx.limits.clone()),
         );
         let router = best_peer_door::tenant_router(door.clone());
-        let _ = me.door.set(door);
-        let _ = me.router.set(router);
+        *me.door.lock().unwrap() = Some(door);
+        *me.router.lock().unwrap() = Some(router);
         Ok(me)
     }
 
@@ -764,8 +912,9 @@ impl Workspace {
         self.live_clouds().iter().flat_map(|c| c.holds_of(holder)).collect()
     }
 
-    pub fn door(&self) -> &Arc<Door> {
-        self.door.get().expect("the door is set at open")
+    /// Its door, until it is archived.
+    pub fn door(&self) -> Option<Arc<Door>> {
+        self.door.lock().unwrap().clone()
     }
 
     /// A membership fact about this workspace, told at the root, told again on this workspace's own stream: the same
@@ -783,8 +932,51 @@ impl Workspace {
         });
     }
 
-    pub fn router(&self) -> &Router {
-        self.router.get().expect("the router is set at open")
+    /// Its routes, until it is archived.
+    pub fn router(&self) -> Option<Router> {
+        self.router.lock().unwrap().clone()
+    }
+
+    /// Lets no cloud be made live from now, or names the live ones, under the lock a cloud is made under: once this
+    /// passed, a configure-cloud folded after it makes none.
+    fn close_to_clouds(&self) -> Result<(), Vec<String>> {
+        let clouds = self.clouds.lock().unwrap();
+        let live: Vec<String> = clouds
+            .iter()
+            .filter(|(_, r)| !r.archived)
+            .map(|(n, _)| n.clone())
+            .collect();
+        if !live.is_empty() {
+            return Err(live);
+        }
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// The names of its clouds that are not archived.
+    fn live_cloud_names(&self) -> Vec<String> {
+        self.clouds
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, r)| !r.archived)
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    /// Archived: no one is its member, so a stream held open there ends at its next frame; its door and its routes
+    /// go, and with them the last hold on it, so it is dropped once the commands it runs end; its store is unset and
+    /// the credentials it kept deleted.
+    fn close(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.members.lock().unwrap().clear();
+        for c in self.live_clouds() {
+            c.halt();
+        }
+        self.door.lock().unwrap().take();
+        self.router.lock().unwrap().take();
+        self.store.lock().unwrap().take();
+        delete_credentials(&self.dir);
     }
 
     fn set_members(&self, members: BTreeMap<String, Role>) {
@@ -954,6 +1146,7 @@ impl Workspace {
     /// followed, once the workspace started) or has its members changed.
     fn materialise(&self) {
         let mut clouds = self.clouds.lock().unwrap();
+        let closed = self.closed.load(std::sync::atomic::Ordering::SeqCst);
         for (name, r) in clouds.iter_mut() {
             match (&r.live, r.archived) {
                 (Some(c), true) => {
@@ -964,7 +1157,7 @@ impl Workspace {
                     c.reconfigure(&r.members);
                     c.set_menu(r.menu.clone());
                 }
-                (None, false) => {
+                (None, false) if !closed => {
                     let c = Cloud::new(
                         name,
                         &self.id,
@@ -990,7 +1183,7 @@ impl Workspace {
                     }
                     r.live = Some(c);
                 }
-                (None, true) => {}
+                (None, _) => {}
             }
         }
     }

@@ -372,6 +372,8 @@ struct ApproveForm {
     deployments: Option<u32>,
     /// The most jobs the credential may run at once; absent for no count.
     jobs: Option<u32>,
+    /// The most workspaces the credential may own at once; absent for the door's default.
+    workspaces: Option<u32>,
     /// Whether a credential with a share runs its jobs outside the closed box; absent for no.
     open_jobs: Option<bool>,
     /// Seconds until the credential ends, whatever lifetime the agent asked for; absent for the agent's choice.
@@ -392,6 +394,7 @@ async fn approve(State(door): State<Shared>, headers: HeaderMap, body: Bytes) ->
         memory_bytes: f.memory_bytes,
         deployments: f.deployments,
         jobs: f.jobs,
+        workspaces: f.workspaces,
         open_jobs: f.open_jobs.unwrap_or(false),
         accelerators_only: f.accelerators_only.unwrap_or(false),
     };

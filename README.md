@@ -114,7 +114,8 @@ Their client's next poll receives a key under that name. No accounts, no passwor
 decides who is in, as with SSH keys, and what they may do: approved with nothing more said, a key may do everything;
 `--may deploy,prompt --memory 40G` makes one that may deploy models and prompt them but run no job, and hold 40 GiB
 of device memory at most across its workloads, which it alone sees, prompts and ends. `--deployments 2 --jobs 2` lets it
-run two of each at once at most. A key with a share runs its jobs in a closed box (no network, a ceiling on host
+run two of each at once at most; a key may own 8 workspaces when not said, and `--workspaces N` sets how many. A key
+with a share runs its jobs in a closed box (no network, a ceiling on host
 memory) unless you add `--open-jobs`. `--expires 8h` ends the key after eight hours, so access lent for an afternoon
 ends without anyone remembering to take it back. To take a key back sooner, at your machine:
 
@@ -259,7 +260,10 @@ Every door hosts **workspaces**, the BEST tenants. The root manifest declares th
 (`/.well-known/best/{tenantId}`), and a workspace's own door is at `/workspaces/<id>` under the root, with its own
 log, catalogue, stream and correlation space; a credential opens the workspaces it belongs to and nothing of the
 others, and `get-workspaces` at the root lists them with each one's endpoint and manifest. At the root:
-`create-workspace` (whoever sends it is the owner), `invite-member` (the owner, naming the invitee's `identity`,
+`create-workspace` (whoever sends it is the owner; it needs the `workspaces` scope, and a key owns 8 at most, or the
+count its approver set with `--workspaces N`, refused past it with `WORKSPACES_EXCEEDED`), `archive-workspace` (the
+owner, once its clouds are archived: it ends for good, closed to every member, its log kept and the credentials it
+kept deleted, and it no longer counts against the owner's), `invite-member` (the owner, naming the invitee's `identity`,
 the opaque id of their credential that `get-workspaces` shows them), `accept-invitation` and `leave-workspace`
 (refused while one still holds a workload there); owner and member are the only roles, and the owner stays. The
 root's events tell a credential the membership facts addressed to it by identity (the workspace it made, the
@@ -712,7 +716,7 @@ joined any workspace still uses the machine's own surface at the root.
 
 **What a credential may do** is set at the approval and travels with the key. The manifest's authentication block
 lists the scopes: `deploy` (pull-image, deploy-model, undeploy-model), `jobs` (run-job, stop-job), `prompt`
-(prompt) and `metrics` (reading the whole door's [metrics](#metrics), and nothing else); `all` is every scope and every holder's workloads, and what a key approved with nothing said is, so the owner's own box changes
+(prompt), `workspaces` (create-workspace) and `metrics` (reading the whole door's [metrics](#metrics), and nothing else); `all` is every scope and every holder's workloads, and what a key approved with nothing said is, so the owner's own box changes
 nothing. Reading is every key's but a metrics key's: the hardware state, and its own workloads and events. `best-peer approve <code>
 --may deploy` grants scopes; `--memory 40G` sets the most device memory the key's workloads may hold together,
 counted across its deployments, jobs and commands admitted but not yet started; `--expires 8h` ends the key after

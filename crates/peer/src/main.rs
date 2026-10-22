@@ -1046,7 +1046,7 @@ fn watch_process(pid: i32) -> std::pin::Pin<Box<dyn std::future::Future<Output =
 /// person was shown. The token goes to the listen address only, never to the public endpoint, and over TLS to the
 /// certificate the peer serves and no other, when it serves one.
 fn approve(args: &[String]) {
-    const USAGE: &str = "usage: best-peer approve <code> [--may deploy,jobs,prompt,metrics | all] [--memory 40G] [--deployments N] [--jobs N] [--open-jobs] [--expires 8h] [--accelerators-only]: the code the agent showed the person; what the credential may do (all when not said; metrics alone reads the door's /metrics and sends nothing, for a collector); the most device memory its workloads may hold together (no share when not said); how many deployments and jobs it may run at once across the door (no count when not said); with a share, whether its jobs leave the closed box (no network, a ceiling on host memory) a tenant's job gets; how long the credential lasts, 366d at most, and 8h at most for a session credential (the agent's choice when not said); whether it sees and uses the accelerators alone, never the host's CPU";
+    const USAGE: &str = "usage: best-peer approve <code> [--may deploy,jobs,prompt,workspaces,metrics | all] [--memory 40G] [--deployments N] [--jobs N] [--workspaces N] [--open-jobs] [--expires 8h] [--accelerators-only]: the code the agent showed the person; what the credential may do (all when not said; metrics alone reads the door's /metrics and sends nothing, for a collector); the most device memory its workloads may hold together (no share when not said); how many deployments and jobs it may run at once across the door (no count when not said); how many workspaces it may own at once, with the workspaces scope (8 when not said); with a share, whether its jobs leave the closed box (no network, a ceiling on host memory) a tenant's job gets; how long the credential lasts, 366d at most, and 8h at most for a session credential (the agent's choice when not said); whether it sees and uses the accelerators alone, never the host's CPU";
     if asks_for_help(args) {
         println!("{USAGE}");
         return;
@@ -1055,7 +1055,7 @@ fn approve(args: &[String]) {
     let (mut may, mut memory, mut open_jobs) = (None::<String>, None::<u64>, false);
     let mut expires = None::<Duration>;
     let mut accelerators_only = false;
-    let (mut deployments, mut jobs) = (None::<u32>, None::<u32>);
+    let (mut deployments, mut jobs, mut workspaces) = (None::<u32>, None::<u32>, None::<u32>);
     let count = |flag: &str, text: Option<&String>| -> u32 {
         match text.map(|t| t.trim().parse::<u32>()) {
             Some(Ok(n)) if n > 0 => n,
@@ -1087,6 +1087,7 @@ fn approve(args: &[String]) {
             "--open-jobs" => open_jobs = true,
             "--deployments" => deployments = Some(count("--deployments", rest.next())),
             "--jobs" => jobs = Some(count("--jobs", rest.next())),
+            "--workspaces" => workspaces = Some(count("--workspaces", rest.next())),
             "--accelerators-only" => accelerators_only = true,
             other => fail(&format!("unknown argument {other:?}. {USAGE}")),
         }
@@ -1109,6 +1110,9 @@ fn approve(args: &[String]) {
     }
     if let Some(n) = jobs {
         form.push(("jobs", n.to_string()));
+    }
+    if let Some(n) = workspaces {
+        form.push(("workspaces", n.to_string()));
     }
     if let Some(d) = expires {
         form.push(("expires_in", d.as_secs().to_string()));
@@ -1148,7 +1152,7 @@ fn admitted_line(a: &serde_json::Value) -> String {
         (Some(b), true) => format!("{b} bytes of device memory at most, its jobs open"),
         (None, _) => "no share set".into(),
     };
-    for kind in ["deployments", "jobs"] {
+    for kind in ["deployments", "jobs", "workspaces"] {
         if let Some(n) = a["grant"][kind].as_u64() {
             share.push_str(&format!(", {n} {kind} at once at most"));
         }
@@ -1450,17 +1454,27 @@ mod tests {
 
     /// A credential approved with `may` and `memory`, as `best-peer approve --may --memory` would.
     async fn key_with(app: &axum::Router, may: Option<&str>, memory: Option<u64>) -> String {
-        key_full(app, may, memory, None, None, false, false).await
+        key_full(app, may, memory, None, None, &[]).await
     }
 
     /// The same, held to the accelerators when `accelerators_only`, as `approve --accelerators-only` would.
     async fn key_held(app: &axum::Router, may: Option<&str>, memory: Option<u64>, accelerators_only: bool) -> String {
-        key_full(app, may, memory, None, None, false, accelerators_only).await
+        let held = [("accelerators_only", "true")];
+        key_full(
+            app,
+            may,
+            memory,
+            None,
+            None,
+            if accelerators_only { &held } else { &[] },
+        )
+        .await
     }
 
     /// The same, its jobs opened by the approver when `open_jobs`, as `best-peer approve --open-jobs` would.
     async fn key_opened(app: &axum::Router, may: Option<&str>, memory: Option<u64>, open_jobs: bool) -> String {
-        key_full(app, may, memory, None, None, open_jobs, false).await
+        let opened = [("open_jobs", "true")];
+        key_full(app, may, memory, None, None, if open_jobs { &opened } else { &[] }).await
     }
 
     /// The same, allowed so many deployments and jobs at once when given, as `approve --deployments --jobs` would.
@@ -1471,19 +1485,18 @@ mod tests {
         deployments: Option<u32>,
         jobs: Option<u32>,
     ) -> String {
-        key_full(app, may, memory, deployments, jobs, false, false).await
+        key_full(app, may, memory, deployments, jobs, &[]).await
     }
 
-    /// A credential approved with all of `best-peer approve`'s words: `may`, `memory`, the counts, `open_jobs` and
-    /// `accelerators_only`.
+    /// A credential approved with all of `best-peer approve`'s words: `may`, `memory`, the counts, and the approval
+    /// form's other fields as `more` names them (`open_jobs`, `accelerators_only`, `workspaces`).
     async fn key_full(
         app: &axum::Router,
         may: Option<&str>,
         memory: Option<u64>,
         deployments: Option<u32>,
         jobs: Option<u32>,
-        open_jobs: bool,
-        accelerators_only: bool,
+        more: &[(&str, &str)],
     ) -> String {
         let form = |f: &[(&str, &str)]| {
             Request::post("/auth/device")
@@ -1500,18 +1513,13 @@ mod tests {
         if let Some(m) = &memory {
             fields.push(("memory_bytes", m));
         }
-        if open_jobs {
-            fields.push(("open_jobs", "true"));
-        }
+        fields.extend_from_slice(more);
         let (deployments, jobs) = (deployments.map(|n| n.to_string()), jobs.map(|n| n.to_string()));
         if let Some(n) = &deployments {
             fields.push(("deployments", n));
         }
         if let Some(n) = &jobs {
             fields.push(("jobs", n));
-        }
-        if accelerators_only {
-            fields.push(("accelerators_only", "true"));
         }
         let approve = Request::post("/auth/approve")
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
@@ -5074,7 +5082,7 @@ mod tests {
             "{stopped}"
         );
         assert_eq!(stopped["peer"], "a");
-        let door = site.workspaces.get(&ws).unwrap().door().clone();
+        let door = site.workspaces.get(&ws).unwrap().door().unwrap();
         assert!(
             door.log.unfinished().iter().all(|u| u.envelope.id != "j2"),
             "the order that ended unplaced completed its command"
@@ -5132,7 +5140,7 @@ mod tests {
             ["JobQueued", "JobStopped"],
             "the order ends under its own correlation too"
         );
-        let door = site.workspaces.get(&ws).unwrap().door().clone();
+        let door = site.workspaces.get(&ws).unwrap().door().unwrap();
         assert!(
             door.log.unfinished().iter().all(|u| u.envelope.id != "j2"),
             "its command is complete"
@@ -5446,7 +5454,7 @@ mod tests {
         let w = site.query(&ws, "get-workloads").await;
         assert_eq!(w["queued"], json!([]), "it no longer waits, nor is it held");
         assert_eq!(w["held_bytes"], 0);
-        let door = site.workspaces.get(&ws).unwrap().door().clone();
+        let door = site.workspaces.get(&ws).unwrap().door().unwrap();
         assert!(door.log.unfinished().iter().all(|u| u.envelope.id != "j1"));
     }
 
@@ -8740,10 +8748,246 @@ mod tests {
         );
     }
 
+    /// What `key` was answered for each of the commands `ids` it sent at the root: the type of the fact that
+    /// completed it, `WorkspaceCreatedV1` or `CommandFailed`, once each has one.
+    async fn created_or_failed(app: &axum::Router, key: &str, ids: &[&str]) -> Vec<String> {
+        let mut out = Vec::new();
+        for id in ids {
+            let mut ended = None;
+            for _ in 0..2000 {
+                let (_, b) = get_as(app, "", key, &format!("/events?correlationId={id}")).await;
+                ended = b["events"].as_array().into_iter().flatten().find_map(|e| {
+                    let t = e["type"].as_str()?;
+                    ["WorkspaceCreatedV1", "CommandFailed"]
+                        .contains(&t)
+                        .then(|| t.to_string())
+                });
+                if ended.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            out.push(ended.unwrap_or_else(|| panic!("{id} never ended")));
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_key_creates_workspaces_only_with_the_workspaces_scope_and_owns_no_more_than_its_count() {
+        let site = site(Vec::new()).await;
+        let create = |key: String, id: String| {
+            let app = site.app.clone();
+            async move {
+                send_as(
+                    &app,
+                    "",
+                    &key,
+                    &id,
+                    "CreateWorkspace",
+                    "create-workspace",
+                    json!({ "name": id }),
+                )
+                .await
+            }
+        };
+        // A key approved to run jobs, and nothing else, makes no workspace, and is told the scope it lacks.
+        let jobs = key_with(&site.app, Some("jobs"), None).await;
+        let (s, e) = create(jobs, "j1".into()).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "FORBIDDEN");
+        assert_eq!(e["error"]["details"]["needs"], "workspaces");
+        // The owner's key, approved with nothing said, owns eight and is refused the ninth with the ones it owns.
+        let mut owned = Vec::new();
+        for i in 0..8 {
+            owned.push(site.workspace(&format!("o{i}"), "Team").await);
+        }
+        let (s, e) = create(site.key.clone(), "o8".into()).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "WORKSPACES_EXCEEDED");
+        assert_eq!(e["error"]["details"]["ceiling"], 8);
+        assert_eq!(e["error"]["details"]["owned"].as_array().unwrap().len(), 8);
+        let said = e["error"]["message"].as_str().unwrap();
+        assert!(
+            said.contains("archive-workspace") && said.contains("--workspaces"),
+            "{said}"
+        );
+        // One archived frees its place.
+        let (s, b) = send_as(
+            &site.app,
+            "",
+            &site.key,
+            "a1",
+            "ArchiveWorkspace",
+            "archive-workspace",
+            json!({ "workspace": owned[0] }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        events_as(&site.app, "", &site.key, "a1", "WorkspaceArchivedV1").await;
+        let (s, b) = create(site.key.clone(), "o9".into()).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        // A key approved for one owns one, and two sent at once make one: the second is counted again as it runs.
+        let one = key_full(&site.app, Some("workspaces"), None, None, None, &[("workspaces", "1")]).await;
+        let (first, second) = tokio::join!(create(one.clone(), "w1".into()), create(one.clone(), "w2".into()));
+        let mut ended = Vec::new();
+        for ((s, b), id) in [(first, "w1"), (second, "w2")] {
+            match s {
+                StatusCode::CREATED => ended.extend(created_or_failed(&site.app, &one, &[id]).await),
+                _ => {
+                    assert_eq!(b["error"]["code"], "WORKSPACES_EXCEEDED", "{b}");
+                    ended.push("refused".into());
+                }
+            }
+        }
+        assert_eq!(
+            ended.iter().filter(|t| *t == "WorkspaceCreatedV1").count(),
+            1,
+            "one made, the other refused or failed: {ended:?}"
+        );
+        let (_, w) = get_as(&site.app, "", &one, "/queries/get-workspaces").await;
+        assert_eq!(w["workspaces"].as_array().unwrap().len(), 1);
+        let (s, e) = create(one, "w3".into()).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["details"]["ceiling"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_workspace_its_owner_archives_closes_to_every_member_for_good_and_its_credentials_go_with_it() {
+        let (a, b) = two_members().await;
+        let key_a = a.key.clone();
+        let data = Arc::new(tempfile::tempdir().unwrap());
+        let log = Arc::new(EventLog::ephemeral());
+        let site = site_over(
+            vec![(A, a), (B, b)],
+            data.clone(),
+            log.clone(),
+            None,
+            Arc::new(Limits::default()),
+        )
+        .await;
+        let ws = site.workspace("c1", "Research").await;
+        let p = format!("/workspaces/{ws}");
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a)]).await;
+        let owner = site.key.clone();
+        let (_, w) = get_as(&site.app, "", &owner, "/queries/get-workspaces").await;
+        let owner_id = w["identity"].as_str().unwrap().to_string();
+        let bob = key(&site.app).await;
+        let (_, w) = get_as(&site.app, "", &bob, "/queries/get-workspaces").await;
+        let bob_id = w["identity"].as_str().unwrap().to_string();
+        let (s, b) = send_as(
+            &site.app,
+            "",
+            &owner,
+            "i1",
+            "InviteMember",
+            "invite-member",
+            json!({ "workspace": ws, "identity": bob_id }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        events_as(&site.app, "", &owner, "i1", "MemberInvitedV1").await;
+        let (s, b) = send_as(
+            &site.app,
+            "",
+            &bob,
+            "j1",
+            "AcceptInvitation",
+            "accept-invitation",
+            json!({ "workspace": ws }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        events_as(&site.app, "", &bob, "j1", "MemberJoinedV1").await;
+        let archive = |key: String, id: &'static str| {
+            let (app, ws) = (site.app.clone(), ws.clone());
+            async move {
+                send_as(
+                    &app,
+                    "",
+                    &key,
+                    id,
+                    "ArchiveWorkspace",
+                    "archive-workspace",
+                    json!({ "workspace": ws }),
+                )
+                .await
+            }
+        };
+        // A member does not end it, and a live cloud is ended first, by name.
+        let (s, e) = archive(bob.clone(), "x0").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "FORBIDDEN");
+        let (s, e) = archive(owner.clone(), "x1").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "WORKSPACE_HAS_CLOUDS");
+        assert_eq!(e["error"]["details"]["clouds"], json!(["lab"]));
+        assert!(e["error"]["message"].as_str().unwrap().contains("archive-cloud"));
+        let (s, b) = site
+            .send(&ws, "z1", "ArchiveCloud", "archive-cloud", json!({ "cloud": "lab" }))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "z1", "CloudArchivedV1").await;
+        let members_file = data
+            .path()
+            .join("workspaces")
+            .join(&ws)
+            .join("clouds")
+            .join("lab")
+            .join("members.json");
+        assert!(
+            members_file.exists(),
+            "an archived cloud keeps its members' keys, to come back"
+        );
+        let held = Arc::downgrade(&site.workspaces.get(&ws).unwrap());
+
+        let (s, b) = archive(owner.clone(), "x2").await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let told = events_as(&site.app, "", &owner, "x2", "WorkspaceArchivedV1").await;
+        let told = told.iter().find(|e| e["type"] == "WorkspaceArchivedV1").unwrap();
+        assert_eq!(told["data"], json!({ "workspace": ws, "owner": owner_id }));
+        assert_eq!(told["dataschema"], format!("{EP}/events/workspace-archived/1.0"));
+        // Closed to every member: its door and its manifest answer as for no workspace, and it is listed nowhere.
+        for key in [&owner, &bob] {
+            let (s, e) = get_as(&site.app, &p, key, "/queries/get-clouds").await;
+            assert_eq!(s, StatusCode::NOT_FOUND, "{e}");
+            assert_eq!(e["error"]["code"], "NO_SUCH_WORKSPACE");
+            let (_, w) = get_as(&site.app, "", key, "/queries/get-workspaces").await;
+            assert_eq!(w["workspaces"], json!([]));
+            assert_eq!(w["invitations"], json!([]));
+        }
+        let (s, _) = get_as(&site.app, "", "", &format!("/.well-known/best/{ws}")).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (s, e) = archive(owner.clone(), "x3").await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"]["code"], "NO_SUCH_WORKSPACE");
+        // The keys it kept are deleted, its log is kept, and nothing holds it, so its log's files are closed.
+        assert!(!members_file.exists(), "the cloud's keys to its members are deleted");
+        assert!(data.path().join("workspaces").join(&ws).join("events").exists());
+        let mut dropped = false;
+        for _ in 0..400 {
+            if held.upgrade().is_none() {
+                dropped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(dropped, "nothing holds an archived workspace");
+
+        // Started again over the same data, it stays archived: not opened, not listed.
+        let auth = site.auth.clone();
+        drop(site);
+        let again = site_over(Vec::new(), data.clone(), log, Some(auth), Arc::new(Limits::default())).await;
+        assert!(again.workspaces.get(&ws).is_none());
+        let (_, w) = get_as(&again.app, "", &owner, "/queries/get-workspaces").await;
+        assert_eq!(w["workspaces"], json!([]));
+        let (s, _) = get_as(&again.app, &p, &owner, "/queries/get-clouds").await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn an_agent_revokes_its_own_credential_with_a_command_and_every_door_here_closes_to_it() {
         let bed = fresh().await;
-        let team = key_with(&bed.app, Some("deploy"), None).await;
+        let team = key_with(&bed.app, Some("deploy,workspaces"), None).await;
         let (s, b) = send_as(
             &bed.app,
             "",
@@ -9219,7 +9463,7 @@ mod tests {
         .await;
         assert_eq!(
             m["best"]["authentication"]["scopes"],
-            json!(["deploy", "jobs", "prompt", "metrics"])
+            json!(["deploy", "jobs", "prompt", "workspaces", "metrics"])
         );
     }
 
