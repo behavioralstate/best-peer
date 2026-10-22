@@ -44,7 +44,8 @@ pub enum JobPhase {
     Running,
     /// A stop is in progress; the exit is expected.
     Stopping,
-    /// It exited, and what it left under /out is being stored: its end, JobFinished or JobFailed, follows.
+    /// It exited, and what it left under /out is being stored: its end follows, JobFinished or JobFailed, or
+    /// JobStopped when a stop cuts the sending.
     Storing,
 }
 

@@ -20,8 +20,10 @@ The plan is the epic [behavioralstate/spec#27](https://github.com/behavioralstat
 here. How the work is made and shipped is [SDLC.md](SDLC.md).
 
 Done means `best-validate` green on the served manifest and an agent running the whole lifecycle from the manifest
-alone, with the transcript kept in this repository: [acceptance/lifecycle-from-the-manifest.md](acceptance/lifecycle-from-the-manifest.md)
-is that record, made with the published connector and a client that had nothing but the person's sentence.
+alone, with the transcript kept in this repository: [acceptance/workspace-from-the-manifest.md](acceptance/workspace-from-the-manifest.md)
+is that record, a workspace with a GPU cloud driven on a rented host, made with the published connector and a client
+that had nothing but the person's sentence; [acceptance/lifecycle-from-the-manifest.md](acceptance/lifecycle-from-the-manifest.md)
+is the first run, before workspaces.
 
 ## Try it on your machine
 
@@ -136,7 +138,9 @@ its own device then serves nothing real, and the clouds are what the door is for
 `BEST_PEER_TRUST=<a's cert.pem>,<b's cert.pem>` when the machines serve their own certificates. The pool is made through that door, by the agent, from the manifest alone: the
 person says "create a workspace called research, then configure a cloud called lab in it with the peers
 a=https://<machine a>:7777 and b=https://<machine b>:7777". The agent sends `create-workspace` at the root, reads
-the workspace's endpoint from `get-workspaces`, and sends `configure-cloud` there. The door signs in to each
+the workspace's endpoint from `get-workspaces`, and sends `configure-cloud` there, with the credential it signed in
+with: a new sign-in is a new identity, and no member (through best-mcp 2.6.0 or later, the workspace is the connection
+`<name>/<workspace id>`). The door signs in to each
 machine as any agent would and logs the code for its owner: `to admit cloud lab of workspace ws-… on a, run on that
 machine: best-peer approve <code>`. Once admitted, the machine is `up` in the workspace's `get-clouds` and its
 devices are in its `get-hardware-state` as `lab/a/gpu-0`; a deploy in the workspace names the cloud and goes to
@@ -150,11 +154,11 @@ door, not the process.
 
 **5. What the agent does from there.** Reads the hardware state (a card shows its memory, temperature, power,
 utilisation and the CUDA version; the host CPU is listed after it), deploys a model on it, follows the events to
-`DeploymentReady`, sends it a `prompt` and reads `PromptAnswered`, runs a job, undeploys. The run as recorded the
-first time it passed is [acceptance/lifecycle-from-the-manifest.md](acceptance/lifecycle-from-the-manifest.md); it
-prompted an inference endpoint the door no longer has, and the run with the prompt as a command is recorded again on
-a GPU host under behavioralstate/spec#54. Send back the terminal output of the peer, whatever happened: the release
-notes say what is proven and what is not yet.
+`DeploymentReady`, sends it a `prompt` and reads `PromptAnswered`, runs a job, undeploys. The run on a GPU host, in a
+workspace with a cloud, the prompt as a command, is recorded in
+[acceptance/workspace-from-the-manifest.md](acceptance/workspace-from-the-manifest.md); the first run, before
+workspaces, in [acceptance/lifecycle-from-the-manifest.md](acceptance/lifecycle-from-the-manifest.md). Send back
+the terminal output of the peer, whatever happened: the release notes say what is proven and what is not yet.
 
 ## Layout
 
@@ -348,7 +352,10 @@ later (`OutOfMemory`, `DeploymentEnded`), and its end when you take its key back
 its model is ready fails the deploy: `DeploymentFailed` carries its exit code and the last lines it wrote. `prompt` names a ready deployment and
 the conversation so far, and `PromptAnswered` follows under its own correlation id with the answer whole, or
 `PromptFailed` with the reason and the fix. `run-job` runs an image once, a tenant's in a closed box, and tells
-`JobStarted` and `JobFinished` with the exit code; `undeploy-model` and `stop-job` end them.
+`JobStarted` and `JobFinished` with the exit code and `output`, the last lines the job printed (twenty at most, 2000
+characters at most), as does a `JobFailed` that follows its exit (its outputs not stored); more than that belongs under
+`/out`, which goes to the workspace's store. `undeploy-model` and
+`stop-job` end them.
 
 On a workspace's door `run-job` is an order, and a cloud with no room now takes it to wait its turn, as the
 serverless GPU platforms do. It is refused at once only when no device of the cloud's members that answer could ever
@@ -398,7 +405,8 @@ second and the currency.
 
 A client deals in sizes and never sees the hardware. Nothing the workspace door serves about an order by size names a
 card, a device or a MIG profile: not the receipt, not `get-menu`, `get-workloads` or `get-usage`, and not the order's
-events, on the page or on the stream. The door's log keeps the device each order went to, for the cloud's own count
+events, on the page or on the stream, save what the job itself printed (`output`), which is its own and is relayed as
+it was printed. The door's log keeps the device each order went to, for the cloud's own count
 of what is held, and leaves it off what it serves. Pinning stays the owner's: `memory_bytes` and `device` work as
 before. `get-hardware-state` and `get-clouds` are the operator's views of the machines and still name them.
 
@@ -458,11 +466,15 @@ while it waits fails when its turn comes.
 The member it places the order on gets only URLs the cloud signed for that order: one to read each input, one to
 write the outputs. Before the job starts, the member makes it a disk of its own, of `disk_bytes` (a size names its
 default in the menu, and an order may name its own), fetches the inputs there and tells `InputsFetched`. The job
-reads `/in`, read-only, and writes `/out`. When it exits, what it left under `/out` is packed as one tar archive and
-sent to `<prefix>/<order>.tar`, and `OutputsStored` says so, with the key, before `JobFinished`; a store that does not
-take it ends the job in `JobFailed`, its exit code kept. A stop while the outputs are being sent is refused
-(`STORING_OUTPUTS`), since the job's end follows; a store that stops answering fails the transfer, ten minutes and a
-second a mebibyte on. The disk goes with the job, whatever its end, and a peer restarted under a running job finds
+reads `/in`, read-only, and writes `/out`. When it exits, its directories, regular files and links under `/out` are
+packed as one tar archive and sent to `<prefix>/<order>.tar` as they are packed, so nothing is written beside the disk,
+and `OutputsStored` says so, with the key, before `JobFinished`. A link is kept as a link, never followed; a pipe, a
+device or a socket it left is not an output. A store that does not take it ends the job in `JobFailed`, its exit code
+kept. The order's `deadline_seconds` covers the sending too: one still running past it is cut and the job ends, its
+outputs not stored (`JobFailed` at a peer's own door; through a cloud, the cloud stops it and `JobStopped` says so).
+A stop while the outputs are being sent ends the job at once in `JobStopped`, its outputs not stored, and cuts the
+sending at its next read; a store that stops answering fails the transfer, ten minutes and a second a mebibyte on,
+which also bounds a sending without a deadline. The disk goes with the job, whatever its end, and a peer restarted under a running job finds
 its disk again and still sends its outputs. A job with outputs
 sends `deadline_seconds`, six days at most, because the URL its outputs are sent with lives seven days at most. A
 member says the room it has for disks in `get-hardware-state` as `disk`, and an order is placed only on a member with
