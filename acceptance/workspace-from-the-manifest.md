@@ -55,11 +55,11 @@ transcript. The run before workspaces and the `prompt` command is
   ([behavioralstate/spec#39](https://github.com/behavioralstate/spec/issues/39)). The cloud took the job as the order
   `job-cb78d686d58e` (`JobQueued`, `JobPlaced`); the member ran it as `job-863bbb657c6f`, and its `JobStarted`,
   relayed, names the order.
-- The agent read the hardware state at 12:46:29, half a second before the door's poll picked up the member's
+- The agent read the hardware state at 12:46:29, two thirds of a second before the door's poll picked up the member's
   admission: no device, and the peer `joining`. From the schema documents alone it told the person that the door
   logs a code to approve on that machine and asked them to approve it, which had been done at 12:46:25; its next read,
   after their answer, had the V100.
-- The deploy pulled the engine image, `ollama/ollama:0.40.6`, in 1 minute 16 seconds, and the model was ready 13
+- The deploy pulled the engine image, `ollama/ollama:0.40.6`, in 1 minute 17 seconds, and the model was ready 13
   seconds after that. The workspace's log has 30 progress events for the whole run (`ImagePulling` 20,
   `WeightsLoading` 10), where the earlier run's had 326
   ([behavioralstate/spec#40](https://github.com/behavioralstate/spec/issues/40)). The pull's first two read 1 % then
