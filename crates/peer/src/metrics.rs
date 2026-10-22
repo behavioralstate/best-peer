@@ -11,8 +11,9 @@
 //!
 //! A door that hosts workspaces is that cloud door: it serves its clouds' members' series beside its own, each
 //! labelled with `workspace`, `cloud` and `peer`, as each member showed them to its cloud at the last reconcile
-//! tick it answered. Only a credential that reads the whole door gets them (approved for all, or for metrics),
-//! since a member's series belong to every workspace's holders at once.
+//! tick it answered: the member machine's own series, and of its workloads those the cloud placed there. A
+//! collector's key reads every cloud's; a key approved for all reads the machines of the workspaces it is a member
+//! of; any other key reads none.
 
 use std::sync::Arc;
 
@@ -31,11 +32,16 @@ pub fn source(peer: Arc<Peer>, workspaces: Arc<crate::workspace::Workspaces>) ->
         let peer = peer.clone();
         let workspaces = workspaces.clone();
         Box::pin(async move {
-            // The same test the door makes for its own whole-door series: approved for all, or for metrics.
-            let whole_door = who.grant.allows(METRICS_SCOPE);
+            // A collector, approved for metrics alone, reads every cloud's members; a key approved for all reads
+            // the machines of the workspaces it is a member of; any other key, none.
+            let collector = who.grant.allows(METRICS_SCOPE) && !who.grant.is_all();
+            let all = who.grant.is_all();
+            let holder = who.holder();
             let mut out = families(&peer, &reader(who)).await;
-            if whole_door {
-                out.extend(workspaces.federated());
+            if collector {
+                out.extend(workspaces.federated(None));
+            } else if all {
+                out.extend(workspaces.federated(Some(&holder)));
             }
             out
         })

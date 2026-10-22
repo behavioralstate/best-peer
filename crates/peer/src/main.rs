@@ -11209,6 +11209,39 @@ mod tests {
         lab.reconcile().await;
         let text = scrape(&site.app, Some(&site.key), false, None).await.2;
         assert!(has(&text, "a") && has(&text, "b"), "{text}");
+
+        // A key approved for all that is no member of the workspace reads none of its machines.
+        let stranger = key(&site.app).await;
+        let text = scrape(&site.app, Some(&stranger), false, None).await.2;
+        assert!(!text.contains("cloud=\"lab\""), "{text}");
+
+        // What runs on a member under another holder, and the member's own door counts, are never served again.
+        let theirs = site.members[0].deployed("x1", "llama3.2:3b", 4).await;
+        lab.reconcile().await;
+        let text = scrape(&site.app, Some(&collector), false, None).await.2;
+        assert!(has(&text, "a"), "{text}");
+        assert!(
+            !text.contains(&theirs),
+            "another holder's deployment is not the cloud's to show: {text}"
+        );
+        assert!(
+            !text
+                .lines()
+                .any(|l| (l.starts_with("best_peer_commands_accepted_total{")
+                    || l.starts_with("best_peer_events_total{")
+                    || l.starts_with("best_peer_device_memory_promised_bytes{"))
+                    && l.contains("peer=\""),),
+            "a member's door counts are its own: {text}"
+        );
+
+        // A member whose credential the cloud no longer holds has no series, nor one removed from the cloud.
+        lab.members().iter().find(|m| m.name == "b").unwrap().clear_key();
+        let text = scrape(&site.app, Some(&collector), false, None).await.2;
+        assert!(has(&text, "a") && !text.contains("peer=\"b\""), "{text}");
+        site.cloud(&ws, "k2", "lab", &[("a", A, &key_a)]).await;
+        lab.reconcile().await;
+        let text = scrape(&site.app, Some(&collector), false, None).await.2;
+        assert!(has(&text, "a") && !text.contains("peer=\"b\""), "{text}");
     }
 
     #[tokio::test]

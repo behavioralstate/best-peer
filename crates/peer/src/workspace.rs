@@ -165,11 +165,17 @@ impl Workspaces {
         out
     }
 
-    /// Every live cloud's members' series, as the cloud door serves them under the workspace, the cloud and the
-    /// member (behavioralstate/spec#47): what each member showed its cloud at the last tick it answered.
-    pub fn federated(&self) -> Vec<best_peer_door::metrics::Family> {
+    /// The live clouds' members' series, as the cloud door serves them under the workspace, the cloud and the
+    /// member (behavioralstate/spec#47): what each member showed its cloud at the last tick it answered. For a
+    /// collector (`member` none) every workspace's, the workloads' included; for a holder, only the workspaces it
+    /// is a member of, and of them the machines' series alone.
+    pub fn federated(&self, member: Option<&str>) -> Vec<best_peer_door::metrics::Family> {
         let mut out = Vec::new();
-        for ws in self.all() {
+        for ws in self
+            .all()
+            .into_iter()
+            .filter(|ws| member.is_none_or(|h| ws.is_member(h)))
+        {
             let clouds: Vec<Arc<Cloud>> = ws
                 .clouds
                 .lock()
@@ -179,7 +185,7 @@ impl Workspaces {
                 .filter_map(|r| r.live.clone())
                 .collect();
             for cloud in clouds {
-                out.extend(cloud.federated());
+                out.extend(cloud.federated(member.is_none()));
             }
         }
         out

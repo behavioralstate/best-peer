@@ -388,19 +388,16 @@ fn unescape(s: &str) -> String {
     out
 }
 
-/// The same families with `labels` added in front of each sample's own, where a sample does not already carry a
-/// label of that name: a cloud door names where a member's series sit, and a series that already says (a member
-/// that is itself a cloud door, re-serving its own members) keeps what it says.
+/// The same families with `labels` in front of each sample's own, replacing any label of the same name the sample
+/// carried: a cloud door names where a member's series sit, and only the door's word on that can be trusted.
 pub fn labelled(families: Vec<Family>, labels: &[(&str, &str)]) -> Vec<Family> {
     families
         .into_iter()
         .map(|mut f| {
             for s in &mut f.samples {
-                let mut added: Vec<(String, String)> = labels
-                    .iter()
-                    .filter(|(k, _)| !s.labels.iter().any(|(own, _)| own == k))
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect();
+                s.labels.retain(|(own, _)| !labels.iter().any(|(k, _)| k == own));
+                let mut added: Vec<(String, String)> =
+                    labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
                 added.append(&mut s.labels);
                 s.labels = added;
             }
@@ -523,7 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn labelled_names_where_a_series_sits_and_keeps_what_it_already_says() {
+    fn labelled_names_where_a_series_sits_whatever_the_series_says() {
         let mut f = Family::new("best_peer_device_power_watts", Kind::Gauge, "Power.");
         f.sample(&[("device", "gpu-0")], 300.0);
         f.sample(&[("peer", "inner"), ("device", "gpu-1")], 200.0);
@@ -537,7 +534,7 @@ mod tests {
         );
         assert!(
             text.contains(
-                "best_peer_device_power_watts{workspace=\"ws-1\",cloud=\"lab\",peer=\"inner\",device=\"gpu-1\"} 200\n"
+                "best_peer_device_power_watts{workspace=\"ws-1\",cloud=\"lab\",peer=\"a\",device=\"gpu-1\"} 200\n"
             ),
             "{text}"
         );

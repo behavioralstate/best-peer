@@ -429,9 +429,13 @@ accelerators' memory. Where the peer sits, its workspace and its cloud, is not a
 may serve the clouds of several workspaces: the collector adds what it knows of the target, or the cloud door does.
 A door that hosts workspaces serves its clouds' members' series beside its own, each labelled `workspace`, `cloud`
 and `peer`, so one scrape of the door sees the whole pool: every reconcile tick (thirty seconds) each cloud reads a
-member's `/metrics` with the credential the member's owner approved for the cloud, and a member that does not answer
-has no series until it does, its absence being the signal. They are served to a key approved for all or for
-metrics, as the door's own counts are, since a member's series belong to every workspace's holders at once. A Prometheus job for a peer, with the key in a
+member's `/metrics` with the credential the member's owner approved for the cloud, and keeps what is the cloud's
+to show: the machine's own series (what it is, its devices, its disk) and, of its workloads, those the cloud placed
+there, never another holder's nor the member's door counts. A member that does not answer within five seconds, one
+removed from the cloud, or one that no longer admits it, has no series until it does, its absence being the
+signal; the `workspace`, `cloud` and `peer` labels are the door's own, whatever a member's series say. A collector's
+key reads every cloud's; a key approved for all reads the machines of the workspaces it is a member of; any other
+key, none. A Prometheus job for a peer, with the key in a
 file only the collector reads and the certificate the peer made named for it:
 
 ```yaml

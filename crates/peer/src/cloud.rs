@@ -49,6 +49,32 @@ use crate::transport::Transport;
 /// workloads are told as ended: the same thirty seconds a peer gives a lost engine.
 pub const RECONCILE_EVERY: Duration = Duration::from_secs(30);
 
+/// How long a member's `/metrics` has to answer at a tick before it counts as having no series: short of a
+/// member's other answers, since telemetry is never worth holding a tick for.
+pub const SCRAPE_WITHIN: Duration = Duration::from_secs(5);
+
+/// A family of a member's workloads: served again only for the workloads the cloud placed there.
+fn is_workload_family(name: &str) -> bool {
+    [
+        "best_peer_deployment",
+        "best_peer_job",
+        "best_peer_prompts",
+        "best_peer_prompt_tokens",
+    ]
+    .iter()
+    .any(|p| name == *p || name.starts_with(&format!("{p}_")))
+}
+
+/// A family of the member machine itself, served again whole: what it is and what its devices and disk read. The
+/// memory promised on a device sums every holder's, so it is not among them.
+fn is_machine_family(name: &str) -> bool {
+    name == "best_peer"
+        || name == "best_peer_hardware_readable"
+        || name.starts_with("best_peer_disk_")
+        || ((name == "best_peer_device" || name.starts_with("best_peer_device_"))
+            && name != "best_peer_device_memory_promised_bytes")
+}
+
 /// How long a member's stream may be silent before it is reconnected: the member keeps it alive every fifteen
 /// seconds, so a minute of nothing is a dead socket.
 const STREAM_SILENCE: Duration = Duration::from_secs(60);
@@ -1626,6 +1652,7 @@ impl Cloud {
                     Err(e) if e.is_unauthorized() => {
                         tracing::warn!(cloud = %me.name, peer = %member.name, "the member no longer honours this cloud's credential; signing in again");
                         member.clear_key();
+                        me.series.lock().unwrap().remove(&member.name);
                         me.save();
                         continue;
                     }
@@ -1672,6 +1699,8 @@ impl Cloud {
                             .and_then(|s| s.key.clone())
                     });
                     let m = Arc::new(Member::new(name, endpoint, key, self.transport.clone()));
+                    // The name now stands for another machine, or for this one renamed: no series of before.
+                    self.series.lock().unwrap().remove(name);
                     if let Some(k) = kept {
                         let mut cursors = self.cursors.lock().unwrap();
                         if let Some(c) = cursors.remove(&k.name) {
@@ -1697,6 +1726,7 @@ impl Cloud {
                 }
                 self.reachable.lock().unwrap().remove(&g.name);
                 self.cursors.lock().unwrap().remove(&g.name);
+                self.series.lock().unwrap().remove(&g.name);
             }
         }
         if self.following.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1814,7 +1844,6 @@ impl Cloud {
         match m.query("get-workloads").await {
             Ok(w) => {
                 let contact = self.contact(m, true, "");
-                self.scrape(m).await;
                 let runs = |id: &str, deployment: bool| {
                     let list = if deployment { &w["deployments"] } else { &w["jobs"] };
                     let field = if deployment { "deployment" } else { "job" };
@@ -1837,6 +1866,8 @@ impl Cloud {
                 if contact == Contact::Joined {
                     self.reclaim(m, &w, &held).await;
                 }
+                // Last, and bounded on its own: telemetry never holds back the lifecycle.
+                self.scrape(m, &held).await;
             }
             Err(e) if e.is_unauthorized() => {
                 tracing::warn!(cloud = %self.name, peer = %m.name, "the member no longer honours this cloud's credential; signing in again");
@@ -1853,16 +1884,41 @@ impl Cloud {
         }
     }
 
-    /// Reads the member's series, keeping them for this door's `/metrics`; a member that does not answer, or
-    /// answers with something that is not series, has none until it does.
-    async fn scrape(&self, m: &Member) {
-        let read = match m.metrics().await {
-            Ok(text) => best_peer_door::metrics::parse(&text),
-            Err(e) => Err(e.text()),
+    /// Reads the member's series, keeping for this door's `/metrics` what is this cloud's to serve: the machine's
+    /// own (its devices, its disk, what it runs), and of its workloads only those this cloud placed there (`held`),
+    /// never another holder's, the member's door counts, or series a member that is itself a cloud door serves of
+    /// its own members. A member that does not answer within [`SCRAPE_WITHIN`], or answers with something that is
+    /// not series, has none until it does.
+    async fn scrape(&self, m: &Member, held: &[(String, bool)]) {
+        let read = match tokio::time::timeout(SCRAPE_WITHIN, m.metrics()).await {
+            Ok(Ok(text)) => best_peer_door::metrics::parse(&text),
+            Ok(Err(e)) => Err(e.text()),
+            Err(_) => Err(format!("no series within {SCRAPE_WITHIN:?}")),
         };
         match read {
             Ok(families) => {
-                self.series.lock().unwrap().insert(m.name.clone(), families);
+                let ours: HashSet<&str> = held.iter().map(|(id, _)| id.as_str()).collect();
+                let kept = families
+                    .into_iter()
+                    .filter_map(|mut f| {
+                        if is_workload_family(&f.name) {
+                            f.samples.retain(|s| {
+                                s.labels
+                                    .iter()
+                                    .any(|(k, v)| (k == "deployment" || k == "job") && ours.contains(v.as_str()))
+                            });
+                        } else if !is_machine_family(&f.name) {
+                            return None;
+                        }
+                        f.samples.retain(|s| {
+                            !s.labels
+                                .iter()
+                                .any(|(k, _)| k == "workspace" || k == "cloud" || k == "peer")
+                        });
+                        (!f.samples.is_empty()).then_some(f)
+                    })
+                    .collect();
+                self.series.lock().unwrap().insert(m.name.clone(), kept);
             }
             Err(why) => {
                 tracing::debug!(cloud = %self.name, peer = %m.name, why, "the member's series could not be read");
@@ -1872,9 +1928,15 @@ impl Cloud {
     }
 
     /// The members' series as this door serves them: each labelled with the workspace, this cloud and the member,
-    /// only for a member that is still one and answered at the last tick.
-    pub fn federated(&self) -> Vec<best_peer_door::metrics::Family> {
-        let members: Vec<String> = self.members().iter().map(|m| m.name.clone()).collect();
+    /// only for a member that is still one, still admits this cloud and answered at the last tick; the workloads'
+    /// series only when `workloads`, the machines' always.
+    pub fn federated(&self, workloads: bool) -> Vec<best_peer_door::metrics::Family> {
+        let members: Vec<String> = self
+            .members()
+            .iter()
+            .filter(|m| m.admitted())
+            .map(|m| m.name.clone())
+            .collect();
         let reachable = self.reachable.lock().unwrap().clone();
         let series = self.series.lock().unwrap();
         members
@@ -1882,8 +1944,13 @@ impl Cloud {
             .filter(|name| reachable.get(*name).copied().unwrap_or(true))
             .filter_map(|name| series.get(name).map(|f| (name, f)))
             .flat_map(|(name, families)| {
+                let families: Vec<_> = families
+                    .iter()
+                    .filter(|f| workloads || !is_workload_family(&f.name))
+                    .cloned()
+                    .collect();
                 best_peer_door::metrics::labelled(
-                    families.clone(),
+                    families,
                     &[("workspace", &self.workspace), ("cloud", &self.name), ("peer", name)],
                 )
             })
