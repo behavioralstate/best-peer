@@ -3,7 +3,7 @@
 # commit of main is what publishes it (.github/workflows/release.yml builds, attests and publishes the binaries).
 #
 #   scripts/release.sh <version> -m "<what this release is, one or two sentences>"
-#   scripts/release.sh 0.2.0 -m "The NVML adapter: a CUDA host says what it has and a deploy lands on the card."
+#   scripts/release.sh 0.0.23 -m "A job's end carries its output, and a workspace reaches its members."
 #
 # It refuses to run anywhere but a clean main that is level with origin, bumps the workspace version, refreshes the
 # lockfile, commits "Release <version>" with the message as its body (that body heads the release notes), tags it
