@@ -140,9 +140,11 @@ that run reviews only what is new, because step 1 passes the reported findings a
 ### 4. The local gate on its head, before a merge
 
 Only once every finding is answered and the maintainer has read the diff, since the gate builds and runs the
-contributor's code on this machine: remove a leftover `<scratch>/pr-<n>` worktree, then
-`git worktree add <scratch>/pr-<n> refs/review/pr-<n>`, run `scripts/gate.sh all` (`pwsh scripts/gate.ps1 all` on
-Windows) from it, and remove the worktree. Until then the report says the gate has not run.
+contributor's code on this machine. The gate runs on what would land, the pull request squashed onto the current
+`main`: `git fetch origin`, remove a leftover `<scratch>/pr-<n>` worktree, then
+`git worktree add --detach <scratch>/pr-<n> origin/main` and, in it, `git merge --squash refs/review/pr-<n>` (a
+conflict is the contributor's to resolve, so it is reported and the gate does not run), then `scripts/gate.sh all`
+(`pwsh scripts/gate.ps1 all` on Windows), and the worktree removed. Until then the report says the gate has not run.
 
 ### 5. Report
 

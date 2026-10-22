@@ -101,7 +101,8 @@
 - **A contributor without write access sends a pull request from a fork**, held to the same sections. A maintainer
   runs `/best-review <number>` on it, which runs the `best-reviewer` skill the same way, posts the findings on the pull
   request and leaves them for the contributor to answer; once the findings are answered and the maintainer has read
-  the diff, the maintainer runs the local gate on its head (it builds and runs the contributor's code) and merges it
+  the diff, the maintainer runs the local gate on what would land, its head squashed onto the current `main` (it builds and
+  runs the contributor's code), and merges it
   as one commit when that and CI are green. A fork's first workflow run waits for a maintainer's
   approval on the Actions tab.
 - **A checkout that runs ahead of `main` on a host is that host's owner's to run**; what the spec promises of it is
