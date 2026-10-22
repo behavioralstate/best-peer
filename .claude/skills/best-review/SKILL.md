@@ -25,8 +25,8 @@ git log --oneline origin/main..main
 
 - On another branch than `main`, or with uncommitted changes: say what differs in one line and stop. Never switch
   branches, stash or discard anything.
-- `main` behind `origin/main`: `git pull --rebase` first (SDLC.md section 4), then the local gate again if what
-  arrived touches the same code.
+- `main` behind `origin/main`: `git pull --rebase` first (SDLC.md section 4). Step 6's gate then runs on the new
+  head whatever arrived; if the rebase changed one's own commits (a conflict resolved), review them again.
 - Nothing ahead of `origin/main`: say so in one line and stop.
 - Findings of a previous run on these commits: those named in the messages of `Review:` commits ahead of
   `origin/main`. Pass them along so the reviewer does not repeat them.
@@ -73,6 +73,7 @@ In chat, one block and nothing longer, then stop: the push is the maintainer's n
 - set aside: <the finding> — <why>
 - owner's call: <what needs a decision>
 gate: GREEN on <sha> (step 6's own run); ready to push
+   | RED (<the step that failed>) on <sha>; not ready to push
 ```
 
 `no findings` when the reviewer reported none.
@@ -87,10 +88,9 @@ gh pr view $ARGUMENTS --json number,url,state,isDraft,baseRefName,headRefName,he
 ```
 
 - Not open: say so in one line and stop.
-- Fetch its head without switching anything: `git fetch origin pull/<n>/head:refs/review/pr-<n>`. The reviewer reads
-  it there (`git show refs/review/pr-<n>:<path>`, `git diff origin/main...refs/review/pr-<n>`), and the local gate
-  runs on it in a worktree of the session's scratchpad (`git worktree add <scratch>/pr-<n> refs/review/pr-<n>`, the
-  gate script run from it, the worktree removed after).
+- Fetch its head without switching anything, forced, since a contributor may have rewritten it:
+  `git fetch origin +refs/pull/<n>/head:refs/review/pr-<n>`. The reviewer reads it there
+  (`git show refs/review/pr-<n>:<path>`, `git diff origin/main...refs/review/pr-<n>`). Nothing of it runs yet.
 - Findings already on the pull request from a previous run: the inline comments AND the review bodies that start with
   `**best-review**` (a finding on an unchanged line lives in a body, not inline). Collect path, line and summary from
   both so the reviewer is told not to repeat them.
@@ -136,7 +136,14 @@ and no comments. The event is always `COMMENT`; never `APPROVE` or `REQUEST_CHAN
 The fixes are the contributor's, on their branch. A later push of theirs is reviewed again by the same command, and
 that run reviews only what is new, because step 1 passes the reported findings along.
 
-### 4. Report
+### 4. The local gate on its head, before a merge
+
+Only once every finding is answered and the maintainer has read the diff, since the gate builds and runs the
+contributor's code on this machine: remove a leftover `<scratch>/pr-<n>` worktree, then
+`git worktree add <scratch>/pr-<n> refs/review/pr-<n>`, run `scripts/gate.sh all` (`pwsh scripts/gate.ps1 all` on
+Windows) from it, and remove the worktree. Until then the report says the gate has not run.
+
+### 5. Report
 
 In chat, one block and nothing longer:
 
@@ -146,7 +153,7 @@ In chat, one block and nothing longer:
 - question: <the question>
 - owner's call: <what needs a decision>
 posted: <review url>
-gate on the head: GREEN | RED (<the step>) on <sha>
+gate on the head: GREEN | RED (<the step>) on <sha> | not run yet (findings open)
 ```
 
 `no findings` when the reviewer reported none. Approve nothing; merge nothing: a maintainer merges once every finding

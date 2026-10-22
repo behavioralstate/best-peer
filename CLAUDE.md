@@ -10,7 +10,9 @@ before changing anything, and keep it the current rule when a change moves the p
 - Every change is made on `main` and pushed there, the owner's and every maintainer's; no branch and no pull request
   is needed. The subject is one plain sentence saying what changed and why, with no type prefix (`feat:`, `fix:`);
   the one prefix is `Review:` on a commit that answers the review, as the history has it. Open work is an issue on
-  the Behavioralstate board, never a plan file or a `TODO`. `git pull --rebase` before the gates.
+  the Behavioralstate board, never a plan file or a `TODO`. `git pull --rebase` before the gates; after a rebase
+  that brought commits in, the local gate runs again on the new head. A red `main` is fixed before anything else is
+  pushed.
 - Two gates before every push, both mandatory. First the local proof: `scripts/gate.sh all` (`pwsh scripts/gate.ps1
   all` on Windows) must end in `GATE GREEN`; CI runs the same script on the push. Then the review: `/best-review`
   always runs `.claude/skills/best-reviewer` on a separate worker with the model that skill pins, on what `main`
@@ -18,7 +20,8 @@ before changing anything, and keep it the current rule when a change moves the p
   commit that names them, or sets it aside with its reason in that message (an empty commit when nothing changed).
   The local gate then runs on the head that is pushed. Nothing is pushed until both are done.
 - A contributor without write access sends a pull request from a fork; `/best-review <number>` reviews it the same
-  way and posts the findings there, and a maintainer merges it once they are answered and CI is green.
+  way and posts the findings there. A maintainer merges it once they are answered, the local gate is green on its
+  head (run only after its diff has been read, since it runs the contributor's code) and CI is green.
 - A behaviour the spec does not ask for is an entry on the spec follow-ups issue, behavioralstate/spec#37, before it
   is code. An adapter is proven on a host by hand, with the proof on the slice's issue.
 - The README's "Try it on your machine" and Run sections move in the same commit as the variable, the check at start,

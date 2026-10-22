@@ -70,11 +70,12 @@
      aside with its reason in that message (an empty commit when no finding changed a file); nothing is dropped
      silently. What a fix changed is reviewed again, and the local gate runs last, on the very head that is pushed.
 - **Pull first.** The push lands on top of what others pushed: `git pull --rebase` before the gates, and again before
-  the push if `origin/main` moved meanwhile, with the gates run again when what arrived touches the same code.
+  the push if `origin/main` moved meanwhile. After a rebase that brought commits in, the local gate runs again on the
+  new head, whatever they touched; the review runs again when the rebase changed one's own commits (a conflict
+  resolved), and stands otherwise.
 - **CI runs on the push**: the same script, on the fakes. A red `main` is fixed before anything else is pushed.
 - **What GitHub holds `main` to**: no force-push and no deletion. It requires no pull request and no check, since the
-  gates run before the push and CI checks the push; that they ran is each maintainer's word, with the `Review:` commit
-  as its record.
+  gates run before the push and CI checks the push; that they ran is each maintainer's word.
 - **The push is what runs.** A host run by the owner builds `main` and runs it; the sha is its version.
 - **A release is a tag.** `scripts/release.sh <version> -m "<what it is>"` runs only on a clean `main` level with
   origin, so everything it releases has passed the gates; it bumps the one version in `Cargo.toml` (every crate
@@ -99,8 +100,9 @@
   first, so the spec and every implementation of it move together, and never a surface of this implementation alone.
 - **A contributor without write access sends a pull request from a fork**, held to the same sections. A maintainer
   runs `/best-review <number>` on it, which runs the `best-reviewer` skill the same way, posts the findings on the pull
-  request and leaves them for the contributor to answer; the maintainer runs the local gate on its head and merges it
-  as one commit once the findings are answered and CI is green. A fork's first workflow run waits for a maintainer's
+  request and leaves them for the contributor to answer; once the findings are answered and the maintainer has read
+  the diff, the maintainer runs the local gate on its head (it builds and runs the contributor's code) and merges it
+  as one commit when that and CI are green. A fork's first workflow run waits for a maintainer's
   approval on the Actions tab.
 - **A checkout that runs ahead of `main` on a host is that host's owner's to run**; what the spec promises of it is
   only what `main` proves.
