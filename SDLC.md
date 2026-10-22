@@ -17,7 +17,8 @@
     acceptance.
   - **Done** when the issue closes, every "Done when" ticked. An issue with nothing to prove on a host or for the
     owner to accept closes when its last pull request merges, and goes from In progress to Done.
-  - An epic moves to **Ready** as soon as any of its issues has started.
+  - An epic is **In progress** as soon as any of its issues is In progress, In review or Done, and **Backlog**
+    before that; Ready is not a status an epic or a slice holds.
 
 ## 2. Design rules every change is held to
 

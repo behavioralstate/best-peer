@@ -4,7 +4,7 @@ How this repository is built and shipped is [`SDLC.md`](SDLC.md), the one place 
 before changing anything, and keep it the current rule when a change moves the process. In short:
 
 - Starting on an issue, move it to In progress on the Behavioralstate board first (project 4 of Amarcode-Studios, its
-  Status field: `gh project item-edit`, or the board itself), and its epic to Ready if it was not; once its code is
+  Status field: `gh project item-edit`, or the board itself), and its epic to In progress if it was not; once its code is
   merged and released, with only a host proof or the owner's acceptance left, move it to In review (SDLC.md
   section 1).
 - Every change is a branch and a pull request to `main`, squash-merged as one commit, the owner's included. The
