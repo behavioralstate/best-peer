@@ -145,9 +145,10 @@ contributor's code on this machine. The gate runs on what would land, the pull r
 `git rev-parse refs/review/pr-<n>`, all 40 characters, with the head the review ran on (the full sha of its
 `**best-review** on <sha>`; never a shortened one, which a contributor could match with other code): when they differ
 the contributor pushed since, so stop and go back to step 1, since the new commits are reviewed before they are
-gated. Note the `origin/main` sha the squash is made on: the merge checks it. Then `git fetch origin`,
+gated. Then `git fetch origin`,
 `git worktree remove --force <scratch>/pr-<n>` for a leftover one, then
-`git worktree add --detach <scratch>/pr-<n> origin/main` and, in it, `git merge --squash refs/review/pr-<n>` (a
+`git worktree add --detach <scratch>/pr-<n> origin/main`, noting `git -C <scratch>/pr-<n> rev-parse HEAD`, the
+`main` the squash is made on, which the report shows and the merge checks; and, in it, `git merge --squash refs/review/pr-<n>` (a
 conflict is the contributor's to resolve, so it is reported and the gate does not run), then `scripts/gate.sh all`
 (`pwsh scripts/gate.ps1 all` on Windows), and the worktree removed (`git worktree remove --force <scratch>/pr-<n>`, since the squash leaves it staged). Until then the report says the gate has not run.
 
