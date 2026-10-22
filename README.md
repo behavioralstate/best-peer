@@ -75,7 +75,9 @@ On Windows x86_64 the archive is `best-peer-x86_64-pc-windows-msvc.zip`, on macO
 holds the same archives under names that carry the version, for pinning one, with `SHA256SUMS` to check them against.
 
 It prints one line, `best-peer is serving its door`, with where it listens and its data folder, and then waits:
-nothing else appears until a client talks to it. If it exits instead, the message names what is missing (the
+nothing else appears until a client talks to it. On Linux, a peer run without root (or the capability to mount and
+the loop devices) prints one more first, `this peer makes no disk for a job`: it runs every other job, and refuses one
+with inputs or outputs (`NO_DISK`), since a job's disk is one it mounts. If it exits instead, the message names what is missing (the
 driver, Docker) and the variable that serves without it. `http://127.0.0.1:7777/.well-known/best` in a browser is
 the manifest, the one document an agent needs.
 
@@ -292,7 +294,11 @@ outside any container (an installed Ollama; no jobs), `fake` serves the whole su
 (what CI runs).
 A job's disk, for its inputs and outputs, is a file system of its own on a loop device, capped at its size and
 allocated whole when it is made (16 MiB at least), under `disks/` in the data folder. The peer makes it where Docker
-runs on Linux, and needs root to mount it; anywhere else a job with inputs or outputs is refused (`NO_DISK`). At
+runs on Linux and it can mount one: run as root, or with the capability to mount and the loop devices. A peer that
+cannot says so at start and makes none, so anywhere else a job with inputs or outputs is refused (`NO_DISK`) before
+any room is reserved. A disk is never promised the last of its file system: 1 GiB, or a twentieth of it when that is
+more, stays free for the peer's own log and the engine: the free room and the size `get-hardware-state` tells are each
+what is left after that, so the size is the largest disk the peer could ever make. At
 start the peer removes every disk there that no running job has, such as one whose job ended while it was down. Its inputs are fetched and its outputs sent over `https://`
 only; `BEST_PEER_STORE_CLEARTEXT=loopback` also allows a store on this machine's loopback over `http://`, for a test
 or a developer's own store, on the cloud's door and on its members alike.

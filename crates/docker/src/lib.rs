@@ -41,6 +41,8 @@ pub struct DockerRuntime {
     tx: broadcast::Sender<Event>,
     /// Where jobs' disks are made: each a file system of its own on a loop device, capped at the size asked for.
     disks: Option<std::path::PathBuf>,
+    /// Whether this peer can mount a disk there; one that cannot makes none, and still clears what is left there.
+    mounts: bool,
 }
 
 impl DockerRuntime {
@@ -59,6 +61,7 @@ impl DockerRuntime {
             bind_ip: bind_ip.into(),
             tx,
             disks: None,
+            mounts: false,
         };
         sweep(&me.docker, &me.exited).await;
         me.follow();
@@ -290,8 +293,19 @@ impl Layers {
 }
 
 impl DockerRuntime {
-    /// The same engine, making jobs' disks under `dir`.
+    /// The same engine, making jobs' disks under `dir`, when this peer can mount them: a peer that cannot makes none,
+    /// so a job asking for one is refused at admission and no room is ever reserved for a disk that cannot be made.
+    /// A Linux peer that cannot says so at start; elsewhere a peer never makes one, and says nothing.
     pub fn with_disks(mut self, dir: std::path::PathBuf) -> Self {
+        self.mounts = match can_mount() {
+            Ok(()) => true,
+            Err(why) => {
+                if cfg!(target_os = "linux") {
+                    tracing::warn!(dir = %dir.display(), %why, "this peer makes no disk for a job");
+                }
+                false
+            }
+        };
         self.disks = Some(dir);
         self
     }
@@ -349,13 +363,18 @@ impl Runtime for DockerRuntime {
     /// A file system of its own for the job `id`: an ext4 file of `bytes`, allocated whole so the room it takes is
     /// taken now, on a loop device mounted under the disks' directory. It has no journal, which a disk that lives as
     /// long as its job does not need, and keeps nothing for root, so the job has all of it. Linux only, and the peer
-    /// needs root to mount.
+    /// needs the capability to mount and the loop devices.
     async fn make_disk(&self, id: &str, bytes: u64) -> Result<std::path::PathBuf, RuntimeError> {
         let Some(dir) = self.disks.clone() else {
             return Err(RuntimeError::NoDisk(
                 "this peer makes no disk for a job: it was started without a place for them".into(),
             ));
         };
+        if !self.mounts {
+            return Err(RuntimeError::NoDisk(
+                "this peer makes no disk for a job: it cannot mount one, as its log said at start".into(),
+            ));
+        }
         if !cfg!(target_os = "linux") {
             return Err(RuntimeError::NoDisk(
                 "a job's disk is a file system on a loop device, which this peer makes on Linux only".into(),
@@ -376,7 +395,7 @@ impl Runtime for DockerRuntime {
             let (img, mnt) = (image.to_string_lossy().to_string(), mount.to_string_lossy().to_string());
             run("mkfs.ext4", &["-q", "-F", "-m", "0", "-O", "^has_journal", &img])?;
             run("mount", &["-o", "loop", &img, &mnt]).map_err(|e| {
-                RuntimeError::NoDisk(format!("{e}; a job's disk is mounted by the peer, which needs root"))
+                RuntimeError::NoDisk(format!("{e}; a job's disk is mounted by the peer, which needs the capability to mount (CAP_SYS_ADMIN) and the loop devices"))
             })?;
             // Whoever the job's image runs as writes there.
             run("chmod", &["0777", &mnt])?;
@@ -405,7 +424,7 @@ impl Runtime for DockerRuntime {
     }
 
     fn makes_disks(&self) -> bool {
-        self.disks.is_some() && cfg!(target_os = "linux")
+        self.disks.is_some() && self.mounts && cfg!(target_os = "linux")
     }
 
     fn disks(&self) -> Vec<String> {
@@ -440,7 +459,7 @@ impl Runtime for DockerRuntime {
     }
 
     fn disk_room(&self) -> Option<(u64, u64)> {
-        let dir = self.disks.clone()?;
+        let dir = self.disks.clone().filter(|_| self.mounts)?;
         if !cfg!(target_os = "linux") {
             return None;
         }
@@ -490,16 +509,7 @@ impl Runtime for DockerRuntime {
             .stdout
             .take()
             .map(|mut out| std::io::Read::read_to_string(&mut out, &mut text));
-        let mut numbers = text
-            .lines()
-            .nth(1)
-            .unwrap_or_default()
-            .split_whitespace()
-            .filter_map(|n| n.parse::<u64>().ok());
-        match (numbers.next(), numbers.next()) {
-            (Some(free), Some(total)) => Some((free, total)),
-            _ => failed(format!("df answered what does not read as room: {text:?}")),
-        }
+        room_in(&text).or_else(|| failed(format!("df answered what does not read as room: {text:?}")))
     }
 
     /// A container, or a user namespace when the engine runs rootless or remaps its users, as its own `info` says.
@@ -742,6 +752,56 @@ fn handed_over(id: &str) -> Result<DeviceRequest, RuntimeError> {
     })
 }
 
+/// The room for disks in what `df --output=avail,size` answered: what is free and the size, each less what is kept
+/// free, so the size is the largest disk that could ever be made there.
+fn room_in(df: &str) -> Option<(u64, u64)> {
+    let mut numbers = df
+        .lines()
+        .nth(1)
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|n| n.parse::<u64>().ok());
+    let (free, total) = (numbers.next()?, numbers.next()?);
+    let kept = kept_free(total);
+    Some((free.saturating_sub(kept), total.saturating_sub(kept)))
+}
+
+/// What a disk is never promised of the file system it is made on: 1 GiB, or a twentieth of it when that is more, so
+/// the peer's own log and the engine can always still write there.
+fn kept_free(total: u64) -> u64 {
+    (total / 20).max(1 << 30)
+}
+
+/// Whether this process can mount a disk: the capability to mount, and the loop devices to mount one on. Linux only.
+fn can_mount() -> Result<(), String> {
+    if !cfg!(target_os = "linux") {
+        return Err("a job's disk is a file system on a loop device, which this peer makes on Linux only".into());
+    }
+    let status =
+        std::fs::read_to_string("/proc/self/status").map_err(|e| format!("cannot read its own status: {e}"))?;
+    if !may_mount(&status) {
+        return Err(
+            "it lacks the capability to mount (CAP_SYS_ADMIN), which a peer that is not run as root has not".into(),
+        );
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/loop-control")
+        .map(|_| ())
+        .map_err(|e| format!("it cannot reach the loop devices (/dev/loop-control: {e})"))
+}
+
+/// Whether the effective capabilities in a `/proc/<pid>/status` text hold CAP_SYS_ADMIN.
+fn may_mount(status: &str) -> bool {
+    const CAP_SYS_ADMIN: u32 = 21;
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("CapEff:"))
+        .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+        .is_some_and(|caps| caps & (1 << CAP_SYS_ADMIN) != 0)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -764,6 +824,42 @@ mod tests {
 
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn a_disk_is_never_promised_the_last_of_its_file_system() {
+        assert_eq!(kept_free(10 << 30), 1 << 30, "a small one keeps 1 GiB");
+        assert_eq!(
+            kept_free(60 << 30),
+            3 << 30,
+            "the host's 60 GiB volume keeps a twentieth"
+        );
+        assert_eq!(kept_free(0), 1 << 30);
+        let df = |free: u64, total: u64| format!("    Avail     1B-blocks\n{free:>9} {total:>13}\n");
+        assert_eq!(room_in(&df(50 << 30, 60 << 30)), Some((47 << 30, 57 << 30)));
+        assert_eq!(
+            room_in(&df(2 << 30, 60 << 30)),
+            Some((0, 57 << 30)),
+            "nothing past the kept room"
+        );
+        assert_eq!(room_in(&df(0, 0)), Some((0, 0)));
+        assert_eq!(room_in("Avail 1B-blocks\n"), None);
+    }
+
+    #[test]
+    fn a_peer_mounts_only_with_the_capability_to() {
+        let status = |caps: &str| {
+            format!("Name:\tbest-peer\nCapInh:\t0000000000000000\nCapEff:\t{caps}\nCapBnd:\t000001ffffffffff\n")
+        };
+        assert!(may_mount(&status("000001ffffffffff")), "root");
+        assert!(may_mount(&status("0000000000200000")), "CAP_SYS_ADMIN alone");
+        assert!(
+            !may_mount(&status("0000000000000000")),
+            "a user, or a unit with no capabilities"
+        );
+        assert!(!may_mount(&status("00000000001fffff")), "every capability below it");
+        assert!(!may_mount("Name:\tbest-peer\n"), "no line, no capability");
+        assert!(!may_mount(&status("not hex")));
+    }
 
     #[test]
     fn a_whole_card_and_a_mig_instance_are_handed_over_by_their_uuid_and_nothing_else_is() {

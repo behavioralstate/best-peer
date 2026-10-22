@@ -1792,7 +1792,7 @@ impl Peer {
         if !self.runtime.makes_disks() {
             return Err(BestError::bad_request(
                 "NO_DISK",
-                "this peer makes no disk for a job: a job with inputs or outputs runs on a peer whose container engine is Docker on Linux",
+                "this peer makes no disk for a job: a job with inputs or outputs runs on a peer whose container engine is Docker on Linux, run so that it can mount one",
             ));
         }
         Ok(Some(JobIo {

@@ -319,6 +319,8 @@ pub struct Fake {
     broken_disk: Mutex<Option<String>>,
     /// Whether its room can be read now: not, as a file system that does not answer.
     room_unread: Mutex<bool>,
+    /// Whether it makes no disk, as an engine whose peer cannot mount one.
+    no_disks: Mutex<bool>,
 }
 
 impl Fake {
@@ -347,12 +349,18 @@ impl Fake {
             broken_disk: Mutex::new(None),
             processes: Mutex::new(Some(Vec::new())),
             room_unread: Mutex::new(false),
+            no_disks: Mutex::new(false),
         }
     }
 
     /// From now on its room cannot be read, or can again.
     pub fn room_unread(&self, unread: bool) {
         *self.room_unread.lock().unwrap() = unread;
+    }
+
+    /// From now on it makes no disk, as a peer that cannot mount one, or does again.
+    pub fn makes_no_disks(&self, none: bool) {
+        *self.no_disks.lock().unwrap() = none;
     }
 
     /// The next disk is begun, its directory made, and then fails with `why`.
@@ -610,7 +618,7 @@ impl Runtime for Fake {
     }
 
     fn makes_disks(&self) -> bool {
-        true
+        !*self.no_disks.lock().unwrap()
     }
 
     fn disk_room(&self) -> Option<(u64, u64)> {

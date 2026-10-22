@@ -10459,6 +10459,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_peer_that_makes_no_disk_refuses_a_job_asking_for_one_before_any_room_is_promised_and_tells_no_room() {
+        let bed = bed(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        assert!(bed.query("get-hardware-state").await["disk"].is_object());
+        bed.runtime.makes_no_disks(true);
+        let job = json!({
+            "image": "busybox",
+            "memory_bytes": 4 * GB,
+            "outputs": { "url": "https://store.example/jobs/renders/r1.tar?X-Amz-Signature=x", "key": "renders/r1.tar" },
+            "disk_bytes": 1u64 << 40
+        });
+        let (s, b) = bed.send("d1", "RunJob", "run-job", job).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "NO_DISK", "{b}");
+        assert!(bed.runtime.disks().is_empty());
+        assert!(
+            bed.query("get-hardware-state").await.get("disk").is_none(),
+            "no room is told for disks it cannot make"
+        );
+    }
+
+    #[tokio::test]
     async fn a_job_at_a_peer_s_own_door_reads_and_writes_by_the_urls_it_was_sent_and_keeps_none_of_them() {
         let (s3, endpoint) = FakeS3::start().await;
         s3.put("inputs/scene.txt", b"the scene");
