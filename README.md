@@ -402,7 +402,8 @@ A key reads there what it reads elsewhere: every card's series, unless it is hel
 no CPU; its own deployments and jobs, unless it was approved for all. A key approved `--may metrics` is what a
 collector holds: it reads every holder's workloads, with their holder ids, and the door's own counts, and may do
 nothing else: every other path refuses it, commands, queries and events alike, so a key that leaks from a
-collector's configuration opens nothing more. The door's counts leave out what no key reads at the root, who made a
+collector's configuration opens nothing more. `metrics` stands alone: an approval that names it beside another
+scope is refused, since a key that could act would read more of the others here than it may anywhere else. The door's counts leave out what no key reads at the root, who made a
 workspace and who joined one. The series, every one named `best_peer_…` in base units:
 
 | Series | Labels | What |
@@ -424,8 +425,13 @@ workspace and who joined one. The series, every one named `best_peer_…` in bas
 | `best_peer_events_total`, `best_peer_event_streams` | `event` | Facts told since the log began, by type, placements and failures among them; streams open now (all or metrics keys) |
 
 The host's CPU is a device too (`api="cpu"`): `sum(best_peer_device_memory_total_bytes{api!="cpu"})` is the
-accelerators' memory. Where the peer sits, its workspace and its cloud, is not a label here, since one machine may
-serve the clouds of several workspaces: the collector adds what it knows of the target. A Prometheus job for a peer, with the key in a
+accelerators' memory. Where the peer sits, its workspace and its cloud, is not a label on its own series, since one machine
+may serve the clouds of several workspaces: the collector adds what it knows of the target, or the cloud door does.
+A door that hosts workspaces serves its clouds' members' series beside its own, each labelled `workspace`, `cloud`
+and `peer`, so one scrape of the door sees the whole pool: every reconcile tick (thirty seconds) each cloud reads a
+member's `/metrics` with the credential the member's owner approved for the cloud, and a member that does not answer
+has no series until it does, its absence being the signal. They are served to a key approved for all or for
+metrics, as the door's own counts are, since a member's series belong to every workspace's holders at once. A Prometheus job for a peer, with the key in a
 file only the collector reads and the certificate the peer made named for it:
 
 ```yaml
@@ -703,7 +709,7 @@ joined any workspace still uses the machine's own surface at the root.
 **What a credential may do** is set at the approval and travels with the key. The manifest's authentication block
 lists the scopes: `deploy` (pull-image, deploy-model, undeploy-model), `jobs` (run-job, stop-job), `prompt`
 (prompt) and `metrics` (reading the whole door's [metrics](#metrics), and nothing else); `all` is every scope and every holder's workloads, and what a key approved with nothing said is, so the owner's own box changes
-nothing. Reading is every key's: the hardware state, and its own workloads and events. `best-peer approve <code>
+nothing. Reading is every key's but a metrics key's: the hardware state, and its own workloads and events. `best-peer approve <code>
 --may deploy` grants scopes; `--memory 40G` sets the most device memory the key's workloads may hold together,
 counted across its deployments, jobs and commands admitted but not yet started; `--expires 8h` ends the key after
 that long (`8h`, `30m`, `2d`, or seconds; 366 days at most, and 8 hours at most for a session credential, which an

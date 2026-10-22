@@ -159,6 +159,37 @@ impl Member {
         self.get(&format!("/queries/{schema}")).await
     }
 
+    /// The member's `/metrics`, in the Prometheus text, read with this peer's credential: the series it shows
+    /// that credential, which the cloud door serves again under where the member sits (behavioralstate/spec#47).
+    pub async fn metrics(&self) -> Result<String, Refusal> {
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("{}/metrics", self.endpoint))
+            .header(header::ACCEPT, "text/plain");
+        if let Some(key) = self.key() {
+            req = req.header(AUTH_HEADER, key);
+        }
+        let req = req.body(Body::empty()).expect("a request to a member is well formed");
+        let answer = async {
+            let res = self.transport.call(req).await.map_err(Refusal::Unreachable)?;
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), 8 << 20)
+                .await
+                .map_err(|e| Refusal::Unreachable(format!("the answer could not be read: {e}")))?;
+            if status.is_success() {
+                Ok(String::from_utf8_lossy(&bytes).into_owned())
+            } else {
+                Err(Refusal::Refused {
+                    status,
+                    body: serde_json::from_slice(&bytes).unwrap_or_default(),
+                })
+            }
+        };
+        tokio::time::timeout(ANSWER_WITHIN, answer)
+            .await
+            .unwrap_or_else(|_| Err(Refusal::Unreachable(format!("no answer within {ANSWER_WITHIN:?}"))))
+    }
+
     /// The base the member builds its schema URIs on: its own endpoint, read once from its manifest, and where it is
     /// reached until the manifest has been read.
     pub async fn schema_base(&self) -> String {

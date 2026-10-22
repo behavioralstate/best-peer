@@ -835,6 +835,14 @@ impl Auth {
                     self.scopes.join(", ")
                 )));
             }
+            // A collector's key reads every holder's series, so it may do nothing else: one that could also act
+            // would read more of the others than its own grant shows it anywhere else.
+            if scopes.len() > 1 && scopes.iter().any(|s| s == crate::metrics::METRICS_SCOPE) {
+                return Err(OAuthError::invalid_request(format!(
+                    "{} stands alone: it is a collector's scope, which reads every holder's series and may do nothing else; approve it on its own, or the other scopes without it",
+                    crate::metrics::METRICS_SCOPE
+                )));
+            }
         }
         self.expire_pending();
         let code = normalise_user_code(user_code);

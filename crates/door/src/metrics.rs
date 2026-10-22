@@ -63,7 +63,7 @@ pub struct Family {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sample {
-    pub labels: Vec<(&'static str, String)>,
+    pub labels: Vec<(String, String)>,
     pub value: f64,
 }
 
@@ -92,7 +92,7 @@ impl Family {
     /// Adds a sample with these labels.
     pub fn sample(&mut self, labels: &[(&'static str, &str)], value: f64) -> &mut Self {
         self.samples.push(Sample {
-            labels: labels.iter().map(|(k, v)| (*k, v.to_string())).collect(),
+            labels: labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             value,
         });
         self
@@ -219,6 +219,196 @@ pub fn render(families: &[Family], format: Format) -> String {
     out
 }
 
+/// The families of a Prometheus text exposition, as another door renders it: what a cloud door reads from a
+/// member's `/metrics` to serve again under its own labels. A counter's family is named without `_total`, and a
+/// gauge named `…_info` whose every sample is 1 is an info, so [`render`] writes the text back as it came. A line
+/// that is not a comment, a type or a sample is an error naming it, so a member that answers something else is not
+/// taken for one that measures nothing.
+pub fn parse(text: &str) -> Result<Vec<Family>, String> {
+    let mut families: Vec<Family> = Vec::new();
+    let mut helps: BTreeMap<String, String> = BTreeMap::new();
+    let mut kinds: BTreeMap<String, Kind> = BTreeMap::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim_end();
+        if line.is_empty() || line == "# EOF" {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("# HELP ") {
+            let (name, help) = rest.split_once(' ').unwrap_or((rest, ""));
+            helps.insert(name.to_string(), unescape(help));
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("# TYPE ") {
+            let (name, kind) = rest.split_once(' ').unwrap_or((rest, ""));
+            let kind = match kind {
+                "counter" => Kind::Counter,
+                "gauge" | "untyped" | "unknown" => Kind::Gauge,
+                "info" => Kind::Info,
+                other => {
+                    return Err(format!(
+                        "line {}: a series of type {other:?}, which this door does not read",
+                        n + 1
+                    ))
+                }
+            };
+            kinds.insert(name.to_string(), kind);
+            continue;
+        }
+        if line.starts_with('#') {
+            continue;
+        }
+        let (name, labels, value) = sample_line(line).ok_or_else(|| format!("line {}: not a sample: {line}", n + 1))?;
+        // The family a sample belongs to: its own name, or its name without the suffix its type adds.
+        let (family, kind) = match kinds.get(&name) {
+            Some(Kind::Counter) => (name.strip_suffix("_total").unwrap_or(&name).to_string(), Kind::Counter),
+            Some(k) => (name.clone(), *k),
+            None => match name
+                .strip_suffix("_total")
+                .filter(|f| kinds.get(*f) == Some(&Kind::Counter))
+            {
+                Some(f) => (f.to_string(), Kind::Counter),
+                None => (name.clone(), Kind::Gauge),
+            },
+        };
+        let help = helps
+            .get(&name)
+            .or_else(|| helps.get(&family))
+            .cloned()
+            .unwrap_or_default();
+        let at = match families.iter().position(|f| f.name == family) {
+            Some(i) => i,
+            None => {
+                families.push(Family::new(&family, kind, &help));
+                families.len() - 1
+            }
+        };
+        families[at].samples.push(Sample { labels, value });
+    }
+    for f in &mut families {
+        if f.kind == Kind::Gauge
+            && f.name.ends_with("_info")
+            && !f.samples.is_empty()
+            && f.samples.iter().all(|s| s.value == 1.0)
+        {
+            f.name.truncate(f.name.len() - "_info".len());
+            f.kind = Kind::Info;
+        }
+    }
+    Ok(families)
+}
+
+/// A sample's labels, by name, in the order they came.
+type Labels = Vec<(String, String)>;
+
+/// `name{labels} value`, or `name value`, with an optional timestamp after the value, which is dropped.
+fn sample_line(line: &str) -> Option<(String, Labels, f64)> {
+    let (name, labels, rest) = match line.find('{') {
+        Some(open) => {
+            let name = &line[..open];
+            let (labels, after) = label_set(&line[open + 1..])?;
+            (name, labels, after)
+        }
+        None => {
+            let (name, rest) = line.split_once(' ')?;
+            (name, Vec::new(), rest)
+        }
+    };
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':') {
+        return None;
+    }
+    let value = rest.split_whitespace().next()?;
+    let value = match value {
+        "NaN" => f64::NAN,
+        "+Inf" | "Inf" => f64::INFINITY,
+        "-Inf" => f64::NEG_INFINITY,
+        v => v.parse().ok()?,
+    };
+    Some((name.to_string(), labels, value))
+}
+
+/// The labels after `{`, up to and including `}`, and what follows them.
+fn label_set(s: &str) -> Option<(Labels, &str)> {
+    let mut labels = Vec::new();
+    let mut rest = s.trim_start();
+    loop {
+        if let Some(after) = rest.strip_prefix('}') {
+            return Some((labels, after));
+        }
+        let eq = rest.find('=')?;
+        let key = rest[..eq].trim().to_string();
+        let mut chars = rest[eq + 1..].char_indices();
+        if chars.next()?.1 != '"' {
+            return None;
+        }
+        let mut value = String::new();
+        let mut escaped = false;
+        let mut end = None;
+        for (i, c) in chars {
+            match (escaped, c) {
+                (true, 'n') => {
+                    value.push('\n');
+                    escaped = false;
+                }
+                (true, c) => {
+                    value.push(c);
+                    escaped = false;
+                }
+                (false, '\\') => escaped = true,
+                (false, '"') => {
+                    end = Some(i);
+                    break;
+                }
+                (false, c) => value.push(c),
+            }
+        }
+        rest = rest[eq + 1 + end? + 1..].trim_start();
+        rest = rest.strip_prefix(',').unwrap_or(rest).trim_start();
+        labels.push((key, value));
+    }
+}
+
+/// Help text as the formats escape it, read back: `\\` and `\n`, and `\"` where OpenMetrics wrote one.
+fn unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut escaped = false;
+    for c in s.chars() {
+        match (escaped, c) {
+            (true, 'n') => {
+                out.push('\n');
+                escaped = false;
+            }
+            (true, c) => {
+                out.push(c);
+                escaped = false;
+            }
+            (false, '\\') => escaped = true,
+            (false, c) => out.push(c),
+        }
+    }
+    out
+}
+
+/// The same families with `labels` added in front of each sample's own, where a sample does not already carry a
+/// label of that name: a cloud door names where a member's series sit, and a series that already says (a member
+/// that is itself a cloud door, re-serving its own members) keeps what it says.
+pub fn labelled(families: Vec<Family>, labels: &[(&str, &str)]) -> Vec<Family> {
+    families
+        .into_iter()
+        .map(|mut f| {
+            for s in &mut f.samples {
+                let mut added: Vec<(String, String)> = labels
+                    .iter()
+                    .filter(|(k, _)| !s.labels.iter().any(|(own, _)| own == k))
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect();
+                added.append(&mut s.labels);
+                s.labels = added;
+            }
+            f
+        })
+        .collect()
+}
+
 /// Commands refused at the door before they were accepted, by type and refusal code, since the door started. A
 /// refusal is told to its sender only, and kept nowhere else, so this count is the one record of how many there
 /// were.
@@ -316,6 +506,41 @@ mod tests {
         let mut t = Family::new("best_peer_device_temperature_celsius", Kind::Gauge, "Temperature.").unit("celsius");
         t.sample(&[("device", "GPU-1")], 41.5);
         vec![free, c, i, t]
+    }
+
+    #[test]
+    fn what_render_writes_parse_reads_back_family_by_family() {
+        let text = render(&families(), Format::Prometheus);
+        let back = parse(&text).unwrap();
+        let mut expected = families();
+        for f in &mut expected {
+            f.unit = None;
+        }
+        assert_eq!(back, expected, "{text}");
+        assert_eq!(render(&back, Format::Prometheus), text);
+        assert!(parse("best_peer_x{a=\"1\"} oops\n").unwrap_err().contains("line 1"));
+        assert!(parse("<html>\n").is_err());
+    }
+
+    #[test]
+    fn labelled_names_where_a_series_sits_and_keeps_what_it_already_says() {
+        let mut f = Family::new("best_peer_device_power_watts", Kind::Gauge, "Power.");
+        f.sample(&[("device", "gpu-0")], 300.0);
+        f.sample(&[("peer", "inner"), ("device", "gpu-1")], 200.0);
+        let out = labelled(vec![f], &[("workspace", "ws-1"), ("cloud", "lab"), ("peer", "a")]);
+        let text = render(&out, Format::Prometheus);
+        assert!(
+            text.contains(
+                "best_peer_device_power_watts{workspace=\"ws-1\",cloud=\"lab\",peer=\"a\",device=\"gpu-0\"} 300\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "best_peer_device_power_watts{workspace=\"ws-1\",cloud=\"lab\",peer=\"inner\",device=\"gpu-1\"} 200\n"
+            ),
+            "{text}"
+        );
     }
 
     #[test]

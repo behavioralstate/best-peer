@@ -222,14 +222,14 @@ pub fn door(peer: Arc<Peer>, workspaces: Arc<workspace::Workspaces>, auth: Arc<A
         &ctx.endpoint,
         SERVICE,
         "A peer: a GPU host that deploys models and runs jobs on request and tells their lifecycle as events, and hosts workspaces, each with its clouds of peers.",
-        domain::catalogue(peer.clone(), workspaces, auth.clone()),
+        domain::catalogue(peer.clone(), workspaces.clone(), auth.clone()),
         peer.log.clone(),
         auth,
     )
     .with_tenants(&ctx.manifest_template())
     .with_partition(workspace::Workspaces::root_partition(peer.log.clone()))
     .with_limits(ctx.limits.clone())
-    .with_metrics(metrics::source(peer))
+    .with_metrics(metrics::source(peer, workspaces))
     // What the root's partition shows no credential, whatever its grant (a workspace's membership, a membership
     // command's failure), and the membership commands themselves: no count of them tells anyone more.
     .with_uncounted(Arc::new(|r#type: &str, data: &serde_json::Value| {
@@ -11162,6 +11162,120 @@ mod tests {
                 | prometheus_parse::Value::Untyped(v) => v,
                 _ => f64::NAN,
             })
+    }
+
+    #[tokio::test]
+    async fn a_cloud_door_serves_its_members_series_under_where_they_sit_and_a_member_gone_has_none() {
+        let (a, b) = two_members().await;
+        let (key_a, key_b) = (a.key.clone(), b.key.clone());
+        let site = site(vec![(A, a), (B, b)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a), ("b", B, &key_b)])
+            .await;
+        let lab = site.live_cloud(&ws, "lab");
+        lab.reconcile().await;
+        let at = |peer: &'static str| {
+            vec![
+                ("workspace", ws.clone()),
+                ("cloud", "lab".to_string()),
+                ("peer", peer.to_string()),
+                ("device", "gpu-0".to_string()),
+            ]
+        };
+        let has = |text: &str, peer: &'static str| {
+            let labels = at(peer);
+            let labels: Vec<(&str, &str)> = labels.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            sample(&parsed(text), "best_peer_device_memory_free_bytes", &labels).is_some()
+        };
+
+        // The door's own key reads both members' series beside its own, each named where it sits.
+        let text = scrape(&site.app, Some(&site.key), false, None).await.2;
+        assert!(has(&text, "a") && has(&text, "b"), "{text}");
+        // So does a collector's; a key that may do less reads none of them, as it reads none of the door's counts.
+        let collector = key_with(&site.app, Some("metrics"), None).await;
+        let text = scrape(&site.app, Some(&collector), false, None).await.2;
+        assert!(has(&text, "a") && has(&text, "b"), "{text}");
+        let other = key_with(&site.app, Some("prompt"), None).await;
+        let text = scrape(&site.app, Some(&other), false, None).await.2;
+        assert!(!text.contains("cloud=\"lab\""), "{text}");
+
+        // b stops answering: at the next tick it has no series, and a's are still there; back, it has them again.
+        site.down[B].store(true, std::sync::atomic::Ordering::SeqCst);
+        lab.reconcile().await;
+        let text = scrape(&site.app, Some(&site.key), false, None).await.2;
+        assert!(has(&text, "a") && !has(&text, "b"), "{text}");
+        assert!(!text.contains("peer=\"b\""), "{text}");
+        site.down[B].store(false, std::sync::atomic::Ordering::SeqCst);
+        lab.reconcile().await;
+        let text = scrape(&site.app, Some(&site.key), false, None).await.2;
+        assert!(has(&text, "a") && has(&text, "b"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_workspace_door_serves_no_metrics_and_a_collector_may_do_nothing_else_anywhere() {
+        let (a, b) = two_members().await;
+        let site = site(vec![(A, a), (B, b)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        let (s, _) = get_as(&site.app, &format!("/workspaces/{ws}"), &site.key, "/metrics").await;
+        assert_eq!(
+            s,
+            StatusCode::NOT_FOUND,
+            "a workspace's door has no /metrics of its own"
+        );
+        let collector = key_with(&site.app, Some("metrics"), None).await;
+        let (s, b) = send_as(
+            &site.app,
+            "",
+            &collector,
+            "w9",
+            "CreateWorkspace",
+            "create-workspace",
+            json!({ "name": "Mine" }),
+        )
+        .await;
+        assert_eq!(
+            (s, b["error"]["code"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("FORBIDDEN")),
+            "{b}"
+        );
+        // Nor does it read a workspace's door, which it is no member of and may read nothing at.
+        let (s, b) = get_as(
+            &site.app,
+            &format!("/workspaces/{ws}"),
+            &collector,
+            "/queries/get-hardware-state",
+        )
+        .await;
+        assert!(!s.is_success(), "{s} {b}");
+    }
+
+    #[tokio::test]
+    async fn a_collectors_scope_stands_alone() {
+        let (a, _) = two_members().await;
+        let form = |f: &[(&str, &str)]| {
+            Request::post(if f[0].0 == "client_id" {
+                "/auth/device"
+            } else {
+                "/auth/approve"
+            })
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(serde_urlencoded::to_string(f).unwrap()))
+            .unwrap()
+        };
+        let d = body(a.app.clone().oneshot(form(&[("client_id", "test")])).await.unwrap()).await;
+        let res = a
+            .app
+            .clone()
+            .oneshot(form(&[
+                ("user_code", d["user_code"].as_str().unwrap()),
+                ("proof", "ok"),
+                ("may", "deploy,metrics"),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let b = body(res).await;
+        assert!(b.to_string().contains("metrics stands alone"), "{b}");
     }
 
     #[tokio::test]

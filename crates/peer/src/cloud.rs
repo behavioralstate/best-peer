@@ -192,6 +192,10 @@ pub struct Cloud {
     cursors: Mutex<HashMap<String, String>>,
     /// Whether each member answered at the last reconcile tick; a member never asked is taken as answering.
     reachable: Mutex<HashMap<String, bool>>,
+    /// Each member's series as its `/metrics` showed them at the last tick it answered, served again by this door
+    /// under the workspace, the cloud and the member (behavioralstate/spec#47); a member that did not answer has
+    /// none, and its absence is the signal.
+    series: Mutex<HashMap<String, Vec<best_peer_door::metrics::Family>>>,
     /// Workloads a member did not list at the last tick: listed at two ticks running, they are told as ended, so
     /// a fact still on its way on the stream is not outrun.
     missing: Mutex<HashSet<String>>,
@@ -457,6 +461,7 @@ impl Cloud {
             pulls: Mutex::new(HashMap::new()),
             cursors: Mutex::new(cursors),
             reachable: Mutex::new(HashMap::new()),
+            series: Mutex::new(HashMap::new()),
             missing: Mutex::new(HashSet::new()),
             file,
             tasks: Mutex::new(HashMap::new()),
@@ -1809,6 +1814,7 @@ impl Cloud {
         match m.query("get-workloads").await {
             Ok(w) => {
                 let contact = self.contact(m, true, "");
+                self.scrape(m).await;
                 let runs = |id: &str, deployment: bool| {
                     let list = if deployment { &w["deployments"] } else { &w["jobs"] };
                     let field = if deployment { "deployment" } else { "job" };
@@ -1835,14 +1841,53 @@ impl Cloud {
             Err(e) if e.is_unauthorized() => {
                 tracing::warn!(cloud = %self.name, peer = %m.name, "the member no longer honours this cloud's credential; signing in again");
                 m.clear_key();
+                self.series.lock().unwrap().remove(&m.name);
                 self.save();
             }
             Err(e) => {
+                self.series.lock().unwrap().remove(&m.name);
                 if self.contact(m, false, &e.text()) == Contact::Lost {
                     self.lost(m, &held);
                 }
             }
         }
+    }
+
+    /// Reads the member's series, keeping them for this door's `/metrics`; a member that does not answer, or
+    /// answers with something that is not series, has none until it does.
+    async fn scrape(&self, m: &Member) {
+        let read = match m.metrics().await {
+            Ok(text) => best_peer_door::metrics::parse(&text),
+            Err(e) => Err(e.text()),
+        };
+        match read {
+            Ok(families) => {
+                self.series.lock().unwrap().insert(m.name.clone(), families);
+            }
+            Err(why) => {
+                tracing::debug!(cloud = %self.name, peer = %m.name, why, "the member's series could not be read");
+                self.series.lock().unwrap().remove(&m.name);
+            }
+        }
+    }
+
+    /// The members' series as this door serves them: each labelled with the workspace, this cloud and the member,
+    /// only for a member that is still one and answered at the last tick.
+    pub fn federated(&self) -> Vec<best_peer_door::metrics::Family> {
+        let members: Vec<String> = self.members().iter().map(|m| m.name.clone()).collect();
+        let reachable = self.reachable.lock().unwrap().clone();
+        let series = self.series.lock().unwrap();
+        members
+            .iter()
+            .filter(|name| reachable.get(*name).copied().unwrap_or(true))
+            .filter_map(|name| series.get(name).map(|f| (name, f)))
+            .flat_map(|(name, families)| {
+                best_peer_door::metrics::labelled(
+                    families.clone(),
+                    &[("workspace", &self.workspace), ("cloud", &self.name), ("peer", name)],
+                )
+            })
+            .collect()
     }
 
     /// A member is lost: every workload it held ends now, whatever its phase, and every command in flight there

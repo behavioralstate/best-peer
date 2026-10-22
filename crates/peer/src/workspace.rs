@@ -165,6 +165,26 @@ impl Workspaces {
         out
     }
 
+    /// Every live cloud's members' series, as the cloud door serves them under the workspace, the cloud and the
+    /// member (behavioralstate/spec#47): what each member showed its cloud at the last tick it answered.
+    pub fn federated(&self) -> Vec<best_peer_door::metrics::Family> {
+        let mut out = Vec::new();
+        for ws in self.all() {
+            let clouds: Vec<Arc<Cloud>> = ws
+                .clouds
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|r| !r.archived)
+                .filter_map(|r| r.live.clone())
+                .collect();
+            for cloud in clouds {
+                out.extend(cloud.federated());
+            }
+        }
+        out
+    }
+
     /// Follows every cloud's members, and from here on a workspace or a cloud made later starts at once.
     pub async fn start(&self) {
         for ws in self.all() {

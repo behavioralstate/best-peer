@@ -8,6 +8,11 @@
 //! `cuda`, `rocm`, `cpu`), and on a workload its id, its device and its holder. Where the peer sits (its
 //! workspace and cloud) is the collector's to add, or the cloud door's that fronts it, since one machine may serve
 //! the clouds of several workspaces.
+//!
+//! A door that hosts workspaces is that cloud door: it serves its clouds' members' series beside its own, each
+//! labelled with `workspace`, `cloud` and `peer`, as each member showed them to its cloud at the last reconcile
+//! tick it answered. Only a credential that reads the whole door gets them (approved for all, or for metrics),
+//! since a member's series belong to every workspace's holders at once.
 
 use std::sync::Arc;
 
@@ -19,11 +24,21 @@ use serde_json::Value;
 use crate::domain::Service;
 use crate::lifecycle::Peer;
 
-/// The series of `peer`, for `/metrics`.
-pub fn source(peer: Arc<Peer>) -> MetricsSource {
+/// The series of `peer`, for `/metrics`, and of the members of the clouds of `workspaces` for a credential that
+/// reads the whole door.
+pub fn source(peer: Arc<Peer>, workspaces: Arc<crate::workspace::Workspaces>) -> MetricsSource {
     Arc::new(move |who: Credential| {
         let peer = peer.clone();
-        Box::pin(async move { families(&peer, &reader(who)).await })
+        let workspaces = workspaces.clone();
+        Box::pin(async move {
+            // The same test the door makes for its own whole-door series: approved for all, or for metrics.
+            let whole_door = who.grant.allows(METRICS_SCOPE);
+            let mut out = families(&peer, &reader(who)).await;
+            if whole_door {
+                out.extend(workspaces.federated());
+            }
+            out
+        })
     })
 }
 
