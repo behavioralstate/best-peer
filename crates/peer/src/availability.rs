@@ -27,8 +27,22 @@ pub const SAMPLE_EVERY: Duration = Duration::from_secs(5);
 /// The longest reason an owner may give a hold: one line a client reads.
 pub const MAX_REASON: usize = 80;
 
-/// What `JobStopped` and `DeploymentEnded` say of a workload a hold ended.
+/// What `JobStopped` and `DeploymentEnded` say of a workload a hold ended, followed by the owner's reason where
+/// they gave one.
 pub const HELD_REASON: &str = "held by its owner";
+
+/// The reason a workload a hold ended is told: [`HELD_REASON`], and the owner's after it where they gave one.
+pub fn held_reason(reason: Option<&str>) -> String {
+    match reason {
+        Some(r) => format!("{HELD_REASON}: {r}"),
+        None => HELD_REASON.to_string(),
+    }
+}
+
+/// Whether `reason` is one a hold ended a workload with.
+pub fn ended_by_hold(reason: &str) -> bool {
+    reason == HELD_REASON || reason.starts_with(&format!("{HELD_REASON}: "))
+}
 
 /// When owner use turns a device busy and when it frees.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,7 +70,8 @@ impl Default for Thresholds {
 
 /// The operator's thresholds from `BEST_PEER_BUSY` (`on` when unset, or `off`), `BEST_PEER_BUSY_MEMORY` (`2G`),
 /// `BEST_PEER_BUSY_UTILISATION` (percent), `BEST_PEER_BUSY_AFTER` and `BEST_PEER_FREE_AFTER` (`30s`, `5m`); none when
-/// the operator turned owner use off. A value that does not read is refused by name, with what it takes.
+/// the operator turned owner use off. A value that does not read is refused by name, with what it takes, with owner use
+/// off too.
 pub fn thresholds(
     busy: Option<&str>,
     memory: Option<&str>,
@@ -64,15 +79,15 @@ pub fn thresholds(
     busy_after: Option<&str>,
     free_after: Option<&str>,
 ) -> Result<Option<Thresholds>, String> {
-    match busy.map(str::trim) {
-        None | Some("on") => {}
-        Some("off") => return Ok(None),
+    let on = match busy.map(str::trim) {
+        None | Some("on") => true,
+        Some("off") => false,
         Some(other) => {
             return Err(format!(
                 "BEST_PEER_BUSY={other:?} is not a setting: on (the default) finds when the owner uses a card, off never does"
             ))
         }
-    }
+    };
     let mut t = Thresholds::default();
     if let Some(m) = memory {
         t.memory_bytes = crate::parse_memory(m).map_err(|why| format!("BEST_PEER_BUSY_MEMORY: {why}"))?;
@@ -93,7 +108,7 @@ pub fn thresholds(
     if let Some(f) = free_after {
         t.free_after = crate::parse_duration(f).map_err(|why| format!("BEST_PEER_FREE_AFTER: {why}"))?;
     }
-    Ok(Some(t))
+    Ok(on.then_some(t))
 }
 
 /// What the owner's processes hold of one device at one reading.
@@ -488,9 +503,12 @@ mod tests {
             thresholds(None, None, None, None, None).unwrap(),
             Some(Thresholds::default())
         );
-        assert_eq!(
-            thresholds(Some("off"), Some("nonsense"), None, None, None).unwrap(),
-            None
+        assert_eq!(thresholds(Some("off"), Some("4G"), None, None, None).unwrap(), None);
+        assert!(
+            thresholds(Some("off"), Some("nonsense"), None, None, None)
+                .unwrap_err()
+                .contains("BEST_PEER_BUSY_MEMORY"),
+            "a typo is told while owner use is off, not once it is turned on"
         );
         let t = thresholds(Some("on"), Some("4G"), Some("50"), Some("1m"), Some("10m"))
             .unwrap()

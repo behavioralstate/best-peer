@@ -53,6 +53,13 @@ pub const RECONCILE_EVERY: Duration = Duration::from_secs(30);
 /// seconds, so a minute of nothing is a dead socket.
 const STREAM_SILENCE: Duration = Duration::from_secs(60);
 
+/// What to do with an order failed the second time its member was lost under it.
+const LOST_AGAIN: &str = "order it again once the cloud's peers answer: PeerJoined on this stream says so";
+
+/// What to do with an order failed the second time its member's owner held the device under it.
+const HELD_AGAIN: &str =
+    "order it again once get-hardware-state shows a device of the cloud free, or with queue_seconds to wait for one";
+
 /// The events after which nothing more is said about a workload or a command.
 const TERMINAL: &[&str] = &[
     "Undeployed",
@@ -1454,7 +1461,8 @@ impl Cloud {
                 // for a member lost, so the client's job runs elsewhere or later with nothing asked of it.
                 let held_back = match &ordered {
                     Some((o, Some((_, true))))
-                        if r#type == "JobStopped" && data["reason"] == crate::availability::HELD_REASON =>
+                        if r#type == "JobStopped"
+                            && data["reason"].as_str().is_some_and(crate::availability::ended_by_hold) =>
                     {
                         self.state.lock().unwrap().orders.get(o).cloned()
                     }
@@ -1468,7 +1476,7 @@ impl Cloud {
                             .remove(&(member.name.clone(), mc.to_string()));
                     }
                     let why = format!("the owner of peer {} took its device back", member.name);
-                    self.queue_again(&o, data["job"].as_str(), &member.name, &why);
+                    self.queue_again(&o, data["job"].as_str(), &member.name, &why, HELD_AGAIN);
                 } else {
                     self.tell(&em, &r#type, data);
                 }
@@ -1847,7 +1855,7 @@ impl Cloud {
                 let order = self.state.lock().unwrap().order_of_job(id);
                 if let Some(o) = order {
                     self.missing.lock().unwrap().remove(id);
-                    self.queue_again(&o, Some(id), &m.name, &why);
+                    self.queue_again(&o, Some(id), &m.name, &why, LOST_AGAIN);
                     continue;
                 }
             }
@@ -1863,7 +1871,7 @@ impl Cloud {
             .cloned()
             .collect();
         for o in sent {
-            self.queue_again(&o, None, &m.name, &why);
+            self.queue_again(&o, None, &m.name, &why, LOST_AGAIN);
         }
         let in_flight: Vec<((String, String), Issued)> = {
             let mut issued = self.issued.lock().unwrap();
@@ -1980,15 +1988,16 @@ impl Cloud {
 
     // ----- the queue ----------------------------------------------------------------------------------------------
 
-    /// An order a lost member held, running or sent and not started, waits again, once, keeping its place: the job
-    /// it had become, `instead_of`, is gone with the member. The second time it fails.
-    fn queue_again(&self, o: &Order, instead_of: Option<&str>, peer: &str, why: &str) {
+    /// An order a lost member held, running or sent and not started, or one whose member's owner held its device,
+    /// waits again, once, keeping its place: the job it had become, `instead_of`, is gone with the member. The second
+    /// time it fails, with `fix`.
+    fn queue_again(&self, o: &Order, instead_of: Option<&str>, peer: &str, why: &str, fix: &str) {
         let em = self.order_emitter(o);
         if o.attempt >= 2 {
             self.tell(
                 &em,
                 "JobFailed",
-                json!({ "job": instead_of.unwrap_or(&o.id), "image": o.image, "reason": format!("{why}, and the order was queued again once already"), "fix": "order it again once the cloud's peers answer: PeerJoined on this stream says so", "peer": peer }),
+                json!({ "job": instead_of.unwrap_or(&o.id), "image": o.image, "reason": format!("{why}, and the order was queued again once already"), "fix": fix, "peer": peer }),
             );
             return;
         }

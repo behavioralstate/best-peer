@@ -139,7 +139,9 @@ best-peer release                     # every device takes work again
 
 `--until 2026-10-20T22:00:00Z` names the end instead, and with neither a hold lasts until `best-peer release`; one by
 `--while` ends after twelve hours at most unless you say otherwise. `--reason maintenance` is one line every approved
-client reads; a hold needs none. A hold is kept across a restart.
+client reads, and with `--now` the holders whose work ended read it after `held by its owner`; a hold needs none.
+`--now` also ends what was starting on the device, its image still pulling, as soon as it starts. A hold is kept
+across a restart.
 
 A code waits ten minutes for you; the door holds at most five waiting from one client, sixteen from one address and 64 in all, and past that
 answers 503 with how long until the oldest expires. An IPv6 address is counted by its /64, which one client holds
@@ -345,7 +347,8 @@ reads each card's processes through the driver every five seconds, the peer's ow
 container engine's `top`: processes not the peer's that hold more than `BEST_PEER_BUSY_MEMORY` (default `2G`) of the
 card or more than `BEST_PEER_BUSY_UTILISATION` percent (default 30) of its compute for `BEST_PEER_BUSY_AFTER` (default
 `30s`) make it busy, and `BEST_PEER_FREE_AFTER` (default `5m`) under both frees it; the start-up line says them.
-`BEST_PEER_BUSY=off` turns this off, for a server that runs another GPU service of its own. An engine installed on the
+`BEST_PEER_BUSY=off` turns this off, for a server that runs another GPU service of its own; the other four are
+still checked at start. An engine installed on the
 host (`BEST_PEER_RUNTIME=native`) cannot name its processes, so a card it serves on is not read while it does. The
 owner's use is never an event: the log would otherwise become a dated record of when the owner sits at their own
 machine. `best-peer hold` and `best-peer release` are the owner's own act, with the admin token as `approve` and

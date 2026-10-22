@@ -851,14 +851,7 @@ fn hold(args: &[String]) {
         "holding while process {} runs; Ctrl-C releases now, and {end} at most",
         pid.unwrap_or_default()
     );
-    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| fail(&format!("cannot start: {e}")));
-    let why = runtime.block_on(async move {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => "Ctrl-C",
-            _ = watched => "the process exited",
-        }
-    });
-    drop(runtime);
+    let why = until_either(async { tokio::signal::ctrl_c().await.map(drop) }, watched);
     let (status, answer) = as_the_authority("/owner/release", vec![("devices", held.join(","))]);
     if status != 200 {
         fail(&format!(
@@ -922,6 +915,23 @@ fn rfc3339_after(span: Duration) -> String {
 
 /// What ends when process `pid` exits, watched through a pidfd, so a process id used again by another is never taken
 /// for it. Refused for a process that is not running, and where there are no pidfds.
+/// Waits until `stop` or the watched process ends, and says which: "Ctrl-C" or "the process exited". A watch still
+/// blocked when `stop` comes is left behind rather than waited for, so the release is posted at once.
+fn until_either(
+    stop: impl std::future::Future<Output = std::io::Result<()>>,
+    watched: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+) -> &'static str {
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| fail(&format!("cannot start: {e}")));
+    let why = runtime.block_on(async move {
+        tokio::select! {
+            _ = stop => "Ctrl-C",
+            _ = watched => "the process exited",
+        }
+    });
+    runtime.shutdown_background();
+    why
+}
+
 #[cfg(target_os = "linux")]
 fn watch_process(pid: i32) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
     use rustix::event::{poll, PollFd, PollFlags};
@@ -1728,6 +1738,23 @@ mod tests {
         child.wait().unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hold_while_stopped_by_ctrl_c_answers_at_once_while_the_watched_process_runs_on() {
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let watched = super::watch_process(child.id() as i32);
+        let began = std::time::Instant::now();
+        let why = super::until_either(async { Ok(()) }, watched);
+        let took = began.elapsed();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(why, "Ctrl-C");
+        assert!(
+            took < Duration::from_secs(2),
+            "it waited {took:?} for the watched process"
+        );
+    }
+
     #[tokio::test]
     async fn a_card_its_owner_uses_is_busy_for_every_approved_client_takes_no_new_work_and_an_order_that_waits_starts_once_it_frees(
     ) {
@@ -2019,6 +2046,31 @@ mod tests {
         let (s, b) = as_owner(&bed.app, "/owner/release", &[]).await;
         assert_eq!(s, StatusCode::OK, "{b}");
         bed.events_of("j2", "JobStarted").await;
+    }
+
+    #[tokio::test]
+    async fn a_hold_now_ends_what_was_starting_on_the_card_as_soon_as_it_starts_with_the_owners_reason() {
+        let bed = fresh().await;
+        let gate = bed.runtime.hold_pulls();
+        let (s, b) = run_on(&bed, "j1", 4, json!({})).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let (s, b) = bed.deploy("d1", "qwen3:0.6b", "ollama", 4).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let (s, b) = as_owner(&bed.app, "/owner/hold", &[("now", "true"), ("reason", "maintenance")]).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["ended"], json!([]), "nothing had started yet");
+        gate.add_permits(100);
+        let told = "held by its owner: maintenance";
+        let stopped = bed.events_of("j1", "JobStopped").await;
+        assert_eq!(stopped.last().unwrap().data["reason"], told);
+        let ended = bed.events_of("d1", "DeploymentEnded").await;
+        assert_eq!(ended.last().unwrap().data["reason"], told);
+        until("nothing runs on the card", || {
+            bed.peer.state.lock().unwrap().jobs.is_empty() && bed.peer.state.lock().unwrap().deployments.is_empty()
+        })
+        .await;
+        assert!(bed.runtime.running().await.unwrap().is_empty());
+        assert!(bed.peer.cleared.lock().unwrap().is_empty(), "nothing is left to end");
     }
 
     #[tokio::test]

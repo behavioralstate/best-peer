@@ -150,6 +150,9 @@ pub struct Peer {
     /// The waiting orders claimed for their end, by a stop admitted for one or by its expiry, until it is told: a step
     /// starts none of them, and nothing else ends them. Locked after `state` when both are held, never before.
     stopping: Mutex<std::collections::HashSet<String>>,
+    /// The workloads admitted on a device a hold with `now` then cleared, before they started: each is ended, with
+    /// the hold's reason, as soon as it starts.
+    pub(crate) cleared: Mutex<HashMap<String, String>>,
     /// The command behind each order, by the order's id: what completes the command.
     keys: Mutex<HashMap<String, String>>,
     /// The commands admitted from a credential held to the accelerators, until the order is told.
@@ -385,6 +388,7 @@ impl Peer {
             steps: tokio::sync::Mutex::new(()),
             starting: Mutex::new(std::collections::HashSet::new()),
             stopping: Mutex::new(std::collections::HashSet::new()),
+            cleared: Mutex::new(HashMap::new()),
             keys: Mutex::new(HashMap::new()),
             held_to_accelerators: Mutex::new(std::collections::HashSet::new()),
             watch: None,
@@ -925,7 +929,10 @@ impl Peer {
         }
         self.tell(&self.emitter(&new_id("hold")), "DeviceHeldV1", fact);
         let ended = match now {
-            true => self.end_on(&held).await,
+            true => {
+                self.end_on(&held, &crate::availability::held_reason(reason.as_deref()))
+                    .await
+            }
             false => Vec::new(),
         };
         Ok(json!({ "held": held, "until": until, "reason": reason, "ended": ended }))
@@ -965,12 +972,22 @@ impl Peer {
         Ok(json!({ "released": released }))
     }
 
-    /// Ends every job and deployment on `devices` for a hold: each told under its own correlation, with the hold as
-    /// the reason. Answers what ended, or could not be ended.
-    async fn end_on(&self, devices: &[String]) -> Vec<Value> {
+    /// Ends every job and deployment on `devices` for a hold: each told under its own correlation, with `reason`, the
+    /// hold's. Answers what ended, or could not be ended.
+    async fn end_on(&self, devices: &[String], reason: &str) -> Vec<Value> {
         let on = |d: Option<&DeviceId>| d.is_some_and(|d| devices.contains(&d.0));
         let (jobs, deployments) = {
             let mut s = self.state.lock().unwrap();
+            let admitted: Vec<String> = s
+                .reserved
+                .values()
+                .filter(|r| on(r.device.as_ref()))
+                .map(|r| r.id.clone())
+                .collect();
+            self.cleared
+                .lock()
+                .unwrap()
+                .extend(admitted.into_iter().map(|id| (id, reason.to_string())));
             let mut jobs = Vec::new();
             for j in s.jobs.values_mut() {
                 if on(j.device.as_ref()) && j.phase == JobPhase::Running {
@@ -995,11 +1012,7 @@ impl Peer {
             };
             match self.runtime.stop(&j.container).await {
                 Ok(()) | Err(RuntimeError::NoSuchContainer(_)) => {
-                    self.tell(
-                        &em,
-                        "JobStopped",
-                        json!({ "job": j.id, "reason": crate::availability::HELD_REASON }),
-                    );
+                    self.tell(&em, "JobStopped", json!({ "job": j.id, "reason": reason }));
                     ended.push(json!({ "job": j.id }));
                 }
                 Err(e) => {
@@ -1026,7 +1039,7 @@ impl Peer {
                     self.tell(
                         &self.emitter(&d.correlation),
                         "DeploymentEnded",
-                        json!({ "deployment": d.id, "model": d.model, "reason": crate::availability::HELD_REASON }),
+                        json!({ "deployment": d.id, "model": d.model, "reason": reason }),
                     );
                     ended.push(json!({ "deployment": d.id }));
                 }
@@ -1289,6 +1302,11 @@ impl Peer {
         );
         em.bind_workload(&id);
         self.replay_unowned(&started.id).await;
+        let cleared = self.cleared.lock().unwrap().remove(&id);
+        if let Some(reason) = cleared {
+            self.end_on(std::slice::from_ref(&device.0), &reason).await;
+            return;
+        }
         let base = self.engine_base(port);
         let loading: best_peer_engine::Progress = {
             let (me, em, id, model, pace) = (
@@ -1398,6 +1416,7 @@ impl Peer {
     /// told. After its start was told, a deployment the state no longer holds, or already ending, has told or
     /// will tell its own end: nothing is said twice.
     async fn fail_deployment(&self, em: &Emitter, id: &str, model: &str, reason: &str, fix: &str, stage: Stage) {
+        self.cleared.lock().unwrap().remove(id);
         let container = match stage {
             Stage::BeforeStart(c) => c,
             Stage::AfterStart => {
@@ -1912,6 +1931,7 @@ impl Peer {
         let id = reservation.id.clone();
         self.run_container(em, image_name, args, reservation, queued, io).await;
         self.starting.lock().unwrap().remove(&id);
+        self.cleared.lock().unwrap().remove(&id);
     }
 
     async fn run_container(
@@ -1992,6 +2012,10 @@ impl Peer {
                 self.tell(&em, "JobStarted", fact);
                 em.bind_workload(&id);
                 self.replay_unowned(&started.id).await;
+                let cleared = self.cleared.lock().unwrap().remove(&id);
+                if let (Some(reason), Some(d)) = (cleared, &reservation.device) {
+                    self.end_on(std::slice::from_ref(&d.0), &reason).await;
+                }
             }
             Err(e) => fail(e.to_string(), fix_for_runtime(&e)),
         }
@@ -2798,7 +2822,7 @@ fn device_busy(busy: &[&best_peer_gpu::Device], what: &str) -> BestError {
     BestError::bad_request(
         "DEVICE_BUSY",
         format!(
-            "{what} would fit on {}, which its owner is using: a run-job with queue_seconds waits for it; otherwise send it again once get-hardware-state shows it free, or name another device",
+            "{what} would fit on {}, which its owner is using or holds: a run-job with queue_seconds waits for it; otherwise send it again once get-hardware-state shows it free, or name another device",
             told.join("; ")
         ),
     )
