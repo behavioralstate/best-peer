@@ -5,7 +5,7 @@ before changing anything, and keep it the current rule when a change moves the p
 
 - Starting on an issue, move it to In progress on the Behavioralstate board first (project 4 of Amarcode-Studios, its
   Status field: `gh project item-edit`, or the board itself), and its epic to In progress if it was not; once its code is
-  merged and released, with only a host proof or the owner's acceptance left, move it to In review (SDLC.md
+  in a release, with only a host proof or the owner's acceptance left, move it to In review (SDLC.md
   section 1).
 - Every change is made on `main` and pushed there, the owner's and every maintainer's; no branch and no pull request
   is needed. The subject is one plain sentence saying what changed and why, with no type prefix (`feat:`, `fix:`);
@@ -15,7 +15,8 @@ before changing anything, and keep it the current rule when a change moves the p
   all` on Windows) must end in `GATE GREEN`; CI runs the same script on the push. Then the review: `/best-review`
   always runs `.claude/skills/best-reviewer` on a separate worker with the model that skill pins, on what `main`
   holds that `origin/main` does not, and this session fixes every finding on `main` with a test, in a `Review:`
-  commit that names them, or sets it aside with its reason in that message. Nothing is pushed until both are done.
+  commit that names them, or sets it aside with its reason in that message (an empty commit when nothing changed).
+  The local gate then runs on the head that is pushed. Nothing is pushed until both are done.
 - A contributor without write access sends a pull request from a fork; `/best-review <number>` reviews it the same
   way and posts the findings there, and a maintainer merges it once they are answered and CI is green.
 - A behaviour the spec does not ask for is an entry on the spec follow-ups issue, behavioralstate/spec#37, before it

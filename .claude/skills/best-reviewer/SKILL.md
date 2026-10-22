@@ -28,12 +28,15 @@ git log --format='%h %s%n%n%b' origin/main..main
 git diff origin/main...main
 ```
 
-For a pull request:
+For a pull request, whose head the `best-review` skill has fetched at `refs/review/pr-<n>`:
 
 ```bash
 gh pr view <n> --json number,title,body,baseRefName,headRefName,headRefOid,url
 gh pr diff <n>
 ```
+
+The checkout is `main`, not the pull request: read its files at its head with `git show refs/review/pr-<n>:<path>`,
+never from the working tree.
 
 Then, for every file the diff touches, read the surrounding code (the whole function or module, not only the hunk)
 and the tests that cover it. Read `SDLC.md` section 2, the design rules every change is held to, and the README

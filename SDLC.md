@@ -67,11 +67,14 @@
      `best-reviewer` skill (`.claude/skills/best-reviewer`): a reviewer that has not seen the conversation, on a
      separate worker with the model that skill pins (Sonnet 5.5, high effort). The author's session verifies each
      finding and fixes it on `main` with a test, in a `Review:` commit whose message names the findings, or sets it
-     aside with its reason in that message; nothing is dropped silently. A finding's fix is proven by the local gate
-     again, and what the fix itself changed is reviewed again before the push.
+     aside with its reason in that message (an empty commit when no finding changed a file); nothing is dropped
+     silently. What a fix changed is reviewed again, and the local gate runs last, on the very head that is pushed.
 - **Pull first.** The push lands on top of what others pushed: `git pull --rebase` before the gates, and again before
   the push if `origin/main` moved meanwhile, with the gates run again when what arrived touches the same code.
 - **CI runs on the push**: the same script, on the fakes. A red `main` is fixed before anything else is pushed.
+- **What GitHub holds `main` to**: no force-push and no deletion. It requires no pull request and no check, since the
+  gates run before the push and CI checks the push; that they ran is each maintainer's word, with the `Review:` commit
+  as its record.
 - **The push is what runs.** A host run by the owner builds `main` and runs it; the sha is its version.
 - **A release is a tag.** `scripts/release.sh <version> -m "<what it is>"` runs only on a clean `main` level with
   origin, so everything it releases has passed the gates; it bumps the one version in `Cargo.toml` (every crate

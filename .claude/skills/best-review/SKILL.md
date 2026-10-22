@@ -50,14 +50,18 @@ For every finding, in order:
    matching the surrounding code and comments. A finding that reveals a design error, or a behaviour the spec does not
    ask for with no entry on the spec follow-ups issue, is not patched: say so in the chat and stop before the push;
    that goes back to the issue first.
-3. **The local gate** again, as SDLC.md section 4 gate 1 asks: `scripts/gate.sh all` (`pwsh scripts/gate.ps1 all` on
-   Windows) must end in `GATE GREEN`. A red gate is reported as red, with the step that failed.
+3. **The local gate** after the fixes, as SDLC.md section 4 gate 1 asks: `scripts/gate.sh all` (`pwsh scripts/gate.ps1
+   all` on Windows) must end in `GATE GREEN`. A red gate is reported as red, with the step that failed.
 4. **Commit** once for all the fixes (or once per finding when they are unrelated), the subject one plain sentence
    saying what changed and why, starting `Review:`, the body naming every finding and what became of it (fixed, or
-   set aside and why), ending with the attribution line this session uses. Line endings as they were
-   (`git diff --stat --ignore-cr-at-eol` shows no whole-file churn).
+   set aside and why), ending with the attribution line this session uses. When no finding changed a file, the
+   commit is empty (`git commit --allow-empty`), so what was set aside is still on record and a later run does not
+   report it again. Line endings as they were (`git diff --stat --ignore-cr-at-eol` shows no whole-file churn).
 5. **Review the fixes**: when step 4 changed code, run this section again on what is new, passing the findings
    already answered, until a run reports nothing new.
+6. **The local gate on the head that is pushed**, always, last, whether or not a finding changed anything:
+   `scripts/gate.sh all` (`pwsh scripts/gate.ps1 all` on Windows). The report says GREEN only from that run's own
+   `GATE GREEN` line, on `git rev-parse --short HEAD`.
 
 ### 4. Report
 
@@ -68,7 +72,7 @@ In chat, one block and nothing longer, then stop: the push is the maintainer's n
 - fixed: <the defect in half a sentence> (<sha>)
 - set aside: <the finding> — <why>
 - owner's call: <what needs a decision>
-gate: GREEN on <sha>; ready to push
+gate: GREEN on <sha> (step 6's own run); ready to push
 ```
 
 `no findings` when the reviewer reported none.
@@ -83,6 +87,10 @@ gh pr view $ARGUMENTS --json number,url,state,isDraft,baseRefName,headRefName,he
 ```
 
 - Not open: say so in one line and stop.
+- Fetch its head without switching anything: `git fetch origin pull/<n>/head:refs/review/pr-<n>`. The reviewer reads
+  it there (`git show refs/review/pr-<n>:<path>`, `git diff origin/main...refs/review/pr-<n>`), and the local gate
+  runs on it in a worktree of the session's scratchpad (`git worktree add <scratch>/pr-<n> refs/review/pr-<n>`, the
+  gate script run from it, the worktree removed after).
 - Findings already on the pull request from a previous run: the inline comments AND the review bodies that start with
   `**best-review**` (a finding on an unchanged line lives in a body, not inline). Collect path, line and summary from
   both so the reviewer is told not to repeat them.
@@ -94,7 +102,8 @@ gh api repos/<owner/repo>/pulls/<n>/reviews --paginate --jq '.[] | select(.body 
 
 ### 2. The findings
 
-As in section A, step 2, with the pull request number as the first word of the reviewer's arguments.
+As in section A, step 2, with the pull request number as the first word of the reviewer's arguments; tell it the
+head is fetched at `refs/review/pr-<n>`.
 
 ### 3. Post the review, comment only
 
@@ -137,6 +146,7 @@ In chat, one block and nothing longer:
 - question: <the question>
 - owner's call: <what needs a decision>
 posted: <review url>
+gate on the head: GREEN | RED (<the step>) on <sha>
 ```
 
 `no findings` when the reviewer reported none. Approve nothing; merge nothing: a maintainer merges once every finding
