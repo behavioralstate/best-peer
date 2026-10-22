@@ -36,16 +36,37 @@ pub fn source(peer: Arc<Peer>, workspaces: Arc<crate::workspace::Workspaces>) ->
             // the machines of the workspaces it is a member of; any other key, none.
             let collector = who.grant.allows(METRICS_SCOPE) && !who.grant.is_all();
             let all = who.grant.is_all();
+            let accelerators_only = who.grant.accelerators_only;
             let holder = who.holder();
             let mut out = families(&peer, &reader(who)).await;
-            if collector {
-                out.extend(workspaces.federated(None));
+            let federated = if collector {
+                workspaces.federated(None)
             } else if all {
-                out.extend(workspaces.federated(Some(&holder)));
-            }
+                workspaces.federated(Some(&holder))
+            } else {
+                Vec::new()
+            };
+            out.extend(held_to_accelerators(federated, accelerators_only));
             out
         })
     })
+}
+
+/// The federated series as a key held to the accelerators may read them: without any device whose compute API is
+/// the host's CPU, as its own series and every hardware answer show it none.
+fn held_to_accelerators(families: Vec<Family>, held: bool) -> Vec<Family> {
+    if !held {
+        return families;
+    }
+    families
+        .into_iter()
+        .map(|mut f| {
+            f.samples
+                .retain(|s| !s.labels.iter().any(|(k, v)| k == "api" && v == "cpu"));
+            f
+        })
+        .filter(|f| !f.samples.is_empty())
+        .collect()
 }
 
 /// Who the series are read as. A credential approved for the metrics scope reads every holder's workloads, as one
@@ -321,4 +342,26 @@ async fn families(peer: &Peer, who: &Credential) -> Vec<Family> {
         job_phase, job_memory, queued,
     ]);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_key_held_to_the_accelerators_reads_no_members_cpu() {
+        let mut free = Family::new("best_peer_device_memory_free_bytes", Kind::Gauge, "Free.");
+        free.sample(&[("peer", "a"), ("device", "gpu-0"), ("api", "cuda")], 8.0);
+        free.sample(&[("peer", "a"), ("device", "cpu-0"), ("api", "cpu")], 64.0);
+        let mut info = Family::new("best_peer_device", Kind::Info, "What it is.");
+        info.sample(&[("peer", "a"), ("device", "cpu-0"), ("api", "cpu")], 1.0);
+        let held = held_to_accelerators(vec![free.clone(), info.clone()], true);
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(held[0].samples.len(), 1);
+        assert!(held[0].samples[0]
+            .labels
+            .iter()
+            .any(|(k, v)| k == "device" && v == "gpu-0"));
+        assert_eq!(held_to_accelerators(vec![free, info], false).len(), 2);
+    }
 }

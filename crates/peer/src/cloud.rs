@@ -1889,7 +1889,7 @@ impl Cloud {
     /// never another holder's, the member's door counts, or series a member that is itself a cloud door serves of
     /// its own members. A member that does not answer within [`SCRAPE_WITHIN`], or answers with something that is
     /// not series, has none until it does.
-    async fn scrape(&self, m: &Member, held: &[(String, bool)]) {
+    async fn scrape(&self, m: &Arc<Member>, held: &[(String, bool)]) {
         let read = match tokio::time::timeout(SCRAPE_WITHIN, m.metrics()).await {
             Ok(Ok(text)) => best_peer_door::metrics::parse(&text),
             Ok(Err(e)) => Err(e.text()),
@@ -1918,7 +1918,12 @@ impl Cloud {
                         (!f.samples.is_empty()).then_some(f)
                     })
                     .collect();
-                self.series.lock().unwrap().insert(m.name.clone(), kept);
+                // The member may have been removed, re-pointed or have stopped admitting this cloud while it
+                // answered: what it said then is no longer this name's to show.
+                let still = m.admitted() && self.members().iter().any(|now| Arc::ptr_eq(now, m));
+                if still {
+                    self.series.lock().unwrap().insert(m.name.clone(), kept);
+                }
             }
             Err(why) => {
                 tracing::debug!(cloud = %self.name, peer = %m.name, why, "the member's series could not be read");
