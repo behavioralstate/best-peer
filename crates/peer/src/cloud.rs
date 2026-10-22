@@ -2053,7 +2053,7 @@ impl Cloud {
                 )
                 .await;
             if let Err(e) = stopped {
-                // It exited, and its outputs are being stored: the member tells its end.
+                // A member older than 0.0.22 refuses a stop while it stores a job's outputs, and tells its end.
                 if e.details["code"] == "STORING_OUTPUTS" {
                     continue;
                 }
@@ -2947,6 +2947,7 @@ impl Service for Cloud {
             if let Some(j) = self.state.lock().unwrap().jobs.get_mut(&id) {
                 j.phase = JobPhase::Running;
             }
+            // A member older than 0.0.22 refuses a stop while it stores a job's outputs: its end follows.
             let reason = match e.details["code"] == "STORING_OUTPUTS" {
                 true => e.message,
                 false => format!("{}; the job keeps running", e.message),

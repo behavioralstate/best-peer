@@ -136,7 +136,7 @@ pub fn expired_reason(o: &Order, place: &str) -> String {
 /// `JobStopped`'s reason for a job its door stopped at its `deadline_seconds`.
 pub fn deadline_reason(o: &Order) -> String {
     format!(
-        "it ran past its deadline_seconds ({} s), so the door stopped it",
+        "it ran past its deadline_seconds ({} s), so the door stopped it; outputs it was still sending were not stored",
         o.deadline_seconds.unwrap_or(0)
     )
 }

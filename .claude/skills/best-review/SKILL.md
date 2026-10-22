@@ -1,27 +1,97 @@
 ---
 name: best-review
-description: The review gate of a best-peer pull request (SDLC.md section 4, gate 3), run by the author's assistant on the branch once the pull request is open. Gets the findings from the `best-reviewer` skill, which runs with an empty context on the model it pins, posts them on the pull request as a comment-only review, then verifies each one against the code, fixes the real ones with a test, runs the local gate, replies on every thread and pushes. Use when a pull request has just been opened or pushed, when asked to review the pull request, to answer the review, or to run gate 3; `/best-review` is how a maintainer types it.
-argument-hint: [pull-request number]
+description: The review gate of best-peer (SDLC.md section 4, gate 2), mandatory before every push to main. With no argument it reviews what the local main holds that origin/main does not; with a number, a contributor's pull request. Always gets the findings from the `best-reviewer` skill, which runs with an empty context on the model it pins. For main, this session verifies each finding, fixes the real ones on main with a test in a `Review:` commit, runs the local gate again, and reports; for a pull request, it posts the findings as a comment-only review for the contributor to answer. Use before any push to main, when asked to review the work, to run the review gate, or to review a contributor's pull request; `/best-review` is how a maintainer types it.
+argument-hint: "[pull-request number]"
 effort: high
 ---
 
 # Review
 
-Gate 3 of every best-peer pull request. The findings come from a reviewer that has not seen this conversation and runs
-on the model the `best-reviewer` skill pins; this session verifies, fixes and answers them. Nothing here approves or
-merges the pull request: the owner merges, after the review is answered and CI is green.
+The review gate of best-peer, mandatory before every push to `main` (SDLC.md section 4). The findings always come
+from the `best-reviewer` skill: a reviewer that has not seen this conversation, on the model it pins. This session
+verifies, fixes and answers them. Nothing here pushes, approves or merges: the push follows once the gate is passed,
+and a contributor's pull request is merged by a maintainer once its findings are answered, the local gate is green
+on what would land and CI is green.
 
-## 1. The pull request
+`$ARGUMENTS` empty: review `main` (section A). A number: review that pull request (section B).
+
+## A. Before a push: what `main` holds that `origin/main` does not
+
+### 1. What is to be pushed
+
+```bash
+git fetch origin && git status --short --branch
+git log --oneline origin/main..main
+```
+
+- On another branch than `main`, or with uncommitted changes: say what differs in one line and stop. Never switch
+  branches, stash or discard anything.
+- `main` behind `origin/main`: `git pull --rebase` first (SDLC.md section 4). Step 6's gate then runs on the new
+  head whatever arrived; if the rebase changed one's own commits (a conflict resolved), review them again.
+- Nothing ahead of `origin/main`: say so in one line and stop.
+- Findings of a previous run on these commits: those named in the messages of `Review:` commits ahead of
+  `origin/main`. Pass them along so the reviewer does not repeat them.
+
+### 2. The findings
+
+Invoke the `best-reviewer` skill with `main` as the first word of its arguments and, after it, the already-reported
+findings if any. It forks on its own model and returns a `FINDINGS` block with every finding it has; the block is
+never truncated, so what it returns is the whole review. If the Skill tool cannot run it, spawn one Agent
+(general-purpose) with `model: "sonnet"` (the Agent tool takes aliases, and the alias is what pins it on this path)
+and `effort: "high"`, whose prompt is the body of `.claude/skills/best-reviewer/SKILL.md` with the arguments filled
+in; never review in this session's own context, which wrote the code.
+
+### 3. Verify, fix, prove
+
+For every finding, in order:
+
+1. **Verify** it against the code yourself. A finding you cannot reproduce from the code is set aside, with the
+   reason, not fixed.
+2. **Fix** a real defect on `main`: a test on the fakes that fails without the fix where one applies, then the fix,
+   matching the surrounding code and comments. A finding that reveals a design error, or a behaviour the spec does not
+   ask for with no entry on the spec follow-ups issue, is not patched: say so in the chat and stop before the push;
+   that goes back to the issue first.
+3. **The local gate** after the fixes, as SDLC.md section 4 gate 1 asks: `scripts/gate.sh all` (`pwsh scripts/gate.ps1
+   all` on Windows) must end in `GATE GREEN`. A red gate is reported as red, with the step that failed.
+4. **Commit** once for all the fixes (or once per finding when they are unrelated), the subject one plain sentence
+   saying what changed and why, starting `Review:`, the body naming every finding and what became of it (fixed, or
+   set aside and why), ending with the attribution line this session uses. When no finding changed a file, the
+   commit is empty (`git commit --allow-empty`), so what was set aside is still on record and a later run does not
+   report it again. Line endings as they were (`git diff --stat --ignore-cr-at-eol` shows no whole-file churn).
+5. **Review the fixes**: when step 4 changed code, run this section again on what is new, passing the findings
+   already answered, until a run reports nothing new.
+6. **The local gate on the head that is pushed**, always, last, whether or not a finding changed anything:
+   `scripts/gate.sh all` (`pwsh scripts/gate.ps1 all` on Windows). The report says GREEN only from that run's own
+   `GATE GREEN` line, on `git rev-parse --short HEAD`.
+
+### 4. Report
+
+In chat, one block and nothing longer, then stop: the push is the maintainer's next step, once the gate is passed.
+
+```
+**main** (<n> commits ahead of origin/main)
+- fixed: <the defect in half a sentence> (<sha>)
+- set aside: <the finding> — <why>
+- owner's call: <what needs a decision>
+gate: GREEN on <sha> (step 6's own run); ready to push
+   | RED (<the step that failed>) on <sha>; not ready to push
+```
+
+`no findings` when the reviewer reported none.
+
+## B. A contributor's pull request
+
+### 1. The pull request
 
 ```bash
 gh repo view --json nameWithOwner -q .nameWithOwner
 gh pr view $ARGUMENTS --json number,url,state,isDraft,baseRefName,headRefName,headRefOid,author
-git fetch origin && git status --short --branch
 ```
 
-- No open pull request for this branch and no number given: say so in one line and stop.
-- The local branch must be the pull request's head, clean, and at `headRefOid`; otherwise stop and say what differs.
-  Never switch branches, stash or discard anything to get there.
+- Not open: say so in one line and stop.
+- Fetch its head without switching anything, forced, since a contributor may have rewritten it:
+  `git fetch origin +refs/pull/<n>/head:refs/review/pr-<n>`. The reviewer reads it there
+  (`git show refs/review/pr-<n>:<path>`, `git diff origin/main...refs/review/pr-<n>`). Nothing of it runs yet.
 - Findings already on the pull request from a previous run: the inline comments AND the review bodies that start with
   `**best-review**` (a finding on an unchanged line lives in a body, not inline). Collect path, line and summary from
   both so the reviewer is told not to repeat them.
@@ -31,31 +101,26 @@ gh api repos/<owner/repo>/pulls/<n>/comments --paginate --jq '.[] | select(.body
 gh api repos/<owner/repo>/pulls/<n>/reviews --paginate --jq '.[] | select(.body | startswith("**best-review**")) | {id, body}'
 ```
 
-## 2. The findings
+### 2. The findings
 
-Invoke the `best-reviewer` skill with the pull request number as the first word of its arguments and, after it, the
-already-reported findings if any. It forks on its own model and returns a `FINDINGS` block with every finding it has;
-the block is never truncated, so what it returns is the whole review. If the Skill tool cannot run it, spawn one Agent
-(general-purpose) with `model: "sonnet"` (the Agent tool takes aliases, and the alias is what pins it on this path)
-and `effort: "high"`, whose prompt is the body of `.claude/skills/best-reviewer/SKILL.md` with the arguments filled
-in; never review in this session's own context, which wrote the code.
+As in section A, step 2, with the pull request number as the first word of the reviewer's arguments; tell it the
+head is fetched at `refs/review/pr-<n>`.
 
-## 3. Post the review, comment only
+### 3. Post the review, comment only
 
-Build one review from the block and post it before touching any code, so the record shows what was found, not what
-was left after the fixes:
+Build one review from the block and post it, so the contributor has every finding where they answer it:
 
 ```bash
 gh api repos/<owner/repo>/pulls/<n>/reviews --input <scratch dir>/review.json
 ```
 
 `review.json` is written in the session's scratchpad directory (or the system temp directory), never inside the
-checkout, so the branch stays clean and nothing can be committed by mistake:
+checkout:
 
 ```json
 {
   "event": "COMMENT",
-  "body": "**best-review** on <head sha, 7 chars>: <n> defects, <m> questions. Findings on unchanged lines are listed here; the rest are inline.\n\n<one bullet per finding with line 0: path, summary, failure>",
+  "body": "**best-review** on <head sha, all 40 characters, of refs/review/pr-<n> as reviewed>: <n> defects, <m> questions. Findings on unchanged lines are listed here; the rest are inline.\n\n<one bullet per finding with line 0: path, summary, failure>",
   "comments": [
     { "path": "<path>", "line": <line>, "side": "RIGHT",
       "body": "**best-review** <defect|question>: <summary>\n\nFailure: <failure>\nFix: <fix>" }
@@ -66,62 +131,42 @@ checkout, so the branch stays clean and nothing can be committed by mistake:
 Before posting, check every inline comment's `path` and `line` against the hunks of `gh pr diff <n>`: a line that is
 not on the new side of the diff goes into the body as a line-0 finding instead, because GitHub rejects the whole
 review (422) for one bad anchor. If the post is still rejected, move the comment it names into the body and post
-again; no finding is dropped.
+again; no finding is dropped. `FINDINGS none` posts a review with the body `**best-review** on <the full sha>: no findings.`
+and no comments. The event is always `COMMENT`; never `APPROVE` or `REQUEST_CHANGES`.
 
-`FINDINGS none` posts a review with the body `**best-review** on <sha>: no findings.` and no comments. The event is
-always `COMMENT`; never `APPROVE` or `REQUEST_CHANGES`. Then read the inline comments back to get their ids:
+The fixes are the contributor's, on their branch. A later push of theirs is reviewed again by the same command, and
+that run reviews only what is new, because step 1 passes the reported findings along.
 
-```bash
-gh api repos/<owner/repo>/pulls/<n>/comments --paginate --jq '.[] | select(.pull_request_review_id == <review id>) | {id, path, line}'
-```
+### 4. The local gate on what would land, before a merge
 
-## 4. Verify, fix, answer
+Only once every finding is answered and the maintainer has read the diff, since the gate builds and runs the
+contributor's code on this machine. The gate runs on what would land, the pull request squashed onto the current
+`main`. First `git fetch origin +refs/pull/<n>/head:refs/review/pr-<n>` again and compare
+`git rev-parse refs/review/pr-<n>`, all 40 characters, with the head the review ran on (the full sha of its
+`**best-review** on <sha>`; never a shortened one, which a contributor could match with other code): when they differ
+the contributor pushed since, so stop and go back to step 1, since the new commits are reviewed before they are
+gated. Then `git fetch origin`,
+`git worktree remove --force <scratch>/pr-<n>` for a leftover one, then
+`git worktree add --detach <scratch>/pr-<n> origin/main`, noting `git -C <scratch>/pr-<n> rev-parse HEAD`, the
+`main` the squash is made on, which the report shows and the merge checks; and, in it, `git merge --squash refs/review/pr-<n>` (a
+conflict is the contributor's to resolve, so it is reported and the gate does not run), then `scripts/gate.sh all`
+(`pwsh scripts/gate.ps1 all` on Windows), and the worktree removed (`git worktree remove --force <scratch>/pr-<n>`, since the squash leaves it staged). Until then the report says the gate has not run.
 
-For every finding, in order:
-
-1. **Verify** it against the code yourself. A finding you cannot reproduce from the code is answered, not fixed.
-2. **Fix** a real defect on this branch: a test on the fakes that fails without the fix where one applies, then the
-   fix, matching the surrounding code and comments. A finding that reveals a design error, or a behaviour the spec
-   does not ask for with no entry on the spec follow-ups issue, is not patched: say so in the reply and in the chat,
-   and stop before the code moves; that goes back to the issue first.
-3. **The local gate** again, as `SDLC.md` section 4 gate 1 asks: `scripts/gate.sh all` (`pwsh scripts/gate.ps1 all` on
-   Windows) must end in `GATE GREEN`. A red gate is reported as red, with the step that failed.
-4. **Commit** once for all the fixes (or once per finding when they are unrelated), the subject one plain sentence
-   saying what changed and why, starting `Review:`, the body naming the findings, ending with the attribution line
-   this session uses. Line endings as they were (`git diff --stat --ignore-cr-at-eol` shows no whole-file churn).
-5. **Reply** on each thread:
-
-   ```bash
-   gh api repos/<owner/repo>/pulls/<n>/comments/<comment id>/replies -f body='<reply>'
-   ```
-
-   Fixed: `Fixed in <sha>: <what changed>.` and resolve the thread. Not a defect: `Not a defect: <why, from the code>.`,
-   thread left open for the owner to judge. A question: the answer, thread left open. Findings that were in the
-   review body (line 0) are answered in one comment on the pull request (`gh pr comment <n> --body ...`).
-
-   Resolving a thread:
-
-   ```bash
-   gh api graphql -f query='query($o:String!,$r:String!,$n:Int!,$c:String){repository(owner:$o,name:$r){pullRequest(number:$n){reviewThreads(first:100,after:$c){pageInfo{hasNextPage endCursor} nodes{id isResolved comments(first:1){nodes{databaseId}}}}}}}' -F o=<owner> -F r=<repo> -F n=<n>
-   gh api graphql -f query='mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{isResolved}}}' -F id=<thread id>
-   ```
-
-   While `hasNextPage` is true, repeat the query with `-F c=<endCursor>` until the thread is found.
-
-6. **Push** the branch, never with force. CI (gate 2) runs on the new head. A later push by the author is reviewed
-   again by the same command, and that run reviews only what is new, because step 1 passes the reported findings along.
-
-## 5. Report
+### 5. Report
 
 In chat, one block and nothing longer:
 
 ```
 **<owner/repo>#<n>** <pull request url>
-- fixed: <the defect in half a sentence> (<sha>)
-- not a defect: <the finding> — <why>
-- question: <the question> — <the answer>
+- defect: <the defect in half a sentence>
+- question: <the question>
 - owner's call: <what needs a decision>
-gate: GREEN on <sha>
+posted: <review url>
+gate on what would land: GREEN | RED (<the step>) on <head sha> squashed onto <origin/main sha> | not run yet (findings open)
 ```
 
-`no findings` when the reviewer reported none. Approve nothing; merge nothing.
+`no findings` when the reviewer reported none. Approve nothing; merge nothing: a maintainer merges once every finding
+is answered, the local gate is green on what would land, and CI is green, pinned to the head that was gated so a push
+after the gate cannot land unseen: `gh pr merge <n> --squash --match-head-commit <the full sha of refs/review/pr-<n>>`.
+Just before it, `git fetch origin` and compare `origin/main` with the sha the gate's squash was made on: when `main`
+moved since, what would land is not what was gated, so step 4 runs again first.
