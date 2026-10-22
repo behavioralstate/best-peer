@@ -142,8 +142,9 @@ that run reviews only what is new, because step 1 passes the reported findings a
 Only once every finding is answered and the maintainer has read the diff, since the gate builds and runs the
 contributor's code on this machine. The gate runs on what would land, the pull request squashed onto the current
 `main`. First `git fetch origin +refs/pull/<n>/head:refs/review/pr-<n>` again and compare
-`git rev-parse refs/review/pr-<n>` with the head the review ran on (the sha in its `**best-review** on <sha>`): when
-the contributor pushed since, stop and go back to step 1, since the new commits are reviewed before they are gated. Then `git fetch origin`,
+`git rev-parse --short=7 refs/review/pr-<n>` with the head the review ran on (the 7 characters of its
+`**best-review** on <sha>`): when they differ the contributor pushed since, so stop and go back to step 1, since the
+new commits are reviewed before they are gated. Then `git fetch origin`,
 `git worktree remove --force <scratch>/pr-<n>` for a leftover one, then
 `git worktree add --detach <scratch>/pr-<n> origin/main` and, in it, `git merge --squash refs/review/pr-<n>` (a
 conflict is the contributor's to resolve, so it is reported and the gate does not run), then `scripts/gate.sh all`
@@ -163,4 +164,5 @@ gate on what would land: GREEN | RED (<the step>) on <head sha> squashed onto <o
 ```
 
 `no findings` when the reviewer reported none. Approve nothing; merge nothing: a maintainer merges once every finding
-is answered, the local gate is green on what would land, and CI is green.
+is answered, the local gate is green on what would land, and CI is green, pinned to the head that was gated so a push
+after the gate cannot land unseen: `gh pr merge <n> --squash --match-head-commit <the full sha of refs/review/pr-<n>>`.
