@@ -92,8 +92,6 @@ pub struct Patience {
     pub load: Duration,
     pub unload: Duration,
     pub prompt: Duration,
-    /// How long a job's outputs may take to be stored when its order set no `deadline_seconds`.
-    pub store: Duration,
 }
 
 impl Default for Patience {
@@ -103,7 +101,6 @@ impl Default for Patience {
             load: Duration::from_secs(3600),
             unload: Duration::from_secs(30),
             prompt: Duration::from_secs(600),
-            store: Duration::from_secs(3600),
         }
     }
 }
@@ -141,22 +138,18 @@ enum Stored {
 }
 
 /// How long a job's outputs may take to be stored at `now`: what is left of its order's `deadline_seconds`, counted
-/// from `started_at` (its JobStarted), or `otherwise` when it has none.
+/// from `started_at` (its JobStarted); none when the order set none here, and then the transfer's own bound holds
+/// (a job a cloud placed is bounded by the cloud, which stops it at its deadline).
 pub(crate) fn storing_for(
     started_at: Option<&str>,
     deadline_seconds: Option<u64>,
     now: OffsetDateTime,
-    otherwise: Duration,
-) -> Duration {
+) -> Option<Duration> {
     let started =
-        started_at.and_then(|t| OffsetDateTime::parse(t, &time::format_description::well_known::Rfc3339).ok());
-    match (started, deadline_seconds) {
-        (Some(started), Some(seconds)) => {
-            let left = started + time::Duration::seconds(i64::try_from(seconds).unwrap_or(i64::MAX)) - now;
-            Duration::try_from(left).unwrap_or(Duration::ZERO)
-        }
-        _ => otherwise,
-    }
+        started_at.and_then(|t| OffsetDateTime::parse(t, &time::format_description::well_known::Rfc3339).ok())?;
+    let seconds = i64::try_from(deadline_seconds?).ok()?;
+    let left = started.checked_add(time::Duration::seconds(seconds))? - now;
+    Some(Duration::try_from(left).unwrap_or(Duration::ZERO))
 }
 
 pub struct Peer {
@@ -1688,7 +1681,8 @@ impl Peer {
         em: &Emitter,
         job: &str,
         disk: &JobDisk,
-        within: Duration,
+        storing: &Storing,
+        within: Option<Duration>,
     ) -> (Stored, Option<tokio::task::JoinHandle<Result<u64, String>>>) {
         if !disk.known {
             return (
@@ -1702,11 +1696,10 @@ impl Peer {
         let Some(outputs) = disk.outputs.clone() else {
             return (Stored::Done, None);
         };
-        let storing = Arc::new(Storing {
-            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            stopped: tokio::sync::Notify::new(),
-        });
-        self.storing.lock().unwrap().insert(job.to_string(), storing.clone());
+        // A stop admitted between the job's exit and now: nothing is sent.
+        if storing.stop.load(std::sync::atomic::Ordering::SeqCst) {
+            return (Stored::Stopped, None);
+        }
         let started = Instant::now();
         let mut sending = {
             let (out, stop) = (disk.path.join("out"), storing.stop.clone());
@@ -1715,13 +1708,11 @@ impl Peer {
         let stored = tokio::select! {
             sent = &mut sending => Some(sent.map_err(|e| e.to_string()).and_then(|r| r)),
             _ = storing.stopped.notified() => None,
-            _ = tokio::time::sleep(within) => {
+            _ = tokio::time::sleep(within.unwrap_or(Duration::MAX)), if within.is_some() => {
                 storing.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-                self.storing.lock().unwrap().remove(job);
                 return (Stored::Late, Some(sending));
             }
         };
-        self.storing.lock().unwrap().remove(job);
         match stored {
             Some(Ok(bytes)) => {
                 self.tell(
@@ -1737,15 +1728,14 @@ impl Peer {
         }
     }
 
-    /// How long the job `job`'s outputs may take to be stored now: what is left of its order's deadline, or the
-    /// peer's own bound when it set none.
-    fn storing_within(&self, job: &str) -> Duration {
+    /// How long the job `job`'s outputs may take to be stored now: what is left of its order's deadline, or no bound
+    /// of its own when the order set none here.
+    fn storing_within(&self, job: &str) -> Option<Duration> {
         let order = self.state.lock().unwrap().order_of_job(job);
         storing_for(
             order.as_ref().and_then(|o| o.started_at.as_deref()),
             order.as_ref().and_then(|o| o.deadline_seconds),
             OffsetDateTime::now_utc(),
-            self.patience.store,
         )
     }
 
@@ -1995,12 +1985,31 @@ impl Peer {
                     // left of its order's deadline. A stop ends it, and tells its end; otherwise its end is told here,
                     // once.
                     (Some(disk), Some(me)) if disk.outputs.is_some() || !disk.known => {
-                        if let Some(j) = self.state.lock().unwrap().jobs.get_mut(&job) {
-                            j.phase = JobPhase::Storing;
+                        // Claimed and registered at once, so a stop admitted from now on finds what it ends; one
+                        // admitted before this has told the job's end, and nothing is sent.
+                        let storing = Arc::new(Storing {
+                            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                            stopped: tokio::sync::Notify::new(),
+                        });
+                        let claimed = {
+                            let mut s = self.state.lock().unwrap();
+                            match s.jobs.get_mut(&job) {
+                                Some(j) if j.phase == JobPhase::Running => {
+                                    j.phase = JobPhase::Storing;
+                                    self.storing.lock().unwrap().insert(job.clone(), storing.clone());
+                                    true
+                                }
+                                _ => false,
+                            }
+                        };
+                        if !claimed {
+                            let _ = self.runtime.remove_disk(&job).await;
+                            return;
                         }
                         let within = self.storing_within(&job);
                         tokio::spawn(async move {
-                            let (stored, sending) = me.store_outputs(&em, &job, &disk, within).await;
+                            let (stored, sending) = me.store_outputs(&em, &job, &disk, &storing, within).await;
+                            me.storing.lock().unwrap().remove(&job);
                             // Claimed here, so a stop admitted from now on is told its end follows.
                             let ours = match me.state.lock().unwrap().jobs.get_mut(&job) {
                                 Some(j) if j.phase == JobPhase::Storing => {
@@ -2025,7 +2034,7 @@ impl Peer {
                                     me.tell(
                                         &em,
                                         "JobFailed",
-                                        json!({ "job": job, "exit_code": code, "reason": format!("its outputs were not stored within {} s, what was left of its deadline: they were not stored", within.as_secs()), "fix": "leave less under /out, give the order a longer deadline_seconds, or check the store answers, then order it again" }),
+                                        json!({ "job": job, "exit_code": code, "reason": format!("its outputs were not stored within {} s, what was left of its deadline_seconds: they were not stored", within.unwrap_or_default().as_secs()), "fix": "leave less under /out, give the order a longer deadline_seconds, or check the store answers, then order it again" }),
                                     );
                                 }
                                 // The stop told it.

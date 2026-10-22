@@ -1053,7 +1053,6 @@ mod tests {
                 load: Duration::from_secs(1),
                 unload: Duration::from_secs(1),
                 prompt: Duration::from_secs(1),
-                store: Duration::from_secs(3600),
             },
             holdings.clone(),
             Confine::default(),
@@ -8937,6 +8936,42 @@ mod tests {
         assert!(!told.contains(&"JobFinished".to_string()), "{told:?}");
         assert!(!told.contains(&"OutputsStored".to_string()), "{told:?}");
 
+        // The order's deadline passes while the member still sends: the cloud stops it, saying the outputs were not
+        // stored, and the member lets it go.
+        let hold = s3.hold.clone().lock_owned().await;
+        site.order(&ws, "j3", 4, with_io()).await;
+        let started = site.events(&ws, "j3", "JobStarted").await.last().unwrap()["data"].clone();
+        let late = started["job"].as_str().unwrap().to_string();
+        let disk = member.runtime.disk_of(&late);
+        member
+            .runtime
+            .exit(
+                &ContainerId(started["container"].as_str().unwrap().into()),
+                0,
+                "rendered",
+            )
+            .unwrap();
+        until("its outputs are being sent", || {
+            member
+                .peer
+                .state
+                .lock()
+                .unwrap()
+                .jobs
+                .get(&late)
+                .is_some_and(|j| j.phase == crate::state::JobPhase::Storing)
+        })
+        .await;
+        site.live_cloud(&ws, "lab").step(later(3700)).await;
+        let stopped = site.events(&ws, "j3", "JobStopped").await;
+        let reason = stopped.last().unwrap()["data"]["reason"].as_str().unwrap().to_string();
+        assert!(
+            reason.contains("deadline_seconds") && reason.contains("were not stored"),
+            "{reason}"
+        );
+        drop(hold);
+        until("the late job's disk is removed", || !disk.exists()).await;
+
         // The store refuses the next one's outputs: the job failed, its exit code kept, and its disk is gone.
         s3.refuse_puts.store(true, std::sync::atomic::Ordering::SeqCst);
         site.order(&ws, "j2", 4, with_io()).await;
@@ -9109,25 +9144,25 @@ mod tests {
     }
 
     #[test]
-    fn outputs_may_take_what_is_left_of_their_orders_deadline_or_the_peers_own_bound() {
+    fn outputs_may_take_what_is_left_of_their_orders_deadline_and_no_bound_of_their_own_without_one() {
         let at = |t: &str| time::OffsetDateTime::parse(t, &time::format_description::well_known::Rfc3339).unwrap();
-        let hour = Duration::from_secs(3600);
         let now = at("2026-10-22T10:00:00Z");
         assert_eq!(
-            lifecycle::storing_for(Some("2026-10-22T09:59:00Z"), Some(300), now, hour),
-            Duration::from_secs(240)
+            lifecycle::storing_for(Some("2026-10-22T09:59:00Z"), Some(300), now),
+            Some(Duration::from_secs(240))
         );
         assert_eq!(
-            lifecycle::storing_for(Some("2026-10-22T09:00:00Z"), Some(300), now, hour),
-            Duration::ZERO,
+            lifecycle::storing_for(Some("2026-10-22T09:00:00Z"), Some(300), now),
+            Some(Duration::ZERO),
             "already past it"
         );
-        assert_eq!(lifecycle::storing_for(None, Some(300), now, hour), hour);
+        assert_eq!(lifecycle::storing_for(None, Some(300), now), None);
+        assert_eq!(lifecycle::storing_for(Some("2026-10-22T09:59:00Z"), None, now), None);
+        assert_eq!(lifecycle::storing_for(Some("not a time"), Some(300), now), None);
         assert_eq!(
-            lifecycle::storing_for(Some("2026-10-22T09:59:00Z"), None, now, hour),
-            hour
+            lifecycle::storing_for(Some("2026-10-22T09:59:00Z"), Some(u64::MAX), now),
+            None
         );
-        assert_eq!(lifecycle::storing_for(Some("not a time"), Some(300), now, hour), hour);
     }
 
     #[tokio::test]

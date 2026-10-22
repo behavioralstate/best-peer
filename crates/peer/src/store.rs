@@ -258,9 +258,12 @@ fn mode_of(meta: &std::fs::Metadata) -> u32 {
     }
 }
 
-/// Writes the tar archive of `outputs` to `to`, paths relative to the outputs' directory. Without `contents`, each file is written as zeros
-/// of its size, which makes an archive of the same length without reading a byte: how its size is counted.
-fn archive(outputs: &[Output], to: impl Write, contents: bool) -> std::io::Result<()> {
+/// Writes the tar archive of `outputs` to `to`, paths relative to the outputs' directory; answers the bytes of file
+/// contents left out. Without `contents`, each file's header is written and its contents are not: the archive's
+/// length is then what was written plus what is answered, each file's size rounded up to a whole block, counted
+/// without reading a byte or spending time on a file's size.
+fn archive(outputs: &[Output], to: impl Write, contents: bool) -> std::io::Result<u64> {
+    let mut left_out = 0;
     let mut tar = tar::Builder::new(to);
     for o in outputs {
         let mut h = tar::Header::new_gnu();
@@ -285,7 +288,10 @@ fn archive(outputs: &[Output], to: impl Write, contents: bool) -> std::io::Resul
                 h.set_size(*bytes);
                 match contents {
                     true => tar.append_data(&mut h, path, Exact::new(std::fs::File::open(from)?, *bytes))?,
-                    false => tar.append_data(&mut h, path, std::io::repeat(0).take(*bytes))?,
+                    false => {
+                        tar.append_data(&mut h, path, std::io::empty())?;
+                        left_out += bytes.div_ceil(512) * 512;
+                    }
                 }
             }
             Output::Link { path, to, mtime } => {
@@ -297,7 +303,8 @@ fn archive(outputs: &[Output], to: impl Write, contents: bool) -> std::io::Resul
             }
         }
     }
-    tar.into_inner()?.flush()
+    tar.into_inner()?.flush()?;
+    Ok(left_out)
 }
 
 /// Exactly `left` bytes of a file, or an error when it holds fewer: the archive's length was told before.
@@ -365,8 +372,8 @@ impl<R: Read> Read for Stoppable<R> {
 pub fn send_outputs(dir: &Path, url: &str, stop: Arc<AtomicBool>) -> Result<u64, String> {
     let outputs = outputs(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
     let mut count = Count::default();
-    archive(&outputs, &mut count, false).map_err(|e| format!("cannot pack {}: {e}", dir.display()))?;
-    let bytes = count.0;
+    let left_out = archive(&outputs, &mut count, false).map_err(|e| format!("cannot pack {}: {e}", dir.display()))?;
+    let bytes = count.0 + left_out;
     let (reader, writer) = std::io::pipe().map_err(|e| e.to_string())?;
     let packer = std::thread::spawn(move || archive(&outputs, writer, true));
     let sent = put_body(
@@ -382,11 +389,12 @@ pub fn send_outputs(dir: &Path, url: &str, stop: Arc<AtomicBool>) -> Result<u64,
     let packed = packer
         .join()
         .map_err(|_| "the packer stopped unexpectedly".to_string())?;
+    // A store that refused the body ends the packing with a broken pipe: what the store said is the reason.
     match (sent, packed) {
         _ if stop.load(Ordering::SeqCst) => Err("stopped".into()),
-        (_, Err(e)) => Err(format!("cannot pack {}: {e}", dir.display())),
-        (Err(e), Ok(())) => Err(e),
-        (Ok(()), Ok(())) => Ok(bytes),
+        (Err(e), _) => Err(e),
+        (Ok(()), Err(e)) => Err(format!("cannot pack {}: {e}", dir.display())),
+        (Ok(()), Ok(_)) => Ok(bytes),
     }
 }
 
@@ -720,7 +728,69 @@ mod tests {
     }
 
     #[test]
-    fn a_transfer_ends_at_once_when_it_is_stopped() {
+    fn a_file_shorter_than_counted_fails_the_sending_rather_than_send_a_broken_archive() {
+        let mut short = Exact::new(&b"ab"[..], 3);
+        let mut read = vec![];
+        let e = short.read_to_end(&mut read).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof);
+        let mut longer = Exact::new(&b"abcd"[..], 3);
+        let mut read = vec![];
+        longer.read_to_end(&mut read).unwrap();
+        assert_eq!(read, b"abc", "no more than was counted");
+    }
+
+    /// Linux only: a file there may claim a terabyte and hold nothing, which Windows does not let an ordinary file do.
+    #[cfg(unix)]
+    #[test]
+    fn a_files_apparent_size_is_counted_without_reading_or_writing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = std::fs::File::create(dir.path().join("sparse")).unwrap();
+        // A file that claims a terabyte and holds nothing: counting it must take no time.
+        big.set_len(1 << 40).unwrap();
+        let sparse = outputs(dir.path()).unwrap();
+        let started = std::time::Instant::now();
+        let mut count = Count::default();
+        let left_out = archive(&sparse, &mut count, false).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        assert_eq!(left_out, 1 << 40);
+    }
+
+    #[test]
+    fn an_archive_counted_without_its_contents_is_exactly_as_long_as_the_archive_written_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("frames")).unwrap();
+        std::fs::write(dir.path().join("odd"), vec![1u8; 1000]).unwrap();
+        std::fs::write(dir.path().join("frames").join("empty"), b"").unwrap();
+        std::fs::write(dir.path().join("a".repeat(150)), b"long name").unwrap();
+        let odd = outputs(dir.path()).unwrap();
+        let (mut count, mut whole) = (Count::default(), vec![]);
+        let left_out = archive(&odd, &mut count, false).unwrap();
+        archive(&odd, &mut whole, true).unwrap();
+        assert_eq!(count.0 + left_out, whole.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn a_store_that_refuses_a_large_body_is_the_reason_given_not_the_broken_pipe_it_leaves() {
+        // A store that answers 403 at once, without reading what is sent.
+        let app = axum::Router::new().fallback(|| async { axum::http::StatusCode::FORBIDDEN });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = format!("http://{}/b/out.tar", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("big"), vec![1u8; 8 << 20]).unwrap();
+        let why = {
+            let dir = dir.path().to_path_buf();
+            tokio::task::spawn_blocking(move || send_outputs(&dir, &at, Arc::new(AtomicBool::new(false))))
+                .await
+                .unwrap()
+                .unwrap_err()
+        };
+        assert!(why.contains("403") || why.contains("did not take it"), "{why}");
+        assert!(!why.contains("cannot pack"), "{why}");
+    }
+
+    #[test]
+    fn a_sending_stopped_before_it_reads_ends_at_its_first_read() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("big"), vec![1u8; 4 << 20]).unwrap();
         // A store that reads nothing: the body waits on it, and the stop is what ends the wait.

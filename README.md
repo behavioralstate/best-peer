@@ -461,10 +461,11 @@ reads `/in`, read-only, and writes `/out`. When it exits, its directories, regul
 packed as one tar archive and sent to `<prefix>/<order>.tar` as they are packed, so nothing is written beside the disk,
 and `OutputsStored` says so, with the key, before `JobFinished`. A link is kept as a link, never followed; a pipe, a
 device or a socket it left is not an output. A store that does not take it ends the job in `JobFailed`, its exit code
-kept; so does a sending that is not done within what is left of the order's `deadline_seconds` (an hour at a peer's
-own door, for an order with none). A stop while the outputs are being sent cuts the sending and ends the job in
-`JobStopped`, its outputs not stored; a store that stops answering fails the transfer, ten minutes and a second a
-mebibyte on. The disk goes with the job, whatever its end, and a peer restarted under a running job finds
+kept. The order's `deadline_seconds` covers the sending too: one still running past it is cut and the job ends, its
+outputs not stored (`JobFailed` at a peer's own door; through a cloud, the cloud stops it and `JobStopped` says so).
+A stop while the outputs are being sent ends the job at once in `JobStopped`, its outputs not stored, and cuts the
+sending at its next read; a store that stops answering fails the transfer, ten minutes and a second a mebibyte on,
+which also bounds a sending without a deadline. The disk goes with the job, whatever its end, and a peer restarted under a running job finds
 its disk again and still sends its outputs. A job with outputs
 sends `deadline_seconds`, six days at most, because the URL its outputs are sent with lives seven days at most. A
 member says the room it has for disks in `get-hardware-state` as `disk`, and an order is placed only on a member with
