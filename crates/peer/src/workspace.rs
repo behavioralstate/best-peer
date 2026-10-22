@@ -221,17 +221,28 @@ impl Workspaces {
     fn tell(&self, em: &Emitter, r#type: &str, data: Value) -> Envelope {
         let e = em.emit(r#type, data);
         let id = e.data["workspace"].as_str().unwrap_or_default();
-        // An archive is heard on the workspace's stream before the fold closes it.
-        if e.r#type == "WorkspaceArchivedV1" {
-            if let Some(ws) = self.get(id) {
-                ws.hear(&e);
-            }
-        }
+        // An archive is heard on the workspace's log once the fold closed it: a stream held open there ends on it.
+        let archived = self.get(id).filter(|_| e.r#type == "WorkspaceArchivedV1");
         self.apply(&e);
-        if let Some(ws) = self.get(id) {
+        if let Some(ws) = archived.or_else(|| self.get(id)) {
             ws.hear(&e);
         }
         e
+    }
+
+    /// Tells a fact about a workspace that may have been archived since its command was admitted, under the lock an
+    /// archive takes: told while the workspace is there, and the command `command` failed otherwise.
+    fn tell_if_there(&self, em: &Emitter, command: &str, r#type: &str, data: Value) {
+        let _deciding = self.deciding.lock().unwrap();
+        let id = data["workspace"].as_str().unwrap_or_default().to_string();
+        if !self.records.lock().unwrap().contains_key(&id) {
+            em.emit(
+                "CommandFailed",
+                json!({ "type": command, "reason": format!("workspace {id} was archived before this ran: nothing changed") }),
+            );
+            return;
+        }
+        self.tell(em, r#type, data);
     }
 
     /// What a credential reads of the root log: the door's own facts under the door's rule, and of the membership
@@ -402,7 +413,7 @@ impl Workspaces {
         Err(BestError::bad_request(
             "WORKSPACES_EXCEEDED",
             format!(
-                "this credential may own {ceiling} workspace(s) at once and owns {}: {}; archive-workspace ends one no longer used, once its clouds are archived, or ask whoever approved it for more (best-peer approve <code> --workspaces N)",
+                "this credential may own {ceiling} workspace(s) at once and owns {}: {}; archive-workspace ends one no longer used, once its clouds are archived. A credential that may own more is a new sign-in, approved with best-peer approve <code> --workspaces N, and a new identity, which opens none of these",
                 owned.len(),
                 list(owned.iter())
             ),
@@ -624,8 +635,9 @@ impl Membership for Workspaces {
             .split_once(':')
             .map(|(sender, _)| best_peer_door::auth::holder_of_hash(sender))
             .unwrap_or_default();
-        self.tell(
+        self.tell_if_there(
             &em,
+            &cmd.r#type,
             "MemberInvitedV1",
             json!({ "workspace": cmd.data["workspace"], "identity": cmd.data["identity"], "invited_by": by }),
         );
@@ -666,8 +678,9 @@ impl Membership for Workspaces {
             .split_once(':')
             .map(|(sender, _)| best_peer_door::auth::holder_of_hash(sender))
             .unwrap_or_default();
-        self.tell(
+        self.tell_if_there(
             &em,
+            &cmd.r#type,
             "MemberJoinedV1",
             json!({ "workspace": cmd.data["workspace"], "identity": who, "role": "member" }),
         );
@@ -704,8 +717,9 @@ impl Membership for Workspaces {
             .split_once(':')
             .map(|(sender, _)| best_peer_door::auth::holder_of_hash(sender))
             .unwrap_or_default();
-        self.tell(
+        self.tell_if_there(
             &em,
+            &cmd.r#type,
             "MemberLeftV1",
             json!({ "workspace": cmd.data["workspace"], "identity": who }),
         );
@@ -812,8 +826,10 @@ pub struct Workspace {
     door: Mutex<Option<Arc<Door>>>,
     router: Mutex<Option<Router>>,
     started: std::sync::atomic::AtomicBool,
-    /// Set once an archive passed: no cloud is made live from then.
+    /// Set once an archive passed: no cloud fact is told and no cloud made live from then.
     closed: std::sync::atomic::AtomicBool,
+    /// Held while a cloud fact is told, and while an archive checks the clouds and closes the workspace.
+    telling: Mutex<()>,
 }
 
 #[derive(Deserialize)]
@@ -889,6 +905,7 @@ impl Workspace {
             router: Mutex::new(None),
             started: std::sync::atomic::AtomicBool::new(false),
             closed: std::sync::atomic::AtomicBool::new(false),
+            telling: Mutex::new(()),
         });
         let mut facts = Vec::new();
         log.replay(|e| facts.push(e.clone()));
@@ -945,9 +962,10 @@ impl Workspace {
         self.router.lock().unwrap().clone()
     }
 
-    /// Lets no cloud be made live from now, or names the live ones, under the lock a cloud is made under: once this
-    /// passed, a configure-cloud folded after it makes none.
+    /// Lets no cloud fact be told from now, or names the live clouds, under the lock a fact is told under: once this
+    /// passed, a command admitted before the archive tells nothing when it runs.
     fn close_to_clouds(&self) -> Result<(), Vec<String>> {
+        let _telling = self.telling.lock().unwrap();
         let clouds = self.clouds.lock().unwrap();
         let live: Vec<String> = clouds
             .iter()
@@ -1095,8 +1113,22 @@ impl Workspace {
         self.dir.join("clouds").join(cloud).join("members.json")
     }
 
-    /// Tells a cloud fact: appended, then folded, then made so.
+    /// Tells a cloud fact: appended, then folded, then made so. Once an archive closed the workspace, under the same
+    /// lock, a fact is no longer told and its command fails instead: it would change a workspace no one reaches.
     fn tell(&self, em: &Emitter, r#type: &str, data: Value) -> Envelope {
+        let _telling = self.telling.lock().unwrap();
+        if r#type != "CommandFailed" && self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            let command = self
+                .completions
+                .iter()
+                .find(|(_, done)| done.contains(r#type))
+                .map(|(c, _)| c.clone())
+                .unwrap_or_default();
+            return em.emit(
+                "CommandFailed",
+                json!({ "type": command, "reason": format!("workspace {} was archived before this ran: nothing changed", self.id) }),
+            );
+        }
         let e = em.emit(r#type, data);
         self.fold(&e);
         self.materialise();

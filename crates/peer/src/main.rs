@@ -1193,11 +1193,11 @@ mod tests {
             "client_id": "proof",
             "connection": "proof",
             "lifetime": "durable",
-            "grant": { "scopes": ["deploy", "jobs"], "memory_bytes": 1024, "jobs": 2, "accelerators_only": true }
+            "grant": { "scopes": ["deploy", "jobs"], "memory_bytes": 1024, "jobs": 2, "workspaces": 3, "accelerators_only": true }
         }));
         assert_eq!(
             line,
-            "admitted the host proof (proof) as connection proof with a durable credential that may deploy,jobs, 1024 bytes of device memory at most, its jobs in the closed box, 2 jobs at once at most, on the accelerators alone, never ending: the agent's next poll gets it"
+            "admitted the host proof (proof) as connection proof with a durable credential that may deploy,jobs, 1024 bytes of device memory at most, its jobs in the closed box, 2 jobs at once at most, 3 workspaces at once at most, on the accelerators alone, never ending: the agent's next poll gets it"
         );
         let plain = admitted_line(&json!({ "client_id": "proof", "expires_in": 60, "grant": {} }));
         assert!(plain.contains("may all, no share set, ending in 60 s"), "{plain}");
@@ -8896,6 +8896,24 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::CREATED, "{b}");
         events_as(&site.app, "", &bob, "j1", "MemberJoinedV1").await;
+        // Carol is invited and has not accepted yet.
+        let carol = key(&site.app).await;
+        let (_, w) = get_as(&site.app, "", &carol, "/queries/get-workspaces").await;
+        let carol_id = w["identity"].as_str().unwrap().to_string();
+        let (s, b) = send_as(
+            &site.app,
+            "",
+            &owner,
+            "i2",
+            "InviteMember",
+            "invite-member",
+            json!({ "workspace": ws, "identity": carol_id }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        events_as(&site.app, "", &owner, "i2", "MemberInvitedV1").await;
+        let (_, w) = get_as(&site.app, "", &carol, "/queries/get-workspaces").await;
+        assert_eq!(w["invitations"][0]["workspace"], ws);
         let archive = |key: String, id: &'static str| {
             let (app, ws) = (site.app.clone(), ws.clone());
             async move {
@@ -8936,7 +8954,21 @@ mod tests {
             members_file.exists(),
             "an archived cloud keeps its members' keys, to come back"
         );
-        let held = Arc::downgrade(&site.workspaces.get(&ws).unwrap());
+        let strong = site.workspaces.get(&ws).unwrap();
+        let held = Arc::downgrade(&strong);
+        let res = site
+            .app
+            .clone()
+            .oneshot(
+                Request::get(format!("{p}/events/stream"))
+                    .header("X-Api-Key", &bob)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let mut bob_stream = res.into_body().into_data_stream();
 
         let (s, b) = archive(owner.clone(), "x2").await;
         assert_eq!(s, StatusCode::CREATED, "{b}");
@@ -8945,6 +8977,61 @@ mod tests {
         assert_eq!(told["data"], json!({ "workspace": ws, "owner": owner_id }));
         assert_eq!(told["dataschema"], format!("{EP}/events/workspace-archived/1.0"));
         // Closed to every member: its door and its manifest answer as for no workspace, and it is listed nowhere.
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(frame) = bob_stream.next().await {
+                frame.unwrap();
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "a member's stream held open ends with the archive");
+        drop(bob_stream);
+        let (_, w) = get_as(&site.app, "", &carol, "/queries/get-workspaces").await;
+        assert_eq!(w["invitations"], json!([]), "an invitation into it goes with it");
+        // A command admitted before the archive and run after it changes nothing, and fails saying why.
+        let invite = serde_json::from_str::<best_peer_door::Envelope>(&envelope(
+            EP,
+            "i9",
+            "InviteMember",
+            "invite-member",
+            json!({ "workspace": ws, "identity": carol_id }),
+        ))
+        .unwrap();
+        let owner_hash = site.auth.authenticate(&owner).unwrap().hash;
+        let at_root =
+            best_peer_door::Emitter::new(log.clone(), SERVICE, "i9", Arc::new(std::collections::HashMap::new()))
+                .with_key(&format!("{owner_hash}:i9"));
+        <workspace::Workspaces as domain::Membership>::invite(site.workspaces.clone(), invite, at_root).await;
+        let configure = serde_json::from_str::<best_peer_door::Envelope>(&envelope(
+            &p,
+            "k9",
+            "ConfigureCloud",
+            "configure-cloud",
+            json!({ "cloud": "lab", "members": [{ "peer": "a", "endpoint": A }] }),
+        ))
+        .unwrap();
+        let on_ws = best_peer_door::Emitter::new(
+            strong.log.clone(),
+            SERVICE,
+            "k9",
+            Arc::new(std::collections::HashMap::new()),
+        );
+        <workspace::Workspace as domain::Clouds>::configure(strong.clone(), configure, on_ws).await;
+        for (on, correlation) in [(&log, "i9"), (&strong.log, "k9")] {
+            let mut told = Vec::new();
+            on.replay(|e| {
+                if e.effective_correlation() == correlation {
+                    told.push((
+                        e.r#type.clone(),
+                        e.data["reason"].as_str().unwrap_or_default().to_string(),
+                    ));
+                }
+            });
+            assert_eq!(told.len(), 1, "{told:?}");
+            assert_eq!(told[0].0, "CommandFailed");
+            assert!(told[0].1.contains("archived before this ran"), "{told:?}");
+        }
+        assert!(!members_file.exists());
+        drop(strong);
         for key in [&owner, &bob] {
             let (s, e) = get_as(&site.app, &p, key, "/queries/get-clouds").await;
             assert_eq!(s, StatusCode::NOT_FOUND, "{e}");
