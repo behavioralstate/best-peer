@@ -1393,13 +1393,15 @@ impl Peer {
         );
         em.bind_workload(&id);
         self.replay_unowned(&started.id).await;
-        if let Some((d, reason)) = self.still_cleared(&id) {
-            self.end_on(&[d], &reason, Some(&id)).await;
-            return;
-        }
+        let cleared = self.still_cleared(&id);
         if self.taken_back.lock().unwrap().contains(&holder) {
             self.end_work_of(std::slice::from_ref(&holder)).await;
             return;
+        }
+        if let Some((d, reason)) = cleared {
+            if self.end_cleared(&id, d, &reason).await {
+                return;
+            }
         }
         let base = self.engine_base(port);
         let loading: best_peer_engine::Progress = {
@@ -2152,12 +2154,12 @@ impl Peer {
                 self.tell(&em, "JobStarted", fact);
                 em.bind_workload(&id);
                 self.replay_unowned(&started.id).await;
-                if let Some((d, reason)) = self.still_cleared(&id) {
-                    self.end_on(&[d], &reason, Some(&id)).await;
-                }
+                let cleared = self.still_cleared(&id);
                 let holder = reservation.holder.clone();
                 if self.taken_back.lock().unwrap().contains(&holder) {
                     self.end_work_of(&[holder]).await;
+                } else if let Some((d, reason)) = cleared {
+                    self.end_cleared(&id, d, &reason).await;
                 }
             }
             Err(e) => fail(e.to_string(), fix_for_runtime(&e)),
@@ -2176,6 +2178,18 @@ impl Peer {
             .get(&device)
             .is_some_and(|h| h.holds_at(OffsetDateTime::now_utc()));
         holds.then_some((device, reason))
+    }
+
+    /// Ends the workload `id` a hold with `now` cleared while it was starting; a credential taken back is checked
+    /// first, since its ending is final where the hold's re-queues a cloud's order. False when the engine could not
+    /// stop it: logged, and it runs on as what a hold could not stop does, until a hold with `now` ends it.
+    async fn end_cleared(&self, id: &str, device: String, reason: &str) -> bool {
+        let ended = self.end_on(&[device], reason, Some(id)).await;
+        let failed = ended.iter().find_map(|e| e["error"].as_str());
+        if let Some(why) = failed {
+            tracing::warn!(workload = %id, why = %why, "a hold could not end what was starting on its device; it runs on until a hold with now ends it");
+        }
+        failed.is_none()
     }
 
     // ----- a credential taken back ------------------------------------------------------------------------------------

@@ -2508,6 +2508,74 @@ mod tests {
         assert!(bed.peer.cleared.lock().unwrap().is_empty(), "nothing is left to end");
     }
 
+    fn ends_of(bed: &Bed, correlation: &str) -> Vec<Value> {
+        bed.log_of(correlation)
+            .iter()
+            .filter(|e| ["JobStopped", "JobFailed", "DeploymentEnded", "DeploymentFailed"].contains(&e.r#type.as_str()))
+            .map(|e| e.data["reason"].clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_workload_starting_under_a_hold_now_and_a_revoke_at_once_ends_once_as_taken_back() {
+        let bed = fresh().await;
+        let gate = bed.runtime.hold_pulls();
+        let taken = key_with(&bed.app, Some("deploy,jobs"), None).await;
+        let job = json!({ "image": "busybox", "memory_bytes": 4 * GB });
+        let (s, b) = send_as(&bed.app, "", &taken, "j1", "RunJob", "run-job", job).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let deploy = json!({ "model": "qwen3:0.6b", "engine": "ollama", "memory_bytes": 4 * GB });
+        let (s, b) = send_as(&bed.app, "", &taken, "d1", "DeployModel", "deploy-model", deploy).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let (s, b) = as_owner(&bed.app, "/owner/hold", &[("now", "true"), ("reason", "mine")]).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(revoke_by_operator(&bed, &taken, false).await["work_ended"], true);
+        gate.add_permits(100);
+        bed.events_of("j1", "JobStopped").await;
+        bed.events_of("d1", "DeploymentEnded").await;
+        bed.peer.step(time::OffsetDateTime::now_utc()).await;
+        assert_eq!(ends_of(&bed, "j1"), vec![json!(lifecycle::TAKEN_BACK)]);
+        assert_eq!(ends_of(&bed, "d1"), vec![json!(lifecycle::TAKEN_BACK)]);
+        assert!(bed.peer.cleared.lock().unwrap().is_empty(), "nothing is left to end");
+        assert!(bed.runtime.running().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_running_job_a_hold_now_ended_is_not_told_ended_again_by_a_revoke() {
+        let bed = fresh().await;
+        let taken = key_with(&bed.app, Some("jobs"), None).await;
+        let job = json!({ "image": "busybox", "memory_bytes": 4 * GB });
+        let (s, b) = send_as(&bed.app, "", &taken, "j1", "RunJob", "run-job", job).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let id = bed.events_of("j1", "JobStarted").await.last().unwrap().data["job"].clone();
+        let (s, b) = as_owner(&bed.app, "/owner/hold", &[("now", "true"), ("reason", "mine")]).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["ended"], json!([{ "job": id }]), "{b}");
+        let answer = revoke_by_operator(&bed, &taken, false).await;
+        assert_eq!(answer["not_ended_yet"], json!([]), "{answer}");
+        bed.peer.step(time::OffsetDateTime::now_utc()).await;
+        assert_eq!(ends_of(&bed, "j1"), vec![json!("held by its owner: mine")]);
+    }
+
+    #[tokio::test]
+    async fn a_deployment_a_hold_now_could_not_stop_as_it_started_comes_ready_and_a_later_hold_now_ends_it() {
+        let bed = fresh().await;
+        let gate = bed.runtime.hold_pulls();
+        let (s, b) = bed.deploy("d1", "qwen3:0.6b", "ollama", 4).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let (s, b) = as_owner(&bed.app, "/owner/hold", &[("now", "true"), ("reason", "mine")]).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        bed.runtime.refuse_stops(Some("the engine does not answer"));
+        gate.add_permits(100);
+        let id = bed.events_of("d1", "DeploymentReady").await.last().unwrap().data["deployment"].clone();
+        assert_eq!(ends_of(&bed, "d1"), Vec::<Value>::new(), "it was not told ended");
+        bed.runtime.refuse_stops(None);
+        let (s, b) = as_owner(&bed.app, "/owner/hold", &[("now", "true"), ("reason", "mine")]).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["ended"], json!([{ "deployment": id }]), "{b}");
+        assert_eq!(ends_of(&bed, "d1"), vec![json!("held by its owner: mine")]);
+    }
+
     #[tokio::test]
     async fn a_workload_a_hold_now_found_starting_runs_once_the_owner_released_the_card() {
         let bed = fresh().await;
