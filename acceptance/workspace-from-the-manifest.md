@@ -26,11 +26,12 @@ transcript. The run before workspaces and the `prompt` command is
 - **Nothing written for the agent**: the person's sentence at the top of the transcript is all it got. It read both
   catalogues at the root and in the workspace, and five schema documents, and never saw this repository.
 - **The person's part**: two approvals at the machine and two answers to the client. The agent's code, `7V8R-2ZF8`,
-  was approved at the door with `best-peer approve`; the cloud's sign-in to the member, whose code the door logged at
+  was approved at the door with `best-peer approve` at 12:44:01, six seconds after the client showed it; the client
+  waited for the person's answer until 12:46:08. The cloud's sign-in to the member, whose code the door logged at
   12:46:25 (`to admit cloud lab of workspace ws-a8efdd1655d9 on gpu, run on that machine: best-peer approve
-  5M9L-83J2`), was approved at the member, and the door logged the member's admission at 12:46:30. Both approvals
-  were made over SSH from the owner's session; the person answered the client's two questions ("approved?") in its
-  terminal.
+  5M9L-83J2`), was approved at the member in the same second, and the door logged the member's admission at 12:46:30,
+  on its next poll. Both approvals were made over SSH from the owner's session, each before the client asked for
+  it; the person answered the client's two questions ("approved?") in its terminal.
 - **The validator**: the door, through the same tunnel, passed `best-validate` 0.4.2 (BEST 0.9.17, conformant, 0
   failures, 0 warnings) anonymous after the run.
 
@@ -39,10 +40,11 @@ transcript. The run before workspaces and the `prompt` command is
 - Every step completed and nothing was refused: sign-in; `create-workspace` at the root; the workspace reached as
   the connector's connection `run62/ws-a8efdd1655d9` with the credential that made it (spec#73); `configure-cloud`;
   the hardware state with the V100 as `lab/gpu/GPU-eeeeb51b-…` and the host CPU; the deploy; the `prompt` command and
-  `PromptAnswered`; a job run to `JobFinished`; the undeploy. Afterwards the member held no container at all.
-- Every fact on the workspace's stream named the cloud and the peer it came from: `PeerJoined`, the image pull, the
-  deployment's start, load and readiness, the prompt's answer, the job's order, placement, start and end, the
-  undeploy.
+  `PromptAnswered`; a job run to `JobFinished`; the undeploy. Afterwards `docker ps -a` on the member listed no
+  container.
+- Every fact on the workspace's stream named the cloud, and every one a member told named the peer too:
+  `PeerJoined`, the image pull, the deployment's start, load and readiness, the prompt's answer, the job's placement,
+  start and end, the undeploy. The job's order, `JobQueued`, names the cloud alone, since no peer holds it yet.
 - The prompt was a command on the door like any other: `PromptAnswered` came back on the workspace's stream under
   the prompt's correlation id with the answer, `Hello, how are you today?` (8 completion tokens, 34 prompt tokens,
   finish `stop`), and the client never reached the engine's port, which stayed on the member's loopback.
@@ -51,9 +53,11 @@ transcript. The run before workspaces and the `prompt` command is
   ([behavioralstate/spec#39](https://github.com/behavioralstate/spec/issues/39)). The cloud took the job as the order
   `job-cb78d686d58e` (`JobQueued`, `JobPlaced`); the member ran it as `job-863bbb657c6f`, and its `JobStarted`,
   relayed, names the order.
-- The agent configured the cloud before the member had admitted it, read the hardware state with no device and the
-  peer `joining`, and asked the person to approve the code in the door's log; once they answered, the V100 was there.
-- The deploy pulled the engine image, `ollama/ollama:0.40.6`, in 1 minute 16 seconds, and the model was ready 14
+- The agent read the hardware state at 12:46:29, half a second before the door's poll picked up the member's
+  admission: no device, and the peer `joining`. From the schema documents alone it told the person that the door
+  logs a code to approve on that machine and asked them to approve it, which had been done at 12:46:25; its next read,
+  after their answer, had the V100.
+- The deploy pulled the engine image, `ollama/ollama:0.40.6`, in 1 minute 16 seconds, and the model was ready 13
   seconds after that. The workspace's log has 30 progress events for the whole run (`ImagePulling` 20,
   `WeightsLoading` 10), where the earlier run's had 326
   ([behavioralstate/spec#40](https://github.com/behavioralstate/spec/issues/40)). The pull's first two read 1 % then
@@ -61,7 +65,7 @@ transcript. The run before workspaces and the `prompt` command is
 - The agent followed the deploy on the stream, `sample_event_stream` filtered by the command's correlation id and
   then by `DeploymentReady`, read the prompt's answer with `get_events`, and waited for the job's `JobFinished` on the
   stream.
-- 31 tool calls in the transcript; 25 model turns and 6 minutes 21 seconds from the client's own log, 2 minutes 35
+- 31 tool calls in the transcript; 25 model turns and 6 minutes 20 seconds from the client's own log, 2 minutes 37
   seconds of them waiting for the person.
 
 ## The transcript
