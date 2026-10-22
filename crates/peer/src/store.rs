@@ -47,14 +47,66 @@ impl Store {
         format!("{endpoint}{path}?{query}")
     }
 
-    /// The size of the object at `key`, or none when the store holds no such object; an error is the store not
-    /// answering as a store does.
-    pub async fn size_of(&self, key: &str) -> Result<Option<u64>, String> {
-        let url = self.presign("HEAD", key, 300, OffsetDateTime::now_utc());
-        tokio::task::spawn_blocking(move || head(&url, ASKING))
-            .await
-            .map_err(|e| e.to_string())?
+    /// The sizes of the objects at `keys`, in their order, asked as many at a time as `asking` lets, which every
+    /// order of the workspace shares, and all answered by `by`. Each question holds a thread until it is answered,
+    /// and none outlives `by`.
+    pub async fn sizes_of(
+        &self,
+        keys: &[String],
+        asking: &Arc<tokio::sync::Semaphore>,
+        by: tokio::time::Instant,
+    ) -> Result<Vec<u64>, Unsized> {
+        let now = OffsetDateTime::now_utc();
+        let mut asked = tokio::task::JoinSet::new();
+        for (n, key) in keys.iter().enumerate() {
+            let url = self.presign("HEAD", key, 300, now);
+            let asking = asking.clone();
+            asked.spawn(async move {
+                let Ok(turn) = asking.acquire_owned().await else {
+                    return (n, Err("the store is no longer asked".to_string()));
+                };
+                let limit = by.saturating_duration_since(tokio::time::Instant::now());
+                let answer = tokio::task::spawn_blocking(move || {
+                    let _turn = turn;
+                    head(&url, limit)
+                })
+                .await
+                .map_err(|e| e.to_string());
+                (n, answer.and_then(|a| a))
+            });
+        }
+        let mut sizes = vec![None; keys.len()];
+        while let Ok(Some(answered)) = tokio::time::timeout_at(by, asked.join_next()).await {
+            match answered {
+                Ok((n, Ok(Some(bytes)))) => sizes[n] = Some(bytes),
+                Ok((n, Ok(None))) => return Err(Unsized::Missing(n)),
+                Ok((n, Err(why))) => return Err(Unsized::Unreachable(n, why)),
+                Err(_) => {}
+            }
+        }
+        let late: Vec<usize> = (0..sizes.len()).filter(|n| sizes[*n].is_none()).collect();
+        match late.is_empty() {
+            true => Ok(sizes.into_iter().flatten().collect()),
+            false => Err(Unsized::Late(late)),
+        }
     }
+}
+
+/// How many questions a workspace's store is asked at once, by all its orders together.
+pub const ASKED_AT_ONCE: usize = 8;
+
+/// How long an order's inputs may take to be sized, all of them together.
+pub const SIZING: Duration = Duration::from_secs(60);
+
+/// Why an order's inputs were not sized, each input by its place in the order.
+#[derive(Debug, PartialEq)]
+pub enum Unsized {
+    /// The store holds no object at this one.
+    Missing(usize),
+    /// The store did not answer as a store does about this one.
+    Unreachable(usize, String),
+    /// The time ran out with these not answered.
+    Late(Vec<usize>),
 }
 
 /// The size of what `url` names, asked within `limit`: none when the store holds nothing there.
@@ -73,7 +125,7 @@ fn head(url: &str, limit: Duration) -> Result<Option<u64>, String> {
     }
 }
 
-/// How long a question to the store may take, and how long it may take to start answering a transfer.
+/// How long connecting to the store may take, and how long it may take to start answering a transfer.
 const ASKING: Duration = Duration::from_secs(60);
 const STARTING: Duration = Duration::from_secs(600);
 

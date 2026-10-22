@@ -818,6 +818,8 @@ pub struct Workspace {
     /// Its store, where its jobs' inputs come from and their outputs go, as its owner set it: kept in its own file,
     /// the credential never on the log.
     store: Arc<Mutex<Option<Store>>>,
+    /// The turns its store is asked in, by every order of every cloud of it together: each question holds a thread.
+    asking: Arc<tokio::sync::Semaphore>,
     /// A store admitted and not yet set, by its command's key: set by the handler that tells StoreSetV1, so what the
     /// workspace uses is what its log says, and a command refused after admission changes nothing.
     pending_store: Mutex<HashMap<String, Store>>,
@@ -900,6 +902,7 @@ impl Workspace {
             clouds: Mutex::new(BTreeMap::new()),
             purse: Arc::new(Purse::new(log.clone())),
             store: Arc::new(Mutex::new(store)),
+            asking: Arc::new(tokio::sync::Semaphore::new(crate::store::ASKED_AT_ONCE)),
             pending_store: Mutex::new(HashMap::new()),
             door: Mutex::new(None),
             router: Mutex::new(None),
@@ -1215,7 +1218,7 @@ impl Workspace {
                     );
                     c.set_menu(r.menu.clone());
                     c.set_purse(self.purse.clone());
-                    c.set_store(self.store.clone());
+                    c.set_store(self.store.clone(), self.asking.clone());
                     let counted = Arc::downgrade(&c);
                     self.purse
                         .add(move || counted.upgrade().map(|c| c.open_orders()).unwrap_or_default());

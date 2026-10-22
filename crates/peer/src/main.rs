@@ -10579,6 +10579,23 @@ mod tests {
             .await
         }
 
+        /// The `JobFailed` of a job of 4 GiB in cloud `lab` with `more` that is taken and ends before it is queued,
+        /// since the store did not size its inputs.
+        async fn not_sized(&self, ws: &str, id: &str, more: Value) -> Value {
+            let order = amended(
+                &with_io(),
+                amended(
+                    &json!({ "cloud": "lab", "image": "busybox", "memory_bytes": 4 * GB }),
+                    more,
+                ),
+            );
+            let (s, b) = self.send(ws, id, "RunJob", "run-job", order).await;
+            assert_eq!(s, StatusCode::CREATED, "{b}");
+            let events = self.events(ws, id, "JobFailed").await;
+            assert_eq!(facts(&events), ["JobFailed"]);
+            events[0]["data"].clone()
+        }
+
         /// The refusal of a job of 4 GiB in cloud `lab` with `more`: its code and the field it names.
         async fn refused(&self, ws: &str, id: &str, more: Value) -> (String, String) {
             let order = amended(
@@ -10642,6 +10659,115 @@ mod tests {
         })
     }
 
+    /// A store on loopback that takes every connection and never answers: answers its endpoint and how many
+    /// connections it has taken.
+    async fn silent_store() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let taken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = taken.clone();
+        tokio::spawn(async move {
+            let mut held = vec![];
+            while let Ok((stream, _)) = listener.accept().await {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                held.push(stream);
+            }
+        });
+        (endpoint, taken)
+    }
+
+    #[tokio::test]
+    async fn a_store_that_never_answers_holds_no_request_and_an_order_it_holds_fails_within_its_deadline_naming_its_inputs(
+    ) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (a, _s3, _endpoint, _logs) = member_and_store().await;
+        let key_a = a.key.clone();
+        let site = site(vec![(A, a)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a)]).await;
+        let (endpoint, taken) = silent_store().await;
+        let (s, b) = site.store(&ws, "st1", &endpoint).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "st1", "StoreSetV1").await;
+        let lab = site.live_cloud(&ws, "lab");
+        lab.set_sizing(Duration::from_millis(1500));
+        let inputs = |n: usize| {
+            json!((0..n)
+                .map(|i| json!({ "key": format!("inputs/{i}.bin"), "path": format!("{i}.bin") }))
+                .collect::<Vec<_>>())
+        };
+        let order = |n: usize| {
+            amended(
+                &with_io(),
+                json!({ "cloud": "lab", "image": "busybox", "memory_bytes": 4 * GB, "inputs": inputs(n) }),
+            )
+        };
+
+        // Admission alone, run by hand: taken, and the store not dialled.
+        let held = site.workspaces.get(&ws).unwrap();
+        let who = site.auth.authenticate(&site.key).unwrap();
+        let cmd: best_peer_door::Envelope = serde_json::from_str(&envelope(
+            &format!("{EP}/workspaces/{ws}"),
+            "d1",
+            "RunJob",
+            "run-job",
+            order(3),
+        ))
+        .unwrap();
+        <workspace::Workspace as domain::Service>::admit_run_job(&held, cmd, who, format!("{}:d1", site.key))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(taken.load(SeqCst), 0);
+
+        // Through the door: taken at once, whatever the store does.
+        let sent = std::time::Instant::now();
+        let (s, b) = site.send(&ws, "j1", "RunJob", "run-job", order(10)).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        assert!(sent.elapsed() < Duration::from_millis(500), "{:?}", sent.elapsed());
+        // Eight questions at a time for the whole workspace: a second order asks nothing while they are held.
+        until("eight questions asked", || taken.load(SeqCst) == 8).await;
+        lab.set_sizing(Duration::from_secs(4));
+        let (s, b) = site.send(&ws, "j2", "RunJob", "run-job", order(1)).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(taken.load(SeqCst), 8);
+
+        // Within its deadline it ends, never queued, every input it did not size named.
+        let events = site.events(&ws, "j1", "JobFailed").await;
+        assert!(sent.elapsed() < Duration::from_secs(5), "{:?}", sent.elapsed());
+        assert_eq!(facts(&events), ["JobFailed"]);
+        let failed = &events[0]["data"];
+        assert_eq!(failed["code"], "INPUTS_LATE");
+        assert_eq!(
+            failed["inputs"],
+            json!((0..10).map(|i| format!("inputs/{i}.bin")).collect::<Vec<_>>())
+        );
+        assert!(failed["reason"].as_str().unwrap().contains("inputs/9.bin"), "{failed}");
+        // No question outlives its order's deadline: the turns are free, and the second order asks.
+        until("the second order's question asked", || taken.load(SeqCst) == 9).await;
+        let events = site.events(&ws, "j2", "JobFailed").await;
+        assert_eq!(events[0]["data"]["code"], "INPUTS_LATE");
+        // What they held on the member is let go: only the order admitted by hand, never run, is still reserved.
+        let reserved: Vec<String> = lab.state.lock().unwrap().reserved.keys().cloned().collect();
+        assert_eq!(reserved, [format!("{}:d1", site.key)]);
+
+        // A store nothing listens at: the input it could not ask about is named.
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gone = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let (s, b) = site.store(&ws, "st2", &gone).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "st2", "StoreSetV1").await;
+        let (s, b) = site.send(&ws, "j3", "RunJob", "run-job", order(1)).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let failed = site.events(&ws, "j3", "JobFailed").await[0]["data"].clone();
+        assert_eq!(
+            (&failed["code"], &failed["inputs"]),
+            (&json!("STORE_UNREACHABLE"), &json!(["inputs/0.bin"]))
+        );
+    }
+
     #[tokio::test]
     async fn a_job_finds_its_inputs_under_in_and_what_it_leaves_under_out_is_in_the_store_before_its_end_is_told() {
         let (a, s3, endpoint, logs) = member_and_store().await;
@@ -10683,11 +10809,6 @@ mod tests {
         let refusals = [
             (json!({ "disk_bytes": null }), "DISK_NEEDED", "disk_bytes"),
             (
-                json!({ "inputs": [{ "key": "inputs/none.txt", "path": "x" }] }),
-                "NO_SUCH_INPUT",
-                "inputs/0/key",
-            ),
-            (
                 json!({ "inputs": [{ "key": "inputs/scene.txt", "path": "../etc/passwd" }] }),
                 "INVALID_INPUT_PATH",
                 "inputs/0/path",
@@ -10718,17 +10839,37 @@ mod tests {
                 "INVALID_INPUT_PATH",
                 "inputs/1/path",
             ),
-            (
-                json!({ "inputs": [{ "key": "inputs/big.bin", "path": "big" }], "disk_bytes": 16 << 20 }),
-                "INPUTS_EXCEED_DISK",
-                "disk_bytes",
-            ),
         ];
         s3.put("inputs/big.bin", &vec![0u8; 16 << 20]);
         for (n, (more, code, field)) in refusals.into_iter().enumerate() {
             let got = site.refused(&ws, &format!("r{n}"), amended(&with_io(), more)).await;
             assert_eq!(got, (code.to_string(), field.to_string()), "refusal {n}");
         }
+        // None of them asked the store anything: what only the store knows is learnt once an order is taken.
+        assert!(s3.asked.lock().unwrap().is_empty());
+        let none = site
+            .not_sized(
+                &ws,
+                "f1",
+                json!({ "inputs": [{ "key": "inputs/none.txt", "path": "x" }] }),
+            )
+            .await;
+        assert_eq!(
+            (&none["code"], &none["inputs"]),
+            (&json!("NO_SUCH_INPUT"), &json!(["inputs/none.txt"]))
+        );
+        let big = site
+            .not_sized(
+                &ws,
+                "f2",
+                json!({ "inputs": [{ "key": "inputs/big.bin", "path": "big" }], "disk_bytes": 16 << 20 }),
+            )
+            .await;
+        assert_eq!(
+            (&big["code"], &big["inputs"]),
+            (&json!("INPUTS_EXCEED_DISK"), &json!(["inputs/big.bin"]))
+        );
+        assert!(big["reason"].as_str().unwrap().contains(&(16u64 << 20).to_string()));
 
         // Ordered: the order says what it reads and where its outputs go, by key, never by URL.
         let queued = site.order(&ws, "j1", 4, with_io()).await;

@@ -575,9 +575,12 @@ under `/in`, and its `outputs` by a key prefix:
 ```
 
 The store is the workspace's: every credential that may run jobs there reads any key in it and writes under any
-prefix. The cloud checks each input is in the store when it takes the order, and refuses one that is not
-(`NO_SUCH_INPUT`), inputs that together exceed the disk (`INPUTS_EXCEED_DISK`), and two that land at one path or one
-under another (`INVALID_INPUT_PATH`). An order is served from the store it was taken for: one whose store is replaced
+prefix. The cloud refuses two inputs that land at one path or one under another (`INVALID_INPUT_PATH`) at once, but
+asks the store nothing while it takes the order: once the order is taken, before `JobQueued`, it asks the store each
+input's size, eight questions at a time for the whole workspace and a minute for the order. An input the store does not
+hold (`NO_SUCH_INPUT`), one it does not answer for (`STORE_UNREACHABLE`), inputs not answered within the minute
+(`INPUTS_LATE`) and inputs that together exceed the disk (`INPUTS_EXCEED_DISK`) end the order in `JobFailed`, the code
+as its `code` and the inputs named. An order is served from the store it was taken for: one whose store is replaced
 while it waits fails when its turn comes.
 The member it places the order on gets only URLs the cloud signed for that order: one to read each input, one to
 write the outputs. Before the job starts, the member makes it a disk of its own, of `disk_bytes` (a size names its

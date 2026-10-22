@@ -257,6 +257,10 @@ pub struct Cloud {
     purse: std::sync::OnceLock<Arc<crate::meter::Purse>>,
     /// The workspace's store, where its orders' inputs come from and their outputs go.
     store: std::sync::OnceLock<Arc<Mutex<Option<crate::store::Store>>>>,
+    /// The turns the workspace's store is asked in, which every order of the workspace shares.
+    asking: std::sync::OnceLock<Arc<tokio::sync::Semaphore>>,
+    /// How long an order's inputs may take to be sized.
+    sizing: Mutex<Duration>,
     /// The inputs, outputs and disk admission read for an order, until its handler tells it.
     admitted_io: Mutex<HashMap<String, Option<crate::state::OrderIo>>>,
     /// When each order sent to a member was answered, by order, until it starts or ends: from then the member counts
@@ -470,6 +474,8 @@ impl Cloud {
             admitted_sizes: Mutex::new(HashMap::new()),
             purse: std::sync::OnceLock::new(),
             store: std::sync::OnceLock::new(),
+            asking: std::sync::OnceLock::new(),
+            sizing: Mutex::new(crate::store::SIZING),
             admitted_io: Mutex::new(HashMap::new()),
             answered_at: Mutex::new(HashMap::new()),
             name: name.into(),
@@ -653,9 +659,123 @@ impl Cloud {
         *self.menu.lock().unwrap() = menu;
     }
 
-    /// Reads its orders' inputs from, and sends their outputs to, the workspace's `store`; set once.
-    pub fn set_store(&self, store: Arc<Mutex<Option<crate::store::Store>>>) {
+    /// Reads its orders' inputs from, and sends their outputs to, the workspace's `store`, asking it in the turns
+    /// `asking` gives; set once.
+    pub fn set_store(&self, store: Arc<Mutex<Option<crate::store::Store>>>, asking: Arc<tokio::sync::Semaphore>) {
         let _ = self.store.set(store);
+        let _ = self.asking.set(asking);
+    }
+
+    /// Gives an order's inputs `limit` to be sized, not a minute.
+    #[cfg(test)]
+    pub fn set_sizing(&self, limit: Duration) {
+        *self.sizing.lock().unwrap() = limit;
+    }
+
+    /// The store order `io` reads from and writes to, as it is set now: none for an order with neither, and the
+    /// reason and the fix of its end when the store it was taken for was removed or replaced since, since an order is
+    /// not served from another.
+    fn store_for(&self, io: &crate::state::OrderIo) -> Result<Option<crate::store::Store>, (String, &'static str)> {
+        if io.inputs.is_empty() && io.outputs.is_none() {
+            return Ok(None);
+        }
+        match self.store_now() {
+            None => Err((
+                "the workspace has no store any more, where its inputs were".into(),
+                "its owner sets one with set-store; then order it again",
+            )),
+            Some(s)
+                if io
+                    .store
+                    .as_ref()
+                    .is_some_and(|(e, b)| (e, b) != (&s.endpoint, &s.bucket)) =>
+            {
+                let (endpoint, bucket) = io.store.clone().unwrap_or_default();
+                Err((
+                    format!("the workspace's store was replaced while the order waited: its inputs were found in bucket {bucket} at {endpoint}"),
+                    "order it again, naming keys in the store set now (get-store)",
+                ))
+            }
+            Some(s) => Ok(Some(s)),
+        }
+    }
+
+    /// Order `io` with each input's size, as its store says, asked after the order was admitted so that no request
+    /// waits on the store; or the data of the `JobFailed` that ends order `job` of `image`, naming the inputs and
+    /// the code: one the store does not hold, one it did not answer for as a store does, those it had not answered
+    /// within the time an order's inputs are given, or inputs that together do not fit the disk.
+    async fn sized(
+        &self,
+        mut io: crate::state::OrderIo,
+        job: &str,
+        image: &str,
+    ) -> Result<crate::state::OrderIo, Value> {
+        let failed = |code: &str, inputs: Vec<&str>, reason: String, fix: &str| json!({ "job": job, "image": image, "reason": reason, "fix": fix, "code": code, "inputs": inputs });
+        let store = match self.store_for(&io) {
+            Ok(Some(store)) if !io.inputs.is_empty() => store,
+            Ok(_) => return Ok(io),
+            Err((reason, fix)) => return Err(failed("NO_STORE", vec![], reason, fix)),
+        };
+        let keys: Vec<String> = io.inputs.iter().map(|i| i.key.clone()).collect();
+        let asking = self
+            .asking
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(crate::store::ASKED_AT_ONCE)))
+            .clone();
+        let by = tokio::time::Instant::now() + *self.sizing.lock().unwrap();
+        let sizes = match store.sizes_of(&keys, &asking, by).await {
+            Ok(sizes) => sizes,
+            Err(crate::store::Unsized::Missing(n)) => {
+                return Err(failed(
+                    "NO_SUCH_INPUT",
+                    vec![&keys[n]],
+                    format!("the workspace's store holds no {}", keys[n]),
+                    &format!("put it in bucket {} first, then order again", store.bucket),
+                ))
+            }
+            Err(crate::store::Unsized::Unreachable(n, why)) => {
+                return Err(failed(
+                    "STORE_UNREACHABLE",
+                    vec![&keys[n]],
+                    format!(
+                        "the workspace's store could not say whether it holds {}: {why}",
+                        keys[n]
+                    ),
+                    "order it again once the store answers",
+                ))
+            }
+            Err(crate::store::Unsized::Late(late)) => {
+                let named: Vec<&str> = late.iter().map(|n| keys[*n].as_str()).collect();
+                return Err(failed(
+                    "INPUTS_LATE",
+                    named.clone(),
+                    format!(
+                        "the workspace's store had not said how large {} {} within {} seconds",
+                        if named.len() == 1 { "input" } else { "inputs" },
+                        named.join(", "),
+                        self.sizing.lock().unwrap().as_secs()
+                    ),
+                    "order it again once the store answers, or with fewer inputs",
+                ));
+            }
+        };
+        // The inputs land on the disk before the job starts: what cannot fit ends the order now, not after the wait.
+        let together: u64 = sizes.iter().sum();
+        if together > usable(io.disk_bytes) {
+            return Err(failed(
+                "INPUTS_EXCEED_DISK",
+                keys.iter().map(String::as_str).collect(),
+                format!(
+                    "the inputs are {together} bytes together, more than a disk of {} bytes holds once its file system takes its share ({} bytes)",
+                    io.disk_bytes,
+                    io.disk_bytes - usable(io.disk_bytes)
+                ),
+                "order it again with more disk_bytes",
+            ));
+        }
+        for (input, bytes) in io.inputs.iter_mut().zip(sizes) {
+            input.bytes = Some(bytes);
+        }
+        Ok(io)
     }
 
     /// The workspace's store, as it is set now.
@@ -711,10 +831,11 @@ impl Cloud {
         out
     }
 
-    /// An order's inputs, outputs and disk, checked against the workspace's store: each input there, each landing
-    /// at a plain path, a disk given by the order or its size, an order with outputs bounded within what a signed URL
-    /// outlives. None for an order with none of them.
-    async fn admit_io(
+    /// An order's inputs, outputs and disk, checked for what they say: a store to hold them, each input landing at
+    /// a plain path, a disk given by the order or its size, an order with outputs bounded within what a signed URL
+    /// outlives. Nothing is asked of the store here; its inputs are sized once the order is taken. None for an order
+    /// with none of them.
+    fn admit_io(
         &self,
         data: &RunJobData,
         size: Option<&crate::menu::Size>,
@@ -782,55 +903,14 @@ impl Cloud {
                 Some(_) => {}
             }
         }
-        let mut sizes = vec![];
-        if let Some(store) = &store {
-            for (n, i) in data.inputs.iter().enumerate() {
-                match store.size_of(&i.key).await {
-                    Ok(Some(bytes)) => sizes.push(bytes),
-                    Ok(None) => {
-                        return bad(
-                            "NO_SUCH_INPUT",
-                            &format!("inputs/{n}/key"),
-                            format!(
-                                "the workspace's store holds no {}: put it in bucket {} first, then order again",
-                                i.key, store.bucket
-                            ),
-                        )
-                    }
-                    Err(why) => {
-                        return bad(
-                            "STORE_UNREACHABLE",
-                            &format!("inputs/{n}/key"),
-                            format!(
-                                "the workspace's store could not say whether it holds {}: {why}; try again",
-                                i.key
-                            ),
-                        )
-                    }
-                }
-            }
-        }
-        // The inputs land on the disk before the job starts: what cannot fit is refused now, not after the wait.
-        let inputs: u64 = sizes.iter().sum();
-        if inputs > usable(disk) {
-            return bad(
-                "INPUTS_EXCEED_DISK",
-                "disk_bytes",
-                format!(
-                    "the inputs are {inputs} bytes together, more than a disk of {disk} bytes holds once its file system takes its share ({} bytes): ask for more disk_bytes",
-                    disk - usable(disk)
-                ),
-            );
-        }
         Ok(Some(crate::state::OrderIo {
             inputs: data
                 .inputs
                 .iter()
-                .zip(sizes.into_iter().map(Some).chain(std::iter::repeat(None)))
-                .map(|(i, bytes)| crate::state::OrderInput {
+                .map(|i| crate::state::OrderInput {
                     key: i.key.clone(),
                     path: i.path.clone(),
-                    bytes,
+                    bytes: None,
                 })
                 .collect(),
             outputs: data
@@ -2276,33 +2356,13 @@ impl Cloud {
             return;
         };
         // Its store first: an order whose store was removed, or replaced, while it waited is not served from another.
-        let store = match &o.io {
-            Some(io) if !io.inputs.is_empty() || io.outputs.is_some() => match self.store_now() {
-                None => {
-                    fail(
-                        "the workspace has no store any more, where its inputs were".into(),
-                        "its owner sets one with set-store; then order it again",
-                        None,
-                    );
-                    return;
-                }
-                Some(s)
-                    if io
-                        .store
-                        .as_ref()
-                        .is_some_and(|(e, b)| (e, b) != (&s.endpoint, &s.bucket)) =>
-                {
-                    let (endpoint, bucket) = io.store.clone().unwrap_or_default();
-                    fail(
-                        format!("the workspace's store was replaced while the order waited: its inputs were found in bucket {bucket} at {endpoint}"),
-                        "order it again, naming keys in the store set now (get-store)",
-                        None,
-                    );
-                    return;
-                }
-                Some(s) => Some(s),
-            },
-            _ => None,
+        let store = match o.io.as_ref().map(|io| self.store_for(io)) {
+            Some(Err((reason, fix))) => {
+                fail(reason, fix, None);
+                return;
+            }
+            Some(Ok(s)) => s,
+            None => None,
         };
         let memory = o.memory_bytes.or(o.size.as_ref().map(|(z, _)| z.memory_bytes));
         let with_device = memory.is_some();
@@ -2713,7 +2773,7 @@ impl Service for Cloud {
         if self.already_placed(&key).is_some() || self.state.lock().unwrap().orders.contains_key(&order_id(&key)) {
             return Ok(());
         }
-        let io = self.admit_io(&data, sized.as_ref().map(|(z, _)| z)).await?;
+        let io = self.admit_io(&data, sized.as_ref().map(|(z, _)| z))?;
         let disk = io.as_ref().map(|io| io.disk_bytes);
         let read = Instant::now();
         let (host, peers, isolations) = self.combined().await;
@@ -2953,6 +3013,22 @@ impl Service for Cloud {
             }
             (None, _) => (None, None),
         };
+        let admitted_io = self.admitted_io.lock().unwrap().get(&key).cloned().flatten();
+        let io = match admitted_io {
+            Some(io) => match self.sized(io, &id, &data.image).await {
+                Ok(io) => Some(io),
+                Err(failed) => {
+                    self.whole.lock().unwrap().remove(&id);
+                    self.held_to_accelerators.lock().unwrap().remove(&key);
+                    self.admitted_sizes.lock().unwrap().remove(&key);
+                    self.admitted_io.lock().unwrap().remove(&key);
+                    self.tell(&em, "JobFailed", failed);
+                    self.kick();
+                    return;
+                }
+            },
+            None => None,
+        };
         let order = Order {
             id: id.clone(),
             correlation: em.correlation().to_string(),
@@ -2974,8 +3050,9 @@ impl Service for Cloud {
             started_at: None,
             size,
             receipt: None,
-            io: self.admitted_io.lock().unwrap().remove(&key).flatten(),
+            io,
         };
+        self.admitted_io.lock().unwrap().remove(&key);
         let reason = waiting.then(|| match &order.size {
             Some((z, _)) => format!(
                 "no device of cloud {} that meets size {}'s floors has its room now: it is placed as soon as one has, after the orders before it",
