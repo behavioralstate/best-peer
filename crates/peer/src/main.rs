@@ -9058,11 +9058,45 @@ mod tests {
         }
         assert!(dropped, "nothing holds an archived workspace");
 
-        // Started again over the same data, it stays archived: not opened, not listed.
+        // A create its credential was taken back before it ran makes nothing.
+        let gone = key(&site.app).await;
+        let gone_hash = site.auth.authenticate(&gone).unwrap().hash;
+        site.auth.revoke_own(&gone_hash).unwrap();
+        let create = serde_json::from_str::<best_peer_door::Envelope>(&envelope(
+            EP,
+            "w9",
+            "CreateWorkspace",
+            "create-workspace",
+            json!({ "name": "Late" }),
+        ))
+        .unwrap();
+        let at_root =
+            best_peer_door::Emitter::new(log.clone(), SERVICE, "w9", Arc::new(std::collections::HashMap::new()))
+                .with_key(&format!("{gone_hash}:w9"));
+        <workspace::Workspaces as domain::Membership>::create(site.workspaces.clone(), create, at_root).await;
+        let mut told = Vec::new();
+        log.replay(|e| {
+            if e.effective_correlation() == "w9" {
+                told.push((
+                    e.r#type.clone(),
+                    e.data["reason"].as_str().unwrap_or_default().to_string(),
+                ));
+            }
+        });
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert_eq!(told[0].0, "CommandFailed");
+        assert!(told[0].1.contains("taken back"), "{told:?}");
+
+        // Started again over the same data, it stays archived: not opened, not listed, and a credential an archive
+        // could not delete is deleted then.
+        let store_file = data.path().join("workspaces").join(&ws).join("store.json");
+        std::fs::write(&store_file, b"{}").unwrap();
+        std::fs::write(&members_file, b"[]").unwrap();
         let auth = site.auth.clone();
         drop(site);
         let again = site_over(Vec::new(), data.clone(), log, Some(auth), Arc::new(Limits::default())).await;
         assert!(again.workspaces.get(&ws).is_none());
+        assert!(!store_file.exists() && !members_file.exists());
         let (_, w) = get_as(&again.app, "", &owner, "/queries/get-workspaces").await;
         assert_eq!(w["workspaces"], json!([]));
         let (s, _) = get_as(&again.app, &p, &owner, "/queries/get-clouds").await;
