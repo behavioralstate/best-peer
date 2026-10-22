@@ -104,7 +104,8 @@
   the diff, the maintainer runs the local gate on what would land, its head squashed onto the current `main` (it builds and
   runs the contributor's code), and merges it
   as one commit when that and CI are green, pinned to the head that was gated (`gh pr merge --squash
-  --match-head-commit`), so a push after the gate cannot land without the review and the gate. A fork's first workflow run waits for a maintainer's
+  --match-head-commit`, the full sha), so a push after the gate cannot land without the review and the gate; when
+  `main` moved since the gate, the gate runs again on the new squash before the merge. A fork's first workflow run waits for a maintainer's
   approval on the Actions tab.
 - **A checkout that runs ahead of `main` on a host is that host's owner's to run**; what the spec promises of it is
   only what `main` proves.
