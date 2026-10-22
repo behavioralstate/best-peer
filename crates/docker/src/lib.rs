@@ -203,9 +203,17 @@ async fn last_words(docker: &Docker, id: &str) -> Option<String> {
         .tail("20")
         .build();
     let mut logs = docker.logs(id, Some(options));
+    // Only the end is kept, so a tail of huge lines (a progress bar rewritten for megabytes) is never held whole.
+    const HELD: usize = 64 * 1024;
     let mut text = String::new();
     while let Some(Ok(chunk)) = logs.next().await {
         text.push_str(&String::from_utf8_lossy(&chunk.into_bytes()));
+        if text.len() > 2 * HELD {
+            let cut = (text.len() - HELD..=text.len())
+                .find(|i| text.is_char_boundary(*i))
+                .unwrap_or(text.len());
+            text.drain(..cut);
+        }
     }
     let text = text.trim();
     // A screen of text at most, its end kept: the last line is the one that says why.

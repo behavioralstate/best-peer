@@ -1378,6 +1378,20 @@ mod tests {
         assert!(silent.get("output").is_none(), "nothing printed, no output: {silent}");
     }
 
+    #[test]
+    fn what_a_jobs_end_carries_of_what_it_printed_is_its_last_twenty_lines_and_2000_characters() {
+        assert_eq!(lifecycle::last_lines("  \n\t "), None);
+        assert_eq!(lifecycle::last_lines("one\ntwo\n").as_deref(), Some("one\ntwo"));
+        let many: Vec<String> = (1..=30).map(|i| format!("line {i}")).collect();
+        let kept = lifecycle::last_lines(&many.join("\n")).unwrap();
+        assert_eq!(kept.lines().count(), 20);
+        assert!(kept.starts_with("line 11") && kept.ends_with("line 30"), "{kept}");
+        let wide = format!("{}é the end", "x".repeat(5000));
+        let kept = lifecycle::last_lines(&wide).unwrap();
+        assert_eq!(kept.chars().count(), 2000);
+        assert!(kept.ends_with("é the end"));
+    }
+
     #[tokio::test]
     async fn a_member_jobs_end_reaches_the_workspace_with_what_it_printed() {
         let (a, b) = two_members().await;
@@ -9184,6 +9198,10 @@ mod tests {
         let (_, disk) = exited("o2", true).await;
         let failed = bed.events_of("o2", "JobFailed").await.last().unwrap().data.clone();
         assert_eq!(failed["exit_code"], 0);
+        assert_eq!(
+            failed["output"], "done",
+            "a late store's JobFailed carries what the job printed"
+        );
         let reason = failed["reason"].as_str().unwrap();
         assert!(reason.contains("were not stored within"), "{reason}");
         drop(hold);
@@ -9195,6 +9213,11 @@ mod tests {
         exited("o3", false).await;
         let finished = bed.events_of("o3", "JobFinished").await;
         assert!(types(&finished).contains(&"OutputsStored".to_string()));
+        assert_eq!(
+            finished.last().unwrap().data["output"],
+            "done",
+            "and so does a stored job's JobFinished"
+        );
         assert_eq!(unpacked(&s3.get("renders/o3.tar").unwrap())["result.txt"], "rendered");
     }
 

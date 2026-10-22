@@ -348,7 +348,8 @@ its model is ready fails the deploy: `DeploymentFailed` carries its exit code an
 the conversation so far, and `PromptAnswered` follows under its own correlation id with the answer whole, or
 `PromptFailed` with the reason and the fix. `run-job` runs an image once, a tenant's in a closed box, and tells
 `JobStarted` and `JobFinished` with the exit code and `output`, the last lines the job printed (twenty at most, 2000
-characters at most); more than that belongs under `/out`, which goes to the workspace's store. `undeploy-model` and
+characters at most), as does a `JobFailed` that follows its exit (its outputs not stored); more than that belongs under
+`/out`, which goes to the workspace's store. `undeploy-model` and
 `stop-job` end them.
 
 On a workspace's door `run-job` is an order, and a cloud with no room now takes it to wait its turn, as the
@@ -399,7 +400,8 @@ second and the currency.
 
 A client deals in sizes and never sees the hardware. Nothing the workspace door serves about an order by size names a
 card, a device or a MIG profile: not the receipt, not `get-menu`, `get-workloads` or `get-usage`, and not the order's
-events, on the page or on the stream. The door's log keeps the device each order went to, for the cloud's own count
+events, on the page or on the stream, save what the job itself printed (`output`), which is its own and is relayed as
+it was printed. The door's log keeps the device each order went to, for the cloud's own count
 of what is held, and leaves it off what it serves. Pinning stays the owner's: `memory_bytes` and `device` work as
 before. `get-hardware-state` and `get-clouds` are the operator's views of the machines and still name them.
 

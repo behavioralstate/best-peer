@@ -1403,7 +1403,7 @@ pub fn event_defs() -> Vec<EventDef> {
             "JobFailed",
             "The job did not start, or the engine ended it, or, on a workspace's door, the peer it ran on was lost; the reason says what happened and the fix what to do.",
             &["job", "reason", "fix"],
-            placed(json!({ "job": s("The job"), "image": s("The image"), "reason": s("What happened"), "fix": s("What to do"), "exit_code": { "type": ["integer", "null"], "description": "The container's exit code, when it exited and what came after failed (its outputs not stored)" }, "output": s("The last lines the job wrote, out and error together: twenty at most, 2000 characters at most, its end kept; absent when it wrote nothing. More than that belongs under /out") })),
+            placed(json!({ "job": s("The job"), "image": s("The image"), "reason": s("What happened"), "fix": s("What to do"), "exit_code": { "type": ["integer", "null"], "description": "The container's exit code, when it exited and what came after failed (its outputs not stored)" }, "output": s("When it exited and what came after failed (its outputs not stored): the last lines the job wrote, twenty at most, 2000 characters at most, its end kept; absent otherwise, and when it wrote nothing") })),
         ),
         event(
             "job-stopped",

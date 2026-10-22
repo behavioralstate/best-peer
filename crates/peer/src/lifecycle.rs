@@ -116,6 +116,24 @@ const PROMPTS_AT_ONCE: usize = 16;
 /// told, and its exit is replayed once it is.
 const MAX_UNOWNED: usize = 64;
 
+/// The most of what a job printed that its end carries: twenty lines and 2000 characters, the end kept.
+const OUTPUT_LINES: usize = 20;
+const OUTPUT_CHARS: usize = 2000;
+
+/// The last of `words` a job's end carries as `output`, whatever the runtime handed over: at most [`OUTPUT_LINES`]
+/// lines and [`OUTPUT_CHARS`] characters, the end kept, since the last line is usually the one that matters; none
+/// when nothing but whitespace was printed.
+pub(crate) fn last_lines(words: &str) -> Option<String> {
+    let words = words.trim();
+    if words.is_empty() {
+        return None;
+    }
+    let lines: Vec<&str> = words.lines().collect();
+    let kept = lines[lines.len().saturating_sub(OUTPUT_LINES)..].join("\n");
+    let count = kept.chars().count();
+    Some(kept.chars().skip(count.saturating_sub(OUTPUT_CHARS)).collect())
+}
+
 /// Why a job stopped while its outputs were being stored ended so: what reached the store is not its outputs.
 pub const STOPPED_STORING: &str = "stopped while its outputs were being stored: they were not stored, and anything under its key is not to be relied on";
 
@@ -1981,7 +1999,7 @@ impl Peer {
                 }
                 // What the job printed last, told with its end (behavioralstate/spec#39).
                 let ended = move |mut fact: serde_json::Value| {
-                    if let Some(words) = last_words.as_deref().filter(|w| !w.trim().is_empty()) {
+                    if let Some(words) = last_words.as_deref().and_then(last_lines) {
                         fact["output"] = json!(words);
                     }
                     fact
