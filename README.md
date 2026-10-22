@@ -457,11 +457,15 @@ while it waits fails when its turn comes.
 The member it places the order on gets only URLs the cloud signed for that order: one to read each input, one to
 write the outputs. Before the job starts, the member makes it a disk of its own, of `disk_bytes` (a size names its
 default in the menu, and an order may name its own), fetches the inputs there and tells `InputsFetched`. The job
-reads `/in`, read-only, and writes `/out`. When it exits, what it left under `/out` is packed as one tar archive and
-sent to `<prefix>/<order>.tar`, and `OutputsStored` says so, with the key, before `JobFinished`; a store that does not
-take it ends the job in `JobFailed`, its exit code kept. A stop while the outputs are being sent is refused
-(`STORING_OUTPUTS`), since the job's end follows; a store that stops answering fails the transfer, ten minutes and a
-second a mebibyte on. The disk goes with the job, whatever its end, and a peer restarted under a running job finds
+reads `/in`, read-only, and writes `/out`. When it exits, its directories, regular files and links under `/out` are
+packed as one tar archive and sent to `<prefix>/<order>.tar` as they are packed, so nothing is written beside the disk,
+and `OutputsStored` says so, with the key, before `JobFinished`. A link is kept as a link, never followed; a pipe, a
+device or a socket it left is not an output. A store that does not take it ends the job in `JobFailed`, its exit code
+kept. The order's `deadline_seconds` covers the sending too: one still running past it is cut and the job ends, its
+outputs not stored (`JobFailed` at a peer's own door; through a cloud, the cloud stops it and `JobStopped` says so).
+A stop while the outputs are being sent ends the job at once in `JobStopped`, its outputs not stored, and cuts the
+sending at its next read; a store that stops answering fails the transfer, ten minutes and a second a mebibyte on,
+which also bounds a sending without a deadline. The disk goes with the job, whatever its end, and a peer restarted under a running job finds
 its disk again and still sends its outputs. A job with outputs
 sends `deadline_seconds`, six days at most, because the URL its outputs are sent with lives seven days at most. A
 member says the room it has for disks in `get-hardware-state` as `disk`, and an order is placed only on a member with

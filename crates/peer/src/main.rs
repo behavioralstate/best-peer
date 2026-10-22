@@ -8898,16 +8898,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outputs_the_store_does_not_take_fail_the_job_with_its_exit_code_and_no_stop_ends_it_while_they_are_sent() {
+    async fn outputs_the_store_does_not_take_fail_the_job_with_its_exit_code_and_a_stop_while_they_are_sent_ends_it() {
         let (site, ws, s3, _logs) = site_with_store().await;
         let member = &site.members[0];
 
-        // The job exits with 3 while the store holds its upload: a stop now is refused, on the member and through
-        // the cloud, and its end is told once, when the outputs are in.
+        // The job exits with 3 while the store holds its upload: a stop through the cloud ends it now, its outputs
+        // not stored, and its end is told once.
         let hold = s3.hold.clone().lock_owned().await;
         let queued = site.order(&ws, "j1", 4, with_io()).await;
         let started = site.events(&ws, "j1", "JobStarted").await.last().unwrap()["data"].clone();
         let job = started["job"].as_str().unwrap().to_string();
+        let disk = member.runtime.disk_of(&job);
         let container = ContainerId(started["container"].as_str().unwrap().into());
         member.runtime.exit(&container, 3, "rendered with warnings").unwrap();
         for _ in 0..400 {
@@ -8917,27 +8918,59 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(member.query("get-workloads").await["jobs"][0]["phase"], "storing");
-        let (s, b) = member.send("s1", "StopJob", "stop-job", json!({ "job": job })).await;
-        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
-        assert_eq!(b["error"]["code"], "STORING_OUTPUTS");
         let (s, b) = site
             .send(&ws, "s2", "StopJob", "stop-job", json!({ "job": queued["job"] }))
             .await;
         assert_eq!(s, StatusCode::CREATED, "{b}");
-        let failed = site.events(&ws, "s2", "CommandFailed").await[0]["data"].clone();
-        let reason = failed["reason"].as_str().unwrap();
+        let stopped = site.events(&ws, "s2", "JobStopped").await;
+        assert!(facts(&stopped).iter().all(|t| t != "CommandFailed"), "{stopped:?}");
+        assert_eq!(
+            member.query("get-workloads").await["jobs"],
+            json!([]),
+            "the member let it go"
+        );
+        drop(hold);
+        until("the stopped job's disk is removed", || !disk.exists()).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let told = facts(&site.events(&ws, "j1", "JobStarted").await);
+        assert!(!told.contains(&"JobFinished".to_string()), "{told:?}");
+        assert!(!told.contains(&"OutputsStored".to_string()), "{told:?}");
+
+        // The order's deadline passes while the member still sends: the cloud stops it, saying the outputs were not
+        // stored, and the member lets it go.
+        let hold = s3.hold.clone().lock_owned().await;
+        site.order(&ws, "j3", 4, with_io()).await;
+        let started = site.events(&ws, "j3", "JobStarted").await.last().unwrap()["data"].clone();
+        let late = started["job"].as_str().unwrap().to_string();
+        let disk = member.runtime.disk_of(&late);
+        member
+            .runtime
+            .exit(
+                &ContainerId(started["container"].as_str().unwrap().into()),
+                0,
+                "rendered",
+            )
+            .unwrap();
+        until("its outputs are being sent", || {
+            member
+                .peer
+                .state
+                .lock()
+                .unwrap()
+                .jobs
+                .get(&late)
+                .is_some_and(|j| j.phase == crate::state::JobPhase::Storing)
+        })
+        .await;
+        site.live_cloud(&ws, "lab").step(later(3700)).await;
+        let stopped = site.events(&ws, "j3", "JobStopped").await;
+        let reason = stopped.last().unwrap()["data"]["reason"].as_str().unwrap().to_string();
         assert!(
-            reason.contains("being stored") && !reason.contains("keeps running"),
+            reason.contains("deadline_seconds") && reason.contains("were not stored"),
             "{reason}"
         );
         drop(hold);
-        let events = site.events(&ws, "j1", "JobFinished").await;
-        assert_eq!(events.last().unwrap()["data"]["exit_code"], 3);
-        let ends = facts(&events)
-            .into_iter()
-            .filter(|t| matches!(t.as_str(), "JobFinished" | "JobStopped" | "JobFailed"))
-            .count();
-        assert_eq!(ends, 1);
+        until("the late job's disk is removed", || !disk.exists()).await;
 
         // The store refuses the next one's outputs: the job failed, its exit code kept, and its disk is gone.
         s3.refuse_puts.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -9002,6 +9035,134 @@ mod tests {
         let (s, b) = site.send(&ws, "j3", "RunJob", "run-job", by_size("large", None)).await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
         assert_eq!(b["error"]["code"], "DISK_NEEDED");
+    }
+
+    #[tokio::test]
+    async fn a_stop_or_its_deadline_ends_a_job_while_its_outputs_are_sent_and_nothing_is_written_beside_its_disk() {
+        let (s3, endpoint) = FakeS3::start().await;
+        let store = crate::store::Store {
+            endpoint,
+            bucket: "jobs".into(),
+            region: "fin-01".into(),
+            access_key_id: "AKIDTESTONLY".into(),
+            secret_access_key: SECRET.into(),
+        };
+        let now = time::OffsetDateTime::now_utc();
+        let job = |key: &str| {
+            json!({
+                "image": "busybox",
+                "memory_bytes": 4 * GB,
+                "outputs": { "url": store.presign("PUT", key, 600, now), "key": key },
+                "disk_bytes": GB
+            })
+        };
+        let bed = bed(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        bed.peer.allow_store_cleartext();
+        // Ends the job `id` with a result under /out; with the store `held`, waits until its outputs are being sent.
+        let exited = |id: &'static str, held: bool| {
+            let bed = &bed;
+            async move {
+                let started = bed.events_of(id, "JobStarted").await.last().unwrap().data.clone();
+                let job = started["job"].as_str().unwrap().to_string();
+                let disk = bed.runtime.disk_of(&job);
+                std::fs::write(disk.join("out").join("result.txt"), "rendered").unwrap();
+                bed.runtime
+                    .exit(&ContainerId(started["container"].as_str().unwrap().into()), 0, "done")
+                    .unwrap();
+                if !held {
+                    return (job, disk);
+                }
+                until("its outputs are being sent", || {
+                    bed.peer
+                        .state
+                        .lock()
+                        .unwrap()
+                        .jobs
+                        .get(&job)
+                        .is_some_and(|j| j.phase == crate::state::JobPhase::Storing)
+                })
+                .await;
+                (job, disk)
+            }
+        };
+
+        // A stop while the store holds the upload: told at once, the outputs not stored, nothing beside the disk.
+        let hold = s3.hold.clone().lock_owned().await;
+        let (s, b) = bed.send("o1", "RunJob", "run-job", job("renders/o1.tar")).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let (job1, disk) = exited("o1", true).await;
+        let beside: Vec<_> = std::fs::read_dir(disk.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(beside, vec![disk.clone()], "the archive is not written beside the disk");
+        let (s, b) = bed.send("s1", "StopJob", "stop-job", json!({ "job": job1 })).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let stopped = bed.events_of("s1", "JobStopped").await;
+        assert_eq!(
+            stopped.last().unwrap().data,
+            json!({ "job": job1, "reason": lifecycle::STOPPED_STORING })
+        );
+        drop(hold);
+        until("the stopped job's disk is removed", || !disk.exists()).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(types(&bed.log_of("o1"))
+            .iter()
+            .all(|t| t != "JobFinished" && t != "OutputsStored"));
+
+        // Its order's deadline passes while the store holds the upload: it fails, its outputs not stored.
+        let hold = s3.hold.clone().lock_owned().await;
+        let (s, b) = bed
+            .send(
+                "o2",
+                "RunJob",
+                "run-job",
+                amended(&job("renders/o2.tar"), json!({ "deadline_seconds": 2 })),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let (_, disk) = exited("o2", true).await;
+        let failed = bed.events_of("o2", "JobFailed").await.last().unwrap().data.clone();
+        assert_eq!(failed["exit_code"], 0);
+        let reason = failed["reason"].as_str().unwrap();
+        assert!(reason.contains("were not stored within"), "{reason}");
+        drop(hold);
+        until("the late job's disk is removed", || !disk.exists()).await;
+
+        // With nothing in the way, the outputs are stored and the job finishes, as before.
+        let (s, b) = bed.send("o3", "RunJob", "run-job", job("renders/o3.tar")).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        exited("o3", false).await;
+        let finished = bed.events_of("o3", "JobFinished").await;
+        assert!(types(&finished).contains(&"OutputsStored".to_string()));
+        assert_eq!(unpacked(&s3.get("renders/o3.tar").unwrap())["result.txt"], "rendered");
+    }
+
+    #[test]
+    fn outputs_may_take_what_is_left_of_their_orders_deadline_and_no_bound_of_their_own_without_one() {
+        let at = |t: &str| time::OffsetDateTime::parse(t, &time::format_description::well_known::Rfc3339).unwrap();
+        let now = at("2026-10-22T10:00:00Z");
+        assert_eq!(
+            lifecycle::storing_for(Some("2026-10-22T09:59:00Z"), Some(300), now),
+            Some(Duration::from_secs(240))
+        );
+        assert_eq!(
+            lifecycle::storing_for(Some("2026-10-22T09:00:00Z"), Some(300), now),
+            Some(Duration::ZERO),
+            "already past it"
+        );
+        assert_eq!(lifecycle::storing_for(None, Some(300), now), None);
+        assert_eq!(lifecycle::storing_for(Some("2026-10-22T09:59:00Z"), None, now), None);
+        assert_eq!(lifecycle::storing_for(Some("not a time"), Some(300), now), None);
+        assert_eq!(
+            lifecycle::storing_for(Some("2026-10-22T09:59:00Z"), Some(u64::MAX), now),
+            None
+        );
     }
 
     #[tokio::test]
