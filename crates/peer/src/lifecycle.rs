@@ -116,6 +116,60 @@ const PROMPTS_AT_ONCE: usize = 16;
 /// told, and its exit is replayed once it is.
 const MAX_UNOWNED: usize = 64;
 
+/// The most of what a job printed that its end carries: twenty lines and 2000 characters, the end kept.
+const OUTPUT_LINES: usize = 20;
+const OUTPUT_CHARS: usize = 2000;
+
+/// The last of `words` a job's end carries as `output`, whatever the runtime handed over: at most [`OUTPUT_LINES`]
+/// lines and [`OUTPUT_CHARS`] characters, the end kept, since the last line is usually the one that matters; none
+/// when nothing but whitespace was printed.
+pub(crate) fn last_lines(words: &str) -> Option<String> {
+    let words = words.trim();
+    if words.is_empty() {
+        return None;
+    }
+    let lines: Vec<&str> = words.lines().collect();
+    let kept = lines[lines.len().saturating_sub(OUTPUT_LINES)..].join("\n");
+    let count = kept.chars().count();
+    Some(kept.chars().skip(count.saturating_sub(OUTPUT_CHARS)).collect())
+}
+
+/// Why a job stopped while its outputs were being stored ended so: what reached the store is not its outputs.
+pub const STOPPED_STORING: &str = "stopped while its outputs were being stored: they were not stored, and anything under its key is not to be relied on";
+
+/// A job whose outputs are being stored: what ends the transfer, and what tells its storing a stop came.
+struct Storing {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    stopped: tokio::sync::Notify,
+}
+
+/// What became of a job's outputs.
+enum Stored {
+    /// In the store, or there were none to send.
+    Done,
+    /// The store did not take them, or they could not be read: why.
+    Failed(String),
+    /// A stop came first.
+    Stopped,
+    /// Its deadline came first.
+    Late,
+}
+
+/// How long a job's outputs may take to be stored at `now`: what is left of its order's `deadline_seconds`, counted
+/// from `started_at` (its JobStarted); none when the order set none here, and then the transfer's own bound holds
+/// (a job a cloud placed is bounded by the cloud, which stops it at its deadline).
+pub(crate) fn storing_for(
+    started_at: Option<&str>,
+    deadline_seconds: Option<u64>,
+    now: OffsetDateTime,
+) -> Option<Duration> {
+    let started =
+        started_at.and_then(|t| OffsetDateTime::parse(t, &time::format_description::well_known::Rfc3339).ok())?;
+    let seconds = i64::try_from(deadline_seconds?).ok()?;
+    let left = started.checked_add(time::Duration::seconds(seconds))? - now;
+    Some(Duration::try_from(left).unwrap_or(Duration::ZERO))
+}
+
 pub struct Peer {
     pub gpu: Arc<dyn Gpu>,
     pub runtime: Arc<dyn Runtime>,
@@ -151,6 +205,8 @@ pub struct Peer {
     stopping: Mutex<std::collections::HashSet<String>>,
     /// The command behind each order, by the order's id: what completes the command.
     keys: Mutex<HashMap<String, String>>,
+    /// The jobs whose outputs are being stored, by job id: what a stop ends.
+    storing: Mutex<HashMap<String, Arc<Storing>>>,
     /// The commands admitted from a credential held to the accelerators, until the order is told.
     held_to_accelerators: Mutex<std::collections::HashSet<String>>,
     /// A job's inputs, outputs and disk, by its command's key, from admission to its start.
@@ -383,6 +439,7 @@ impl Peer {
             starting: Mutex::new(std::collections::HashSet::new()),
             stopping: Mutex::new(std::collections::HashSet::new()),
             keys: Mutex::new(HashMap::new()),
+            storing: Mutex::new(HashMap::new()),
             held_to_accelerators: Mutex::new(std::collections::HashSet::new()),
             pending_io: Mutex::new(HashMap::new()),
             job_disks: Mutex::new(HashMap::new()),
@@ -1634,34 +1691,70 @@ impl Peer {
         }
     }
 
-    /// Packs what the job `job` left under /out and sends it where its outputs go, telling `OutputsStored`; or why
-    /// not.
-    async fn store_outputs(&self, em: &Emitter, job: &str, disk: &JobDisk) -> Result<(), String> {
+    /// Sends what the job `job` left under /out where its outputs go, packed as it is sent, telling `OutputsStored`;
+    /// or why not. It takes `within` at most, and a stop ends it; then the transfer is cut and handed back, to be
+    /// waited for before the disk it reads goes.
+    async fn store_outputs(
+        &self,
+        em: &Emitter,
+        job: &str,
+        disk: &JobDisk,
+        storing: &Storing,
+        within: Option<Duration>,
+    ) -> (Stored, Option<tokio::task::JoinHandle<Result<u64, String>>>) {
         if !disk.known {
-            return Err(
-                "the peer restarted while the job ran and lost where they go; what it left under /out was not sent"
-                    .into(),
+            return (
+                Stored::Failed(
+                    "the peer restarted while the job ran and lost where they go; what it left under /out was not sent"
+                        .into(),
+                ),
+                None,
             );
         }
         let Some(outputs) = disk.outputs.clone() else {
-            return Ok(());
+            return (Stored::Done, None);
         };
-        let (out, archive) = (disk.path.join("out"), disk.path.with_extension("outputs.tar"));
+        // A stop admitted between the job's exit and now: nothing is sent.
+        if storing.stop.load(std::sync::atomic::Ordering::SeqCst) {
+            return (Stored::Stopped, None);
+        }
         let started = Instant::now();
-        let sent = tokio::task::spawn_blocking(move || {
-            let packed = crate::store::pack(&out, &archive);
-            let sent = packed.and_then(|_| crate::store::put(&outputs.url, &archive));
-            let _ = std::fs::remove_file(&archive);
-            sent
-        })
-        .await
-        .map_err(|e| e.to_string())??;
-        self.tell(
-            em,
-            "OutputsStored",
-            json!({ "job": job, "key": disk.outputs.as_ref().map(|o| o.key.clone()), "bytes": sent, "seconds": (started.elapsed().as_secs_f64() * 1000.0).round() / 1000.0 }),
-        );
-        Ok(())
+        let mut sending = {
+            let (out, stop) = (disk.path.join("out"), storing.stop.clone());
+            tokio::task::spawn_blocking(move || crate::store::send_outputs(&out, &outputs.url, stop))
+        };
+        let stored = tokio::select! {
+            sent = &mut sending => Some(sent.map_err(|e| e.to_string()).and_then(|r| r)),
+            _ = storing.stopped.notified() => None,
+            _ = tokio::time::sleep(within.unwrap_or(Duration::MAX)), if within.is_some() => {
+                storing.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                return (Stored::Late, Some(sending));
+            }
+        };
+        match stored {
+            Some(Ok(bytes)) => {
+                self.tell(
+                    em,
+                    "OutputsStored",
+                    json!({ "job": job, "key": disk.outputs.as_ref().map(|o| o.key.clone()), "bytes": bytes, "seconds": (started.elapsed().as_secs_f64() * 1000.0).round() / 1000.0 }),
+                );
+                (Stored::Done, None)
+            }
+            Some(Err(_)) if storing.stop.load(std::sync::atomic::Ordering::SeqCst) => (Stored::Stopped, None),
+            Some(Err(why)) => (Stored::Failed(why), None),
+            None => (Stored::Stopped, Some(sending)),
+        }
+    }
+
+    /// How long the job `job`'s outputs may take to be stored now: what is left of its order's deadline, or no bound
+    /// of its own when the order set none here.
+    fn storing_within(&self, job: &str) -> Option<Duration> {
+        let order = self.state.lock().unwrap().order_of_job(job);
+        storing_for(
+            order.as_ref().and_then(|o| o.started_at.as_deref()),
+            order.as_ref().and_then(|o| o.deadline_seconds),
+            OffsetDateTime::now_utc(),
+        )
     }
 
     /// Starts the job `reservation` holds the place of: its image held, then its container, told as `JobStarted`, or
@@ -1799,13 +1892,6 @@ impl Peer {
                 format!("job {id} is already stopping: its JobStopped event follows"),
             )
             .with_details(json!({ "job": id }))),
-            Some(j) if j.phase == JobPhase::Storing => Err(BestError::bad_request(
-                "STORING_OUTPUTS",
-                format!(
-                    "job {id} has exited and its outputs are being stored: its JobFinished, or its JobFailed, follows"
-                ),
-            )
-            .with_details(json!({ "job": id }))),
             Some(j) => {
                 j.phase = JobPhase::Stopping;
                 Ok(())
@@ -1829,6 +1915,14 @@ impl Peer {
             self.tell(&self.order_emitter(&o), "JobStopped", stopped.clone());
             self.tell(&em, "JobStopped", stopped);
             self.stopping.lock().unwrap().remove(&id);
+            return;
+        }
+        // It exited and its outputs are being sent: the transfer is cut, and the stop tells its end.
+        let storing = self.storing.lock().unwrap().remove(&id);
+        if let Some(storing) = storing {
+            storing.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            storing.stopped.notify_one();
+            self.tell(&em, "JobStopped", json!({ "job": id, "reason": STOPPED_STORING }));
             return;
         }
         let container = self.state.lock().unwrap().jobs.get(&id).map(|j| j.container.clone());
@@ -1899,36 +1993,86 @@ impl Peer {
                     }
                 }
             }
-            (RuntimeEvent::Exited { code, .. }, Owner::Job(job)) => {
+            (RuntimeEvent::Exited { code, last_words, .. }, Owner::Job(job)) => {
                 if !self.job_running(&job) {
                     return;
                 }
+                // What the job printed last, told with its end (behavioralstate/spec#39).
+                let ended = move |mut fact: serde_json::Value| {
+                    if let Some(words) = last_words.as_deref().and_then(last_lines) {
+                        fact["output"] = json!(words);
+                    }
+                    fact
+                };
                 let disk = self.job_disks.lock().unwrap().remove(&job);
                 match (disk, self.me.get().and_then(|m| m.upgrade())) {
-                    // Its outputs go first, off the engine's events, which keep flowing meanwhile; no stop and no
-                    // deadline ends it while they do, so its end is told once.
+                    // Its outputs go first, off the engine's events, which keep flowing meanwhile, within what is
+                    // left of its order's deadline. A stop ends it, and tells its end; otherwise its end is told here,
+                    // once.
                     (Some(disk), Some(me)) if disk.outputs.is_some() || !disk.known => {
-                        if let Some(j) = self.state.lock().unwrap().jobs.get_mut(&job) {
-                            j.phase = JobPhase::Storing;
-                        }
-                        tokio::spawn(async move {
-                            match me.store_outputs(&em, &job, &disk).await {
-                                Ok(()) => {
-                                    me.tell(&em, "JobFinished", json!({ "job": job, "exit_code": code }));
+                        // Claimed and registered at once, so a stop admitted from now on finds what it ends; one
+                        // admitted before this has told the job's end, and nothing is sent.
+                        let storing = Arc::new(Storing {
+                            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                            stopped: tokio::sync::Notify::new(),
+                        });
+                        let claimed = {
+                            let mut s = self.state.lock().unwrap();
+                            match s.jobs.get_mut(&job) {
+                                Some(j) if j.phase == JobPhase::Running => {
+                                    j.phase = JobPhase::Storing;
+                                    self.storing.lock().unwrap().insert(job.clone(), storing.clone());
+                                    true
                                 }
-                                Err(why) => {
+                                _ => false,
+                            }
+                        };
+                        if !claimed {
+                            let _ = self.runtime.remove_disk(&job).await;
+                            return;
+                        }
+                        let within = self.storing_within(&job);
+                        tokio::spawn(async move {
+                            let (stored, sending) = me.store_outputs(&em, &job, &disk, &storing, within).await;
+                            me.storing.lock().unwrap().remove(&job);
+                            // Claimed here, so a stop admitted from now on is told its end follows.
+                            let ours = match me.state.lock().unwrap().jobs.get_mut(&job) {
+                                Some(j) if j.phase == JobPhase::Storing => {
+                                    j.phase = JobPhase::Stopping;
+                                    true
+                                }
+                                _ => false,
+                            };
+                            match stored {
+                                _ if !ours => {}
+                                Stored::Done => {
+                                    me.tell(&em, "JobFinished", ended(json!({ "job": job, "exit_code": code })));
+                                }
+                                Stored::Failed(why) => {
                                     me.tell(
                                         &em,
                                         "JobFailed",
-                                        json!({ "job": job, "exit_code": code, "reason": format!("its outputs could not be stored: {why}"), "fix": "check the store takes what the order names, then order it again" }),
+                                        ended(json!({ "job": job, "exit_code": code, "reason": format!("its outputs could not be stored: {why}"), "fix": "check the store takes what the order names, then order it again" })),
                                     );
                                 }
+                                Stored::Late => {
+                                    me.tell(
+                                        &em,
+                                        "JobFailed",
+                                        ended(json!({ "job": job, "exit_code": code, "reason": format!("its outputs were not stored within {} s, what was left of its deadline_seconds: they were not stored", within.unwrap_or_default().as_secs()), "fix": "leave less under /out, give the order a longer deadline_seconds, or check the store answers, then order it again" })),
+                                    );
+                                }
+                                // The stop told it.
+                                Stored::Stopped => {}
+                            }
+                            if let Some(sending) = sending {
+                                let _ = sending.await;
                             }
                             let _ = me.runtime.remove_disk(&job).await;
                         });
                     }
                     (disk, _) => {
-                        self.tell(&em, "JobFinished", json!({ "job": job, "exit_code": code }));
+                        self.tell(&em, "JobFinished", ended(json!({ "job": job, "exit_code": code })));
                         if disk.is_some() {
                             let _ = self.runtime.remove_disk(&job).await;
                         }
