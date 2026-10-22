@@ -1345,6 +1345,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_jobs_end_carries_the_last_lines_it_printed_and_nothing_when_it_printed_nothing() {
+        let bed = bed(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        let end = |id: &'static str, code: i64, words: &'static str| {
+            let bed = &bed;
+            async move {
+                let (s, b) = run_on(bed, id, 2, json!({})).await;
+                assert_eq!(s, StatusCode::CREATED, "{b}");
+                let started = bed.events_of(id, "JobStarted").await.last().unwrap().data.clone();
+                bed.runtime
+                    .exit(&ContainerId(started["container"].as_str().unwrap().into()), code, words)
+                    .unwrap();
+                bed.events_of(id, "JobFinished").await.last().unwrap().data.clone()
+            }
+        };
+        let printed = end("j1", 0, "hello from a job").await;
+        assert_eq!(
+            (printed["exit_code"].clone(), printed["output"].clone()),
+            (json!(0), json!("hello from a job"))
+        );
+        let silent = end(
+            "j2", 1, "  
+ ",
+        )
+        .await;
+        assert_eq!(silent["exit_code"], 1);
+        assert!(silent.get("output").is_none(), "nothing printed, no output: {silent}");
+    }
+
+    #[tokio::test]
+    async fn a_member_jobs_end_reaches_the_workspace_with_what_it_printed() {
+        let (a, b) = two_members().await;
+        let key_a = a.key.clone();
+        let site = site(vec![(A, a), (B, b)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a)]).await;
+        site.order(&ws, "j1", 4, json!({})).await;
+        let started = site.events(&ws, "j1", "JobStarted").await.last().unwrap()["data"].clone();
+        site.members[0]
+            .runtime
+            .exit(
+                &ContainerId(started["container"].as_str().unwrap().into()),
+                0,
+                "rendered 12 frames",
+            )
+            .unwrap();
+        let finished = site.events(&ws, "j1", "JobFinished").await;
+        assert_eq!(finished.last().unwrap()["data"]["output"], "rendered 12 frames");
+    }
+
+    #[tokio::test]
     async fn a_peer_queues_an_order_that_asked_to_wait_and_starts_it_when_its_device_frees() {
         let bed = bed(
             card(),

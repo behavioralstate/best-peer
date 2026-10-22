@@ -347,7 +347,9 @@ later (`OutOfMemory`, `DeploymentEnded`) is told under the same correlation id. 
 its model is ready fails the deploy: `DeploymentFailed` carries its exit code and the last lines it wrote. `prompt` names a ready deployment and
 the conversation so far, and `PromptAnswered` follows under its own correlation id with the answer whole, or
 `PromptFailed` with the reason and the fix. `run-job` runs an image once, a tenant's in a closed box, and tells
-`JobStarted` and `JobFinished` with the exit code; `undeploy-model` and `stop-job` end them.
+`JobStarted` and `JobFinished` with the exit code and `output`, the last lines the job printed (twenty at most, 2000
+characters at most); more than that belongs under `/out`, which goes to the workspace's store. `undeploy-model` and
+`stop-job` end them.
 
 On a workspace's door `run-job` is an order, and a cloud with no room now takes it to wait its turn, as the
 serverless GPU platforms do. It is refused at once only when no device of the cloud's members that answer could ever

@@ -1975,10 +1975,17 @@ impl Peer {
                     }
                 }
             }
-            (RuntimeEvent::Exited { code, .. }, Owner::Job(job)) => {
+            (RuntimeEvent::Exited { code, last_words, .. }, Owner::Job(job)) => {
                 if !self.job_running(&job) {
                     return;
                 }
+                // What the job printed last, told with its end (behavioralstate/spec#39).
+                let ended = move |mut fact: serde_json::Value| {
+                    if let Some(words) = last_words.as_deref().filter(|w| !w.trim().is_empty()) {
+                        fact["output"] = json!(words);
+                    }
+                    fact
+                };
                 let disk = self.job_disks.lock().unwrap().remove(&job);
                 match (disk, self.me.get().and_then(|m| m.upgrade())) {
                     // Its outputs go first, off the engine's events, which keep flowing meanwhile, within what is
@@ -2021,20 +2028,20 @@ impl Peer {
                             match stored {
                                 _ if !ours => {}
                                 Stored::Done => {
-                                    me.tell(&em, "JobFinished", json!({ "job": job, "exit_code": code }));
+                                    me.tell(&em, "JobFinished", ended(json!({ "job": job, "exit_code": code })));
                                 }
                                 Stored::Failed(why) => {
                                     me.tell(
                                         &em,
                                         "JobFailed",
-                                        json!({ "job": job, "exit_code": code, "reason": format!("its outputs could not be stored: {why}"), "fix": "check the store takes what the order names, then order it again" }),
+                                        ended(json!({ "job": job, "exit_code": code, "reason": format!("its outputs could not be stored: {why}"), "fix": "check the store takes what the order names, then order it again" })),
                                     );
                                 }
                                 Stored::Late => {
                                     me.tell(
                                         &em,
                                         "JobFailed",
-                                        json!({ "job": job, "exit_code": code, "reason": format!("its outputs were not stored within {} s, what was left of its deadline_seconds: they were not stored", within.unwrap_or_default().as_secs()), "fix": "leave less under /out, give the order a longer deadline_seconds, or check the store answers, then order it again" }),
+                                        ended(json!({ "job": job, "exit_code": code, "reason": format!("its outputs were not stored within {} s, what was left of its deadline_seconds: they were not stored", within.unwrap_or_default().as_secs()), "fix": "leave less under /out, give the order a longer deadline_seconds, or check the store answers, then order it again" })),
                                     );
                                 }
                                 // The stop told it.
@@ -2047,7 +2054,7 @@ impl Peer {
                         });
                     }
                     (disk, _) => {
-                        self.tell(&em, "JobFinished", json!({ "job": job, "exit_code": code }));
+                        self.tell(&em, "JobFinished", ended(json!({ "job": job, "exit_code": code })));
                         if disk.is_some() {
                             let _ = self.runtime.remove_disk(&job).await;
                         }
