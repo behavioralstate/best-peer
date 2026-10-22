@@ -10449,6 +10449,8 @@ mod tests {
         refuse_puts: Arc<std::sync::atomic::AtomicBool>,
         /// Held by a test, every PUT waits until it is let go.
         hold: Arc<tokio::sync::Mutex<()>>,
+        /// Held by a test, every HEAD waits until it is let go.
+        hold_heads: Arc<tokio::sync::Mutex<()>>,
     }
 
     impl FakeS3 {
@@ -10501,6 +10503,9 @@ mod tests {
                 StatusCode::OK.into_response()
             }
             Method::HEAD | Method::GET => {
+                if method == Method::HEAD {
+                    let _held = s3.hold_heads.lock().await;
+                }
                 let Some(object) = s3.objects.lock().unwrap().get(&name).cloned() else {
                     return StatusCode::NOT_FOUND.into_response();
                 };
@@ -10751,6 +10756,53 @@ mod tests {
         // What they held on the member is let go: only the order admitted by hand, never run, is still reserved.
         let reserved: Vec<String> = lab.state.lock().unwrap().reserved.keys().cloned().collect();
         assert_eq!(reserved, [format!("{}:d1", site.key)]);
+
+        // A store replaced while an order's inputs are sized: the order is not served from the other, and its end
+        // carries no code, as when it is replaced while the order waits.
+        let (other, other_endpoint) = FakeS3::start().await;
+        other.put("inputs/0.bin", b"zero");
+        let (s, b) = site.store(&ws, "st3", &other_endpoint).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "st3", "StoreSetV1").await;
+        let held_heads = other.hold_heads.lock().await;
+        let (s, b) = site.send(&ws, "j4", "RunJob", "run-job", order(1)).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        until("the input asked about", || {
+            other.asked.lock().unwrap().iter().any(|a| a.starts_with("HEAD"))
+        })
+        .await;
+        let (s, b) = site.store(&ws, "st4", &endpoint).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "st4", "StoreSetV1").await;
+        drop(held_heads);
+        let events = site.events(&ws, "j4", "JobFailed").await;
+        let failed = &events.last().unwrap()["data"];
+        assert!(failed["reason"].as_str().unwrap().contains("replaced"), "{failed}");
+        assert!(failed.get("code").is_none(), "{failed}");
+        // Replaced between its admission and its handler, run by hand: it ends before it is queued, the same way.
+        let who = site.auth.authenticate(&site.key).unwrap();
+        let cmd: best_peer_door::Envelope = serde_json::from_str(&envelope(
+            &format!("{EP}/workspaces/{ws}"),
+            "d2",
+            "RunJob",
+            "run-job",
+            order(1),
+        ))
+        .unwrap();
+        let key = format!("{}:d2", who.hash);
+        <workspace::Workspace as domain::Service>::admit_run_job(&held, cmd.clone(), who, key.clone())
+            .await
+            .unwrap();
+        let (s, b) = site.store(&ws, "st5", &other_endpoint).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        site.events(&ws, "st5", "StoreSetV1").await;
+        let door = held.door().unwrap();
+        <workspace::Workspace as domain::Service>::run_job(held.clone(), cmd, door.emitter("d2").with_key(&key)).await;
+        let events = site.events(&ws, "d2", "JobFailed").await;
+        assert_eq!(facts(&events), ["JobFailed"]);
+        let failed = &events[0]["data"];
+        assert!(failed["reason"].as_str().unwrap().contains("replaced"), "{failed}");
+        assert!(failed.get("code").is_none(), "{failed}");
 
         // A store nothing listens at: the input it could not ask about is named.
         let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

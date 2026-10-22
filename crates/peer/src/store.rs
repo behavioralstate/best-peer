@@ -66,6 +66,9 @@ impl Store {
                     return (n, Err("the store is no longer asked".to_string()));
                 };
                 let limit = by.saturating_duration_since(tokio::time::Instant::now());
+                if limit.is_zero() {
+                    return (n, Err("not asked: the time ran out".to_string()));
+                }
                 let answer = tokio::task::spawn_blocking(move || {
                     let _turn = turn;
                     head(&url, limit)
@@ -80,6 +83,8 @@ impl Store {
             match answered {
                 Ok((n, Ok(Some(bytes)))) => sizes[n] = Some(bytes),
                 Ok((n, Ok(None))) => return Err(Unsized::Missing(n)),
+                // Past the time, an error is the time running out, whatever the store would have said.
+                Ok((_, Err(_))) if tokio::time::Instant::now() >= by => {}
                 Ok((n, Err(why))) => return Err(Unsized::Unreachable(n, why)),
                 Err(_) => {}
             }

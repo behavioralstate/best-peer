@@ -714,7 +714,7 @@ impl Cloud {
         let store = match self.store_for(&io) {
             Ok(Some(store)) if !io.inputs.is_empty() => store,
             Ok(_) => return Ok(io),
-            Err((reason, fix)) => return Err(failed("NO_STORE", vec![], reason, fix)),
+            Err((reason, fix)) => return Err(json!({ "job": job, "image": image, "reason": reason, "fix": fix })),
         };
         let keys: Vec<String> = io.inputs.iter().map(|i| i.key.clone()).collect();
         let asking = self
