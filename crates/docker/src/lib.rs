@@ -286,11 +286,14 @@ impl Layers {
 impl DockerRuntime {
     /// The same engine, making jobs' disks under `dir`, when this peer can mount them: a peer that cannot makes none,
     /// so a job asking for one is refused at admission and no room is ever reserved for a disk that cannot be made.
+    /// A Linux peer that cannot says so at start; elsewhere a peer never makes one, and says nothing.
     pub fn with_disks(mut self, dir: std::path::PathBuf) -> Self {
         self.mounts = match can_mount() {
             Ok(()) => true,
             Err(why) => {
-                tracing::warn!(dir = %dir.display(), %why, "this peer makes no disk for a job");
+                if cfg!(target_os = "linux") {
+                    tracing::warn!(dir = %dir.display(), %why, "this peer makes no disk for a job");
+                }
                 false
             }
         };
