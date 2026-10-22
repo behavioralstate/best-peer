@@ -60,7 +60,7 @@ irm https://raw.githubusercontent.com/behavioralstate/best-peer/main/install.ps1
 
 Neither touches the data folder, so an upgrade keeps the credentials and the certificate. From then on the peer is
 `best-peer` in any terminal (a new one, on Windows), and the steps below run it so: `best-peer --version`, then
-`best-peer` to start it. Or take the archive by hand, unpack it, and run it from its folder as `./best-peer`:
+`best-peer` to start it; `best-peer --help` lists the commands and the settings to start with. Or take the archive by hand, unpack it, and run it from its folder as `./best-peer`:
 
 ```bash
 curl -fLO https://github.com/behavioralstate/best-peer/releases/latest/download/best-peer-x86_64-unknown-linux-gnu.tar.gz
@@ -217,7 +217,8 @@ Or take a [release](https://github.com/behavioralstate/best-peer/releases), as i
 with `install.sh` or `install.ps1` or by hand: one binary per machine (Linux x86_64 on glibc 2.35 or newer; Windows
 x86_64; macOS Apple silicon), with `SHA256SUMS` and a build provenance attestation
 (`gh attestation verify <archive> --repo behavioralstate/best-peer`).
-`best-peer --version` says which it is.
+`best-peer --version` says which it is; `best-peer --help` lists the commands, and `--help` after any of them
+(`best-peer approve --help`, `best-peer hold --help`) says what it takes.
 
 `BEST_PEER_LISTEN` (default `127.0.0.1:7777`) is where it listens; `BEST_PEER_ENDPOINT` is the consumer-facing base URL
 the manifest advertises, required when the peer listens on every interface. An `http://` endpoint is served only
