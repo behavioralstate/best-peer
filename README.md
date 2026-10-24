@@ -338,8 +338,8 @@ accepted, in order. How many deployments and jobs a key runs at once is set when
 new commands one credential with a share may send in any sixty seconds across the door, and
 `BEST_PEER_STREAMS_PER_CREDENTIAL` (default 4) how many event streams it may hold open; a number below 1 is refused at start.
 
-A container runs confined: no capabilities, no new privileges, a ceiling on tasks (every thread counts as one), and
-a small init as its first process, which reaps what the image leaves behind and passes a stop on to it. The job of a
+A container runs confined: no capabilities, no new privileges, a ceiling on tasks (every thread counts as one), the
+NVIDIA driver's compute and utility capabilities alone when it is handed a card, whatever its image asks, and a small init as its first process, which reaps what the image leaves behind and passes a stop on to it. The job of a
 credential approved with a share, a tenant's, runs code the owner did not write, so it also gets a closed box: a
 read-only filesystem with a private `/tmp` of 1 GiB, which counts in its memory, no network, and a ceiling on host
 memory with swap counted in, half the host's cores and 65536 open files at most; a volume its image declares is a

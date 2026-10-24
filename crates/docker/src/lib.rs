@@ -1,7 +1,8 @@
 //! [`Runtime`] over the Docker Engine API through bollard. Every container this adapter creates carries the label
 //! `best-peer`, so `running` and the event feed see the peer's containers and nothing else. A device is handed over
 //! by the NVIDIA container toolkit when its id is an NVML UUID: a whole card (`GPU-...`) or one MIG instance of a split
-//! card (`MIG-...`), which the toolkit hands over alone; other accelerators wait for their own adapter. A mount is a bind the engine refuses when its source is not there. A container is confined as its spec
+//! card (`MIG-...`), which the toolkit hands over alone, with the driver's compute and utility capabilities and no
+//! other; other accelerators wait for their own adapter. A mount is a bind the engine refuses when its source is not there. A container is confined as its spec
 //! says, in the engine's own words: capabilities dropped, no new privileges, a read-only root with a private `/tmp`,
 //! ceilings on processes, on memory with swap counted in, on cores and on open files, no core dump, and its network;
 //! with a read-only root, a volume the image declares is a private tmpfs, never a volume on the host. A container that exits is removed by
@@ -585,7 +586,7 @@ impl Runtime for DockerRuntime {
         let body = ContainerCreateBody {
             image: Some(spec.image.0.clone()),
             cmd: (!spec.args.is_empty()).then(|| spec.args.clone()),
-            env: Some(spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect()),
+            env: Some(env_of(&spec)),
             exposed_ports: Some(spec.ports.iter().map(|p| format!("{p}/tcp")).collect()),
             labels: Some({
                 let mut labels = HashMap::from([(LABEL.to_string(), "1".to_string())]);
@@ -732,6 +733,17 @@ impl Runtime for DockerRuntime {
     fn events(&self) -> broadcast::Receiver<Event> {
         self.tx.subscribe()
     }
+}
+
+/// A container's environment: the spec's, then, for one handed a device, the NVIDIA driver's compute and utility
+/// capabilities alone, last so they stand over whatever the image or the spec says (the engine keeps the last of a
+/// name): no video codec, display or graphics library of the host's driver is mounted in.
+fn env_of(spec: &Spec) -> Vec<String> {
+    let mut env: Vec<String> = spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    if !spec.devices.is_empty() {
+        env.push("NVIDIA_DRIVER_CAPABILITIES=compute,utility".into());
+    }
+    env
 }
 
 /// The engine's words for a container's confinement: what it may not do on the host, and how much of the host it may
@@ -1056,6 +1068,37 @@ mod tests {
             None,
             "an engine with a writable root keeps its volumes"
         );
+    }
+
+    fn with_devices(devices: &[&str], env: &[(&str, &str)]) -> Spec {
+        Spec {
+            image: ImageRef("ghcr.io/example/train:1".into()),
+            args: vec![],
+            env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            devices: devices.iter().map(|d| (*d).into()).collect(),
+            ports: vec![],
+            mounts: vec![],
+            confinement: Confinement::default(),
+            name: None,
+        }
+    }
+
+    #[test]
+    fn a_container_handed_a_card_is_given_compute_and_utility_alone_whatever_its_image_or_spec_asks() {
+        let card = "GPU-00000000-0000-0000-0000-000000000001";
+        assert_eq!(
+            env_of(&with_devices(
+                &[card],
+                &[("NVIDIA_DRIVER_CAPABILITIES", "all"), ("A", "1")]
+            )),
+            vec![
+                "NVIDIA_DRIVER_CAPABILITIES=all".to_string(),
+                "A=1".to_string(),
+                "NVIDIA_DRIVER_CAPABILITIES=compute,utility".to_string(),
+            ],
+            "the last word is the adapter's"
+        );
+        assert_eq!(env_of(&with_devices(&[], &[("A", "1")])), vec!["A=1".to_string()]);
     }
 
     fn listed(items: &[(&str, Option<i64>)]) -> Option<String> {
