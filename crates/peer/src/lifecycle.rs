@@ -3256,6 +3256,7 @@ fn fix_for_runtime(e: &RuntimeError) -> &'static str {
         RuntimeError::NoDisk(_) => {
             "a job with inputs or outputs needs a disk of its own on the machine: order it with less disk_bytes, or where the cloud says there is room"
         }
+        RuntimeError::NoName(_) => "this runtime does not find a container by name: keep the id that start answered",
     }
 }
 
@@ -3386,6 +3387,13 @@ mod tests {
             fix_for_runtime(&RuntimeError::Engine("anything else".into())),
             "read the container engine's logs on the host"
         );
+    }
+
+    #[test]
+    fn a_runtime_that_finds_no_container_by_name_is_refused_with_the_id_to_keep() {
+        let fix = fix_for_runtime(&RuntimeError::NoName("anything".into()));
+        assert!(fix.contains("keep the id"), "{fix}");
+        assert!(!fix.contains("engine's logs"), "{fix}");
     }
 
     #[test]

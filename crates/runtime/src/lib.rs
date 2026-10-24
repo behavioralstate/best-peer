@@ -164,6 +164,9 @@ pub enum RuntimeError {
     /// A job's disk could not be made, or this runtime makes none: the words say which.
     #[error("{0}")]
     NoDisk(String),
+    /// A container could not be found by its name, or this runtime finds none by name: the words say which.
+    #[error("{0}")]
+    NoName(String),
 }
 
 /// What stands between a workload and the host and the other workloads on it, weakest first, so a workload that asks
@@ -238,7 +241,7 @@ pub trait Runtime: Send + Sync {
     /// holds no such container. A runtime that cannot look a container up by name errs, never none, so a caller never
     /// mistakes "cannot tell" for "nothing there".
     async fn named(&self, _name: &str) -> Result<Option<ContainerId>, RuntimeError> {
-        Err(RuntimeError::Engine("this runtime finds no container by name".into()))
+        Err(RuntimeError::NoName("this runtime finds no container by name".into()))
     }
     /// Every event from now on. A slow subscriber may lag; the door rebuilds from its own stream, not from this.
     fn events(&self) -> broadcast::Receiver<Event>;
@@ -893,6 +896,6 @@ mod tests {
     #[tokio::test]
     async fn a_runtime_that_cannot_look_a_container_up_by_name_says_so_and_never_answers_none() {
         let err = NoNames.named("deployment-1").await.unwrap_err();
-        assert!(matches!(err, RuntimeError::Engine(_)));
+        assert!(matches!(err, RuntimeError::NoName(_)));
     }
 }
