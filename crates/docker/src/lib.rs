@@ -3,7 +3,8 @@
 //! by the NVIDIA container toolkit when its id is an NVML UUID: a whole card (`GPU-...`) or one MIG instance of a split
 //! card (`MIG-...`), which the toolkit hands over alone; other accelerators wait for their own adapter. A mount is a bind the engine refuses when its source is not there. A container is confined as its spec
 //! says, in the engine's own words: capabilities dropped, no new privileges, a read-only root with a private `/tmp`,
-//! ceilings on processes, on memory with swap counted in, on cores and on open files, no core dump, and its network. A container that exits is removed by
+//! ceilings on processes, on memory with swap counted in, on cores and on open files, no core dump, and its network;
+//! with a read-only root, a volume the image declares is a private tmpfs, never a volume on the host. A container that exits is removed by
 //! this adapter once it has read the last lines the container wrote, which the exit then carries; one whose exit was
 //! not heard (the peer was down, or the event feed broke) is removed by a sweep, every minute and after the feed
 //! reconnects, once this adapter has seen it exited for a minute, so a peer that shares the engine has read its own
@@ -577,6 +578,10 @@ impl Runtime for DockerRuntime {
                 )
             })
             .collect();
+        let volumes = match spec.confinement.read_only_root {
+            true => self.volumes_of(&spec.image).await?,
+            false => Vec::new(),
+        };
         let body = ContainerCreateBody {
             image: Some(spec.image.0.clone()),
             cmd: (!spec.args.is_empty()).then(|| spec.args.clone()),
@@ -608,7 +613,7 @@ impl Runtime for DockerRuntime {
                         })
                         .collect()
                 }),
-                ..confined(&spec.confinement)
+                ..confined(&spec.confinement, &volumes)
             }),
             ..Default::default()
         };
@@ -730,8 +735,10 @@ impl Runtime for DockerRuntime {
 }
 
 /// The engine's words for a container's confinement: what it may not do on the host, and how much of the host it may
-/// take. No container dumps its memory as a core, which the host's own core handler would write outside it.
-fn confined(confinement: &Confinement) -> HostConfig {
+/// take. No container dumps its memory as a core, which the host's own core handler would write outside it. With a
+/// read-only root, each of the image's declared `volumes` is a private tmpfs the size of `/tmp`, counted in its
+/// memory as `/tmp` is, so the engine makes no volume on the host for it.
+fn confined(confinement: &Confinement, volumes: &[String]) -> HostConfig {
     let mut ulimits = Vec::new();
     if let Some(n) = confinement.open_files {
         ulimits.push(ResourcesUlimits {
@@ -749,9 +756,12 @@ fn confined(confinement: &Confinement) -> HostConfig {
         cap_drop: confinement.drop_capabilities.then(|| vec!["ALL".into()]),
         security_opt: confinement.no_new_privileges.then(|| vec!["no-new-privileges".into()]),
         readonly_rootfs: Some(confinement.read_only_root),
-        tmpfs: confinement
-            .read_only_root
-            .then(|| HashMap::from([("/tmp".to_string(), "rw,nosuid,nodev,size=1g".to_string())])),
+        tmpfs: confinement.read_only_root.then(|| {
+            std::iter::once("/tmp")
+                .chain(volumes.iter().map(String::as_str))
+                .map(|path| (path.to_string(), "rw,nosuid,nodev,size=1g".to_string()))
+                .collect()
+        }),
         pids_limit: confinement.pids.map(|p| p as i64),
         // One ceiling for memory and swap together: a ceiling that swap can exceed is none.
         memory: confinement.memory_bytes.map(|m| m as i64),
@@ -765,6 +775,22 @@ fn confined(confinement: &Confinement) -> HostConfig {
         // An init as PID 1 reaps and forwards signals, so a stop reaches an image that did not expect to be it.
         init: Some(true),
         ..Default::default()
+    }
+}
+
+impl DockerRuntime {
+    /// The paths the image declares as volumes, which the engine would otherwise make on the host for each container.
+    async fn volumes_of(&self, image: &ImageRef) -> Result<Vec<String>, RuntimeError> {
+        match self.docker.inspect_image(&image.0).await {
+            Ok(inspected) => Ok(inspected.config.and_then(|c| c.volumes).unwrap_or_default()),
+            Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => {
+                Err(RuntimeError::ImageNotFound(image.0.clone()))
+            }
+            Err(e) => Err(RuntimeError::Engine(format!(
+                "the container engine cannot say what volumes {} declares: {e}",
+                image.0
+            ))),
+        }
     }
 }
 
@@ -989,7 +1015,7 @@ mod tests {
             open_files: Some(65536),
             ..Confinement::default()
         };
-        let h = confined(&boxed);
+        let h = confined(&boxed, &[]);
         assert_eq!(h.nano_cpus, Some(8_000_000_000));
         let limit = |name: &str| {
             h.ulimits
@@ -1000,7 +1026,7 @@ mod tests {
         };
         assert_eq!(limit("nofile"), Some((Some(65536), Some(65536))));
         assert_eq!(limit("core"), Some((Some(0), Some(0))));
-        let open = confined(&Confinement::serving());
+        let open = confined(&Confinement::serving(), &[]);
         assert_eq!(open.nano_cpus, None, "no ceiling on an engine's cores");
         assert_eq!(
             open.ulimits
@@ -1010,6 +1036,25 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some("core".to_string())],
             "no core dump from any container"
+        );
+    }
+
+    #[test]
+    fn a_volume_the_image_declares_is_a_small_private_tmpfs_in_the_box_and_no_volume_of_the_host() {
+        let volumes = ["/data".to_string(), "/root/.cache".to_string()];
+        let tmpfs = confined(&Confinement::default(), &volumes).tmpfs.unwrap();
+        for path in ["/tmp", "/data", "/root/.cache"] {
+            assert_eq!(
+                tmpfs.get(path).map(String::as_str),
+                Some("rw,nosuid,nodev,size=1g"),
+                "{path}"
+            );
+        }
+        assert_eq!(tmpfs.len(), 3);
+        assert_eq!(
+            confined(&Confinement::serving(), &volumes).tmpfs,
+            None,
+            "an engine with a writable root keeps its volumes"
         );
     }
 
