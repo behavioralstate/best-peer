@@ -14,3 +14,6 @@ bollard = "0.21"
 futures = "0.3"
 tokio = { workspace = true }
 tracing = "0.1"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }

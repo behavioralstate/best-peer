@@ -10,7 +10,9 @@
 //! this adapter once it has read the last lines the container wrote, which the exit then carries; one whose exit was
 //! not heard (the peer was down, or the event feed broke) is removed by a sweep, every minute and after the feed
 //! reconnects, once this adapter has seen it exited for a minute, so a peer that shares the engine has read its own
-//! first. A container goes with its anonymous volumes, as the engine's own removal on exit took them. Thin; proven on a host by hand. Only the share of a pull, which is arithmetic over what the engine
+//! first. A container goes with its anonymous volumes, as the engine's own removal on exit took them. An image is
+//! removed by the reference it was pulled as, never forced, and the room for images is read from the engine's root
+//! directory on this host. Thin; proven on a host by hand. Only the share of a pull, which is arithmetic over what the engine
 //! reports, is unit-tested.
 
 use std::collections::HashMap;
@@ -27,7 +29,7 @@ use bollard::models::{
 };
 use bollard::query_parameters::{
     CreateImageOptionsBuilder, EventsOptionsBuilder, ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
-    StopContainerOptionsBuilder,
+    RemoveImageOptionsBuilder, StopContainerOptionsBuilder,
 };
 use bollard::Docker;
 use futures::StreamExt;
@@ -561,6 +563,29 @@ impl Runtime for DockerRuntime {
         }
     }
 
+    async fn remove_image(&self, image: &ImageRef) -> Result<(), RuntimeError> {
+        match self
+            .docker
+            .remove_image(&image.0, Some(RemoveImageOptionsBuilder::new().build()), None)
+            .await
+        {
+            Ok(_) | Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => Ok(()),
+            Err(e) => Err(RuntimeError::Engine(format!(
+                "the container engine did not remove {}: {e}",
+                image.0
+            ))),
+        }
+    }
+
+    /// What the file system of the engine's root directory, as its `info` names it, has free for anyone, read on this
+    /// host: none when the engine does not say, or the engine is on another host and the directory is not here.
+    async fn image_room(&self) -> Option<u64> {
+        let root = self.docker.info().await.ok()?.docker_root_dir?;
+        tokio::task::spawn_blocking(move || free_at(std::path::Path::new(&root)))
+            .await
+            .ok()?
+    }
+
     async fn start(&self, spec: Spec) -> Result<Started, RuntimeError> {
         let device_requests = spec
             .devices
@@ -891,6 +916,20 @@ fn handed_over(id: &str) -> Result<DeviceRequest, RuntimeError> {
     })
 }
 
+/// The bytes free to an unprivileged writer on the file system holding `dir`. Unix only.
+fn free_at(dir: &std::path::Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let fs = rustix::fs::statvfs(dir).ok()?;
+        Some(fs.f_bavail.saturating_mul(fs.f_frsize))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
 /// The room for disks in what `df --output=avail,size` answered: what is free and the size, each less what is kept
 /// free, so the size is the largest disk that could ever be made there.
 fn room_in(df: &str) -> Option<(u64, u64)> {
@@ -982,6 +1021,12 @@ mod tests {
         );
         assert_eq!(room_in(&df(0, 0)), Some((0, 0)));
         assert_eq!(room_in("Avail 1B-blocks\n"), None);
+    }
+
+    #[test]
+    fn the_room_free_is_read_from_the_file_system_holding_a_directory_and_none_where_there_is_none() {
+        assert!(free_at(&std::env::temp_dir()).is_some_and(|free| free > 0));
+        assert_eq!(free_at(std::path::Path::new("/no/such/directory/anywhere")), None);
     }
 
     #[test]

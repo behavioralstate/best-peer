@@ -247,6 +247,17 @@ pub trait Runtime: Send + Sync {
     async fn holds(&self, _image: &ImageRef) -> Result<bool, RuntimeError> {
         Ok(false)
     }
+    /// Removes the image from the engine by the reference it was pulled as, so it takes no more room: one the engine
+    /// no longer holds is no error, and one a container still uses is refused. A runtime that keeps no images has
+    /// none to remove.
+    async fn remove_image(&self, _image: &ImageRef) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+    /// The bytes free to the engine on the file system where it keeps its images, so a caller can refuse a pull that
+    /// would fill it; none when the runtime cannot tell. It may take a while on a file system that does not answer.
+    async fn image_room(&self) -> Option<u64> {
+        None
+    }
     /// Creates and starts a container, answering its id and the published ports; emits `Started` too.
     async fn start(&self, spec: Spec) -> Result<Started, RuntimeError>;
     /// Stops and removes a container; emits `Exited`.
@@ -324,6 +335,10 @@ pub struct Fake {
     containers: Mutex<BTreeMap<ContainerId, Spec>>,
     /// Every image a pull was asked for, in order: what went to the registry.
     pulled: Mutex<Vec<ImageRef>>,
+    /// Every image a removal was asked for, in order.
+    removed: Mutex<Vec<ImageRef>>,
+    /// The room it says it has for images, as a test sets it; `None` for an engine that cannot tell.
+    image_room: Mutex<Option<u64>>,
     devices: Vec<DeviceId>,
     next: Mutex<u32>,
     tx: broadcast::Sender<Event>,
@@ -364,6 +379,8 @@ impl Fake {
             steps: vec![Some(50)],
             containers: Mutex::new(BTreeMap::new()),
             pulled: Mutex::new(Vec::new()),
+            removed: Mutex::new(Vec::new()),
+            image_room: Mutex::new(Some(1 << 40)),
             devices,
             next: Mutex::new(0),
             tx,
@@ -427,6 +444,16 @@ impl Fake {
     /// Every image a pull was asked for, in order: what went to the registry.
     pub fn pulled(&self) -> Vec<ImageRef> {
         self.pulled.lock().unwrap().clone()
+    }
+
+    /// Every image a removal was asked for, in order.
+    pub fn removed(&self) -> Vec<ImageRef> {
+        self.removed.lock().unwrap().clone()
+    }
+
+    /// Sets the room it says it has for images from now on, or `None` for an engine that cannot tell.
+    pub fn set_image_room(&self, free: Option<u64>) {
+        *self.image_room.lock().unwrap() = free;
     }
 
     /// Declares an image the registry serves, so a `pull` of it succeeds; it is not local until pulled.
@@ -559,6 +586,22 @@ impl Runtime for Fake {
 
     async fn holds(&self, image: &ImageRef) -> Result<bool, RuntimeError> {
         Ok(self.local.lock().unwrap().contains(image))
+    }
+
+    async fn remove_image(&self, image: &ImageRef) -> Result<(), RuntimeError> {
+        self.removed.lock().unwrap().push(image.clone());
+        if self.containers.lock().unwrap().values().any(|s| s.image == *image) {
+            return Err(RuntimeError::Engine(format!(
+                "the image {} is used by a running container",
+                image.0
+            )));
+        }
+        self.local.lock().unwrap().retain(|i| i != image);
+        Ok(())
+    }
+
+    async fn image_room(&self) -> Option<u64> {
+        *self.image_room.lock().unwrap()
     }
 
     async fn start(&self, spec: Spec) -> Result<Started, RuntimeError> {
@@ -848,6 +891,43 @@ mod tests {
             rt.stop(&a).await.unwrap_err(),
             RuntimeError::NoSuchContainer(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_removed_image_is_no_longer_held_and_one_a_running_container_uses_is_refused() {
+        let rt = fake();
+        let image = ImageRef("ollama/ollama:0.6".into());
+        let id = rt.start(spec("ollama/ollama:0.6", "gpu-0")).await.unwrap().id;
+        assert!(matches!(
+            rt.remove_image(&image).await.unwrap_err(),
+            RuntimeError::Engine(_)
+        ));
+        assert!(rt.holds(&image).await.unwrap(), "an image in use stays");
+        rt.stop(&id).await.unwrap();
+        rt.remove_image(&image).await.unwrap();
+        assert!(!rt.holds(&image).await.unwrap());
+        assert!(matches!(
+            rt.start(spec("ollama/ollama:0.6", "gpu-0")).await.unwrap_err(),
+            RuntimeError::ImageNotFound(_)
+        ));
+        rt.remove_image(&image).await.unwrap();
+        assert_eq!(
+            rt.removed(),
+            vec![image.clone(), image.clone(), image],
+            "every removal asked for"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_room_for_images_is_what_a_test_sets_and_none_where_it_cannot_be_told() {
+        let rt = fake();
+        assert_eq!(rt.image_room().await, Some(1 << 40));
+        rt.set_image_room(Some(10 << 30));
+        assert_eq!(rt.image_room().await, Some(10 << 30));
+        rt.set_image_room(None);
+        assert_eq!(rt.image_room().await, None);
+        assert_eq!(NoNames.image_room().await, None, "a runtime that cannot tell says none");
+        NoNames.remove_image(&ImageRef("x".into())).await.unwrap();
     }
 
     fn named_spec(name: &str) -> Spec {
