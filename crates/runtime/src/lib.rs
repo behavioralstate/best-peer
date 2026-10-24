@@ -36,6 +36,8 @@ pub struct Spec {
     pub mounts: Vec<Mount>,
     /// What the container may not do on the host, and how much of the host it may take.
     pub confinement: Confinement,
+    /// The caller's own name for the container, which the adapter carries as a label and [`Runtime::named`] finds;
+    /// none means no label.
     pub name: Option<String>,
 }
 
@@ -232,8 +234,11 @@ pub trait Runtime: Send + Sync {
     async fn stop(&self, id: &ContainerId) -> Result<(), RuntimeError>;
     /// The containers this engine runs for the peer.
     async fn running(&self) -> Result<Vec<ContainerId>, RuntimeError>;
+    /// The running container the caller started under `name`, the newest when several carry it; none when the engine
+    /// holds no such container. A runtime that cannot look a container up by name errs, never none, so a caller never
+    /// mistakes "cannot tell" for "nothing there".
     async fn named(&self, _name: &str) -> Result<Option<ContainerId>, RuntimeError> {
-        Ok(None)
+        Err(RuntimeError::Engine("this runtime finds no container by name".into()))
     }
     /// Every event from now on. A slow subscriber may lag; the door rebuilds from its own stream, not from this.
     fn events(&self) -> broadcast::Receiver<Event>;
@@ -862,5 +867,32 @@ mod tests {
         let b = rt.start(named_spec("deployment-2")).await.unwrap().id;
         assert_eq!(rt.named("deployment-1").await.unwrap(), Some(a));
         assert_eq!(rt.named("deployment-2").await.unwrap(), Some(b));
+    }
+
+    struct NoNames;
+
+    #[async_trait]
+    impl Runtime for NoNames {
+        async fn pull(&self, _image: &ImageRef, _progress: Progress) -> Result<(), RuntimeError> {
+            unimplemented!()
+        }
+        async fn start(&self, _spec: Spec) -> Result<Started, RuntimeError> {
+            unimplemented!()
+        }
+        async fn stop(&self, _id: &ContainerId) -> Result<(), RuntimeError> {
+            unimplemented!()
+        }
+        async fn running(&self) -> Result<Vec<ContainerId>, RuntimeError> {
+            unimplemented!()
+        }
+        fn events(&self) -> broadcast::Receiver<Event> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_runtime_that_cannot_look_a_container_up_by_name_says_so_and_never_answers_none() {
+        let err = NoNames.named("deployment-1").await.unwrap_err();
+        assert!(matches!(err, RuntimeError::Engine(_)));
     }
 }
