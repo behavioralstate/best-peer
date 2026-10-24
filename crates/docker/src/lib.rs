@@ -734,12 +734,15 @@ impl Runtime for DockerRuntime {
             .list_containers(Some(ListContainersOptionsBuilder::new().filters(&filters).build()))
             .await
             .map_err(|e| RuntimeError::Unreachable(e.to_string()))?;
-        let mut ids = list.into_iter().filter_map(|c| c.id);
-        let newest = ids.next();
-        if newest.is_some() && ids.next().is_some() {
+        if list.len() > 1 {
             tracing::warn!("more than one running container carries one name; answering the newest");
         }
-        Ok(newest.map(ContainerId))
+        Ok(list
+            .into_iter()
+            .filter(|c| c.id.is_some())
+            .max_by_key(|c| c.created.unwrap_or(0))
+            .and_then(|c| c.id)
+            .map(ContainerId))
     }
 
     fn events(&self) -> broadcast::Receiver<Event> {
