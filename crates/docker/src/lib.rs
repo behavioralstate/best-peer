@@ -3,7 +3,7 @@
 //! by the NVIDIA container toolkit when its id is an NVML UUID: a whole card (`GPU-...`) or one MIG instance of a split
 //! card (`MIG-...`), which the toolkit hands over alone; other accelerators wait for their own adapter. A mount is a bind the engine refuses when its source is not there. A container is confined as its spec
 //! says, in the engine's own words: capabilities dropped, no new privileges, a read-only root with a private `/tmp`,
-//! ceilings on processes and on memory with swap counted in, and its network. A container that exits is removed by
+//! ceilings on processes, on memory with swap counted in, on cores and on open files, no core dump, and its network. A container that exits is removed by
 //! this adapter once it has read the last lines the container wrote, which the exit then carries; one whose exit was
 //! not heard (the peer was down, or the event feed broke) is removed by a sweep, every minute and after the feed
 //! reconnects, once this adapter has seen it exited for a minute, so a peer that shares the engine has read its own
@@ -15,11 +15,12 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use best_peer_runtime::{
-    ContainerId, Event, ImageRef, Isolation, Network, Progress, Published, Runtime, RuntimeError, Spec, Started,
+    Confinement, ContainerId, Event, ImageRef, Isolation, Network, Progress, Published, Runtime, RuntimeError, Spec,
+    Started,
 };
 use bollard::models::{
     ContainerCreateBody, ContainerTopResponse, DeviceRequest, EventMessageTypeEnum, HostConfig, Mount, MountType,
-    PortBinding,
+    PortBinding, ResourcesUlimits,
 };
 use bollard::query_parameters::{
     CreateImageOptionsBuilder, EventsOptionsBuilder, ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
@@ -576,7 +577,6 @@ impl Runtime for DockerRuntime {
                 )
             })
             .collect();
-        let confinement = &spec.confinement;
         let body = ContainerCreateBody {
             image: Some(spec.image.0.clone()),
             cmd: (!spec.args.is_empty()).then(|| spec.args.clone()),
@@ -608,23 +608,7 @@ impl Runtime for DockerRuntime {
                         })
                         .collect()
                 }),
-                cap_drop: confinement.drop_capabilities.then(|| vec!["ALL".into()]),
-                security_opt: confinement.no_new_privileges.then(|| vec!["no-new-privileges".into()]),
-                readonly_rootfs: Some(confinement.read_only_root),
-                tmpfs: confinement
-                    .read_only_root
-                    .then(|| HashMap::from([("/tmp".to_string(), "rw,nosuid,nodev,size=1g".to_string())])),
-                pids_limit: confinement.pids.map(|p| p as i64),
-                // One ceiling for memory and swap together: a ceiling that swap can exceed is none.
-                memory: confinement.memory_bytes.map(|m| m as i64),
-                memory_swap: confinement.memory_bytes.map(|m| m as i64),
-                network_mode: match &confinement.network {
-                    Network::None => Some("none".into()),
-                    Network::Default => None,
-                },
-                // An init as PID 1 reaps and forwards signals, so a stop reaches an image that did not expect to be it.
-                init: Some(true),
-                ..Default::default()
+                ..confined(&spec.confinement)
             }),
             ..Default::default()
         };
@@ -742,6 +726,45 @@ impl Runtime for DockerRuntime {
 
     fn events(&self) -> broadcast::Receiver<Event> {
         self.tx.subscribe()
+    }
+}
+
+/// The engine's words for a container's confinement: what it may not do on the host, and how much of the host it may
+/// take. No container dumps its memory as a core, which the host's own core handler would write outside it.
+fn confined(confinement: &Confinement) -> HostConfig {
+    let mut ulimits = Vec::new();
+    if let Some(n) = confinement.open_files {
+        ulimits.push(ResourcesUlimits {
+            name: Some("nofile".into()),
+            soft: Some(n as i64),
+            hard: Some(n as i64),
+        });
+    }
+    ulimits.push(ResourcesUlimits {
+        name: Some("core".into()),
+        soft: Some(0),
+        hard: Some(0),
+    });
+    HostConfig {
+        cap_drop: confinement.drop_capabilities.then(|| vec!["ALL".into()]),
+        security_opt: confinement.no_new_privileges.then(|| vec!["no-new-privileges".into()]),
+        readonly_rootfs: Some(confinement.read_only_root),
+        tmpfs: confinement
+            .read_only_root
+            .then(|| HashMap::from([("/tmp".to_string(), "rw,nosuid,nodev,size=1g".to_string())])),
+        pids_limit: confinement.pids.map(|p| p as i64),
+        // One ceiling for memory and swap together: a ceiling that swap can exceed is none.
+        memory: confinement.memory_bytes.map(|m| m as i64),
+        memory_swap: confinement.memory_bytes.map(|m| m as i64),
+        nano_cpus: confinement.cpus.map(|c| i64::from(c) * 1_000_000_000),
+        ulimits: Some(ulimits),
+        network_mode: match &confinement.network {
+            Network::None => Some("none".into()),
+            Network::Default => None,
+        },
+        // An init as PID 1 reaps and forwards signals, so a stop reaches an image that did not expect to be it.
+        init: Some(true),
+        ..Default::default()
     }
 }
 
@@ -957,6 +980,37 @@ mod tests {
         l.report("held", "Already exists", None, None);
         l.report("new", "Downloading", Some(10), Some(100));
         assert_eq!(l.share(), Some(5));
+    }
+
+    #[test]
+    fn a_containers_cores_and_open_files_are_held_to_its_box_and_it_dumps_no_core() {
+        let boxed = Confinement {
+            cpus: Some(8),
+            open_files: Some(65536),
+            ..Confinement::default()
+        };
+        let h = confined(&boxed);
+        assert_eq!(h.nano_cpus, Some(8_000_000_000));
+        let limit = |name: &str| {
+            h.ulimits
+                .iter()
+                .flatten()
+                .find(|u| u.name.as_deref() == Some(name))
+                .map(|u| (u.soft, u.hard))
+        };
+        assert_eq!(limit("nofile"), Some((Some(65536), Some(65536))));
+        assert_eq!(limit("core"), Some((Some(0), Some(0))));
+        let open = confined(&Confinement::serving());
+        assert_eq!(open.nano_cpus, None, "no ceiling on an engine's cores");
+        assert_eq!(
+            open.ulimits
+                .iter()
+                .flatten()
+                .map(|u| u.name.clone())
+                .collect::<Vec<_>>(),
+            vec![Some("core".to_string())],
+            "no core dump from any container"
+        );
     }
 
     fn listed(items: &[(&str, Option<i64>)]) -> Option<String> {

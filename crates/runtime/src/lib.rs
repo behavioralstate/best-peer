@@ -57,6 +57,12 @@ pub struct Confinement {
     /// The most host memory the container may hold, swap counted in; none for no ceiling. Not device memory.
     pub memory_bytes: Option<u64>,
     pub network: Network,
+    /// The most of the host's cores the container may keep busy at once, in whole cores; none for no ceiling.
+    #[serde(default)]
+    pub cpus: Option<u32>,
+    /// The most files the container may hold open at once; none for the engine's own default.
+    #[serde(default)]
+    pub open_files: Option<u64>,
 }
 
 impl Confinement {
@@ -70,12 +76,14 @@ impl Confinement {
             pids: Some(4096),
             memory_bytes: None,
             network: Network::Default,
+            cpus: None,
+            open_files: None,
         }
     }
 }
 
-/// The closed box a job gets: no network, no capabilities, no new privileges, a read-only root, 4096 tasks and
-/// 4 GiB of host memory at most.
+/// The closed box a job gets: no network, no capabilities, no new privileges, a read-only root, 4096 tasks, 4 GiB of
+/// host memory, half the host's cores and 65536 open files at most.
 impl Default for Confinement {
     fn default() -> Self {
         Self {
@@ -85,8 +93,16 @@ impl Default for Confinement {
             pids: Some(4096),
             memory_bytes: Some(4 << 30),
             network: Network::None,
+            cpus: Some(half_the_cores()),
+            open_files: Some(65536),
         }
     }
+}
+
+/// Half the cores this host lets the process use, one at least: a job never takes the whole host.
+fn half_the_cores() -> u32 {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
+    (cores / 2).max(1)
 }
 
 /// Where a container's network goes: nowhere, what a job gets, or the container engine's own default, what an
@@ -716,6 +732,17 @@ mod tests {
             confinement: Confinement::default(),
             name: None,
         }
+    }
+
+    #[test]
+    fn the_closed_box_takes_half_the_hosts_cores_and_a_ceiling_on_open_files() {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
+        let job = Confinement::default();
+        assert_eq!(job.cpus, Some((cores / 2).max(1)));
+        assert_eq!(job.open_files, Some(65536));
+        let serving = Confinement::serving();
+        assert_eq!(serving.cpus, None, "an engine serving a model keeps the host's cores");
+        assert_eq!(serving.open_files, None);
     }
 
     #[tokio::test]
