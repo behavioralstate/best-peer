@@ -164,7 +164,7 @@ pub enum RuntimeError {
     /// A job's disk could not be made, or this runtime makes none: the words say which.
     #[error("{0}")]
     NoDisk(String),
-    /// A container could not be found by its name, or this runtime finds none by name: the words say which.
+    /// This runtime finds no container by name at all; a name no container carries is `Ok(None)`, never this.
     #[error("{0}")]
     NoName(String),
 }
