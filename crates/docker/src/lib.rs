@@ -5,7 +5,8 @@
 //! other; other accelerators wait for their own adapter. A mount is a bind the engine refuses when its source is not there. A container is confined as its spec
 //! says, in the engine's own words: capabilities dropped, no new privileges, a read-only root with a private `/tmp`,
 //! ceilings on processes, on memory with swap counted in, on cores and on open files, no core dump, and its network;
-//! with a read-only root, a volume the image declares is a private tmpfs, never a volume on the host. A container that exits is removed by
+//! with a read-only root, a volume the image declares is a private tmpfs, never a volume on the host; and the seccomp
+//! and AppArmor profiles the engine has, named. A container that exits is removed by
 //! this adapter once it has read the last lines the container wrote, which the exit then carries; one whose exit was
 //! not heard (the peer was down, or the event feed broke) is removed by a sweep, every minute and after the feed
 //! reconnects, once this adapter has seen it exited for a minute, so a peer that shares the engine has read its own
@@ -579,6 +580,7 @@ impl Runtime for DockerRuntime {
                 )
             })
             .collect();
+        let offered = self.security_options().await;
         let volumes = match spec.confinement.read_only_root {
             true => self.volumes_of(&spec.image).await?,
             false => Vec::new(),
@@ -614,7 +616,7 @@ impl Runtime for DockerRuntime {
                         })
                         .collect()
                 }),
-                ..confined(&spec.confinement, &volumes)
+                ..confined(&spec.confinement, &volumes, &offered)
             }),
             ..Default::default()
         };
@@ -749,8 +751,10 @@ fn env_of(spec: &Spec) -> Vec<String> {
 /// The engine's words for a container's confinement: what it may not do on the host, and how much of the host it may
 /// take. No container dumps its memory as a core, which the host's own core handler would write outside it. With a
 /// read-only root, each of the image's declared `volumes` is a private tmpfs the size of `/tmp`, counted in its
-/// memory as `/tmp` is, so the engine makes no volume on the host for it.
-fn confined(confinement: &Confinement, volumes: &[String]) -> HostConfig {
+/// memory as `/tmp` is, so the engine makes no volume on the host for it. The seccomp and AppArmor profiles are
+/// named where the engine's `offered` security options say it has them, so no default of the engine's can leave a
+/// container without them, and a host without AppArmor still runs.
+fn confined(confinement: &Confinement, volumes: &[String], offered: &[String]) -> HostConfig {
     let mut ulimits = Vec::new();
     if let Some(n) = confinement.open_files {
         ulimits.push(ResourcesUlimits {
@@ -766,7 +770,14 @@ fn confined(confinement: &Confinement, volumes: &[String]) -> HostConfig {
     });
     HostConfig {
         cap_drop: confinement.drop_capabilities.then(|| vec!["ALL".into()]),
-        security_opt: confinement.no_new_privileges.then(|| vec!["no-new-privileges".into()]),
+        security_opt: {
+            let mut opts = Vec::new();
+            if confinement.no_new_privileges {
+                opts.push("no-new-privileges".to_string());
+            }
+            opts.extend(profiles(offered));
+            (!opts.is_empty()).then_some(opts)
+        },
         readonly_rootfs: Some(confinement.read_only_root),
         tmpfs: confinement.read_only_root.then(|| {
             std::iter::once("/tmp")
@@ -790,7 +801,41 @@ fn confined(confinement: &Confinement, volumes: &[String]) -> HostConfig {
     }
 }
 
+/// The profiles a container is given by name among the engine's security options (`name=seccomp,profile=builtin`,
+/// `name=apparmor`): its built-in seccomp profile unless it runs one of its own, which stays its default, and
+/// AppArmor's `docker-default` where AppArmor is there.
+fn profiles(offered: &[String]) -> Vec<String> {
+    let mut named = Vec::new();
+    let option = |name: &str| {
+        offered.iter().find_map(|o| {
+            let mut fields = o.split(',').map(str::trim);
+            (fields.next() == Some(name)).then(|| fields.find_map(|f| f.strip_prefix("profile=")))
+        })
+    };
+    if let Some(profile) = option("name=seccomp") {
+        if matches!(profile, None | Some("builtin" | "default" | "unconfined")) {
+            named.push("seccomp=builtin".to_string());
+        }
+    }
+    if option("name=apparmor").is_some() {
+        named.push("apparmor=docker-default".to_string());
+    }
+    named
+}
+
 impl DockerRuntime {
+    /// The engine's security options as its `info` says them; none when it does not answer, so no profile is named
+    /// and the engine's own defaults stand.
+    async fn security_options(&self) -> Vec<String> {
+        match self.docker.info().await {
+            Ok(info) => info.security_options.unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!(error = %e, "the container engine did not say its security options; its defaults stand for this container");
+                Vec::new()
+            }
+        }
+    }
+
     /// The paths the image declares as volumes, which the engine would otherwise make on the host for each container.
     async fn volumes_of(&self, image: &ImageRef) -> Result<Vec<String>, RuntimeError> {
         match self.docker.inspect_image(&image.0).await {
@@ -1027,7 +1072,7 @@ mod tests {
             open_files: Some(65536),
             ..Confinement::default()
         };
-        let h = confined(&boxed, &[]);
+        let h = confined(&boxed, &[], &[]);
         assert_eq!(h.nano_cpus, Some(8_000_000_000));
         let limit = |name: &str| {
             h.ulimits
@@ -1038,7 +1083,7 @@ mod tests {
         };
         assert_eq!(limit("nofile"), Some((Some(65536), Some(65536))));
         assert_eq!(limit("core"), Some((Some(0), Some(0))));
-        let open = confined(&Confinement::serving(), &[]);
+        let open = confined(&Confinement::serving(), &[], &[]);
         assert_eq!(open.nano_cpus, None, "no ceiling on an engine's cores");
         assert_eq!(
             open.ulimits
@@ -1054,7 +1099,7 @@ mod tests {
     #[test]
     fn a_volume_the_image_declares_is_a_small_private_tmpfs_in_the_box_and_no_volume_of_the_host() {
         let volumes = ["/data".to_string(), "/root/.cache".to_string()];
-        let tmpfs = confined(&Confinement::default(), &volumes).tmpfs.unwrap();
+        let tmpfs = confined(&Confinement::default(), &volumes, &[]).tmpfs.unwrap();
         for path in ["/tmp", "/data", "/root/.cache"] {
             assert_eq!(
                 tmpfs.get(path).map(String::as_str),
@@ -1064,7 +1109,7 @@ mod tests {
         }
         assert_eq!(tmpfs.len(), 3);
         assert_eq!(
-            confined(&Confinement::serving(), &volumes).tmpfs,
+            confined(&Confinement::serving(), &volumes, &[]).tmpfs,
             None,
             "an engine with a writable root keeps its volumes"
         );
@@ -1099,6 +1144,57 @@ mod tests {
             "the last word is the adapter's"
         );
         assert_eq!(env_of(&with_devices(&[], &[("A", "1")])), vec!["A=1".to_string()]);
+    }
+
+    fn offered(options: &[&str]) -> Vec<String> {
+        options.iter().map(|o| o.to_string()).collect()
+    }
+
+    #[test]
+    fn seccomp_and_apparmor_are_named_on_every_container_where_the_engine_offers_them_and_only_there() {
+        let both = offered(&["name=apparmor", "name=seccomp,profile=builtin", "name=cgroupns"]);
+        assert_eq!(
+            confined(&Confinement::default(), &[], &both).security_opt,
+            Some(offered(&[
+                "no-new-privileges",
+                "seccomp=builtin",
+                "apparmor=docker-default"
+            ]))
+        );
+        assert_eq!(
+            confined(
+                &Confinement::serving(),
+                &[],
+                &offered(&["name=seccomp,profile=default"])
+            )
+            .security_opt,
+            Some(offered(&["no-new-privileges", "seccomp=builtin"]))
+        );
+        assert_eq!(
+            confined(
+                &Confinement::default(),
+                &[],
+                &offered(&["name=seccomp,profile=unconfined"])
+            )
+            .security_opt,
+            Some(offered(&["no-new-privileges", "seccomp=builtin"])),
+            "an engine that runs its containers unconfined still confines these"
+        );
+        assert_eq!(
+            confined(
+                &Confinement::default(),
+                &[],
+                &offered(&["name=seccomp,profile=/etc/docker/strict.json"])
+            )
+            .security_opt,
+            Some(offered(&["no-new-privileges"])),
+            "an engine's own profile is left to it"
+        );
+        assert_eq!(
+            confined(&Confinement::default(), &[], &offered(&["name=cgroupns"])).security_opt,
+            Some(offered(&["no-new-privileges"])),
+            "a host without AppArmor or seccomp still runs"
+        );
     }
 
     fn listed(items: &[(&str, Option<i64>)]) -> Option<String> {

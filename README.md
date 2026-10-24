@@ -344,7 +344,8 @@ credential approved with a share, a tenant's, runs code the owner did not write,
 read-only filesystem with a private `/tmp` of 1 GiB, which counts in its memory, no network, and a ceiling on host
 memory with swap counted in, half the host's cores and 65536 open files at most; a volume its image declares is a
 private `/tmp`-sized tmpfs too, never a volume on the host. No container dumps a core, which the
-host's own core handler would write outside it. The owner's own jobs, from a credential with no share, keep the network, a writable
+host's own core handler would write outside it, and each is given by name the seccomp profile and AppArmor's
+`docker-default` the engine has, as its `info` says them. The owner's own jobs, from a credential with no share, keep the network, a writable
 filesystem and the host's memory, as before; so do a tenant's whose approver said `best-peer approve --open-jobs`,
 which only the approver can say, never the credential or the job. `JobStarted` says `boxed`.
 `BEST_PEER_JOB_MEMORY` (default `4G`) is the box's host memory ceiling and `BEST_PEER_JOB_PIDS` (default 4096) every
