@@ -737,17 +737,24 @@ impl Runtime for DockerRuntime {
         if list.len() > 1 {
             tracing::warn!("more than one running container carries one name; answering the newest");
         }
-        Ok(list
-            .into_iter()
-            .filter(|c| c.id.is_some())
-            .max_by_key(|c| c.created.unwrap_or(0))
-            .and_then(|c| c.id)
-            .map(ContainerId))
+        Ok(newest(list.into_iter().filter_map(|c| Some((c.id?, c.created)))).map(ContainerId))
     }
 
     fn events(&self) -> broadcast::Receiver<Event> {
         self.tx.subscribe()
     }
+}
+
+fn newest(listed: impl Iterator<Item = (String, Option<i64>)>) -> Option<String> {
+    listed
+        .fold(None::<(String, i64)>, |best, (id, created)| {
+            let created = created.unwrap_or(0);
+            match best {
+                Some((_, at)) if at >= created => best,
+                _ => Some((id, created)),
+            }
+        })
+        .map(|(id, _)| id)
 }
 
 /// The process ids in a container's `top`: the column titled PID, whatever else the engine lists beside it.
@@ -950,5 +957,39 @@ mod tests {
         l.report("held", "Already exists", None, None);
         l.report("new", "Downloading", Some(10), Some(100));
         assert_eq!(l.share(), Some(5));
+    }
+
+    fn listed(items: &[(&str, Option<i64>)]) -> Option<String> {
+        super::newest(items.iter().map(|(id, at)| (id.to_string(), *at)))
+    }
+
+    #[test]
+    fn the_newest_of_several_same_named_containers_is_the_latest_created() {
+        assert_eq!(
+            listed(&[("older", Some(100)), ("newer", Some(200))]).as_deref(),
+            Some("newer")
+        );
+        assert_eq!(
+            listed(&[("newer", Some(200)), ("older", Some(100))]).as_deref(),
+            Some("newer")
+        );
+    }
+
+    #[test]
+    fn containers_created_in_the_same_second_keep_the_engines_order_newest_first() {
+        assert_eq!(
+            listed(&[("listed-first", Some(300)), ("listed-second", Some(300))]).as_deref(),
+            Some("listed-first")
+        );
+    }
+
+    #[test]
+    fn a_container_with_no_creation_time_loses_to_one_with_it_and_none_is_none() {
+        assert_eq!(
+            listed(&[("unknown", None), ("known", Some(1))]).as_deref(),
+            Some("known")
+        );
+        assert_eq!(listed(&[("only", None)]).as_deref(), Some("only"));
+        assert_eq!(listed(&[]), None);
     }
 }
