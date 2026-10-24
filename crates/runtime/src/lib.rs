@@ -36,6 +36,7 @@ pub struct Spec {
     pub mounts: Vec<Mount>,
     /// What the container may not do on the host, and how much of the host it may take.
     pub confinement: Confinement,
+    pub name: Option<String>,
 }
 
 /// How a container is confined: what it may not do on the host, and how much of the host it may take. A peer runs
@@ -231,6 +232,9 @@ pub trait Runtime: Send + Sync {
     async fn stop(&self, id: &ContainerId) -> Result<(), RuntimeError>;
     /// The containers this engine runs for the peer.
     async fn running(&self) -> Result<Vec<ContainerId>, RuntimeError>;
+    async fn named(&self, _name: &str) -> Result<Option<ContainerId>, RuntimeError> {
+        Ok(None)
+    }
     /// Every event from now on. A slow subscriber may lag; the door rebuilds from its own stream, not from this.
     fn events(&self) -> broadcast::Receiver<Event>;
     /// Whether this engine runs a job: an image run once to its exit. One that cannot (an engine already installed
@@ -589,6 +593,16 @@ impl Runtime for Fake {
         Ok(self.containers.lock().unwrap().keys().cloned().collect())
     }
 
+    async fn named(&self, name: &str) -> Result<Option<ContainerId>, RuntimeError> {
+        Ok(self
+            .containers
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, spec)| spec.name.as_deref() == Some(name))
+            .map(|(id, _)| id.clone()))
+    }
+
     fn events(&self) -> broadcast::Receiver<Event> {
         self.tx.subscribe()
     }
@@ -691,6 +705,7 @@ mod tests {
             ports: vec![11434],
             mounts: vec![],
             confinement: Confinement::default(),
+            name: None,
         }
     }
 
@@ -797,5 +812,44 @@ mod tests {
             rt.stop(&a).await.unwrap_err(),
             RuntimeError::NoSuchContainer(_)
         ));
+    }
+
+    fn named_spec(name: &str) -> Spec {
+        Spec {
+            name: Some(name.into()),
+            ..spec("ollama/ollama:0.6", "gpu-0")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_container_started_with_a_name_is_found_by_it() {
+        let rt = fake();
+        let id = rt.start(named_spec("deployment-1")).await.unwrap().id;
+        assert_eq!(rt.named("deployment-1").await.unwrap(), Some(id));
+    }
+
+    #[tokio::test]
+    async fn a_container_started_without_a_name_is_found_by_no_name() {
+        let rt = fake();
+        rt.start(spec("ollama/ollama:0.6", "gpu-0")).await.unwrap();
+        assert_eq!(rt.named("").await.unwrap(), None);
+        assert_eq!(rt.named("deployment-1").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_stopped_container_is_no_longer_found_by_its_name() {
+        let rt = fake();
+        let id = rt.start(named_spec("deployment-1")).await.unwrap().id;
+        rt.stop(&id).await.unwrap();
+        assert_eq!(rt.named("deployment-1").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn two_containers_with_different_names_are_each_found_by_their_own() {
+        let rt = fake();
+        let a = rt.start(named_spec("deployment-1")).await.unwrap().id;
+        let b = rt.start(named_spec("deployment-2")).await.unwrap().id;
+        assert_eq!(rt.named("deployment-1").await.unwrap(), Some(a));
+        assert_eq!(rt.named("deployment-2").await.unwrap(), Some(b));
     }
 }

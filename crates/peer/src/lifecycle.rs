@@ -1353,6 +1353,7 @@ impl Peer {
             ports: vec![recipe.port],
             mounts,
             confinement: self.confine.engine.clone(),
+            name: None,
         };
         let started = match self.runtime.start(spec).await {
             Ok(s) => s,
@@ -2140,6 +2141,7 @@ impl Peer {
                 true => self.confine.job.clone(),
                 false => self.confine.open_job.clone(),
             },
+            name: None,
         };
         let host_memory_bytes = match reservation.boxed {
             true => self.confine.job.memory_bytes,

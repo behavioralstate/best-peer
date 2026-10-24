@@ -30,6 +30,7 @@ use futures::StreamExt;
 use tokio::sync::broadcast;
 
 const LABEL: &str = "best-peer";
+const NAME_LABEL: &str = "best-peer.name";
 
 pub struct DockerRuntime {
     docker: Docker,
@@ -581,7 +582,13 @@ impl Runtime for DockerRuntime {
             cmd: (!spec.args.is_empty()).then(|| spec.args.clone()),
             env: Some(spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect()),
             exposed_ports: Some(spec.ports.iter().map(|p| format!("{p}/tcp")).collect()),
-            labels: Some(HashMap::from([(LABEL.to_string(), "1".to_string())])),
+            labels: Some({
+                let mut labels = HashMap::from([(LABEL.to_string(), "1".to_string())]);
+                if let Some(name) = &spec.name {
+                    labels.insert(NAME_LABEL.to_string(), name.clone());
+                }
+                labels
+            }),
             host_config: Some(HostConfig {
                 // Not removed by the engine on exit: the adapter reads its last lines first, then removes it.
                 auto_remove: Some(false),
@@ -717,6 +724,22 @@ impl Runtime for DockerRuntime {
             .await
             .map_err(|e| RuntimeError::Unreachable(e.to_string()))?;
         Ok(list.into_iter().filter_map(|c| c.id).map(ContainerId).collect())
+    }
+
+    async fn named(&self, name: &str) -> Result<Option<ContainerId>, RuntimeError> {
+        let named = format!("{NAME_LABEL}={name}");
+        let filters = HashMap::from([("label", vec![LABEL, named.as_str()])]);
+        let list = self
+            .docker
+            .list_containers(Some(ListContainersOptionsBuilder::new().filters(&filters).build()))
+            .await
+            .map_err(|e| RuntimeError::Unreachable(e.to_string()))?;
+        let mut ids = list.into_iter().filter_map(|c| c.id);
+        let first = ids.next();
+        if first.is_some() && ids.next().is_some() {
+            tracing::warn!(%name, "more than one running container carries this name; answering the first");
+        }
+        Ok(first.map(ContainerId))
     }
 
     fn events(&self) -> broadcast::Receiver<Event> {
