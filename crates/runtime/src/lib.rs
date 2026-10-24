@@ -599,8 +599,9 @@ impl Runtime for Fake {
             .lock()
             .unwrap()
             .iter()
-            .find(|(_, spec)| spec.name.as_deref() == Some(name))
-            .map(|(id, _)| id.clone()))
+            .filter(|(_, spec)| spec.name.as_deref() == Some(name))
+            .map(|(id, _)| id.clone())
+            .max_by_key(|id| id.0.rsplit('-').next().and_then(|n| n.parse::<u64>().ok())))
     }
 
     fn events(&self) -> broadcast::Receiver<Event> {
@@ -842,6 +843,16 @@ mod tests {
         let id = rt.start(named_spec("deployment-1")).await.unwrap().id;
         rt.stop(&id).await.unwrap();
         assert_eq!(rt.named("deployment-1").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_name_started_twice_is_answered_by_the_newest_container() {
+        let rt = fake();
+        let older = rt.start(named_spec("job-7")).await.unwrap().id;
+        let newer = rt.start(named_spec("job-7")).await.unwrap().id;
+        assert_eq!(rt.named("job-7").await.unwrap(), Some(newer.clone()));
+        rt.stop(&newer).await.unwrap();
+        assert_eq!(rt.named("job-7").await.unwrap(), Some(older));
     }
 
     #[tokio::test]

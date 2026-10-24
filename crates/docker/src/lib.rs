@@ -735,11 +735,11 @@ impl Runtime for DockerRuntime {
             .await
             .map_err(|e| RuntimeError::Unreachable(e.to_string()))?;
         let mut ids = list.into_iter().filter_map(|c| c.id);
-        let first = ids.next();
-        if first.is_some() && ids.next().is_some() {
-            tracing::warn!(%name, "more than one running container carries this name; answering the first");
+        let newest = ids.next();
+        if newest.is_some() && ids.next().is_some() {
+            tracing::warn!("more than one running container carries one name; answering the newest");
         }
-        Ok(first.map(ContainerId))
+        Ok(newest.map(ContainerId))
     }
 
     fn events(&self) -> broadcast::Receiver<Event> {
