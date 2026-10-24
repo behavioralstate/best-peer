@@ -36,8 +36,8 @@ pub struct Spec {
     pub mounts: Vec<Mount>,
     /// What the container may not do on the host, and how much of the host it may take.
     pub confinement: Confinement,
-    /// The caller's own name for the container, which the adapter carries as a label and [`Runtime::named`] finds;
-    /// none means no label.
+    /// The caller's own name for the container, carried as a label by an adapter that finds containers by name
+    /// ([`Runtime::named`]) and ignored by one that cannot; none means no label.
     pub name: Option<String>,
 }
 
