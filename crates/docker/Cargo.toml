@@ -1,6 +1,6 @@
 [package]
 name = "best-peer-docker"
-description = "The Runtime adapter over the Docker Engine API through bollard: pull, start with devices handed over, stop, and the engine's events. Thin; proven on a host by hand, never unit-tested."
+description = "The Runtime adapter over the Docker Engine API through bollard: pull, start with devices handed over, stop, follow what a container writes, and the engine's events. Thin; proven on a host by hand, never unit-tested."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,6 +14,9 @@ bollard = "0.21"
 futures = "0.3"
 tokio = { workspace = true }
 tracing = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs"] }

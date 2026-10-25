@@ -6,8 +6,10 @@
 //! says, in the engine's own words: capabilities dropped, no new privileges, a read-only root with a private `/tmp`,
 //! ceilings on processes, on memory with swap counted in, on cores and on open files, no core dump, and its network;
 //! with a read-only root, a volume the image declares is a private tmpfs, never a volume on the host; and the seccomp
-//! and AppArmor profiles the engine has, named. A container that exits is removed by
-//! this adapter once it has read the last lines the container wrote, which the exit then carries; one whose exit was
+//! and AppArmor profiles the engine has, named; and the engine's own copy of what it writes rotated at two files of
+//! ten megabytes. What a container writes is followed from its first byte, out and error apart. A container that exits
+//! is removed by this adapter once it has read the last lines the container wrote, which the exit then carries, and
+//! once whoever follows it has read the rest, ten seconds at most; one whose exit was
 //! not heard (the peer was down, or the event feed broke) is removed by a sweep, every minute and after the feed
 //! reconnects, once this adapter has seen it exited for a minute, so a peer that shares the engine has read its own
 //! first. A container goes with its anonymous volumes, as the engine's own removal on exit took them. An image is
@@ -23,16 +25,17 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use best_peer_runtime::{
-    Confinement, ContainerId, Event, ImageRef, Isolation, Network, Progress, Published, Runtime, RuntimeError, Spec,
-    Started,
+    Confinement, ContainerId, Event, Following, ImageRef, Isolation, Network, Output, Progress, Published, Runtime,
+    RuntimeError, Spec, Started, Written,
 };
+use bollard::container::LogOutput;
 use bollard::models::{
-    ContainerCreateBody, ContainerTopResponse, DeviceRequest, EventMessageTypeEnum, HostConfig, Mount, MountType,
-    PortBinding, ResourcesUlimits,
+    ContainerCreateBody, ContainerTopResponse, DeviceRequest, EventMessageTypeEnum, HostConfig, HostConfigLogConfig,
+    Mount, MountType, PortBinding, ResourcesUlimits,
 };
 use bollard::query_parameters::{
-    CreateImageOptionsBuilder, EventsOptionsBuilder, ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
-    RemoveImageOptionsBuilder, StopContainerOptionsBuilder,
+    CreateImageOptionsBuilder, EventsOptionsBuilder, ListContainersOptionsBuilder, LogsOptionsBuilder,
+    RemoveContainerOptionsBuilder, RemoveImageOptionsBuilder, StopContainerOptionsBuilder,
 };
 use bollard::Docker;
 use futures::StreamExt;
@@ -56,6 +59,8 @@ pub struct DockerRuntime {
     /// Whether the engine runs on this host, so the room for its images can be read here: published ports bound to
     /// loopback, as they are when the peer reaches the engines on this host.
     engine_here: bool,
+    /// Who follows each container's output now: a container that ends is removed once they have read it all.
+    followers: Arc<Followers>,
 }
 
 impl DockerRuntime {
@@ -76,9 +81,10 @@ impl DockerRuntime {
             disks: None,
             mounts: false,
             engine_here: engine_is_here(bind_ip),
+            followers: Arc::new(Followers::default()),
         };
         sweep(&me.docker, &me.exited).await;
-        me.follow();
+        me.follow_events();
         let (docker, exited) = (me.docker.clone(), me.exited.clone());
         tokio::spawn(async move {
             loop {
@@ -89,10 +95,11 @@ impl DockerRuntime {
         Ok(me)
     }
 
-    fn follow(&self) {
+    fn follow_events(&self) {
         let docker = self.docker.clone();
         let exited = self.exited.clone();
         let tx = self.tx.clone();
+        let followers = self.followers.clone();
         tokio::spawn(async move {
             loop {
                 let filters = HashMap::from([
@@ -127,13 +134,19 @@ impl DockerRuntime {
                                 .and_then(|c| c.parse::<i64>().ok())
                                 .unwrap_or(-1);
                             let last_words = last_words(&docker, &id.0).await;
-                            let _ = docker
-                                .remove_container(
-                                    &id.0,
-                                    Some(RemoveContainerOptionsBuilder::new().force(true).v(true).build()),
-                                )
-                                .await;
-                            let _ = tx.send(Event::Exited { id, code, last_words });
+                            // Removed once its followers have read all it wrote, each exit on its own, so a follower
+                            // slow to finish never holds another container's exit.
+                            let (docker, tx, followers) = (docker.clone(), tx.clone(), followers.clone());
+                            tokio::spawn(async move {
+                                followers.drained(&id.0, FOLLOWED_FOR).await;
+                                let _ = docker
+                                    .remove_container(
+                                        &id.0,
+                                        Some(RemoveContainerOptionsBuilder::new().force(true).v(true).build()),
+                                    )
+                                    .await;
+                                let _ = tx.send(Event::Exited { id, code, last_words });
+                            });
                         }
                         _ => {}
                     }
@@ -145,6 +158,71 @@ impl DockerRuntime {
                 tokio::spawn(async move { sweep(&d, &e).await });
             }
         });
+    }
+}
+
+/// The longest an exited container waits for its followers to read the rest of what it wrote before it is removed.
+const FOLLOWED_FOR: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What a follower holds unread before the engine's feed waits for it.
+const FOLLOWED: usize = 256;
+
+/// What the engine keeps on the host of a container's output, as its `json-file` driver rotates it: a follower reads
+/// from there, so one that keeps up reads it all, and a container that writes without end never fills the host's disk.
+const KEPT_PER_FILE: &str = "10m";
+const KEPT_FILES: &str = "2";
+
+/// The followers of each container's output this adapter has open, so a container that ends is removed only once
+/// they have read all it wrote.
+#[derive(Default)]
+struct Followers {
+    open: Mutex<HashMap<String, usize>>,
+    changed: tokio::sync::Notify,
+}
+
+/// One follower of a container, counted while it is held.
+struct Follower {
+    followers: Arc<Followers>,
+    id: String,
+}
+
+impl Followers {
+    fn begin(self: &Arc<Self>, id: &str) -> Follower {
+        *self.open.lock().unwrap().entry(id.to_string()).or_default() += 1;
+        Follower {
+            followers: self.clone(),
+            id: id.to_string(),
+        }
+    }
+
+    /// Whether every follower of `id` has finished within `within`; false once it has passed with one still open.
+    async fn drained(&self, id: &str, within: std::time::Duration) -> bool {
+        let until = tokio::time::Instant::now() + within;
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !self.open.lock().unwrap().contains_key(id) {
+                return true;
+            }
+            if tokio::time::timeout_at(until, changed).await.is_err() {
+                return false;
+            }
+        }
+    }
+}
+
+impl Drop for Follower {
+    fn drop(&mut self) {
+        let mut open = self.followers.open.lock().unwrap();
+        if let Some(n) = open.get_mut(&self.id) {
+            *n -= 1;
+            if *n == 0 {
+                open.remove(&self.id);
+            }
+        }
+        drop(open);
+        self.followers.changed.notify_waiters();
     }
 }
 
@@ -755,7 +833,9 @@ impl Runtime for DockerRuntime {
             Err(bollard::errors::Error::DockerResponseServerError { status_code: 304, .. }) => {}
             Err(e) => return Err(RuntimeError::Engine(e.to_string())),
         }
-        // The adapter removes it when its exit is heard; one already stopped, or not heard, is removed here.
+        // The adapter removes it when its exit is heard; one already stopped, or not heard, is removed here, once its
+        // followers have read all it wrote.
+        self.followers.drained(&id.0, FOLLOWED_FOR).await;
         match self
             .docker
             .remove_container(
@@ -768,6 +848,45 @@ impl Runtime for DockerRuntime {
             Err(bollard::errors::Error::DockerResponseServerError { status_code: 409, .. }) => Ok(()),
             Err(e) => Err(RuntimeError::Engine(e.to_string())),
         }
+    }
+
+    async fn follow(&self, id: &ContainerId) -> Result<Following, RuntimeError> {
+        // Counted before the engine is asked, so an exit heard meanwhile already waits for this follower.
+        let follower = self.followers.begin(&id.0);
+        match self.docker.inspect_container(&id.0, None).await {
+            Ok(_) => {}
+            Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => {
+                return Err(RuntimeError::NoSuchContainer(id.0.clone()))
+            }
+            Err(e) => return Err(RuntimeError::Unreachable(e.to_string())),
+        }
+        let options = LogsOptionsBuilder::new().follow(true).stdout(true).stderr(true).build();
+        let mut logs = self.docker.logs(&id.0, Some(options));
+        let (tx, rx) = tokio::sync::mpsc::channel(FOLLOWED);
+        tokio::spawn(async move {
+            let _follower = follower;
+            while let Some(next) = logs.next().await {
+                let read = match next {
+                    Ok(LogOutput::StdOut { message }) | Ok(LogOutput::Console { message }) => Ok(Written {
+                        output: Output::Out,
+                        bytes: message.to_vec(),
+                    }),
+                    Ok(LogOutput::StdErr { message }) => Ok(Written {
+                        output: Output::Err,
+                        bytes: message.to_vec(),
+                    }),
+                    Ok(LogOutput::StdIn { .. }) => continue,
+                    Err(e) => Err(RuntimeError::Engine(format!(
+                        "the engine stopped telling what the container writes: {e}"
+                    ))),
+                };
+                let last = read.is_err();
+                if tx.send(read).await.is_err() || last {
+                    break;
+                }
+            }
+        });
+        Ok(rx)
     }
 
     async fn running(&self) -> Result<Vec<ContainerId>, RuntimeError> {
@@ -870,6 +989,13 @@ fn confined(confinement: &Confinement, volumes: &[String], offered: &[String]) -
         },
         // An init as PID 1 reaps and forwards signals, so a stop reaches an image that did not expect to be it.
         init: Some(true),
+        log_config: Some(HostConfigLogConfig {
+            typ: Some("json-file".into()),
+            config: Some(HashMap::from([
+                ("max-size".to_string(), KEPT_PER_FILE.to_string()),
+                ("max-file".to_string(), KEPT_FILES.to_string()),
+            ])),
+        }),
         ..Default::default()
     }
 }
@@ -1370,6 +1496,54 @@ mod tests {
         l.report("held", "Already exists", None, None);
         l.report("new", "Downloading", Some(10), Some(100));
         assert_eq!(l.share(), Some(5));
+    }
+
+    #[test]
+    fn what_the_engine_keeps_of_a_containers_output_on_the_host_is_bounded_whatever_its_box() {
+        for confinement in [Confinement::default(), Confinement::serving()] {
+            let kept = confined(&confinement, &[], &[]).log_config.unwrap();
+            assert_eq!(kept.typ.as_deref(), Some("json-file"));
+            let config = kept.config.unwrap();
+            assert_eq!(config.get("max-size").map(String::as_str), Some("10m"));
+            assert_eq!(config.get("max-file").map(String::as_str), Some("2"));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_container_with_no_follower_is_removed_at_once() {
+        let followers = Arc::new(Followers::default());
+        assert!(followers.drained("c-1", Duration::from_secs(10)).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_container_is_removed_once_its_last_follower_has_read_it_all() {
+        let followers = Arc::new(Followers::default());
+        let first = followers.begin("c-1");
+        let second = followers.begin("c-1");
+        let other = followers.begin("c-2");
+        let waiting = tokio::spawn({
+            let followers = followers.clone();
+            async move { followers.drained("c-1", Duration::from_secs(10)).await }
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        drop(first);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!waiting.is_finished(), "one follower still reads");
+        drop(second);
+        assert!(
+            waiting.await.unwrap(),
+            "drained once the last follower of c-1 is done, whatever c-2's does"
+        );
+        drop(other);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_follower_that_never_finishes_holds_a_container_only_for_the_bound() {
+        let followers = Arc::new(Followers::default());
+        let _stuck = followers.begin("c-1");
+        let started = tokio::time::Instant::now();
+        assert!(!followers.drained("c-1", Duration::from_secs(10)).await);
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
     }
 
     #[test]

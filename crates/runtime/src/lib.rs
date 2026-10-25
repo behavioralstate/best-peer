@@ -187,7 +187,30 @@ pub enum RuntimeError {
     /// This runtime finds no container by name at all; a name no container carries is `Ok(None)`, never this.
     #[error("{0}")]
     NoName(String),
+    /// This runtime cannot follow what a container writes; a container that wrote nothing is a feed that ends.
+    #[error("{0}")]
+    NoFollow(String),
 }
+
+/// Which of a container's outputs some bytes came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Output {
+    Out,
+    Err,
+}
+
+/// Bytes a container wrote, as the engine handed them over: neither cut at lines nor read as text, which is the
+/// caller's to do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Written {
+    pub output: Output,
+    pub bytes: Vec<u8>,
+}
+
+/// What a follower reads: what the container wrote, in the order written, from its first byte. It closes once the
+/// container has ended and all it wrote is read, or after an error, which is the last thing it tells.
+pub type Following = tokio::sync::mpsc::Receiver<Result<Written, RuntimeError>>;
 
 /// What stands between a workload and the host and the other workloads on it, weakest first, so a workload that asks
 /// for one is placed only where at least that is offered.
@@ -290,6 +313,15 @@ pub trait Runtime: Send + Sync {
     async fn named(&self, _name: &str) -> Result<Option<ContainerId>, RuntimeError> {
         Err(RuntimeError::NoName("this runtime finds no container by name".into()))
     }
+    /// What the container wrote, out and error apart, from its first byte until it has ended and all of it is read,
+    /// whether it is running or has just exited and is not yet removed. While one follows, the runtime does not remove
+    /// the container before the follower has read it all, or a bound has passed. A runtime that cannot follow errs,
+    /// never an empty feed, so a caller never mistakes "cannot tell" for "wrote nothing".
+    async fn follow(&self, _id: &ContainerId) -> Result<Following, RuntimeError> {
+        Err(RuntimeError::NoFollow(
+            "this runtime cannot follow what a container writes".into(),
+        ))
+    }
     /// Every event from now on. A slow subscriber may lag; the door rebuilds from its own stream, not from this.
     fn events(&self) -> broadcast::Receiver<Event>;
     /// Whether this engine runs a job: an image run once to its exit. One that cannot (an engine already installed
@@ -386,7 +418,20 @@ pub struct Fake {
     room_unread: Mutex<bool>,
     /// Whether it makes no disk, as an engine whose peer cannot mount one.
     no_disks: Mutex<bool>,
+    /// What each container it started wrote, and who follows it while it runs.
+    written: Mutex<HashMap<ContainerId, Writing>>,
 }
+
+/// One container's output on the fake: all it wrote, its followers while it runs, and whether it has ended.
+#[derive(Default)]
+struct Writing {
+    chunks: Vec<Written>,
+    followers: Vec<tokio::sync::mpsc::Sender<Result<Written, RuntimeError>>>,
+    ended: bool,
+}
+
+/// What one follower of the fake holds unread: more than any test writes before reading.
+const FAKE_FOLLOWED: usize = 1024;
 
 impl Fake {
     /// A fake whose engine can see `devices` and already holds `local` images.
@@ -418,6 +463,7 @@ impl Fake {
             processes: Mutex::new(Some(Vec::new())),
             room_unread: Mutex::new(false),
             no_disks: Mutex::new(false),
+            written: Mutex::new(HashMap::new()),
         }
     }
 
@@ -539,6 +585,7 @@ impl Fake {
             .unwrap()
             .remove(id)
             .ok_or_else(|| RuntimeError::NoSuchContainer(id.0.clone()))?;
+        self.ended(id);
         let _ = self.tx.send(Event::OutOfMemory { id: id.clone() });
         Ok(())
     }
@@ -550,6 +597,7 @@ impl Fake {
             .unwrap()
             .remove(id)
             .ok_or_else(|| RuntimeError::NoSuchContainer(id.0.clone()))?;
+        self.ended(id);
         let _ = self.tx.send(Event::Failed {
             id: id.clone(),
             reason: reason.to_string(),
@@ -564,12 +612,37 @@ impl Fake {
             .unwrap()
             .remove(id)
             .ok_or_else(|| RuntimeError::NoSuchContainer(id.0.clone()))?;
+        self.ended(id);
         let _ = self.tx.send(Event::Exited {
             id: id.clone(),
             code,
             last_words: Some(last_words.to_string()),
         });
         Ok(())
+    }
+
+    /// Makes a running container write `text` to `output`, as a process does: told to every follower at once.
+    pub fn write(&self, id: &ContainerId, output: Output, text: &str) -> Result<(), RuntimeError> {
+        let mut written = self.written.lock().unwrap();
+        let writing = written
+            .get_mut(id)
+            .filter(|w| !w.ended)
+            .ok_or_else(|| RuntimeError::NoSuchContainer(id.0.clone()))?;
+        let chunk = Written {
+            output,
+            bytes: text.as_bytes().to_vec(),
+        };
+        writing.chunks.push(chunk.clone());
+        writing.followers.retain(|f| f.try_send(Ok(chunk.clone())).is_ok());
+        Ok(())
+    }
+
+    /// Ends what a container writes: its followers read what is left and close.
+    fn ended(&self, id: &ContainerId) {
+        if let Some(writing) = self.written.lock().unwrap().get_mut(id) {
+            writing.ended = true;
+            writing.followers.clear();
+        }
     }
 
     pub fn spec_of(&self, id: &ContainerId) -> Option<Spec> {
@@ -676,6 +749,7 @@ impl Runtime for Fake {
             })
             .collect::<Result<Vec<_>, _>>()?;
         self.containers.lock().unwrap().insert(id.clone(), spec);
+        self.written.lock().unwrap().insert(id.clone(), Writing::default());
         let _ = self.tx.send(Event::Started {
             id: id.clone(),
             ports: ports.clone(),
@@ -692,6 +766,7 @@ impl Runtime for Fake {
             .unwrap()
             .remove(id)
             .ok_or_else(|| RuntimeError::NoSuchContainer(id.0.clone()))?;
+        self.ended(id);
         let _ = self.tx.send(Event::Exited {
             id: id.clone(),
             code: 0,
@@ -713,6 +788,21 @@ impl Runtime for Fake {
             .filter(|(_, spec)| spec.name.as_deref() == Some(name))
             .map(|(id, _)| id.clone())
             .max_by_key(|id| id.0.rsplit('-').next().and_then(|n| n.parse::<u64>().ok())))
+    }
+
+    async fn follow(&self, id: &ContainerId) -> Result<Following, RuntimeError> {
+        let mut written = self.written.lock().unwrap();
+        let writing = written
+            .get_mut(id)
+            .ok_or_else(|| RuntimeError::NoSuchContainer(id.0.clone()))?;
+        let (tx, rx) = tokio::sync::mpsc::channel(FAKE_FOLLOWED);
+        for chunk in &writing.chunks {
+            let _ = tx.try_send(Ok(chunk.clone()));
+        }
+        if !writing.ended {
+            writing.followers.push(tx);
+        }
+        Ok(rx)
     }
 
     fn events(&self) -> broadcast::Receiver<Event> {
@@ -1079,5 +1169,117 @@ mod tests {
     async fn a_runtime_that_cannot_look_a_container_up_by_name_says_so_and_never_answers_none() {
         let err = NoNames.named("deployment-1").await.unwrap_err();
         assert!(matches!(err, RuntimeError::NoName(_)));
+    }
+
+    #[tokio::test]
+    async fn a_runtime_that_cannot_follow_what_a_container_writes_says_so_and_never_answers_an_empty_feed() {
+        let err = NoNames.follow(&ContainerId("c".into())).await.unwrap_err();
+        assert!(matches!(err, RuntimeError::NoFollow(_)));
+    }
+
+    fn out(text: &str) -> Written {
+        Written {
+            output: Output::Out,
+            bytes: text.as_bytes().to_vec(),
+        }
+    }
+
+    fn err(text: &str) -> Written {
+        Written {
+            output: Output::Err,
+            bytes: text.as_bytes().to_vec(),
+        }
+    }
+
+    async fn all_of(mut following: Following) -> Vec<Written> {
+        let mut read = Vec::new();
+        while let Some(next) = following.recv().await {
+            read.push(next.unwrap());
+        }
+        read
+    }
+
+    #[tokio::test]
+    async fn a_follower_reads_what_a_container_wrote_from_its_first_byte_in_order_and_ends_with_its_exit() {
+        let rt = fake();
+        let id = rt.start(spec("ollama/ollama:0.6", "gpu-0")).await.unwrap().id;
+        rt.write(
+            &id,
+            Output::Out,
+            "loading
+",
+        )
+        .unwrap();
+        let following = rt.follow(&id).await.unwrap();
+        rt.write(
+            &id,
+            Output::Err,
+            "warning
+",
+        )
+        .unwrap();
+        rt.write(
+            &id,
+            Output::Out,
+            "done
+",
+        )
+        .unwrap();
+        rt.exit(&id, 0, "done").unwrap();
+        assert_eq!(
+            all_of(following).await,
+            vec![
+                out("loading
+"),
+                err("warning
+"),
+                out("done
+")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn every_way_a_container_ends_ends_its_followers() {
+        let rt = fake();
+        for end in ["stop", "fail", "oom"] {
+            let id = rt.start(spec("ollama/ollama:0.6", "gpu-0")).await.unwrap().id;
+            let following = rt.follow(&id).await.unwrap();
+            rt.write(&id, Output::Out, end).unwrap();
+            match end {
+                "stop" => rt.stop(&id).await.unwrap(),
+                "fail" => rt.fail(&id, "the engine said no").unwrap(),
+                _ => rt.out_of_memory(&id).unwrap(),
+            }
+            assert_eq!(all_of(following).await, vec![out(end)], "{end} ends the follower");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_container_that_has_ended_is_still_read_whole_and_one_never_started_is_refused() {
+        let rt = fake();
+        let id = rt.start(spec("ollama/ollama:0.6", "gpu-0")).await.unwrap().id;
+        rt.write(&id, Output::Out, "all of it").unwrap();
+        rt.exit(&id, 3, "all of it").unwrap();
+        assert_eq!(all_of(rt.follow(&id).await.unwrap()).await, vec![out("all of it")]);
+        assert!(matches!(
+            rt.write(&id, Output::Out, "late"),
+            Err(RuntimeError::NoSuchContainer(_))
+        ));
+        let never = rt.follow(&ContainerId("fake-99".into())).await.unwrap_err();
+        assert!(matches!(never, RuntimeError::NoSuchContainer(_)));
+    }
+
+    #[tokio::test]
+    async fn two_followers_of_one_container_each_read_all_of_it() {
+        let rt = fake();
+        let id = rt.start(spec("ollama/ollama:0.6", "gpu-0")).await.unwrap().id;
+        let first = rt.follow(&id).await.unwrap();
+        rt.write(&id, Output::Out, "a").unwrap();
+        let second = rt.follow(&id).await.unwrap();
+        rt.write(&id, Output::Err, "b").unwrap();
+        rt.stop(&id).await.unwrap();
+        assert_eq!(all_of(first).await, vec![out("a"), err("b")]);
+        assert_eq!(all_of(second).await, vec![out("a"), err("b")]);
     }
 }
