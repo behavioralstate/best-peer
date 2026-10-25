@@ -53,8 +53,8 @@ pub struct DockerRuntime {
     disks: Option<std::path::PathBuf>,
     /// Whether this peer can mount a disk there; one that cannot makes none, and still clears what is left there.
     mounts: bool,
-    /// Whether the engine runs on this host, so the room for its images can be read here: `DOCKER_HOST` unset or a
-    /// local socket or pipe.
+    /// Whether the engine runs on this host, so the room for its images can be read here: published ports bound to
+    /// loopback, as they are when the peer reaches the engines on this host.
     engine_here: bool,
 }
 
@@ -75,7 +75,7 @@ impl DockerRuntime {
             tx,
             disks: None,
             mounts: false,
-            engine_here: engine_is_here(std::env::var("DOCKER_HOST").ok().as_deref()),
+            engine_here: engine_is_here(bind_ip),
         };
         sweep(&me.docker, &me.exited).await;
         me.follow();
@@ -605,8 +605,8 @@ impl Runtime for DockerRuntime {
     }
 
     /// What the file system holding the engine's root directory, as its `info` names it, has free for anyone, read
-    /// on this host: none when the engine does not say, is reached other than by a local socket or pipe, its root is
-    /// not on this host, or neither the directory nor the mount holding it can be read.
+    /// on this host: none when the engine does not say, is on another host, its root is not on this host, or neither
+    /// the directory nor the mount holding it can be read.
     async fn image_room(&self) -> Option<u64> {
         if !self.engine_here {
             return None;
@@ -988,9 +988,10 @@ fn free_or_why(dir: &std::path::Path) -> std::io::Result<u64> {
     }
 }
 
-/// Whether an engine named by `DOCKER_HOST` runs on this host: unset, empty, or a local socket or named pipe.
-fn engine_is_here(docker_host: Option<&str>) -> bool {
-    docker_host.is_none_or(|h| h.is_empty() || h.starts_with("unix://") || h.starts_with("npipe://"))
+/// Whether the engine runs on this host: its published ports are bound to loopback, which the peer chooses only when
+/// it reaches the engines here, the socket the client connects through saying nothing of where the engine is.
+fn engine_is_here(bind_ip: &str) -> bool {
+    bind_ip.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// The room free on the file system holding `dir`: read at `dir`, or, when a directory above it is closed to this
@@ -1191,13 +1192,12 @@ mod tests {
     }
 
     #[test]
-    fn only_an_engine_on_a_local_socket_or_pipe_is_on_this_host() {
-        assert!(engine_is_here(None));
-        assert!(engine_is_here(Some("")));
-        assert!(engine_is_here(Some("unix:///var/run/docker.sock")));
-        assert!(engine_is_here(Some("npipe:////./pipe/docker_engine")));
-        assert!(!engine_is_here(Some("tcp://10.0.0.5:2376")));
-        assert!(!engine_is_here(Some("ssh://user@host")));
+    fn only_an_engine_whose_ports_are_bound_to_loopback_is_on_this_host() {
+        assert!(engine_is_here("127.0.0.1"));
+        assert!(engine_is_here("::1"));
+        assert!(!engine_is_here("0.0.0.0"));
+        assert!(!engine_is_here("10.0.0.5"));
+        assert!(!engine_is_here("not an address"));
     }
 
     #[cfg(unix)]
