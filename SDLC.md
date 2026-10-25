@@ -37,8 +37,8 @@
 ## 2. Design rules every change is held to
 
 - BEST is the surface: a capability exists only when it has a schema, a catalogue entry and a description an agent
-  can act on; a refusal is a 400 that says what to do; sign-in is the spec's. Nothing is invented before the
-  implementation proves the spec lacks it.
+  can act on; a refusal is a 400 that says what to do; sign-in is the spec's. What the spec does not mention is
+  best-peer's own, documented in the README (section 1).
 - Facts are events; an event is versioned, never mutated; a redelivery is idempotent; nothing is clamped silently.
 - Low-level dependencies sit behind abstractions this workspace owns (`Gpu`, `Runtime`, `Engine`, later
   `Transport`); tests use the fakes, never the dependency; an adapter is thin and is proven on a host by hand, with the
