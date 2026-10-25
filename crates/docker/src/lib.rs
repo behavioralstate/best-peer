@@ -605,8 +605,8 @@ impl Runtime for DockerRuntime {
     }
 
     /// What the file system holding the engine's root directory, as its `info` names it, has free for anyone, read
-    /// on this host: none when the engine does not say, is on another host, or neither the directory nor the mount
-    /// holding it can be read.
+    /// on this host: none when the engine does not say, is reached other than by a local socket or pipe, its root is
+    /// not on this host, or neither the directory nor the mount holding it can be read.
     async fn image_room(&self) -> Option<u64> {
         if !self.engine_here {
             return None;
@@ -972,15 +972,19 @@ fn handed_over(id: &str) -> Result<DeviceRequest, RuntimeError> {
 
 /// The bytes free to an unprivileged writer on the file system holding `dir`. Unix only.
 fn free_at(dir: &std::path::Path) -> Option<u64> {
+    free_or_why(dir).ok()
+}
+
+fn free_or_why(dir: &std::path::Path) -> std::io::Result<u64> {
     #[cfg(unix)]
     {
-        let fs = rustix::fs::statvfs(dir).ok()?;
-        Some(fs.f_bavail.saturating_mul(fs.f_frsize))
+        let fs = rustix::fs::statvfs(dir)?;
+        Ok(fs.f_bavail.saturating_mul(fs.f_frsize))
     }
     #[cfg(not(unix))]
     {
         let _ = dir;
-        None
+        Err(std::io::ErrorKind::Unsupported.into())
     }
 }
 
@@ -989,10 +993,15 @@ fn engine_is_here(docker_host: Option<&str>) -> bool {
     docker_host.is_none_or(|h| h.is_empty() || h.starts_with("unix://") || h.starts_with("npipe://"))
 }
 
-/// The room free on the file system holding `dir`: read at `dir`, or, when `dir` cannot be reached (a directory
-/// above it is closed to this process), at the mount that holds it in `mountinfo`, the text of `/proc/self/mountinfo`.
+/// The room free on the file system holding `dir`: read at `dir`, or, when a directory above it is closed to this
+/// process, at the mount that holds it in `mountinfo`, the text of `/proc/self/mountinfo`; none when `dir` is not
+/// there, as an engine's root in a virtual machine is not.
 fn room_at(dir: &std::path::Path, mountinfo: &str) -> Option<u64> {
-    free_at(dir).or_else(|| free_at(&mount_holding(dir, mountinfo)?))
+    match free_or_why(dir) {
+        Ok(free) => Some(free),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => free_at(&mount_holding(dir, mountinfo)?),
+        Err(_) => None,
+    }
 }
 
 /// The mount point in `mountinfo` that holds `path`: the longest one `path` lies under, whole names compared; none
@@ -1215,6 +1224,12 @@ mod tests {
         if closed_to_us {
             assert_eq!(unreachable, None);
         }
+    }
+
+    #[test]
+    fn a_root_directory_not_on_this_host_has_no_room_here_whatever_the_mount_table_holds() {
+        let missing = std::path::Path::new("/no/such/directory/anywhere");
+        assert_eq!(room_at(missing, &mountinfo(&["/"])), None);
     }
 
     #[test]
