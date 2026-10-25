@@ -764,5 +764,5 @@ only those, and a device that offers the CPU alone, or a host with no accelerato
 still be placed on the CPU device, within its share. In a workspace the rule holds for the cloud's devices, and a
 member's owner who approved the cloud with `--accelerators-only` holds every tenant of the cloud to that member's
 accelerators. Another sign-in is another holder, as the spec has it: what a key that expired or was
-replaced left running is the owner's to end with a key approved for all. The spec has no per-command scope field
-yet, so the requirement is in the description text; that is an entry on the spec follow-ups.
+replaced left running is the owner's to end with a key approved for all. The spec has no per-command scope field,
+so the requirement is in the description text: it is best-peer's own.

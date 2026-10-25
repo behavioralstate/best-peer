@@ -23,7 +23,10 @@ before changing anything, and keep it the current rule when a change moves the p
   The local gate then runs on the head that is pushed. Nothing is pushed until both are done.
 - A contributor without write access sends a pull request from a fork; `/best-review <number>` reviews it the same
   way and posts the findings there. A maintainer merges it once they are answered, the local gate is green on what would land, its head squashed onto `main` (run only after its diff has been read, since it runs the contributor's code) and CI is green.
-- A behaviour the spec does not ask for is an entry on the spec follow-ups issue, behavioralstate/spec#37, before it
-  is code. An adapter is proven on a host by hand, with the proof on the slice's issue.
+- The BEST spec is stable (behavioralstate/spec#37 holds the rule). A behaviour the spec does not mention is
+  best-peer's own, documented in the README: never an entry on #37, a spec issue or a spec pull request, and never a
+  review finding. Only the owner changes the spec, on proof that two independent implementations read the same
+  sentence differently and a client failed; a session that believes it holds that proof brings it to the owner in
+  the chat and stops. An adapter is proven on a host by hand, with the proof on the slice's issue.
 - The README's "Try it on your machine" and Run sections move in the same commit as the variable, the check at start,
   the command or the sign-in they describe.

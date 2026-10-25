@@ -41,9 +41,9 @@ never from the working tree.
 Then, for every file the diff touches, read the surrounding code (the whole function or module, not only the hunk)
 and the tests that cover it. Read `SDLC.md` section 2, the design rules every change is held to, and the README
 sections the change moves. If a commit message or the pull request body links an issue, read it with `gh issue view <n> --repo
-<owner/repo>`: its decisions and its "Done when" list are part of the review. A change that adds a behaviour the spec
-does not ask for must name its entry on the spec follow-ups issue (behavioralstate/spec#37); one that does not is a
-finding.
+<owner/repo>`: its decisions and its "Done when" list are part of the review. A behaviour the spec does not mention is
+best-peer's own (behavioralstate/spec#37 holds the rule): one the README does not describe is a finding, and one with
+no entry on #37 or no spec change never is.
 
 If the arguments include findings already reported on this change (a previous run), do not report them again;
 report only what is new since, or what the fix for a previous finding broke.

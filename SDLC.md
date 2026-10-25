@@ -1,14 +1,18 @@
 # How best-peer is built and shipped
 
 > This is the one place the lifecycle of this repository is written down. Open work of any kind (a slice, a bug, a
-> decision, a spec gap) is an issue on the Behavioralstate board, never a file: the epic
+> decision) is an issue on the Behavioralstate board, never a file: the epic
 > [behavioralstate/spec#27](https://github.com/behavioralstate/spec/issues/27) and its sub-issues are the plan.
 
 ## 1. Intake
 
 - Work is a slice of the epic, or an issue filed next to it on the same board, with the problem, the outcome from the
-  agent's side, numbered decisions, and a "Done when" list. A spec gap met while implementing is an entry on the
-  spec follow-ups issue, never a silent patch and never a spec change up front.
+  agent's side, numbered decisions, and a "Done when" list.
+- **The BEST spec is stable** ([behavioralstate/spec#37](https://github.com/behavioralstate/spec/issues/37) holds the
+  rule). A behaviour the spec does not mention is best-peer's own, documented in its README: never an entry on #37, a
+  spec issue or a spec pull request. Only the owner changes the spec, on proof that two independent implementations
+  read the same sentence differently and a client failed; a session that believes it holds that proof brings it to
+  the owner in the chat and stops.
 - Ambiguity is resolved by reading the spec and the running code, never by guessing.
 - The board's Status says where each issue is:
   - **Backlog** until its first change.
@@ -104,8 +108,8 @@
 
 - **A maintainer works as the owner does**: on `main`, with write access, the two gates before every push. One change
   per need the implementation proved, held to sections 2, 3 and 4 as any change is. Its commit names the spec text it
-  satisfies or the entry it adds to the spec follow-ups issue; a behaviour the spec does not ask for is that entry
-  first, so the spec and every implementation of it move together, and never a surface of this implementation alone.
+  satisfies or the issue it serves; a behaviour the spec does not mention is best-peer's own, in the README in the
+  same commit, and never a change to the spec (section 1).
 - **A contributor without write access sends a pull request from a fork**, held to the same sections. A maintainer
   runs `/best-review <number>` on it, which runs the `best-reviewer` skill the same way, posts the findings on the pull
   request and leaves them for the contributor to answer; once the findings are answered and the maintainer has read

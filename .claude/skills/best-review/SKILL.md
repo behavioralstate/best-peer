@@ -48,9 +48,9 @@ For every finding, in order:
 1. **Verify** it against the code yourself. A finding you cannot reproduce from the code is set aside, with the
    reason, not fixed.
 2. **Fix** a real defect on `main`: a test on the fakes that fails without the fix where one applies, then the fix,
-   matching the surrounding code and comments. A finding that reveals a design error, or a behaviour the spec does not
-   ask for with no entry on the spec follow-ups issue, is not patched: say so in the chat and stop before the push;
-   that goes back to the issue first.
+   matching the surrounding code and comments. A finding that reveals a design error is not patched: say so in the chat
+   and stop before the push; that goes back to the issue first. A behaviour the spec does not mention is best-peer's
+   own, in the README, never a reason to change the spec (behavioralstate/spec#37 holds the rule).
 3. **The local gate** after the fixes, as SDLC.md section 4 gate 1 asks: `scripts/gate.sh all` (`pwsh scripts/gate.ps1
    all` on Windows) must end in `GATE GREEN`. A red gate is reported as red, with the step that failed.
 4. **Commit** once for all the fixes (or once per finding when they are unrelated), the subject one plain sentence
