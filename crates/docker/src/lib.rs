@@ -11,7 +11,8 @@
 //! not heard (the peer was down, or the event feed broke) is removed by a sweep, every minute and after the feed
 //! reconnects, once this adapter has seen it exited for a minute, so a peer that shares the engine has read its own
 //! first. A container goes with its anonymous volumes, as the engine's own removal on exit took them. An image is
-//! removed by the reference it was pulled as, never forced, and the room for images is read from the engine's root
+//! removed by the reference it was pulled as, never forced, a pull may be bounded by the sizes of the layers it
+//! downloads, and the room for images is read from the engine's root
 //! directory on this host. Thin; proven on a host by hand. Only the share of a pull, which is arithmetic over what the engine
 //! reports, is unit-tested.
 
@@ -289,6 +290,12 @@ impl Layers {
         }
     }
 
+    /// The bytes the pull downloads, as far as the engine has said: every layer's size once it is said. A layer the
+    /// engine already holds says none and counts nothing.
+    fn downloads(&self) -> u64 {
+        self.of.values().map(|(size, _, _)| (*size).max(0) as u64).sum()
+    }
+
     /// The share done, in percent, once any layer has said its size.
     fn share(&self) -> Option<u8> {
         let (done, whole) = self
@@ -341,6 +348,17 @@ fn run(program: &str, args: &[&str]) -> Result<(), RuntimeError> {
 #[async_trait]
 impl Runtime for DockerRuntime {
     async fn pull(&self, image: &ImageRef, progress: Progress) -> Result<(), RuntimeError> {
+        self.pull_bounded(image, progress, None).await
+    }
+
+    /// Gives the pull up as soon as the layers' sizes the engine has said pass `most_bytes`: the stream is dropped,
+    /// which ends the engine's pull, and the caller removes what it kept.
+    async fn pull_bounded(
+        &self,
+        image: &ImageRef,
+        progress: Progress,
+        most_bytes: Option<u64>,
+    ) -> Result<(), RuntimeError> {
         let (name, tag) = name_and_tag(image);
         let mut options = CreateImageOptionsBuilder::new().from_image(&name);
         if let Some(tag) = &tag {
@@ -357,6 +375,9 @@ impl Runtime for DockerRuntime {
             if let Some(layer) = info.id {
                 let (current, total) = info.progress_detail.map(|p| (p.current, p.total)).unwrap_or_default();
                 layers.report(&layer, info.status.as_deref().unwrap_or_default(), current, total);
+                if most_bytes.is_some_and(|most| layers.downloads() > most) {
+                    return Err(RuntimeError::TooLarge(image.0.clone()));
+                }
             }
             let pct = layers.share();
             if pct.is_some() && pct != last {
@@ -1100,6 +1121,18 @@ mod tests {
         assert!(e.since.is_empty());
         // Seen again later, a container is counted from then.
         assert!(e.due(&ids(&["b"]), t0 + Duration::from_secs(130)).is_empty());
+    }
+
+    #[test]
+    fn what_a_pull_downloads_is_its_layers_sizes_as_they_appear_and_nothing_for_a_layer_held() {
+        let mut l = Layers::default();
+        l.report("held", "Already exists", None, None);
+        assert_eq!(l.downloads(), 0);
+        l.report("a", "Downloading", Some(10), Some(300));
+        assert_eq!(l.downloads(), 300, "a layer's whole size as soon as it is said");
+        l.report("b", "Downloading", Some(0), Some(700));
+        l.report("a", "Extracting", Some(300), Some(300));
+        assert_eq!(l.downloads(), 1000, "extraction counts nothing more");
     }
 
     #[test]

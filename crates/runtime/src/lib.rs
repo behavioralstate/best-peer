@@ -177,6 +177,9 @@ pub enum RuntimeError {
     Unreachable(String),
     #[error("the engine failed: {0}")]
     Engine(String),
+    /// A pull would download more than its caller allows; nothing of it is kept.
+    #[error("image larger than allowed: {0}")]
+    TooLarge(String),
     /// A job's disk could not be made, or this runtime makes none: the words say which.
     #[error("{0}")]
     NoDisk(String),
@@ -242,6 +245,22 @@ impl Isolation {
 pub trait Runtime: Send + Sync {
     /// Makes the image present, telling `progress` as it goes: from the registry, whether or not it is held.
     async fn pull(&self, image: &ImageRef, progress: Progress) -> Result<(), RuntimeError>;
+    /// [`Runtime::pull`], given up with [`RuntimeError::TooLarge`] once what it downloads would pass `most_bytes`,
+    /// the layers' sizes counted as the engine says them; none for no bound. Layers the engine already holds count for
+    /// nothing. A runtime that cannot count what a pull downloads refuses a bound rather than ignore it.
+    async fn pull_bounded(
+        &self,
+        image: &ImageRef,
+        progress: Progress,
+        most_bytes: Option<u64>,
+    ) -> Result<(), RuntimeError> {
+        match most_bytes {
+            None => self.pull(image, progress).await,
+            Some(_) => Err(RuntimeError::Engine(
+                "this runtime cannot count what a pull downloads, so it takes no bound on it".into(),
+            )),
+        }
+    }
     /// Whether the engine holds the image now, so starting it needs no registry. An error is the engine's, never
     /// "not held". An engine that cannot tell says no, and every image is pulled.
     async fn holds(&self, _image: &ImageRef) -> Result<bool, RuntimeError> {
@@ -337,6 +356,8 @@ pub struct Fake {
     pulled: Mutex<Vec<ImageRef>>,
     /// Every image a removal was asked for, in order.
     removed: Mutex<Vec<ImageRef>>,
+    /// What a pull of an image downloads, where a test sets it; nothing for one it holds.
+    sizes: Mutex<HashMap<ImageRef, u64>>,
     /// The room it says it has for images, as a test sets it; `None` for an engine that cannot tell.
     image_room: Mutex<Option<u64>>,
     devices: Vec<DeviceId>,
@@ -380,6 +401,7 @@ impl Fake {
             containers: Mutex::new(BTreeMap::new()),
             pulled: Mutex::new(Vec::new()),
             removed: Mutex::new(Vec::new()),
+            sizes: Mutex::new(HashMap::new()),
             image_room: Mutex::new(Some(1 << 40)),
             devices,
             next: Mutex::new(0),
@@ -449,6 +471,11 @@ impl Fake {
     /// Every image a removal was asked for, in order.
     pub fn removed(&self) -> Vec<ImageRef> {
         self.removed.lock().unwrap().clone()
+    }
+
+    /// A pull of `image`, while the engine does not hold it, downloads `bytes`.
+    pub fn sized(&self, image: ImageRef, bytes: u64) {
+        self.sizes.lock().unwrap().insert(image, bytes);
     }
 
     /// Sets the room it says it has for images from now on, or `None` for an engine that cannot tell.
@@ -564,6 +591,15 @@ fn uuid_like() -> String {
 #[async_trait]
 impl Runtime for Fake {
     async fn pull(&self, image: &ImageRef, progress: Progress) -> Result<(), RuntimeError> {
+        self.pull_bounded(image, progress, None).await
+    }
+
+    async fn pull_bounded(
+        &self,
+        image: &ImageRef,
+        progress: Progress,
+        most_bytes: Option<u64>,
+    ) -> Result<(), RuntimeError> {
         self.pulled.lock().unwrap().push(image.clone());
         let gate = self.gate.lock().unwrap().clone();
         if let Some(gate) = gate {
@@ -573,6 +609,13 @@ impl Runtime for Fake {
         }
         if !self.open_registry && !self.registry.lock().unwrap().contains(image) {
             return Err(RuntimeError::ImageNotFound(image.0.clone()));
+        }
+        let held = self.local.lock().unwrap().contains(image);
+        let downloads = self.sizes.lock().unwrap().get(image).copied().filter(|_| !held);
+        if let (Some(bytes), Some(most)) = (downloads, most_bytes) {
+            if bytes > most {
+                return Err(RuntimeError::TooLarge(image.0.clone()));
+            }
         }
         for &step in &self.steps {
             progress(step);
@@ -916,6 +959,37 @@ mod tests {
             vec![image.clone(), image.clone(), image],
             "every removal asked for"
         );
+    }
+
+    #[tokio::test]
+    async fn a_pull_that_would_download_more_than_its_bound_is_refused_and_leaves_nothing_held() {
+        let rt = Fake::new(vec!["gpu-0".into()], vec![ImageRef("ollama/ollama:0.6".into())]).with_open_registry();
+        let big = ImageRef("vllm/vllm-openai:v0.8".into());
+        rt.sized(big.clone(), 20 << 30);
+        let err = rt
+            .pull_bounded(&big, Arc::new(|_| {}), Some(10 << 30))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::TooLarge(ref i) if i == "vllm/vllm-openai:v0.8"));
+        assert!(!rt.holds(&big).await.unwrap(), "nothing of it is kept");
+        rt.pull_bounded(&big, Arc::new(|_| {}), Some(20 << 30)).await.unwrap();
+        assert!(rt.holds(&big).await.unwrap());
+        rt.pull_bounded(&big, Arc::new(|_| {}), Some(1)).await.unwrap();
+        let held = ImageRef("ollama/ollama:0.6".into());
+        rt.sized(held.clone(), 20 << 30);
+        rt.pull_bounded(&held, Arc::new(|_| {}), Some(1)).await.unwrap();
+        let other = ImageRef("nobody/else:1".into());
+        rt.sized(other.clone(), 20 << 30);
+        rt.pull_bounded(&other, Arc::new(|_| {}), None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_runtime_that_cannot_bound_a_pull_refuses_one_with_a_bound() {
+        let err = NoNames
+            .pull_bounded(&ImageRef("x".into()), Arc::new(|_| {}), Some(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::Engine(_)));
     }
 
     #[tokio::test]

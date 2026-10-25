@@ -3257,6 +3257,7 @@ fn fix_for_runtime(e: &RuntimeError) -> &'static str {
             "a job with inputs or outputs needs a disk of its own on the machine: order it with less disk_bytes, or where the cloud says there is room"
         }
         RuntimeError::NoName(_) => "this runtime does not find a container by name: keep the id that start answered",
+        RuntimeError::TooLarge(_) => "the image is larger than this peer pulls: order a smaller one",
     }
 }
 
