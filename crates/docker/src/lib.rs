@@ -614,14 +614,9 @@ impl Runtime for DockerRuntime {
         let root = self.docker.info().await.ok()?.docker_root_dir?;
         tokio::task::spawn_blocking(move || {
             let mounts = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
-            let room = room_at(std::path::Path::new(&root), &mounts);
-            if room.is_none() {
-                tracing::warn!(
-                    root = %root,
-                    "neither the engine's root directory nor the mount holding it can be read: the room for images is not known"
-                );
-            }
-            room
+            room_at(std::path::Path::new(&root), &mounts)
+                .inspect_err(|why| tracing::warn!(root = %root, "the room for images is not known: {why}"))
+                .ok()
         })
         .await
         .ok()?
@@ -970,11 +965,7 @@ fn handed_over(id: &str) -> Result<DeviceRequest, RuntimeError> {
     })
 }
 
-/// The bytes free to an unprivileged writer on the file system holding `dir`. Unix only.
-fn free_at(dir: &std::path::Path) -> Option<u64> {
-    free_or_why(dir).ok()
-}
-
+/// The bytes free to an unprivileged writer on the file system holding `dir`, or why they cannot be read. Unix only.
 fn free_or_why(dir: &std::path::Path) -> std::io::Result<u64> {
     #[cfg(unix)]
     {
@@ -995,15 +986,22 @@ fn engine_is_here(bind_ip: &str) -> bool {
 }
 
 /// The room free on the file system holding `dir`: read at `dir`, or, when a directory above it is closed to this
-/// process, at the mount that holds it in `mountinfo`, the text of `/proc/self/mountinfo`; none when `dir` is not
-/// there, as an engine's root in a virtual machine is not.
-fn room_at(dir: &std::path::Path, mountinfo: &str) -> Option<u64> {
+/// process, at the mount that holds it in `mountinfo`, the text of `/proc/self/mountinfo`; why not when `dir` is not
+/// there, as an engine's root in a virtual machine is not, or neither it nor that mount can be read.
+fn room_at(dir: &std::path::Path, mountinfo: &str) -> Result<u64, String> {
     match free_or_why(dir) {
-        Ok(free) => Some(free),
+        Ok(free) => Ok(free),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            free_at(&mount_holding(&real_as_far_as_reached(dir), mountinfo)?)
+            let mount = mount_holding(&real_as_far_as_reached(dir), mountinfo)
+                .ok_or("the engine's root directory is closed to this peer and no mount in the table holds it")?;
+            free_or_why(&mount).map_err(|e| {
+                format!(
+                    "the engine's root directory is closed to this peer and the mount holding it, {}, cannot be read: {e}",
+                    mount.display()
+                )
+            })
         }
-        Err(_) => None,
+        Err(e) => Err(format!("the engine's root directory cannot be read on this host: {e}")),
     }
 }
 
@@ -1160,8 +1158,11 @@ mod tests {
 
     #[test]
     fn the_room_free_is_read_from_the_file_system_holding_a_directory_and_none_where_there_is_none() {
-        assert!(free_at(&std::env::temp_dir()).is_some_and(|free| free > 0));
-        assert_eq!(free_at(std::path::Path::new("/no/such/directory/anywhere")), None);
+        assert!(free_or_why(&std::env::temp_dir()).ok().is_some_and(|free| free > 0));
+        assert_eq!(
+            free_or_why(std::path::Path::new("/no/such/directory/anywhere")).ok(),
+            None
+        );
     }
 
     fn mountinfo(points: &[&str]) -> String {
@@ -1222,11 +1223,12 @@ mod tests {
         let inner = base.join("closed").join("root");
         std::fs::create_dir_all(&inner).unwrap();
         std::fs::set_permissions(base.join("closed"), std::fs::Permissions::from_mode(0o600)).unwrap();
-        let closed_to_us = free_at(&inner).is_none();
+        let closed_to_us = free_or_why(&inner).ok().is_none();
         let table = mountinfo(&["/", base.to_str().unwrap()]);
-        let room = room_at(&inner, &table);
-        let open = free_at(&base);
+        let room = room_at(&inner, &table).ok();
+        let open = free_or_why(&base).ok();
         let unreachable = room_at(&inner.join("deeper"), &mountinfo(&["/", inner.to_str().unwrap()]));
+        let unmounted = room_at(&inner, "");
         std::fs::set_permissions(base.join("closed"), std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::remove_dir_all(&base).unwrap();
         let (room, open) = (room.unwrap(), open.unwrap());
@@ -1235,7 +1237,8 @@ mod tests {
             "{room} read under the closed directory, {open} at its mount"
         );
         if closed_to_us {
-            assert_eq!(unreachable, None);
+            assert!(unreachable.unwrap_err().contains("the mount holding it"));
+            assert!(unmounted.unwrap_err().contains("no mount in the table holds it"));
         }
     }
 
@@ -1251,8 +1254,8 @@ mod tests {
         let through_link = base.join("link").join("closed").join("root");
         let resolved = real_as_far_as_reached(&through_link);
         let real_mount = std::fs::canonicalize(&real).unwrap();
-        let room = room_at(&through_link, &mountinfo(&[real_mount.to_str().unwrap()]));
-        let closed_to_us = free_at(&through_link).is_none();
+        let room = room_at(&through_link, &mountinfo(&[real_mount.to_str().unwrap()])).ok();
+        let closed_to_us = free_or_why(&through_link).ok().is_none();
         std::fs::set_permissions(real.join("closed"), std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::remove_dir_all(&base).unwrap();
         assert_eq!(resolved, real_mount.join("closed").join("root"));
@@ -1264,7 +1267,9 @@ mod tests {
     #[test]
     fn a_root_directory_not_on_this_host_has_no_room_here_whatever_the_mount_table_holds() {
         let missing = std::path::Path::new("/no/such/directory/anywhere");
-        assert_eq!(room_at(missing, &mountinfo(&["/"])), None);
+        assert!(room_at(missing, &mountinfo(&["/"]))
+            .unwrap_err()
+            .contains("cannot be read on this host"));
     }
 
     #[test]
