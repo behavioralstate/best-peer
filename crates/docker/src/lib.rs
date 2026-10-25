@@ -863,9 +863,17 @@ impl Runtime for DockerRuntime {
         let options = LogsOptionsBuilder::new().follow(true).stdout(true).stderr(true).build();
         let mut logs = self.docker.logs(&id.0, Some(options));
         let (tx, rx) = tokio::sync::mpsc::channel(FOLLOWED);
+        let gone = id.0.clone();
         tokio::spawn(async move {
             let _follower = follower;
-            while let Some(next) = logs.next().await {
+            loop {
+                // A caller that drops what it follows ends this at once, even while the container writes nothing,
+                // so no abandoned follower holds the engine's feed or the container's removal.
+                let next = tokio::select! {
+                    next = logs.next() => next,
+                    _ = tx.closed() => break,
+                };
+                let Some(next) = next else { break };
                 let read = match next {
                     Ok(LogOutput::StdOut { message }) | Ok(LogOutput::Console { message }) => Ok(Written {
                         output: Output::Out,
@@ -876,6 +884,10 @@ impl Runtime for DockerRuntime {
                         bytes: message.to_vec(),
                     }),
                     Ok(LogOutput::StdIn { .. }) => continue,
+                    // Removed between the look and the feed: gone, as the look itself would have said.
+                    Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => {
+                        Err(RuntimeError::NoSuchContainer(gone.clone()))
+                    }
                     Err(e) => Err(RuntimeError::Engine(format!(
                         "the engine stopped telling what the container writes: {e}"
                     ))),

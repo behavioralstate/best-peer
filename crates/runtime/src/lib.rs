@@ -633,7 +633,15 @@ impl Fake {
             bytes: text.as_bytes().to_vec(),
         };
         writing.chunks.push(chunk.clone());
-        writing.followers.retain(|f| f.try_send(Ok(chunk.clone())).is_ok());
+        // A follower that was dropped is let go; one that fell behind is a test writing more than the fake holds,
+        // said aloud, never a quiet end that looks like the container's.
+        writing.followers.retain(|f| match f.try_send(Ok(chunk.clone())) {
+            Ok(()) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                panic!("a follower of the fake fell {FAKE_FOLLOWED} chunks behind")
+            }
+        });
         Ok(())
     }
 
@@ -795,6 +803,12 @@ impl Runtime for Fake {
         let writing = written
             .get_mut(id)
             .ok_or_else(|| RuntimeError::NoSuchContainer(id.0.clone()))?;
+        // The fake never removes a container, so one that has ended is followed as an engine follows one exited and
+        // not yet removed: all it wrote, then the end.
+        assert!(
+            writing.chunks.len() < FAKE_FOLLOWED,
+            "the fake holds {FAKE_FOLLOWED} chunks for a follower"
+        );
         let (tx, rx) = tokio::sync::mpsc::channel(FAKE_FOLLOWED);
         for chunk in &writing.chunks {
             let _ = tx.try_send(Ok(chunk.clone()));

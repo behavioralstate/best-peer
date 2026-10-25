@@ -1,6 +1,6 @@
 [package]
 name = "best-peer-runtime"
-description = "The container runtime abstraction best-peer owns: pull, start, stop, observe, with a fake for tests. Adapters (Docker/containerd via bollard, ...) are separate crates and are never unit-tested."
+description = "The container runtime abstraction best-peer owns: pull, start, stop, observe, follow what a container writes, with a fake for tests. Adapters (Docker/containerd via bollard, ...) are separate crates and are never unit-tested."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
