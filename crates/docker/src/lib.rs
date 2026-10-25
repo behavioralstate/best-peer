@@ -12,10 +12,11 @@
 //! reconnects, once this adapter has seen it exited for a minute, so a peer that shares the engine has read its own
 //! first. A container goes with its anonymous volumes, as the engine's own removal on exit took them. An image is
 //! removed by the reference it was pulled as, never forced, a pull may be bounded by the sizes of the layers it
-//! downloads, and the room for images is read from the engine's root
-//! directory on this host. Thin; proven on a host by hand. What needs no engine is unit-tested: the share and the bytes
+//! downloads, and the room for images is read from the file system holding the engine's root directory on this host,
+//! found in the mount table when the directory itself cannot be reached, as an engine with user namespaces remapped
+//! keeps it; none when the engine is on another host. Thin; proven on a host by hand. What needs no engine is unit-tested: the share and the bytes
 //! of a pull over what the engine reports, the host config a confinement becomes, a container's environment, the
-//! profiles named from the engine's options, and the room free at a directory.
+//! profiles named from the engine's options, the room free at a directory, and the mount holding it.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -52,6 +53,9 @@ pub struct DockerRuntime {
     disks: Option<std::path::PathBuf>,
     /// Whether this peer can mount a disk there; one that cannot makes none, and still clears what is left there.
     mounts: bool,
+    /// Whether the engine runs on this host, so the room for its images can be read here: `DOCKER_HOST` unset or a
+    /// local socket or pipe.
+    engine_here: bool,
 }
 
 impl DockerRuntime {
@@ -71,6 +75,7 @@ impl DockerRuntime {
             tx,
             disks: None,
             mounts: false,
+            engine_here: engine_is_here(std::env::var("DOCKER_HOST").ok().as_deref()),
         };
         sweep(&me.docker, &me.exited).await;
         me.follow();
@@ -599,13 +604,27 @@ impl Runtime for DockerRuntime {
         }
     }
 
-    /// What the file system of the engine's root directory, as its `info` names it, has free for anyone, read on this
-    /// host: none when the engine does not say, or the engine is on another host and the directory is not here.
+    /// What the file system holding the engine's root directory, as its `info` names it, has free for anyone, read
+    /// on this host: none when the engine does not say, is on another host, or neither the directory nor the mount
+    /// holding it can be read.
     async fn image_room(&self) -> Option<u64> {
+        if !self.engine_here {
+            return None;
+        }
         let root = self.docker.info().await.ok()?.docker_root_dir?;
-        tokio::task::spawn_blocking(move || free_at(std::path::Path::new(&root)))
-            .await
-            .ok()?
+        tokio::task::spawn_blocking(move || {
+            let mounts = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+            let room = room_at(std::path::Path::new(&root), &mounts);
+            if room.is_none() {
+                tracing::warn!(
+                    root = %root,
+                    "neither the engine's root directory nor the mount holding it can be read: the room for images is not known"
+                );
+            }
+            room
+        })
+        .await
+        .ok()?
     }
 
     async fn start(&self, spec: Spec) -> Result<Started, RuntimeError> {
@@ -965,6 +984,64 @@ fn free_at(dir: &std::path::Path) -> Option<u64> {
     }
 }
 
+/// Whether an engine named by `DOCKER_HOST` runs on this host: unset, empty, or a local socket or named pipe.
+fn engine_is_here(docker_host: Option<&str>) -> bool {
+    docker_host.is_none_or(|h| h.is_empty() || h.starts_with("unix://") || h.starts_with("npipe://"))
+}
+
+/// The room free on the file system holding `dir`: read at `dir`, or, when `dir` cannot be reached (a directory
+/// above it is closed to this process), at the mount that holds it in `mountinfo`, the text of `/proc/self/mountinfo`.
+fn room_at(dir: &std::path::Path, mountinfo: &str) -> Option<u64> {
+    free_at(dir).or_else(|| free_at(&mount_holding(dir, mountinfo)?))
+}
+
+/// The mount point in `mountinfo` that holds `path`: the longest one `path` lies under, whole names compared; none
+/// when no mount holds it. Where two mounts share a point, the file system read there is the one mounted last.
+fn mount_holding(path: &std::path::Path, mountinfo: &str) -> Option<std::path::PathBuf> {
+    mountinfo
+        .lines()
+        .filter_map(|line| line.split(' ').nth(4).map(unescaped))
+        .filter(|mount| path.starts_with(mount))
+        .fold(None, |held: Option<std::path::PathBuf>, mount| match held {
+            Some(h) if h.components().count() > mount.components().count() => Some(h),
+            _ => Some(mount),
+        })
+}
+
+/// A path as the mount table writes it, with a space, a tab, a newline or a backslash as an octal escape (`\040`).
+fn unescaped(field: &str) -> std::path::PathBuf {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let octal = bytes
+            .get(i + 1..i + 4)
+            .filter(|d| bytes[i] == b'\\' && d.iter().all(|b| (b'0'..=b'7').contains(b)));
+        match octal.and_then(|d| u8::from_str_radix(std::str::from_utf8(d).ok()?, 8).ok()) {
+            Some(b) => {
+                out.push(b);
+                i += 4;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    path_of(out)
+}
+
+#[cfg(unix)]
+fn path_of(bytes: Vec<u8>) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    std::ffi::OsString::from_vec(bytes).into()
+}
+
+#[cfg(not(unix))]
+fn path_of(bytes: Vec<u8>) -> std::path::PathBuf {
+    String::from_utf8_lossy(&bytes).into_owned().into()
+}
+
 /// The room for disks in what `df --output=avail,size` answered: what is free and the size, each less what is kept
 /// free, so the size is the largest disk that could ever be made there.
 fn room_in(df: &str) -> Option<(u64, u64)> {
@@ -1062,6 +1139,82 @@ mod tests {
     fn the_room_free_is_read_from_the_file_system_holding_a_directory_and_none_where_there_is_none() {
         assert!(free_at(&std::env::temp_dir()).is_some_and(|free| free > 0));
         assert_eq!(free_at(std::path::Path::new("/no/such/directory/anywhere")), None);
+    }
+
+    fn mountinfo(points: &[&str]) -> String {
+        points
+            .iter()
+            .enumerate()
+            .map(|(i, p)| format!("{} 1 8:2 / {p} rw,relatime shared:1 - ext4 /dev/sda2 rw\n", 20 + i))
+            .collect()
+    }
+
+    #[test]
+    fn the_mount_holding_a_path_is_the_longest_it_lies_under_by_whole_names() {
+        let p = std::path::Path::new;
+        let table = mountinfo(&["/", "/var", "/var/lib/docker", "/home"]);
+        assert_eq!(
+            mount_holding(p("/var/lib/docker/100000.100000"), &table),
+            Some(p("/var/lib/docker").into())
+        );
+        assert_eq!(
+            mount_holding(p("/var/lib/docker"), &table),
+            Some(p("/var/lib/docker").into())
+        );
+        assert_eq!(mount_holding(p("/var/lib/docker2/x"), &table), Some(p("/var").into()));
+        assert_eq!(mount_holding(p("/srv/x"), &table), Some(p("/").into()));
+        assert_eq!(mount_holding(p("relative/x"), &table), None);
+        assert_eq!(mount_holding(p("/var/x"), ""), None);
+    }
+
+    #[test]
+    fn a_mount_point_with_an_escaped_space_tab_newline_or_backslash_is_read_as_its_name() {
+        let p = std::path::Path::new;
+        assert_eq!(unescaped(r"/mnt/my\040disk"), p("/mnt/my disk"));
+        assert_eq!(unescaped(r"/a\011b\012c\134d"), p("/a\tb\nc\\d"));
+        assert_eq!(unescaped(r"/plain\0"), p(r"/plain\0"));
+        assert_eq!(unescaped(r"/not\089"), p(r"/not\089"));
+        let table = mountinfo(&["/", r"/mnt/my\040disk"]);
+        assert_eq!(
+            mount_holding(p("/mnt/my disk/images"), &table),
+            Some(p("/mnt/my disk").into())
+        );
+    }
+
+    #[test]
+    fn only_an_engine_on_a_local_socket_or_pipe_is_on_this_host() {
+        assert!(engine_is_here(None));
+        assert!(engine_is_here(Some("")));
+        assert!(engine_is_here(Some("unix:///var/run/docker.sock")));
+        assert!(engine_is_here(Some("npipe:////./pipe/docker_engine")));
+        assert!(!engine_is_here(Some("tcp://10.0.0.5:2376")));
+        assert!(!engine_is_here(Some("ssh://user@host")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_room_under_a_directory_closed_to_this_process_is_read_at_the_mount_holding_it_and_none_when_that_is_closed_too(
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("best-peer-room-{}", std::process::id()));
+        let inner = base.join("closed").join("root");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::set_permissions(base.join("closed"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        let closed_to_us = free_at(&inner).is_none();
+        let table = mountinfo(&["/", base.to_str().unwrap()]);
+        let room = room_at(&inner, &table);
+        let open = free_at(&base);
+        let unreachable = room_at(&inner.join("deeper"), &mountinfo(&["/", inner.to_str().unwrap()]));
+        std::fs::set_permissions(base.join("closed"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
+        let (room, open) = (room.unwrap(), open.unwrap());
+        assert!(
+            room.abs_diff(open) < 1 << 30,
+            "{room} read under the closed directory, {open} at its mount"
+        );
+        if closed_to_us {
+            assert_eq!(unreachable, None);
+        }
     }
 
     #[test]
