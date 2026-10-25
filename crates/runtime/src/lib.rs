@@ -177,7 +177,8 @@ pub enum RuntimeError {
     Unreachable(String),
     #[error("the engine failed: {0}")]
     Engine(String),
-    /// A pull would download more than its caller allows; nothing of it is kept.
+    /// A pull would download more than its caller allows; what it downloaded is the engine's own to release, and no
+    /// image is made for it.
     #[error("image larger than allowed: {0}")]
     TooLarge(String),
     /// A job's disk could not be made, or this runtime makes none: the words say which.

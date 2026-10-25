@@ -115,8 +115,8 @@ decides who is in, as with SSH keys, and what they may do: approved with nothing
 `--may deploy,prompt --memory 40G` makes one that may deploy models and prompt them but run no job, and hold 40 GiB
 of device memory at most across its workloads, which it alone sees, prompts and ends. `--deployments 2 --jobs 2` lets it
 run two of each at once at most; a key may own 8 workspaces when not said, and `--workspaces N` sets how many. A key
-with a share runs its jobs in a closed box (no network, a ceiling on host
-memory) unless you add `--open-jobs`. `--expires 8h` ends the key after eight hours, so access lent for an afternoon
+with a share runs its jobs in a closed box (no network, a read-only filesystem, ceilings on host memory, cores,
+tasks and open files) unless you add `--open-jobs`. `--expires 8h` ends the key after eight hours, so access lent for an afternoon
 ends without anyone remembering to take it back. To take a key back sooner, at your machine:
 
 ```bash

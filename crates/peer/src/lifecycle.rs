@@ -58,10 +58,12 @@ impl Images {
 }
 
 /// How the containers are confined, as the operator set it. A job of a credential with a share runs code from a
-/// tenant, so it gets the closed box: no network, no capabilities and a read-only filesystem, under ceilings on
-/// host memory and tasks the operator sets (`BEST_PEER_JOB_MEMORY`, `BEST_PEER_JOB_PIDS`). Any other job, the
-/// owner's or one whose credential was approved with `--open-jobs`, keeps the network, a writable filesystem and the
-/// host's memory, under the same capability and privilege rules and the same task ceiling. An engine is confined as
+/// tenant, so it gets the closed box: no network, no capabilities and a read-only filesystem, a private tmpfs for
+/// `/tmp` and every volume its image declares, no core dump, the driver's compute and utility capabilities alone,
+/// under ceilings on host memory and tasks the operator sets (`BEST_PEER_JOB_MEMORY`, `BEST_PEER_JOB_PIDS`) and on
+/// half the host's cores and 65536 open files. Any other job, the owner's or one whose credential was approved with
+/// `--open-jobs`, keeps the network, a writable filesystem, the host's memory and cores, under the same capability
+/// and privilege rules and the same task ceiling. An engine is confined as
 /// an open job is, with its own ceilings (`BEST_PEER_ENGINE_MEMORY`, `BEST_PEER_ENGINE_PIDS`).
 #[derive(Clone, Debug)]
 pub struct Confine {

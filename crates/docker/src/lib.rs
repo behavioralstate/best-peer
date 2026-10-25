@@ -13,8 +13,9 @@
 //! first. A container goes with its anonymous volumes, as the engine's own removal on exit took them. An image is
 //! removed by the reference it was pulled as, never forced, a pull may be bounded by the sizes of the layers it
 //! downloads, and the room for images is read from the engine's root
-//! directory on this host. Thin; proven on a host by hand. Only the share of a pull, which is arithmetic over what the engine
-//! reports, is unit-tested.
+//! directory on this host. Thin; proven on a host by hand. What needs no engine is unit-tested: the share and the bytes
+//! of a pull over what the engine reports, the host config a confinement becomes, a container's environment, the
+//! profiles named from the engine's options, and the room free at a directory.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -352,7 +353,7 @@ impl Runtime for DockerRuntime {
     }
 
     /// Gives the pull up as soon as the layers' sizes the engine has said pass `most_bytes`: the stream is dropped,
-    /// which ends the engine's pull, and the caller removes what it kept.
+    /// which ends the engine's pull; what it downloaded is the engine's own to release, and no image is made for it.
     async fn pull_bounded(
         &self,
         image: &ImageRef,
@@ -628,7 +629,7 @@ impl Runtime for DockerRuntime {
             .collect();
         let offered = self.security_options().await;
         let volumes = match spec.confinement.read_only_root {
-            true => self.volumes_of(&spec.image).await?,
+            true => unmounted(self.volumes_of(&spec.image).await?, &spec.mounts),
             false => Vec::new(),
         };
         let body = ContainerCreateBody {
@@ -783,15 +784,26 @@ impl Runtime for DockerRuntime {
     }
 }
 
-/// A container's environment: the spec's, then, for one handed a device, the NVIDIA driver's compute and utility
-/// capabilities alone, last so they stand over whatever the image or the spec says (the engine keeps the last of a
-/// name): no video codec, display or graphics library of the host's driver is mounted in.
+/// A container's environment: the spec's and, for one handed a device, the NVIDIA driver's compute and utility
+/// capabilities alone, in place of any the spec names, which the engine sets over the image's entry of that name: no
+/// video codec, display or graphics library of the host's driver is mounted in.
 fn env_of(spec: &Spec) -> Vec<String> {
     let mut env: Vec<String> = spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
     if !spec.devices.is_empty() {
+        env.retain(|e| !e.starts_with("NVIDIA_DRIVER_CAPABILITIES="));
         env.push("NVIDIA_DRIVER_CAPABILITIES=compute,utility".into());
     }
     env
+}
+
+/// The image's declared volumes less those the spec mounts a directory over, since the engine refuses a tmpfs and a
+/// mount at one path, and the mount covers the volume as it did.
+fn unmounted(volumes: Vec<String>, mounts: &[best_peer_runtime::Mount]) -> Vec<String> {
+    let same = |a: &str, b: &str| a.trim_end_matches('/') == b.trim_end_matches('/');
+    volumes
+        .into_iter()
+        .filter(|v| !mounts.iter().any(|m| same(&m.container, v)))
+        .collect()
 }
 
 /// The engine's words for a container's confinement: what it may not do on the host, and how much of the host it may
@@ -848,8 +860,9 @@ fn confined(confinement: &Confinement, volumes: &[String], offered: &[String]) -
 }
 
 /// The profiles a container is given by name among the engine's security options (`name=seccomp,profile=builtin`,
-/// `name=apparmor`): its built-in seccomp profile unless it runs one of its own, which stays its default, and
-/// AppArmor's `docker-default` where AppArmor is there.
+/// `name=apparmor`): its built-in seccomp profile where the engine knows that name (its info says `builtin`, or
+/// `unconfined`, which only an engine that knows the name says), an older engine's default or an engine's own profile
+/// file left as it is, and AppArmor's `docker-default` where AppArmor is there.
 fn profiles(offered: &[String]) -> Vec<String> {
     let mut named = Vec::new();
     let option = |name: &str| {
@@ -859,7 +872,7 @@ fn profiles(offered: &[String]) -> Vec<String> {
         })
     };
     if let Some(profile) = option("name=seccomp") {
-        if matches!(profile, None | Some("builtin" | "default" | "unconfined")) {
+        if matches!(profile, Some("builtin" | "unconfined")) {
             named.push("seccomp=builtin".to_string());
         }
     }
@@ -1193,6 +1206,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_volume_the_spec_mounts_a_directory_over_is_that_mount_and_no_tmpfs() {
+        let mount = |container: &str| best_peer_runtime::Mount {
+            host: format!("/disks/x{container}"),
+            container: container.into(),
+            read_only: false,
+        };
+        let volumes = vec!["/in".to_string(), "/out/".to_string(), "/data".to_string()];
+        assert_eq!(
+            unmounted(volumes, &[mount("/in"), mount("/out")]),
+            vec!["/data".to_string()],
+            "a mount covers the volume as it did, and the engine refuses both at one path"
+        );
+        assert_eq!(unmounted(vec!["/data".to_string()], &[]), vec!["/data".to_string()]);
+    }
+
     fn with_devices(devices: &[&str], env: &[(&str, &str)]) -> Spec {
         Spec {
             image: ImageRef("ghcr.io/example/train:1".into()),
@@ -1215,11 +1244,10 @@ mod tests {
                 &[("NVIDIA_DRIVER_CAPABILITIES", "all"), ("A", "1")]
             )),
             vec![
-                "NVIDIA_DRIVER_CAPABILITIES=all".to_string(),
                 "A=1".to_string(),
                 "NVIDIA_DRIVER_CAPABILITIES=compute,utility".to_string(),
             ],
-            "the last word is the adapter's"
+            "the adapter's word, once"
         );
         assert_eq!(env_of(&with_devices(&[], &[("A", "1")])), vec!["A=1".to_string()]);
     }
@@ -1246,7 +1274,8 @@ mod tests {
                 &offered(&["name=seccomp,profile=default"])
             )
             .security_opt,
-            Some(offered(&["no-new-privileges", "seccomp=builtin"]))
+            Some(offered(&["no-new-privileges"])),
+            "an older engine, which does not know the name, keeps its default"
         );
         assert_eq!(
             confined(
