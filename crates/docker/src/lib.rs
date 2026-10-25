@@ -860,9 +860,10 @@ fn confined(confinement: &Confinement, volumes: &[String], offered: &[String]) -
 }
 
 /// The profiles a container is given by name among the engine's security options (`name=seccomp,profile=builtin`,
-/// `name=apparmor`): its built-in seccomp profile where the engine knows that name (its info says `builtin`, or
-/// `unconfined`, which only an engine that knows the name says), an older engine's default or an engine's own profile
-/// file left as it is, and AppArmor's `docker-default` where AppArmor is there.
+/// `name=apparmor`): its built-in seccomp profile where its info says `builtin`, or `unconfined`, so that an engine
+/// set to run its containers unconfined still confines these (an engine too old to know the name and set so refuses
+/// the container, which is right: none runs here without the profile); an older engine's default or an engine's own
+/// profile file left as it is; and AppArmor's `docker-default` where AppArmor is there.
 fn profiles(offered: &[String]) -> Vec<String> {
     let mut named = Vec::new();
     let option = |name: &str| {
