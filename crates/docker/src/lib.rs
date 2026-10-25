@@ -1301,7 +1301,14 @@ mod tests {
 
     #[test]
     fn the_room_free_is_read_from_the_file_system_holding_a_directory_and_none_where_there_is_none() {
+        #[cfg(unix)]
         assert!(free_or_why(&std::env::temp_dir()).ok().is_some_and(|free| free > 0));
+        #[cfg(not(unix))]
+        assert_eq!(
+            free_or_why(&std::env::temp_dir()).map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::Unsupported),
+            "read on unix alone: elsewhere the room is not known, never guessed"
+        );
         assert_eq!(
             free_or_why(std::path::Path::new("/no/such/directory/anywhere")).ok(),
             None
