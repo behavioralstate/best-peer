@@ -1000,9 +1000,22 @@ fn engine_is_here(bind_ip: &str) -> bool {
 fn room_at(dir: &std::path::Path, mountinfo: &str) -> Option<u64> {
     match free_or_why(dir) {
         Ok(free) => Some(free),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => free_at(&mount_holding(dir, mountinfo)?),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            free_at(&mount_holding(&real_as_far_as_reached(dir), mountinfo)?)
+        }
         Err(_) => None,
     }
+}
+
+/// `path` with its links resolved as far down as this process can reach, the rest as written: the mount table names
+/// real paths, and a link above a closed directory would otherwise be matched as the path it is not.
+fn real_as_far_as_reached(path: &std::path::Path) -> std::path::PathBuf {
+    path.ancestors()
+        .find_map(|above| {
+            let real = std::fs::canonicalize(above).ok()?;
+            Some(real.join(path.strip_prefix(above).ok()?))
+        })
+        .unwrap_or_else(|| path.to_path_buf())
 }
 
 /// The mount point in `mountinfo` that holds `path`: the longest one `path` lies under, whole names compared; none
@@ -1223,6 +1236,28 @@ mod tests {
         );
         if closed_to_us {
             assert_eq!(unreachable, None);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_above_a_closed_directory_is_resolved_before_the_mount_table_is_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("best-peer-link-{}", std::process::id()));
+        let real = base.join("real");
+        std::fs::create_dir_all(real.join("closed").join("root")).unwrap();
+        std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
+        std::fs::set_permissions(real.join("closed"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        let through_link = base.join("link").join("closed").join("root");
+        let resolved = real_as_far_as_reached(&through_link);
+        let real_mount = std::fs::canonicalize(&real).unwrap();
+        let room = room_at(&through_link, &mountinfo(&[real_mount.to_str().unwrap()]));
+        let closed_to_us = free_at(&through_link).is_none();
+        std::fs::set_permissions(real.join("closed"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
+        assert_eq!(resolved, real_mount.join("closed").join("root"));
+        if closed_to_us {
+            assert!(room.is_some_and(|free| free > 0));
         }
     }
 
