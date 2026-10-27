@@ -1549,7 +1549,7 @@ mod tests {
             ("nvidia/cuda@sha256:abc", "docker.io"),
             ("index.docker.io/library/busybox:1", "docker.io"),
             ("localhost:5187/acct/x:1", "localhost:5187"),
-            ("registry.windlet.io/acct/x:1", "registry.windlet.io"),
+            ("registry.example.org/acct/x:1", "registry.example.org"),
             ("Registry/app:1", "Registry"),
             ("Evil/x@sha256:abc", "Evil"),
         ] {
