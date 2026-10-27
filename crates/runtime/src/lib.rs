@@ -93,10 +93,13 @@ impl RegistryToken {
         &self.token
     }
 
-    /// Refused unless `image` is pulled from this credential's registry: a token is never sent to another.
+    /// Refused unless `image` is pulled from this credential's registry: a token is never sent to another. The registry
+    /// is named by its host, with a dot or a port, or `localhost`; a name that is none is no registry, and is refused.
     pub fn for_image(&self, image: &ImageRef) -> Result<(), RuntimeError> {
-        let registry = ImageRef(format!("{}/x", self.registry)).registry();
-        match image.registry() == registry {
+        let named = &self.registry;
+        let host = named.contains('.') || named.contains(':') || named == "localhost";
+        let registry = ImageRef(format!("{named}/x")).registry();
+        match host && !named.contains('/') && image.registry() == registry {
             true => Ok(()),
             false => Err(RuntimeError::Engine(format!(
                 "a credential for {} is not sent to {}, the registry of {}",
@@ -1044,6 +1047,9 @@ impl Runtime for Fake {
         limits: PullLimits,
         credential: Option<&RegistryToken>,
     ) -> Result<(), RuntimeError> {
+        if let Some(credential) = credential {
+            credential.for_image(image)?;
+        }
         self.pulled.lock().unwrap().push(image.clone());
         self.asked(image, credential)?;
         let gate = self.gate.lock().unwrap().clone();
@@ -1482,10 +1488,20 @@ mod tests {
             assert!(matches!(pulled.unwrap_err(), RuntimeError::Engine(_)), "{}", image.0);
         }
         assert!(rt.credentials().is_empty(), "refused before the registry is asked");
+        assert!(rt.pulled().is_empty(), "and nothing pulled");
+        let busybox = ImageRef("busybox:1.36".into());
+        for named in ["", "nvidia", "docker.io/library"] {
+            let unnamed = RegistryToken::new(named, "t0ken");
+            assert!(
+                matches!(
+                    rt.resolve_with(&busybox, Some(&unnamed)).await.unwrap_err(),
+                    RuntimeError::Engine(_)
+                ),
+                "{named:?} names no registry"
+            );
+        }
         let docker_hub = RegistryToken::new("index.docker.io", "t0ken");
-        rt.resolve_with(&ImageRef("busybox:1.36".into()), Some(&docker_hub))
-            .await
-            .unwrap();
+        rt.resolve_with(&busybox, Some(&docker_hub)).await.unwrap();
     }
 
     #[test]
