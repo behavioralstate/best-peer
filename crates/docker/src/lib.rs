@@ -818,7 +818,7 @@ impl Runtime for DockerRuntime {
     }
 
     /// Asks the engine's distribution endpoint, which asks the registry for the manifest and pulls nothing. The
-    /// request carries no credentials, as a pull's does not, so a registry that needs them refuses it. A registry
+    /// request carries no credentials, and neither does a pull's, so a registry that needs them refuses both. A registry
     /// that refuses or does not know the reference is [`RuntimeError::ImageNotFound`], one that cannot be reached the
     /// engine's words, as a pull's are: neither depends on what the engine holds.
     async fn resolve(&self, image: &ImageRef) -> Result<ImageRef, RuntimeError> {
