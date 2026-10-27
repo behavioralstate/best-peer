@@ -32,12 +32,19 @@ impl ImageRef {
 
     /// [`ImageRef::repository`] as the engine's default registry spells it in full, so two spellings of one
     /// repository compare equal: `nvidia/cuda`, `docker.io/nvidia/cuda` and `index.docker.io/nvidia/cuda` are all
-    /// `docker.io/nvidia/cuda`, and `busybox` is `docker.io/library/busybox`. A first part with a dot or a port, or
-    /// `localhost`, is a registry of its own.
+    /// `docker.io/nvidia/cuda`, and `busybox` is `docker.io/library/busybox`. A first part with a dot, a port or an
+    /// uppercase letter, or `localhost`, is a registry of its own, as Docker reads it.
     pub fn canonical_repository(&self) -> String {
         let repo = self.repository();
         let (registry, path) = match repo.split_once('/') {
-            Some((first, rest)) if first.contains('.') || first.contains(':') || first == "localhost" => (first, rest),
+            Some((first, rest))
+                if first.contains('.')
+                    || first.contains(':')
+                    || first == "localhost"
+                    || first.chars().any(|c| c.is_ascii_uppercase()) =>
+            {
+                (first, rest)
+            }
             _ => ("docker.io", repo),
         };
         let registry = if registry == "index.docker.io" {
@@ -1516,6 +1523,14 @@ mod tests {
         }
         let docker_hub = RegistryToken::new("index.docker.io", "t0ken");
         rt.resolve_with(&busybox, Some(&docker_hub)).await.unwrap();
+        let hosted = ImageRef("Registry/app:1".into());
+        assert!(
+            matches!(
+                rt.resolve_with(&hosted, Some(&docker_hub)).await.unwrap_err(),
+                RuntimeError::Engine(_)
+            ),
+            "an uppercase first part is a host of its own, as Docker reads it"
+        );
     }
 
     #[test]
@@ -1535,6 +1550,8 @@ mod tests {
             ("index.docker.io/library/busybox:1", "docker.io"),
             ("localhost:5187/acct/x:1", "localhost:5187"),
             ("registry.windlet.io/acct/x:1", "registry.windlet.io"),
+            ("Registry/app:1", "Registry"),
+            ("Evil/x@sha256:abc", "Evil"),
         ] {
             assert_eq!(ImageRef(image.into()).registry(), registry, "{image}");
         }
