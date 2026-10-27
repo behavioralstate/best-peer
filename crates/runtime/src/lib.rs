@@ -2039,6 +2039,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_runtime_that_cannot_carry_a_credential_refuses_one_and_pulls_and_resolves_as_before_without() {
+        let rt = Uncredentialed::default();
+        let image = ImageRef("registry.example.com/app:1".into());
+        let token = RegistryToken::new("registry.example.com", "t0ken");
+        assert!(matches!(
+            rt.pull_bounded_with(&image, Arc::new(|_| {}), PullLimits::default(), Some(&token))
+                .await,
+            Err(RuntimeError::Engine(_))
+        ));
+        assert!(matches!(
+            rt.resolve_with(&image, Some(&token)).await,
+            Err(RuntimeError::Engine(_))
+        ));
+        assert!(
+            rt.asked.lock().unwrap().is_empty(),
+            "nothing is asked without the credential"
+        );
+        rt.pull_bounded_with(&image, Arc::new(|_| {}), PullLimits::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(rt.resolve_with(&image, None).await.unwrap(), image);
+        assert_eq!(*rt.asked.lock().unwrap(), vec!["pull_bounded", "resolve"]);
+    }
+
+    #[derive(Default)]
+    struct Uncredentialed {
+        asked: Mutex<Vec<&'static str>>,
+    }
+
+    #[async_trait]
+    impl Runtime for Uncredentialed {
+        async fn pull(&self, _image: &ImageRef, _progress: Progress) -> Result<(), RuntimeError> {
+            unimplemented!()
+        }
+        async fn pull_bounded(
+            &self,
+            _image: &ImageRef,
+            _progress: Progress,
+            _limits: PullLimits,
+        ) -> Result<(), RuntimeError> {
+            self.asked.lock().unwrap().push("pull_bounded");
+            Ok(())
+        }
+        async fn resolve(&self, image: &ImageRef) -> Result<ImageRef, RuntimeError> {
+            self.asked.lock().unwrap().push("resolve");
+            Ok(image.clone())
+        }
+        async fn start(&self, _spec: Spec) -> Result<Started, RuntimeError> {
+            unimplemented!()
+        }
+        async fn stop(&self, _id: &ContainerId) -> Result<(), RuntimeError> {
+            unimplemented!()
+        }
+        async fn running(&self) -> Result<Vec<ContainerId>, RuntimeError> {
+            unimplemented!()
+        }
+        fn events(&self) -> broadcast::Receiver<Event> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
     async fn a_runtime_that_cannot_bound_a_pull_refuses_one_with_a_bound() {
         let err = NoNames
             .pull_bounded(&ImageRef("x".into()), Arc::new(|_| {}), most(1))
