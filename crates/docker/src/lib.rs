@@ -40,7 +40,7 @@ use bollard::models::{
 };
 use bollard::query_parameters::{
     CreateImageOptionsBuilder, EventsOptionsBuilder, ListContainersOptionsBuilder, LogsOptionsBuilder,
-    RemoveContainerOptionsBuilder, RemoveImageOptionsBuilder, StopContainerOptionsBuilder,
+    RemoveContainerOptionsBuilder, RemoveImageOptionsBuilder, StopContainerOptionsBuilder, TagImageOptionsBuilder,
 };
 use bollard::Docker;
 use futures::StreamExt;
@@ -374,9 +374,10 @@ async fn room_under(root: Option<String>) -> Option<u64> {
 
 /// Reads the engine's pull `stream` to its end, telling `progress` the share done, and holds it to `limits`: the
 /// `room` free on the engine's disk is read once before the first line and every `every` after, while the first
-/// reading said one, and the layers' sizes the engine says are held to the bound as they come. Returning before the
-/// end drops the stream, which gives the engine's pull up. A floor with no room read at the start is refused before
-/// a line is read; a reading that fails later is skipped, said once.
+/// reading said one, and once more when the stream ends, and the layers' sizes the engine says are held to the bound as
+/// they come. Returning an error before the end drops the stream, which gives the engine's pull up; a pull past its
+/// limits by the reading at its end answers [`Pulled::Past`], since the engine has made its image by then. A floor
+/// with no room read at the start is refused before a line is read; a reading that fails later is skipped, said once.
 async fn watched<S, R, F>(
     image: &ImageRef,
     mut stream: S,
@@ -384,7 +385,7 @@ async fn watched<S, R, F>(
     limits: PullLimits,
     mut room: R,
     every: std::time::Duration,
-) -> Result<(), RuntimeError>
+) -> Result<Pulled, RuntimeError>
 where
     S: futures::Stream<Item = Result<CreateImageInfo, bollard::errors::Error>> + Unpin,
     R: FnMut() -> F,
@@ -446,7 +447,36 @@ where
             }
         }
     }
-    Ok(())
+    // A last layer may land between two ticks: the room is read once more now the engine has made the image.
+    let Some(start) = start else {
+        return Ok(Pulled::Within);
+    };
+    match room().await {
+        Some(now) => Ok(limits
+            .hold(image, start, now)
+            .map_or_else(Pulled::Past, |()| Pulled::Within)),
+        None => {
+            tracing::warn!(image = %image.0, "the room on the engine's disk could not be read when the pull ended; it is held to what was read last");
+            Ok(Pulled::Within)
+        }
+    }
+}
+
+/// `past` with `note` on what became of the image it made added to its words.
+fn noted(past: RuntimeError, note: &str) -> RuntimeError {
+    match past {
+        RuntimeError::TooLarge(why) => RuntimeError::TooLarge(format!("{why}; {note}")),
+        RuntimeError::NoRoom(why) => RuntimeError::NoRoom(format!("{why}; {note}")),
+        other => other,
+    }
+}
+
+/// How a pull held to limits ended once the engine made its image: within them, or past them by the room read at its
+/// end, the image then to be undone.
+#[derive(Debug)]
+enum Pulled {
+    Within,
+    Past(RuntimeError),
 }
 
 /// The share of a pull across every layer, not per layer. The engine reports each layer twice over its own bytes:
@@ -539,54 +569,37 @@ impl Runtime for DockerRuntime {
 
     /// Gives the pull up as soon as it passes `limits`, by dropping the engine's stream, which ends the request and,
     /// with it, the engine's pull: the room on the file system holding the engine's root directory is read when the
-    /// pull begins and every [`ROOM_EVERY`] while it runs, where it can be read on this host, and the layers' sizes
-    /// the engine says are counted as they come. What it downloaded is the engine's own to release, and no image is
-    /// made for it. An image pulled whole whose unpacked size passes the bound is removed, unless the engine held that
-    /// very image before the pull; one the engine will not remove is left there, said in the log, and the pull still
-    /// answers [`RuntimeError::TooLarge`].
+    /// pull begins, every [`ROOM_EVERY`] while it runs and once more at its end, where it can be read on this host, and
+    /// the layers' sizes the engine says are counted as they come. What a pull given up downloaded is the engine's own
+    /// to release, and no image is made for it. An image pulled whole and past the limits by the room read at the end,
+    /// or by its unpacked size, is undone as [`DockerRuntime::undo_pull`] says, and the pull answers the limit it
+    /// passed.
     async fn pull_bounded(&self, image: &ImageRef, progress: Progress, limits: PullLimits) -> Result<(), RuntimeError> {
-        let watching = limits != PullLimits::default();
-        let root = match watching && self.engine_here {
+        if limits == PullLimits::default() {
+            return self.pull_whole(image, &progress, limits, None).await.map(|_| ());
+        }
+        let root = match self.engine_here {
             true => self.docker.info().await.ok().and_then(|i| i.docker_root_dir),
             false => None,
         };
-        let before = match limits.most_bytes {
-            Some(_) => self.image_id_and_size(image).await?.map(|(id, _)| id),
-            None => None,
+        let before = self.image_id_and_size(image).await?.map(|(id, _)| id);
+        let past = match self.pull_whole(image, &progress, limits, root).await? {
+            Pulled::Past(e) => Some(e),
+            Pulled::Within => match limits.most_bytes {
+                None => None,
+                Some(_) => match self.image_id_and_size(image).await? {
+                    Some((_, size)) => limits.hold_unpacked(image, size).err(),
+                    None => Some(RuntimeError::Engine(format!(
+                        "the engine does not hold {} after pulling it, so its size cannot be held to a bound",
+                        image.0
+                    ))),
+                },
+            },
         };
-        let (name, tag) = name_and_tag(image);
-        let mut options = CreateImageOptionsBuilder::new().from_image(&name);
-        if let Some(tag) = &tag {
-            options = options.tag(tag);
+        match past {
+            Some(e) => Err(self.undo_pull(image, before, e).await),
+            None => Ok(()),
         }
-        let stream = self.docker.create_image(Some(options.build()), None, None);
-        watched(
-            image,
-            stream,
-            &progress,
-            limits,
-            || room_under(root.clone()),
-            ROOM_EVERY,
-        )
-        .await?;
-        if limits.most_bytes.is_none() {
-            return Ok(());
-        }
-        let Some((id, size)) = self.image_id_and_size(image).await? else {
-            return Err(RuntimeError::Engine(format!(
-                "the engine does not hold {} after pulling it, so its size cannot be held to a bound",
-                image.0
-            )));
-        };
-        if let Err(e) = limits.hold_unpacked(image, size) {
-            if before.as_ref() != Some(&id) {
-                if let Err(why) = self.remove_image(image).await {
-                    tracing::warn!(image = %image.0, error = %why, "an image pulled past its bound could not be removed: it is left on the engine");
-                }
-            }
-            return Err(e);
-        }
-        Ok(())
     }
 
     /// A file system of its own for the job `id`: an ext4 file of `bytes`, allocated whole so the room it takes is
@@ -1173,6 +1186,67 @@ fn profiles(offered: &[String]) -> Vec<String> {
 }
 
 impl DockerRuntime {
+    /// The engine's pull of `image`, read to its end through [`watched`] with the room under the engine's `root`.
+    async fn pull_whole(
+        &self,
+        image: &ImageRef,
+        progress: &Progress,
+        limits: PullLimits,
+        root: Option<String>,
+    ) -> Result<Pulled, RuntimeError> {
+        let (name, tag) = name_and_tag(image);
+        let mut options = CreateImageOptionsBuilder::new().from_image(&name);
+        if let Some(tag) = &tag {
+            options = options.tag(tag);
+        }
+        let stream = self.docker.create_image(Some(options.build()), None, None);
+        watched(image, stream, progress, limits, || room_under(root.clone()), ROOM_EVERY).await
+    }
+
+    /// Undoes a pull that made an image past its limits, answering `past` with what became of it. An image the engine
+    /// held under `image` before, `before` its id, is the owner's: when the pull left the reference naming that very
+    /// image, nothing is touched; when it moved the reference to a new one, the reference is given back to the old
+    /// image first and the new one then removed by its id, so the owner's image keeps its name. A reference pinned by
+    /// digest, or one the engine will not give back, is left on the new image, which is kept, and the answer says so.
+    /// An image the engine did not hold before is removed by the reference.
+    async fn undo_pull(&self, image: &ImageRef, before: Option<String>, past: RuntimeError) -> RuntimeError {
+        let now = match self.image_id_and_size(image).await {
+            Ok(Some((id, _))) => id,
+            Ok(None) => return past,
+            Err(e) => return noted(past, &format!("it could not be looked up to be removed: {e}")),
+        };
+        let Some(before) = before else {
+            return match self.remove_image(image).await {
+                Ok(()) => past,
+                Err(e) => noted(past, &format!("it could not be removed and is left on the engine: {e}")),
+            };
+        };
+        if before == now {
+            return past;
+        }
+        let (repo, tag) = name_and_tag(image);
+        let Some(tag) = tag else {
+            return noted(
+                past,
+                "the reference is pinned by digest and cannot be given back, so the image is left on the engine",
+            );
+        };
+        let options = TagImageOptionsBuilder::new().repo(&repo).tag(&tag).build();
+        if let Err(e) = self.docker.tag_image(&before, Some(options)).await {
+            return noted(
+                past,
+                &format!("the reference could not be given back to the image the engine held before ({e}), so the new image is left on the engine under it"),
+            );
+        }
+        match self.remove_image(&ImageRef(now)).await {
+            Ok(()) => past,
+            Err(e) => noted(
+                past,
+                &format!("the reference names the image the engine held before again, and the new image could not be removed: {e}"),
+            ),
+        }
+    }
+
     /// The id and unpacked size, every layer counted, of the image the engine holds by `image`; none when it holds none.
     async fn image_id_and_size(&self, image: &ImageRef) -> Result<Option<(String, u64)>, RuntimeError> {
         match self.docker.inspect_image(&image.0).await {
@@ -1881,6 +1955,76 @@ mod tests {
             matches!(err, RuntimeError::TooLarge(ref why) if why.contains("download")),
             "{err}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_last_layer_landing_between_two_readings_is_held_to_one_more_when_the_pull_ends() {
+        let image = ImageRef("big/unpacks:1".into());
+        let short = || vec![line("a", "Extracting", 50, 100), line("a", "Pull complete", 100, 100)];
+        let every = Duration::from_secs(60);
+        let (progress, _) = told();
+        let (room, asked) = readings(&[Some(100 * GIB), Some(85 * GIB)]);
+        let ended = watched(
+            &image,
+            pulling(short(), true),
+            &progress,
+            limits(Some(50 * GIB), Some(90 * GIB)),
+            room,
+            every,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(ended, Pulled::Past(RuntimeError::NoRoom(ref why)) if why.contains("floor")),
+            "{ended:?}"
+        );
+        assert_eq!(
+            *asked.lock().unwrap(),
+            2,
+            "read at the start and at the end, no tick between"
+        );
+        let (room, _) = readings(&[Some(100 * GIB), Some(70 * GIB)]);
+        let ended = watched(
+            &image,
+            pulling(short(), true),
+            &progress,
+            limits(Some(25 * GIB), None),
+            room,
+            every,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(ended, Pulled::Past(RuntimeError::TooLarge(ref why)) if why.contains("took")),
+            "{ended:?}"
+        );
+        let (room, _) = readings(&[Some(100 * GIB), Some(95 * GIB)]);
+        let ended = watched(
+            &image,
+            pulling(short(), true),
+            &progress,
+            limits(Some(25 * GIB), Some(90 * GIB)),
+            room,
+            every,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(ended, Pulled::Within), "{ended:?}");
+    }
+
+    #[test]
+    fn what_became_of_an_image_past_its_limits_is_added_to_the_limits_words() {
+        let noted = noted(
+            RuntimeError::TooLarge("x: past its bound".into()),
+            "it is left on the engine",
+        );
+        assert!(
+            matches!(noted, RuntimeError::TooLarge(ref why) if why == "x: past its bound; it is left on the engine")
+        );
+        assert!(matches!(
+            super::noted(RuntimeError::NoRoom("x".into()), "kept"),
+            RuntimeError::NoRoom(ref why) if why == "x; kept"
+        ));
     }
 
     #[tokio::test(start_paused = true)]

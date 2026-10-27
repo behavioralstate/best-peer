@@ -340,11 +340,13 @@ pub trait Runtime: Send + Sync {
     async fn pull(&self, image: &ImageRef, progress: Progress) -> Result<(), RuntimeError>;
     /// [`Runtime::pull`], held to `limits` from its start to its end. It is given up with [`RuntimeError::TooLarge`]
     /// once the room it has taken on the engine's disk, or the layers' sizes the engine says it downloads, pass the
-    /// bound, and with [`RuntimeError::NoRoom`] once that disk's free room falls under the floor; an image it pulled
-    /// whose unpacked size passes the bound is removed, and the pull answers [`RuntimeError::TooLarge`]. A layer the
-    /// engine already holds takes no room while it pulls, and counts in the unpacked size. A floor where the room
-    /// cannot be read is refused with [`RuntimeError::NoRoom`] before anything is pulled. A runtime that cannot hold a
-    /// pull to limits refuses any rather than ignore them.
+    /// bound, and with [`RuntimeError::NoRoom`] once that disk's free room falls under the floor. An image it pulled
+    /// whole and past either limit, by the room read at its end or by its unpacked size, is undone and the pull answers
+    /// the limit it passed: an image the engine did not hold is removed; a reference the engine held that the pull
+    /// moved to a new image names the image it named before again, the new one removed; an image the pull left as the
+    /// engine held it is the owner's and stays. A layer the engine already holds takes no room while it pulls, and
+    /// counts in the unpacked size. A floor where the room cannot be read is refused with [`RuntimeError::NoRoom`]
+    /// before anything is pulled. A runtime that cannot hold a pull to limits refuses any rather than ignore them.
     async fn pull_bounded(&self, image: &ImageRef, progress: Progress, limits: PullLimits) -> Result<(), RuntimeError> {
         match limits == PullLimits::default() {
             true => self.pull(image, progress).await,
@@ -463,6 +465,10 @@ pub struct Fake {
     unpacked: Mutex<HashMap<ImageRef, u64>>,
     /// What each image a pull made took from the room for images, given back when it is removed.
     landed: Mutex<HashMap<ImageRef, u64>>,
+    /// References the engine holds that the registry now names a newer image by: the next pull moves them to it.
+    moved: Mutex<std::collections::HashSet<ImageRef>>,
+    /// How many times a pull moved each reference the engine holds to a newer image: its id is told by it.
+    generation: Mutex<HashMap<ImageRef, u32>>,
     /// The room it says it has for images, as a test sets it; `None` for an engine that cannot tell.
     image_room: Mutex<Option<u64>>,
     devices: Vec<DeviceId>,
@@ -524,6 +530,8 @@ impl Fake {
             sizes: Mutex::new(HashMap::new()),
             unpacked: Mutex::new(HashMap::new()),
             landed: Mutex::new(HashMap::new()),
+            moved: Mutex::new(std::collections::HashSet::new()),
+            generation: Mutex::new(HashMap::new()),
             image_room: Mutex::new(Some(1 << 40)),
             devices,
             next: Mutex::new(0),
@@ -627,6 +635,22 @@ impl Fake {
     /// by that in step with what the pull reports, while it can be read, and the image's size once pulled is that.
     pub fn unpacks(&self, image: ImageRef, bytes: u64) {
         self.unpacked.lock().unwrap().insert(image, bytes);
+    }
+
+    /// The registry names a newer image by `image`, a reference the engine holds: the next pull of it moves the
+    /// reference to that image, a new id, which downloads and unpacks as a test set for it.
+    pub fn moves_on_pull(&self, image: ImageRef) {
+        self.moved.lock().unwrap().insert(image);
+    }
+
+    /// The id of the image the engine holds by `image`, none when it holds none: a pull that moves the reference
+    /// changes it.
+    pub fn image_id(&self, image: &ImageRef) -> Option<String> {
+        if !self.local.lock().unwrap().contains(image) {
+            return None;
+        }
+        let generation = self.generation.lock().unwrap().get(image).copied().unwrap_or(0);
+        Some(format!("{}#{generation}", image.0))
     }
 
     /// Sets the room it says it has for images from now on, or `None` for an engine that cannot tell.
@@ -792,13 +816,15 @@ impl Runtime for Fake {
             return Err(RuntimeError::ImageNotFound(image.0.clone()));
         }
         let held = self.local.lock().unwrap().contains(image);
-        let downloads = self.sizes.lock().unwrap().get(image).copied().filter(|_| !held);
+        let moves = held && self.moved.lock().unwrap().contains(image);
+        let fresh = !held || moves;
+        let downloads = self.sizes.lock().unwrap().get(image).copied().filter(|_| fresh);
         if let (Some(bytes), Some(most)) = (downloads, limits.most_bytes) {
             if bytes > most {
                 return Err(RuntimeError::TooLarge(image.0.clone()));
             }
         }
-        let unpacked = self.unpacked.lock().unwrap().get(image).copied().filter(|_| !held);
+        let unpacked = self.unpacked.lock().unwrap().get(image).copied().filter(|_| fresh);
         let start = *self.image_room.lock().unwrap();
         if limits.floor_bytes.is_some() && start.is_none() {
             return Err(RuntimeError::NoRoom(format!(
@@ -809,16 +835,20 @@ impl Runtime for Fake {
         if let Some(start) = start {
             limits.hold(image, start, start)?;
         }
+        // The room falls in step with what the pull reports, held to the limits at each step but the last, which is
+        // the reading at its end, once the image is made.
         let steps = self.steps.len() as u64;
         for (i, &step) in self.steps.iter().enumerate() {
             progress(step);
             if let (Some(start), Some(unpacked)) = (start, unpacked) {
                 let now = start.saturating_sub(unpacked * (i as u64 + 1) / steps.max(1));
                 *self.image_room.lock().unwrap() = Some(now);
-                if let Err(e) = limits.hold(image, start, now) {
-                    // Given up: what it downloaded is the engine's to release.
-                    *self.image_room.lock().unwrap() = Some(start);
-                    return Err(e);
+                if (i as u64) + 1 < steps {
+                    if let Err(e) = limits.hold(image, start, now) {
+                        // Given up: what it downloaded is the engine's to release, and no image is made.
+                        *self.image_room.lock().unwrap() = Some(start);
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -835,15 +865,33 @@ impl Runtime for Fake {
                 local.push(image.clone());
             }
         }
-        let size = self.unpacked.lock().unwrap().get(image).copied().unwrap_or(0);
-        if let Err(e) = limits.hold_unpacked(image, size) {
-            // An image the engine held before the pull is not the pull's to remove.
-            if !held {
-                let _ = self.remove_image(image).await;
-            }
-            return Err(e);
+        if moves {
+            self.moved.lock().unwrap().remove(image);
+            *self.generation.lock().unwrap().entry(image.clone()).or_default() += 1;
         }
-        Ok(())
+        let end = *self.image_room.lock().unwrap();
+        let size = self.unpacked.lock().unwrap().get(image).copied().unwrap_or(0);
+        let past = match (start, end) {
+            (Some(start), Some(end)) => limits.hold(image, start, end).err(),
+            _ => None,
+        }
+        .or_else(|| limits.hold_unpacked(image, size).err());
+        let Some(e) = past else {
+            return Ok(());
+        };
+        // Undone as an engine's adapter undoes it: an image it did not hold is removed; a reference it held and the
+        // pull moved is given back to the image it named, the new one removed; one the pull left alone is the owner's.
+        if !held {
+            let _ = self.remove_image(image).await;
+        } else if moves {
+            *self.generation.lock().unwrap().entry(image.clone()).or_default() -= 1;
+            if let Some(taken) = self.landed.lock().unwrap().remove(image) {
+                if let Some(room) = self.image_room.lock().unwrap().as_mut() {
+                    *room = room.saturating_add(taken);
+                }
+            }
+        }
+        Err(e)
     }
 
     async fn holds(&self, image: &ImageRef) -> Result<bool, RuntimeError> {
@@ -1393,6 +1441,52 @@ mod tests {
         assert!(matches!(err, RuntimeError::TooLarge(_)));
         assert!(rt.holds(&image).await.unwrap());
         assert!(rt.removed().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_reference_the_owner_held_that_a_pull_moved_past_its_bound_names_the_owners_image_again() {
+        let image = ImageRef("owners/own:latest".into());
+        let rt = Fake::new(vec!["gpu-0".into()], vec![image.clone()]).with_open_registry();
+        let owners = rt.image_id(&image).unwrap();
+        rt.moves_on_pull(image.clone());
+        rt.unpacks(image.clone(), 30 << 30);
+        rt.set_image_room(None);
+        let err = rt
+            .pull_bounded(&image, Arc::new(|_| {}), most(25 << 30))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::TooLarge(_)), "{err}");
+        assert_eq!(
+            rt.image_id(&image),
+            Some(owners.clone()),
+            "the reference names the owner's image again"
+        );
+        assert!(rt.removed().is_empty(), "the owner's image is never removed");
+        rt.moves_on_pull(image.clone());
+        rt.pull_bounded(&image, Arc::new(|_| {}), most(30 << 30)).await.unwrap();
+        assert_ne!(
+            rt.image_id(&image),
+            Some(owners),
+            "within its bound, the pull moves it as an engine does"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pull_past_its_floor_by_the_reading_at_its_end_is_undone() {
+        let image = ImageRef("big/unpacks:1".into());
+        let rt = unpacking(&image, 20 << 30, Some(100 << 30)).reporting(&[100]);
+        let limits = PullLimits {
+            most_bytes: None,
+            floor_bytes: Some(90 << 30),
+        };
+        let err = rt.pull_bounded(&image, Arc::new(|_| {}), limits).await.unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::NoRoom(ref why) if why.contains("floor")),
+            "{err}"
+        );
+        assert!(!rt.holds(&image).await.unwrap(), "the image it made is removed");
+        assert_eq!(rt.removed(), vec![image]);
+        assert_eq!(rt.image_room().await, Some(100 << 30), "and its room given back");
     }
 
     #[tokio::test]
