@@ -1612,6 +1612,26 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn a_credential_reaches_the_engine_as_a_registry_token_for_its_registry_alone() {
+        let image = ImageRef("registry.example.org/acct/train:1".into());
+        let token = RegistryToken::new("registry.example.org", "t0ken");
+        assert_eq!(credentials_for(&image, None).unwrap(), None);
+        assert_eq!(
+            credentials_for(&image, Some(&token)).unwrap(),
+            Some(DockerCredentials {
+                serveraddress: Some("registry.example.org".into()),
+                registrytoken: Some("t0ken".into()),
+                ..Default::default()
+            })
+        );
+        let elsewhere = ImageRef("nvidia/cuda:13.0-base".into());
+        assert!(matches!(
+            credentials_for(&elsewhere, Some(&token)),
+            Err(RuntimeError::Engine(_))
+        ));
+    }
+
+    #[test]
     fn a_disk_is_never_promised_the_last_of_its_file_system() {
         assert_eq!(kept_free(10 << 30), 1 << 30, "a small one keeps 1 GiB");
         assert_eq!(
