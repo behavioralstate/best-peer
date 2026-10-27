@@ -14,7 +14,9 @@
 //! not heard (the peer was down, or the event feed broke) is removed by a sweep, every minute and after the feed
 //! reconnects, once this adapter has seen it exited for a minute, so a peer that shares the engine has read its own
 //! first. A container goes with its anonymous volumes, as the engine's own removal on exit took them. An image is
-//! removed by the reference it was pulled as, never forced, and the room for images is read from the file system
+//! removed by the reference it was pulled as, never forced; a reference is resolved to its digest at the registry
+//! through the engine's distribution endpoint, pulling nothing, and one pinned by digest is held when the image found
+//! by it lists that digest, pulled with no tag made, and removed as that reference alone; and the room for images is read from the file system
 //! holding the engine's root directory on this host, found in the mount table when the directory itself cannot be
 //! reached, as an engine with user namespaces remapped keeps it; none when the engine is on another host. A pull may be
 //! held to limits on that disk: given up, its stream dropped, once the room it took there or the sizes of the layers
@@ -481,6 +483,18 @@ fn unpacked_past(
     }
 }
 
+/// Whether an image whose repository digests are `repo_digests` is the one `image` names: always for a reference by
+/// tag, which the engine found it by; for one pinned by digest, only when that digest is among them, as
+/// `repository@digest`.
+fn lists_digest(image: &ImageRef, repo_digests: &[String]) -> bool {
+    match image.digest() {
+        None => true,
+        Some(digest) => repo_digests
+            .iter()
+            .any(|r| r.split_once('@').is_some_and(|(_, d)| d == digest)),
+    }
+}
+
 /// `past` with `note` on what became of the image it made added to its words.
 fn noted(past: RuntimeError, note: &str) -> RuntimeError {
     match past {
@@ -801,9 +815,35 @@ impl Runtime for DockerRuntime {
         Some(pids)
     }
 
+    /// Asks the engine's distribution endpoint, which asks the registry for the manifest and pulls nothing; the
+    /// engine sends what credentials it keeps for that registry, as a pull does. A registry that refuses or does not
+    /// know the reference is [`RuntimeError::ImageNotFound`], one that cannot be reached the engine's words, as a
+    /// pull's are: neither depends on what the engine holds.
+    async fn resolve(&self, image: &ImageRef) -> Result<ImageRef, RuntimeError> {
+        match self.docker.inspect_registry_image(&image.0, None).await {
+            Ok(inspected) => match inspected.descriptor.digest {
+                Some(digest) => Ok(image.pinned(&digest)),
+                None => Err(RuntimeError::Engine(format!(
+                    "the registry gave no digest for {}",
+                    image.0
+                ))),
+            },
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 401 | 403 | 404,
+                ..
+            }) => Err(RuntimeError::ImageNotFound(image.0.clone())),
+            Err(e) => Err(image_error(image, &e.to_string())),
+        }
+    }
+
+    /// By the reference; one pinned by digest is held only when the image the engine finds by it lists that digest
+    /// among its repository digests, whatever its tags.
     async fn holds(&self, image: &ImageRef) -> Result<bool, RuntimeError> {
         match self.docker.inspect_image(&image.0).await {
-            Ok(_) => Ok(true),
+            Ok(inspected) => Ok(lists_digest(
+                image,
+                inspected.repo_digests.as_deref().unwrap_or_default(),
+            )),
             Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => Ok(false),
             Err(e) => Err(RuntimeError::Engine(format!(
                 "the container engine cannot say whether it holds {}: {e}",
@@ -2047,6 +2087,24 @@ mod tests {
             unpacked_past(&image, bound, Some("sha256:a"), None),
             Some(RuntimeError::Engine(_))
         ));
+    }
+
+    #[test]
+    fn an_image_is_held_by_a_digest_only_when_its_repository_digests_list_it() {
+        let pinned = ImageRef("nvidia/cuda@sha256:aaa".into());
+        assert!(lists_digest(&pinned, &["nvidia/cuda@sha256:aaa".into()]));
+        assert!(lists_digest(&pinned, &["docker.io/nvidia/cuda@sha256:aaa".into()]));
+        assert!(!lists_digest(&pinned, &["nvidia/cuda@sha256:bbb".into()]));
+        assert!(!lists_digest(&pinned, &[]), "a local build lists no digest");
+        assert!(lists_digest(&ImageRef("nvidia/cuda:12".into()), &[]));
+    }
+
+    #[test]
+    fn a_reference_pinned_by_digest_is_pulled_whole_and_with_no_tag() {
+        assert_eq!(
+            name_and_tag(&ImageRef("nvidia/cuda@sha256:aaa".into())),
+            ("nvidia/cuda@sha256:aaa".to_string(), None)
+        );
     }
 
     #[test]

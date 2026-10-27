@@ -14,9 +14,32 @@ use best_peer_gpu::DeviceId;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-/// An image reference as the engine understands it (`ollama/ollama:0.6`, `vllm/vllm-openai:v0.8`).
+/// An image reference as the engine understands it (`ollama/ollama:0.6`, `vllm/vllm-openai:v0.8`), or one pinned by
+/// digest (`nvidia/cuda@sha256:...`), which names one image whatever the registry's tags say later.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ImageRef(pub String);
+
+impl ImageRef {
+    /// The repository it names, without its tag or digest: a port in the registry's host is not a tag.
+    pub fn repository(&self) -> &str {
+        let r = self.0.split('@').next().unwrap_or_default();
+        let after_slash = r.rfind('/').map_or(0, |i| i + 1);
+        match r[after_slash..].rfind(':') {
+            Some(i) => &r[..after_slash + i],
+            None => r,
+        }
+    }
+
+    /// Its digest, when it is pinned by one.
+    pub fn digest(&self) -> Option<&str> {
+        self.0.split_once('@').map(|(_, d)| d)
+    }
+
+    /// The same repository pinned by `digest`: what pulls, runs and removes that one image and never a tag.
+    pub fn pinned(&self, digest: &str) -> ImageRef {
+        ImageRef(format!("{}@{digest}", self.repository()))
+    }
+}
 
 /// The engine's id for a running container.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -359,14 +382,25 @@ pub trait Runtime: Send + Sync {
             )),
         }
     }
-    /// Whether the engine holds the image now, so starting it needs no registry. An error is the engine's, never
-    /// "not held". An engine that cannot tell says no, and every image is pulled.
+    /// The reference pinned by digest to the image the registry serves under `image` now, asked of the registry and
+    /// nothing pulled: an image the registry does not serve is [`RuntimeError::ImageNotFound`] whatever the engine
+    /// holds, so the answer tells a caller nothing of the host. Pulling, running and removing what it answers never
+    /// touches a tag on the engine. A runtime that cannot ask a registry errs.
+    async fn resolve(&self, _image: &ImageRef) -> Result<ImageRef, RuntimeError> {
+        Err(RuntimeError::Engine(
+            "this runtime cannot resolve a reference at its registry".into(),
+        ))
+    }
+    /// Whether the engine holds the image now, so starting it needs no registry: a reference pinned by digest is held
+    /// when the engine holds that digest under that repository, whatever its tags name. An error is the engine's,
+    /// never "not held". An engine that cannot tell says no, and every image is pulled.
     async fn holds(&self, _image: &ImageRef) -> Result<bool, RuntimeError> {
         Ok(false)
     }
     /// Removes the image from the engine by the reference it was pulled as, so it takes no more room: one the engine
-    /// no longer holds is no error, and one a container still uses is refused. A runtime that keeps no images has
-    /// none to remove.
+    /// no longer holds is no error, and one a container still uses is refused. A reference pinned by digest removes
+    /// that reference alone: an image a tag still names stays, with its tag. A runtime that keeps no images has none to
+    /// remove.
     async fn remove_image(&self, _image: &ImageRef) -> Result<(), RuntimeError> {
         Ok(())
     }
@@ -473,6 +507,8 @@ pub struct Fake {
     moved: Mutex<std::collections::HashSet<ImageRef>>,
     /// How many times a pull moved each reference the engine holds to a newer image: its id is told by it.
     generation: Mutex<HashMap<ImageRef, u32>>,
+    /// Every reference pinned by digest it resolved, with the reference it was resolved from.
+    resolved: Mutex<HashMap<ImageRef, ImageRef>>,
     /// The room it says it has for images, as a test sets it; `None` for an engine that cannot tell.
     image_room: Mutex<Option<u64>>,
     devices: Vec<DeviceId>,
@@ -536,6 +572,7 @@ impl Fake {
             landed: Mutex::new(HashMap::new()),
             moved: Mutex::new(std::collections::HashSet::new()),
             generation: Mutex::new(HashMap::new()),
+            resolved: Mutex::new(HashMap::new()),
             image_room: Mutex::new(Some(1 << 40)),
             devices,
             next: Mutex::new(0),
@@ -571,7 +608,7 @@ impl Fake {
                 .image_users
                 .lock()
                 .unwrap()
-                .get(&spec.image)
+                .get(&self.source_of(&spec.image))
                 .cloned()
                 .unwrap_or_else(|| "root".into()),
         })
@@ -655,6 +692,45 @@ impl Fake {
         }
         let generation = self.generation.lock().unwrap().get(image).copied().unwrap_or(0);
         Some(format!("{}#{generation}", image.0))
+    }
+
+    /// The digest of the image `image` names at `generation`: the registry's now, or the one the engine holds.
+    fn digest_at(image: &ImageRef, generation: u32) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (image.repository(), &image.0, generation).hash(&mut h);
+        let h = h.finish();
+        format!("sha256:{h:016x}{h:016x}{h:016x}{h:016x}")
+    }
+
+    /// The reference a test set things on for `image`: the tag it was resolved from, for one pinned by digest.
+    fn source_of(&self, image: &ImageRef) -> ImageRef {
+        self.resolved
+            .lock()
+            .unwrap()
+            .get(image)
+            .cloned()
+            .unwrap_or_else(|| image.clone())
+    }
+
+    fn serves(&self, image: &ImageRef) -> bool {
+        self.open_registry || self.registry.lock().unwrap().contains(image)
+    }
+
+    /// Whether it holds `image`: by that reference, or, for one pinned by digest, under a tag of its repository that
+    /// names that digest now.
+    fn held(&self, image: &ImageRef) -> bool {
+        let local = self.local.lock().unwrap();
+        if local.contains(image) {
+            return true;
+        }
+        image.digest().is_some()
+            && local.iter().any(|tag| {
+                tag.digest().is_none() && tag.repository() == image.repository() && {
+                    let generation = self.generation.lock().unwrap().get(tag).copied().unwrap_or(0);
+                    tag.pinned(&Self::digest_at(tag, generation)) == *image
+                }
+            })
     }
 
     /// Sets the room it says it has for images from now on, or `None` for an engine that cannot tell.
@@ -816,19 +892,21 @@ impl Runtime for Fake {
                 permit.forget();
             }
         }
-        if !self.open_registry && !self.registry.lock().unwrap().contains(image) {
+        let source = self.source_of(image);
+        let resolved = self.resolved.lock().unwrap().contains_key(image);
+        if !(resolved && self.serves(&source)) && !self.serves(image) {
             return Err(RuntimeError::ImageNotFound(image.0.clone()));
         }
-        let held = self.local.lock().unwrap().contains(image);
-        let moves = held && self.moved.lock().unwrap().contains(image);
+        let held = self.held(image);
+        let moves = held && image.digest().is_none() && self.moved.lock().unwrap().contains(image);
         let fresh = !held || moves;
-        let downloads = self.sizes.lock().unwrap().get(image).copied().filter(|_| fresh);
+        let downloads = self.sizes.lock().unwrap().get(&source).copied().filter(|_| fresh);
         if let (Some(bytes), Some(most)) = (downloads, limits.most_bytes) {
             if bytes > most {
                 return Err(RuntimeError::TooLarge(image.0.clone()));
             }
         }
-        let unpacked = self.unpacked.lock().unwrap().get(image).copied().filter(|_| fresh);
+        let unpacked = self.unpacked.lock().unwrap().get(&source).copied().filter(|_| fresh);
         let start = *self.image_room.lock().unwrap();
         if limits.floor_bytes.is_some() && start.is_none() {
             return Err(RuntimeError::RoomUnknown(format!(
@@ -874,7 +952,7 @@ impl Runtime for Fake {
             *self.generation.lock().unwrap().entry(image.clone()).or_default() += 1;
         }
         let end = *self.image_room.lock().unwrap();
-        let size = self.unpacked.lock().unwrap().get(image).copied().unwrap_or(0);
+        let size = self.unpacked.lock().unwrap().get(&source).copied().unwrap_or(0);
         let past = match (start, end) {
             (Some(start), Some(end)) => limits.hold(image, start, end).err(),
             _ => None,
@@ -898,8 +976,26 @@ impl Runtime for Fake {
         Err(e)
     }
 
+    async fn resolve(&self, image: &ImageRef) -> Result<ImageRef, RuntimeError> {
+        if image.digest().is_some() {
+            let known = self.resolved.lock().unwrap().contains_key(image);
+            return match known || self.serves(image) {
+                true => Ok(image.clone()),
+                false => Err(RuntimeError::ImageNotFound(image.0.clone())),
+            };
+        }
+        if !self.serves(image) {
+            return Err(RuntimeError::ImageNotFound(image.0.clone()));
+        }
+        let generation = self.generation.lock().unwrap().get(image).copied().unwrap_or(0);
+        let newer = u32::from(self.moved.lock().unwrap().contains(image));
+        let pinned = image.pinned(&Self::digest_at(image, generation + newer));
+        self.resolved.lock().unwrap().insert(pinned.clone(), image.clone());
+        Ok(pinned)
+    }
+
     async fn holds(&self, image: &ImageRef) -> Result<bool, RuntimeError> {
-        Ok(self.local.lock().unwrap().contains(image))
+        Ok(self.held(image))
     }
 
     async fn remove_image(&self, image: &ImageRef) -> Result<(), RuntimeError> {
@@ -927,7 +1023,7 @@ impl Runtime for Fake {
         if let Some(why) = self.refusal.lock().unwrap().clone() {
             return Err(RuntimeError::Engine(why));
         }
-        if !self.local.lock().unwrap().contains(&spec.image) {
+        if !self.held(&spec.image) {
             return Err(RuntimeError::ImageNotFound(spec.image.0.clone()));
         }
         if let Some(d) = spec.devices.iter().find(|d| !self.devices.contains(d)) {
@@ -1497,6 +1593,118 @@ mod tests {
         assert!(!rt.holds(&image).await.unwrap(), "the image it made is removed");
         assert_eq!(rt.removed(), vec![image]);
         assert_eq!(rt.image_room().await, Some(100 << 30), "and its room given back");
+    }
+
+    #[test]
+    fn a_reference_is_pinned_to_its_repository_by_digest_whatever_its_tag_or_registry_port() {
+        let d = "sha256:abc";
+        for (r, repo) in [
+            ("nvidia/cuda:12.8.0-base-ubuntu24.04", "nvidia/cuda"),
+            ("registry.example:5000/team/train", "registry.example:5000/team/train"),
+            ("registry.example:5000/team/train:1", "registry.example:5000/team/train"),
+            ("busybox", "busybox"),
+            ("busybox:1@sha256:old", "busybox"),
+        ] {
+            let image = ImageRef(r.into());
+            assert_eq!(image.repository(), repo, "{r}");
+            assert_eq!(image.pinned(d), ImageRef(format!("{repo}@{d}")), "{r}");
+        }
+        assert_eq!(ImageRef("busybox@sha256:abc".into()).digest(), Some("sha256:abc"));
+        assert_eq!(ImageRef("busybox:1".into()).digest(), None);
+    }
+
+    #[tokio::test]
+    async fn a_reference_is_resolved_at_the_registry_and_its_digest_pulled_run_and_removed_with_no_tag_made() {
+        let tag = ImageRef("ghcr.io/example/train:1".into());
+        let rt = Fake::new(vec!["gpu-0".into()], vec![]);
+        rt.registry_has(tag.clone());
+        let pinned = rt.resolve(&tag).await.unwrap();
+        assert_eq!(pinned.repository(), "ghcr.io/example/train");
+        assert!(pinned.digest().unwrap().starts_with("sha256:"));
+        assert!(rt.pulled().is_empty(), "resolving pulls nothing");
+        assert!(!rt.holds(&pinned).await.unwrap());
+        rt.pull(&pinned, Arc::new(|_| {})).await.unwrap();
+        assert!(rt.holds(&pinned).await.unwrap());
+        assert!(!rt.holds(&tag).await.unwrap(), "a pull by digest makes no tag");
+        let mut s = spec(&pinned.0, "gpu-0");
+        s.ports = vec![];
+        let id = rt.start(s).await.unwrap().id;
+        rt.stop(&id).await.unwrap();
+        rt.remove_image(&pinned).await.unwrap();
+        assert!(!rt.holds(&pinned).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_tag_the_owner_holds_at_an_older_image_is_left_on_it_by_a_pull_of_the_registrys_digest() {
+        let tag = ImageRef("pytorch/pytorch:latest".into());
+        let rt = Fake::new(vec!["gpu-0".into()], vec![tag.clone()]).with_open_registry();
+        let owners = rt.image_id(&tag);
+        let then = rt.resolve(&tag).await.unwrap();
+        assert!(
+            rt.holds(&then).await.unwrap(),
+            "the engine holds the digest its tag names, by that digest"
+        );
+        rt.moves_on_pull(tag.clone());
+        let now = rt.resolve(&tag).await.unwrap();
+        assert_ne!(now, then, "the registry names a newer image by the tag");
+        assert!(
+            !rt.holds(&now).await.unwrap(),
+            "the tag the engine holds is not the registry's digest"
+        );
+        rt.pull(&now, Arc::new(|_| {})).await.unwrap();
+        assert_eq!(
+            rt.image_id(&tag),
+            owners,
+            "the owner's tag still names the owner's image"
+        );
+        rt.remove_image(&now).await.unwrap();
+        assert!(rt.holds(&tag).await.unwrap() && rt.holds(&then).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn removing_a_digest_leaves_a_tag_the_owner_pulled_meanwhile_on_its_image() {
+        let tag = ImageRef("pytorch/pytorch:latest".into());
+        let rt = Fake::new(vec!["gpu-0".into()], vec![]).with_open_registry();
+        let pinned = rt.resolve(&tag).await.unwrap();
+        rt.pull(&pinned, Arc::new(|_| {})).await.unwrap();
+        rt.pull(&tag, Arc::new(|_| {})).await.unwrap();
+        let owners = rt.image_id(&tag);
+        rt.remove_image(&pinned).await.unwrap();
+        assert!(rt.holds(&tag).await.unwrap());
+        assert_eq!(rt.image_id(&tag), owners);
+    }
+
+    #[tokio::test]
+    async fn an_image_only_the_host_holds_is_not_found_at_the_registry_as_one_nobody_holds_is() {
+        let local = ImageRef("owners/own-build:1".into());
+        let rt = Fake::new(vec!["gpu-0".into()], vec![local.clone()]);
+        let held = rt.resolve(&local).await.unwrap_err();
+        let nowhere = rt.resolve(&ImageRef("owners/no-such:1".into())).await.unwrap_err();
+        assert!(matches!(held, RuntimeError::ImageNotFound(ref r) if r == "owners/own-build:1"));
+        assert!(matches!(nowhere, RuntimeError::ImageNotFound(ref r) if r == "owners/no-such:1"));
+        assert_eq!(
+            held.to_string().replace("own-build", "X"),
+            nowhere.to_string().replace("no-such", "X"),
+            "the same answer, whatever the host holds"
+        );
+        assert!(rt.pulled().is_empty());
+        let guessed = ImageRef("owners/own-build@sha256:anything".into());
+        assert!(matches!(
+            rt.resolve(&guessed).await,
+            Err(RuntimeError::ImageNotFound(_))
+        ));
+        assert!(matches!(
+            rt.pull(&guessed, Arc::new(|_| {})).await,
+            Err(RuntimeError::ImageNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_runtime_that_cannot_resolve_a_reference_says_so() {
+        assert!(matches!(
+            NoNames.resolve(&ImageRef("x:1".into())).await,
+            Err(RuntimeError::Engine(_))
+        ));
     }
 
     #[tokio::test]
