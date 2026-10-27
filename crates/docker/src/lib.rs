@@ -462,6 +462,25 @@ where
     }
 }
 
+/// Whether an image pulled whole is past the bound by its unpacked size, `after` its id and size as the engine holds it
+/// now: never when it is the very image the engine held before the pull, `before` its id, since nothing of it landed
+/// on the disk; an image the engine does not hold after the pull cannot be held to a bound, and is an error.
+fn unpacked_past(
+    image: &ImageRef,
+    limits: PullLimits,
+    before: Option<&str>,
+    after: Option<(String, u64)>,
+) -> Option<RuntimeError> {
+    match after {
+        Some((id, _)) if before == Some(id.as_str()) => None,
+        Some((_, size)) => limits.hold_unpacked(image, size).err(),
+        None => Some(RuntimeError::Engine(format!(
+            "the engine does not hold {} after pulling it, so its size cannot be held to a bound",
+            image.0
+        ))),
+    }
+}
+
 /// `past` with `note` on what became of the image it made added to its words.
 fn noted(past: RuntimeError, note: &str) -> RuntimeError {
     match past {
@@ -573,7 +592,8 @@ impl Runtime for DockerRuntime {
     /// the layers' sizes the engine says are counted as they come. What a pull given up downloaded is the engine's own
     /// to release, and no image is made for it. An image pulled whole and past the limits by the room read at the end,
     /// or by its unpacked size, is undone as [`DockerRuntime::undo_pull`] says, and the pull answers the limit it
-    /// passed.
+    /// passed; the unpacked size of the very image the engine held before the pull is not held to the bound, since
+    /// none of it landed on the disk.
     async fn pull_bounded(&self, image: &ImageRef, progress: Progress, limits: PullLimits) -> Result<(), RuntimeError> {
         if limits == PullLimits::default() {
             return self.pull_whole(image, &progress, limits, None).await.map(|_| ());
@@ -587,13 +607,7 @@ impl Runtime for DockerRuntime {
             Pulled::Past(e) => Some(e),
             Pulled::Within => match limits.most_bytes {
                 None => None,
-                Some(_) => match self.image_id_and_size(image).await? {
-                    Some((_, size)) => limits.hold_unpacked(image, size).err(),
-                    None => Some(RuntimeError::Engine(format!(
-                        "the engine does not hold {} after pulling it, so its size cannot be held to a bound",
-                        image.0
-                    ))),
-                },
+                Some(_) => unpacked_past(image, limits, before.as_deref(), self.image_id_and_size(image).await?),
             },
         };
         match past {
@@ -2010,6 +2024,29 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(ended, Pulled::Within), "{ended:?}");
+    }
+
+    #[test]
+    fn the_image_the_engine_held_before_its_pull_is_not_held_to_the_bound_by_its_unpacked_size() {
+        let image = ImageRef("nvidia/cuda:12.8.0-base-ubuntu24.04".into());
+        let bound = limits(Some(25 * GIB), None);
+        assert!(
+            unpacked_past(&image, bound, Some("sha256:a"), Some(("sha256:a".into(), 30 * GIB))).is_none(),
+            "the owner's own image, unmoved, lands nothing"
+        );
+        assert!(matches!(
+            unpacked_past(&image, bound, Some("sha256:a"), Some(("sha256:b".into(), 30 * GIB))),
+            Some(RuntimeError::TooLarge(_))
+        ));
+        assert!(matches!(
+            unpacked_past(&image, bound, None, Some(("sha256:b".into(), 30 * GIB))),
+            Some(RuntimeError::TooLarge(_))
+        ));
+        assert!(unpacked_past(&image, bound, None, Some(("sha256:b".into(), 25 * GIB))).is_none());
+        assert!(matches!(
+            unpacked_past(&image, bound, Some("sha256:a"), None),
+            Some(RuntimeError::Engine(_))
+        ));
     }
 
     #[test]

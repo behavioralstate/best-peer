@@ -347,7 +347,8 @@ pub trait Runtime: Send + Sync {
     /// whole and past either limit, by the room read at its end or by its unpacked size, is undone and the pull answers
     /// the limit it passed: an image the engine did not hold is removed; a reference the engine held that the pull
     /// moved to a new image names the image it named before again, the new one removed; an image the pull left as the
-    /// engine held it is the owner's and stays. A layer the engine already holds takes no room while it pulls, and
+    /// engine held it is the owner's and stays. The unpacked size of an image the pull left as the engine held it is
+    /// not held to the bound, since none of it landed on the disk: such a pull succeeds whatever that size. A layer the engine already holds takes no room while it pulls, and
     /// counts in the unpacked size. A floor where the room cannot be read is refused with [`RuntimeError::RoomUnknown`]
     /// before anything is pulled. A runtime that cannot hold a pull to limits refuses any rather than ignore them.
     async fn pull_bounded(&self, image: &ImageRef, progress: Progress, limits: PullLimits) -> Result<(), RuntimeError> {
@@ -878,7 +879,7 @@ impl Runtime for Fake {
             (Some(start), Some(end)) => limits.hold(image, start, end).err(),
             _ => None,
         }
-        .or_else(|| limits.hold_unpacked(image, size).err());
+        .or_else(|| limits.hold_unpacked(image, size).err().filter(|_| fresh));
         let Some(e) = past else {
             return Ok(());
         };
@@ -1433,17 +1434,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_image_the_engine_held_before_its_pull_is_never_removed_by_it() {
+    async fn an_image_the_engine_held_before_its_pull_and_still_holds_is_pulled_whatever_it_unpacks_to() {
         let image = ImageRef("owners/own:latest".into());
         let rt = Fake::new(vec!["gpu-0".into()], vec![image.clone()]).with_open_registry();
+        let owners = rt.image_id(&image);
         rt.unpacks(image.clone(), 30 << 30);
-        let err = rt
-            .pull_bounded(&image, Arc::new(|_| {}), most(25 << 30))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RuntimeError::TooLarge(_)));
+        rt.pull_bounded(&image, Arc::new(|_| {}), most(25 << 30)).await.unwrap();
         assert!(rt.holds(&image).await.unwrap());
+        assert_eq!(rt.image_id(&image), owners, "the same image, nothing of it landed");
         assert!(rt.removed().is_empty());
+        rt.set_image_room(Some(0));
+        let floor = PullLimits {
+            most_bytes: None,
+            floor_bytes: Some(1),
+        };
+        let err = rt.pull_bounded(&image, Arc::new(|_| {}), floor).await.unwrap_err();
+        assert!(matches!(err, RuntimeError::NoRoom(_)), "the floor is still held");
+        assert!(rt.holds(&image).await.unwrap());
     }
 
     #[tokio::test]
