@@ -60,6 +60,60 @@ impl ImageRef {
     pub fn pinned(&self, digest: &str) -> ImageRef {
         ImageRef(format!("{}@{digest}", self.repository()))
     }
+
+    /// The registry it is pulled from, as [`ImageRef::canonical_repository`] spells it: `docker.io` when it names none.
+    pub fn registry(&self) -> String {
+        let canonical = self.canonical_repository();
+        canonical.split('/').next().unwrap_or_default().to_string()
+    }
+}
+
+/// A credential for one registry: the bearer token its token service gave for a pull, which the engine sends that
+/// registry as it is. It is sent to that registry alone, and never shown: its `Debug` names the registry, not the token.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RegistryToken {
+    registry: String,
+    token: String,
+}
+
+impl RegistryToken {
+    /// The token `token` for `registry`, spelled as an image names it (`registry.example.com`, `localhost:5000`).
+    pub fn new(registry: impl Into<String>, token: impl Into<String>) -> Self {
+        Self {
+            registry: registry.into(),
+            token: token.into(),
+        }
+    }
+
+    pub fn registry(&self) -> &str {
+        &self.registry
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// Refused unless `image` is pulled from this credential's registry: a token is never sent to another.
+    pub fn for_image(&self, image: &ImageRef) -> Result<(), RuntimeError> {
+        let registry = ImageRef(format!("{}/x", self.registry)).registry();
+        match image.registry() == registry {
+            true => Ok(()),
+            false => Err(RuntimeError::Engine(format!(
+                "a credential for {} is not sent to {}, the registry of {}",
+                self.registry,
+                image.registry(),
+                image.0
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Debug for RegistryToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryToken")
+            .field("registry", &self.registry)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The engine's id for a running container.
@@ -403,6 +457,23 @@ pub trait Runtime: Send + Sync {
             )),
         }
     }
+    /// [`Runtime::pull_bounded`], the registry asked with `credential` when it is one: a token for the image's registry
+    /// ([`RegistryToken`]), refused before anything is asked when it is for another. A runtime that cannot carry a
+    /// credential refuses one rather than pull without it; without one, this is [`Runtime::pull_bounded`].
+    async fn pull_bounded_with(
+        &self,
+        image: &ImageRef,
+        progress: Progress,
+        limits: PullLimits,
+        credential: Option<&RegistryToken>,
+    ) -> Result<(), RuntimeError> {
+        match credential {
+            None => self.pull_bounded(image, progress, limits).await,
+            Some(_) => Err(RuntimeError::Engine(
+                "this runtime cannot carry a registry credential".into(),
+            )),
+        }
+    }
     /// The reference pinned by digest to the image the registry serves under `image` now, asked of the registry and
     /// nothing pulled: an image the registry does not serve is [`RuntimeError::ImageNotFound`] whatever the engine
     /// holds, so the answer tells a caller nothing of the host. Pulling, running and removing what it answers never
@@ -413,6 +484,20 @@ pub trait Runtime: Send + Sync {
         Err(RuntimeError::Engine(
             "this runtime cannot resolve a reference at its registry".into(),
         ))
+    }
+    /// [`Runtime::resolve`], the registry asked with `credential` when it is one, as [`Runtime::pull_bounded_with`]
+    /// carries it: a registry that refuses it is [`RuntimeError::ImageNotFound`], as one that refuses a request without.
+    async fn resolve_with(
+        &self,
+        image: &ImageRef,
+        credential: Option<&RegistryToken>,
+    ) -> Result<ImageRef, RuntimeError> {
+        match credential {
+            None => self.resolve(image).await,
+            Some(_) => Err(RuntimeError::Engine(
+                "this runtime cannot carry a registry credential".into(),
+            )),
+        }
     }
     /// Whether the engine holds the image now, so starting it needs no registry: a reference pinned by digest is held
     /// when the engine holds that digest under that repository, however the repository is spelled
@@ -566,6 +651,10 @@ pub struct Fake {
     written: Mutex<HashMap<ContainerId, Writing>>,
     /// The user an image names, where a test sets one; root otherwise, as an image that names none runs.
     image_users: Mutex<HashMap<ImageRef, String>>,
+    /// The repositories its registry serves only to a request carrying a token, by canonical repository.
+    guarded: Mutex<HashMap<String, String>>,
+    /// Every resolve and pull, in order, with the credential it carried.
+    credentials: Mutex<Vec<(ImageRef, Option<RegistryToken>)>>,
 }
 
 /// One container's output on the fake: all it wrote, its followers while it runs, and whether it has ended.
@@ -616,6 +705,40 @@ impl Fake {
             no_disks: Mutex::new(false),
             written: Mutex::new(HashMap::new()),
             image_users: Mutex::new(HashMap::new()),
+            guarded: Mutex::new(HashMap::new()),
+            credentials: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Its registry serves `image`'s repository, under any tag or digest, only to a request carrying `token`: one
+    /// without it, or with another, is refused as a registry refuses it, the image not found.
+    pub fn guards(&self, image: &ImageRef, token: &str) {
+        self.guarded
+            .lock()
+            .unwrap()
+            .insert(image.canonical_repository(), token.to_string());
+    }
+
+    /// Every resolve and pull, in order, with the credential it carried.
+    pub fn credentials(&self) -> Vec<(ImageRef, Option<RegistryToken>)> {
+        self.credentials.lock().unwrap().clone()
+    }
+
+    /// A request to its registry for `image` carrying `credential`: recorded, and refused for a credential of another
+    /// registry, or for a guarded repository without its token.
+    fn asked(&self, image: &ImageRef, credential: Option<&RegistryToken>) -> Result<(), RuntimeError> {
+        if let Some(credential) = credential {
+            credential.for_image(image)?;
+        }
+        self.credentials
+            .lock()
+            .unwrap()
+            .push((image.clone(), credential.cloned()));
+        match self.guarded.lock().unwrap().get(&image.canonical_repository()) {
+            Some(token) if credential.map(|c| c.token()) != Some(token.as_str()) => {
+                Err(RuntimeError::ImageNotFound(image.0.clone()))
+            }
+            _ => Ok(()),
         }
     }
 
@@ -911,7 +1034,18 @@ impl Runtime for Fake {
     }
 
     async fn pull_bounded(&self, image: &ImageRef, progress: Progress, limits: PullLimits) -> Result<(), RuntimeError> {
+        self.pull_bounded_with(image, progress, limits, None).await
+    }
+
+    async fn pull_bounded_with(
+        &self,
+        image: &ImageRef,
+        progress: Progress,
+        limits: PullLimits,
+        credential: Option<&RegistryToken>,
+    ) -> Result<(), RuntimeError> {
         self.pulled.lock().unwrap().push(image.clone());
+        self.asked(image, credential)?;
         let gate = self.gate.lock().unwrap().clone();
         if let Some(gate) = gate {
             if let Ok(permit) = gate.acquire().await {
@@ -1003,6 +1137,15 @@ impl Runtime for Fake {
     }
 
     async fn resolve(&self, image: &ImageRef) -> Result<ImageRef, RuntimeError> {
+        self.resolve_with(image, None).await
+    }
+
+    async fn resolve_with(
+        &self,
+        image: &ImageRef,
+        credential: Option<&RegistryToken>,
+    ) -> Result<ImageRef, RuntimeError> {
+        self.asked(image, credential)?;
         if image.digest().is_some() {
             let known = self.resolved.lock().unwrap().contains_key(image);
             return match known || self.serves(image) {
@@ -1284,6 +1427,87 @@ mod tests {
         assert!(matches!(err, RuntimeError::ImageNotFound(ref i) if i == "vllm/vllm-openai:v0.8"));
         rt.pull(&image, Arc::new(|_| {})).await.unwrap();
         rt.start(spec("vllm/vllm-openai:v0.8", "gpu-0")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_guarded_repository_resolves_and_pulls_only_with_its_registrys_token() {
+        let rt = Fake::new(vec!["gpu-0".into()], vec![]);
+        let image = ImageRef("registry.example.com/acct/train:1".into());
+        rt.registry_has(image.clone());
+        rt.guards(&image, "t0ken");
+        let token = RegistryToken::new("registry.example.com", "t0ken");
+        let wrong = RegistryToken::new("registry.example.com", "other");
+        let none = PullLimits::default();
+
+        assert!(matches!(
+            rt.resolve(&image).await.unwrap_err(),
+            RuntimeError::ImageNotFound(_)
+        ));
+        assert!(matches!(
+            rt.resolve_with(&image, Some(&wrong)).await.unwrap_err(),
+            RuntimeError::ImageNotFound(_)
+        ));
+        let pinned = rt.resolve_with(&image, Some(&token)).await.unwrap();
+        assert!(matches!(
+            rt.pull_bounded(&pinned, Arc::new(|_| {}), none).await.unwrap_err(),
+            RuntimeError::ImageNotFound(_)
+        ));
+        rt.pull_bounded_with(&pinned, Arc::new(|_| {}), none, Some(&token))
+            .await
+            .unwrap();
+        assert_eq!(rt.credentials().last(), Some(&(pinned, Some(token))));
+    }
+
+    #[tokio::test]
+    async fn a_token_is_never_sent_to_another_registry() {
+        let rt = Fake::new(vec!["gpu-0".into()], vec![]).with_open_registry();
+        let token = RegistryToken::new("registry.example.com", "t0ken");
+        for image in [
+            "nvidia/cuda:13.0-base",
+            "ghcr.io/acme/train:1",
+            "registry.example.com.evil.io/acct/x:1",
+        ] {
+            let image = ImageRef(image.into());
+            assert!(
+                matches!(
+                    rt.resolve_with(&image, Some(&token)).await.unwrap_err(),
+                    RuntimeError::Engine(_)
+                ),
+                "{}",
+                image.0
+            );
+            let pulled = rt
+                .pull_bounded_with(&image, Arc::new(|_| {}), PullLimits::default(), Some(&token))
+                .await;
+            assert!(matches!(pulled.unwrap_err(), RuntimeError::Engine(_)), "{}", image.0);
+        }
+        assert!(rt.credentials().is_empty(), "refused before the registry is asked");
+        let docker_hub = RegistryToken::new("index.docker.io", "t0ken");
+        rt.resolve_with(&ImageRef("busybox:1.36".into()), Some(&docker_hub))
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn a_registry_token_never_shows_its_token() {
+        let shown = format!("{:?}", RegistryToken::new("registry.example.com", "s3cret-token"));
+        assert!(
+            shown.contains("registry.example.com") && !shown.contains("s3cret-token"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn an_images_registry_is_spelled_as_its_canonical_repository_spells_it() {
+        for (image, registry) in [
+            ("busybox", "docker.io"),
+            ("nvidia/cuda@sha256:abc", "docker.io"),
+            ("index.docker.io/library/busybox:1", "docker.io"),
+            ("localhost:5187/acct/x:1", "localhost:5187"),
+            ("registry.windlet.io/acct/x:1", "registry.windlet.io"),
+        ] {
+            assert_eq!(ImageRef(image.into()).registry(), registry, "{image}");
+        }
     }
 
     #[tokio::test]

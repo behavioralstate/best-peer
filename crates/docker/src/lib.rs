@@ -33,8 +33,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use best_peer_runtime::{
     Confinement, ContainerId, Event, Following, ImageRef, Isolation, Network, Output, Progress, Published, PullLimits,
-    Runtime, RuntimeError, Spec, Started, Written,
+    RegistryToken, Runtime, RuntimeError, Spec, Started, Written,
 };
+use bollard::auth::DockerCredentials;
 use bollard::container::LogOutput;
 use bollard::models::{
     ContainerCreateBody, ContainerTopResponse, CreateImageInfo, DeviceRequest, EventMessageTypeEnum, HostConfig,
@@ -327,6 +328,23 @@ async fn last_words(docker: &Docker, id: &str) -> Option<String> {
     (!text.is_empty()).then(|| text[start..].to_string())
 }
 
+/// The engine's credentials for a request about `image`: none without a credential; with one, its token as a registry
+/// token for its registry, refused when the image is pulled from another.
+fn credentials_for(
+    image: &ImageRef,
+    credential: Option<&RegistryToken>,
+) -> Result<Option<DockerCredentials>, RuntimeError> {
+    let Some(credential) = credential else {
+        return Ok(None);
+    };
+    credential.for_image(image)?;
+    Ok(Some(DockerCredentials {
+        serveraddress: Some(credential.registry().to_string()),
+        registrytoken: Some(credential.token().to_string()),
+        ..Default::default()
+    }))
+}
+
 /// `name:tag` as the engine wants them apart; a reference without a tag means `latest`. A port in the registry's
 /// host is not a tag. A reference pinned by digest (`name:tag@sha256:...`) is handed over whole, with no tag: the
 /// digest is the name.
@@ -611,15 +629,31 @@ impl Runtime for DockerRuntime {
     /// passed; the unpacked size of the very image the engine held before the pull is not held to the bound, since
     /// none of it landed on the disk.
     async fn pull_bounded(&self, image: &ImageRef, progress: Progress, limits: PullLimits) -> Result<(), RuntimeError> {
+        self.pull_bounded_with(image, progress, limits, None).await
+    }
+
+    /// [`DockerRuntime::pull_bounded`], the credential in the pull's `X-Registry-Auth` as a registry token, which the
+    /// engine sends the registry as a bearer token, and in nothing else of the pull.
+    async fn pull_bounded_with(
+        &self,
+        image: &ImageRef,
+        progress: Progress,
+        limits: PullLimits,
+        credential: Option<&RegistryToken>,
+    ) -> Result<(), RuntimeError> {
+        let credentials = credentials_for(image, credential)?;
         if limits == PullLimits::default() {
-            return self.pull_whole(image, &progress, limits, None).await.map(|_| ());
+            return self
+                .pull_whole(image, &progress, limits, None, credentials)
+                .await
+                .map(|_| ());
         }
         let root = match self.engine_here {
             true => self.docker.info().await.ok().and_then(|i| i.docker_root_dir),
             false => None,
         };
         let before = self.image_id_and_size(image).await?.map(|(id, _)| id);
-        let past = match self.pull_whole(image, &progress, limits, root).await? {
+        let past = match self.pull_whole(image, &progress, limits, root, credentials).await? {
             Pulled::Past(e) => Some(e),
             Pulled::Within => match limits.most_bytes {
                 None => None,
@@ -818,11 +852,23 @@ impl Runtime for DockerRuntime {
     }
 
     /// Asks the engine's distribution endpoint, which asks the registry for the manifest and pulls nothing. The
-    /// request carries no credentials, and neither does a pull's, so a registry that needs them refuses both. A registry
+    /// request carries no credentials, and neither does a pull's, so a registry that needs them refuses both:
+    /// [`DockerRuntime::resolve_with`] and [`DockerRuntime::pull_bounded_with`] carry one. A registry
     /// that refuses or does not know the reference is [`RuntimeError::ImageNotFound`], one that cannot be reached the
     /// engine's words, as a pull's are: neither depends on what the engine holds.
     async fn resolve(&self, image: &ImageRef) -> Result<ImageRef, RuntimeError> {
-        match self.docker.inspect_registry_image(&image.0, None).await {
+        self.resolve_with(image, None).await
+    }
+
+    /// [`DockerRuntime::resolve`], the credential carried as a pull's is: a registry that refuses it refuses the
+    /// reference, [`RuntimeError::ImageNotFound`].
+    async fn resolve_with(
+        &self,
+        image: &ImageRef,
+        credential: Option<&RegistryToken>,
+    ) -> Result<ImageRef, RuntimeError> {
+        let credentials = credentials_for(image, credential)?;
+        match self.docker.inspect_registry_image(&image.0, credentials).await {
             Ok(inspected) => match inspected.descriptor.digest {
                 Some(digest) => Ok(image.pinned(&digest)),
                 None => Err(RuntimeError::Engine(format!(
@@ -1250,13 +1296,14 @@ impl DockerRuntime {
         progress: &Progress,
         limits: PullLimits,
         root: Option<String>,
+        credentials: Option<DockerCredentials>,
     ) -> Result<Pulled, RuntimeError> {
         let (name, tag) = name_and_tag(image);
         let mut options = CreateImageOptionsBuilder::new().from_image(&name);
         if let Some(tag) = &tag {
             options = options.tag(tag);
         }
-        let stream = self.docker.create_image(Some(options.build()), None, None);
+        let stream = self.docker.create_image(Some(options.build()), None, credentials);
         watched(image, stream, progress, limits, || room_under(root.clone()), ROOM_EVERY).await
     }
 
