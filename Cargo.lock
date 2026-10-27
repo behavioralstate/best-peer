@@ -208,7 +208,7 @@ checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "best-peer"
-version = "0.0.29"
+version = "0.0.30"
 dependencies = [
  "async-trait",
  "axum",
@@ -251,7 +251,7 @@ dependencies = [
 
 [[package]]
 name = "best-peer-docker"
-version = "0.0.29"
+version = "0.0.30"
 dependencies = [
  "async-trait",
  "best-peer-gpu",
@@ -265,7 +265,7 @@ dependencies = [
 
 [[package]]
 name = "best-peer-door"
-version = "0.0.29"
+version = "0.0.30"
 dependencies = [
  "async-trait",
  "axum",
@@ -292,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "best-peer-engine"
-version = "0.0.29"
+version = "0.0.30"
 dependencies = [
  "async-trait",
  "best-peer-gpu",
@@ -305,7 +305,7 @@ dependencies = [
 
 [[package]]
 name = "best-peer-engine-http"
-version = "0.0.29"
+version = "0.0.30"
 dependencies = [
  "async-trait",
  "best-peer-engine",
@@ -317,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "best-peer-gpu"
-version = "0.0.29"
+version = "0.0.30"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "best-peer-host"
-version = "0.0.29"
+version = "0.0.30"
 dependencies = [
  "best-peer-gpu",
  "sysinfo",
@@ -333,7 +333,7 @@ dependencies = [
 
 [[package]]
 name = "best-peer-native"
-version = "0.0.29"
+version = "0.0.30"
 dependencies = [
  "async-trait",
  "best-peer-runtime",
@@ -342,7 +342,7 @@ dependencies = [
 
 [[package]]
 name = "best-peer-nvml"
-version = "0.0.29"
+version = "0.0.30"
 dependencies = [
  "best-peer-gpu",
  "nvml-wrapper",
@@ -350,7 +350,7 @@ dependencies = [
 
 [[package]]
 name = "best-peer-runtime"
-version = "0.0.29"
+version = "0.0.30"
 dependencies = [
  "async-trait",
  "best-peer-gpu",
