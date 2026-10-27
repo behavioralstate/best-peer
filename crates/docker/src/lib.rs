@@ -398,7 +398,7 @@ where
     match start {
         Some(start) => limits.hold(image, start, start)?,
         None if limits.floor_bytes.is_some() => {
-            return Err(RuntimeError::NoRoom(format!(
+            return Err(RuntimeError::RoomUnknown(format!(
                 "{}: the room on the engine's disk cannot be read on this host, so its floor cannot be held",
                 image.0
             )))
@@ -1898,7 +1898,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            matches!(err, RuntimeError::NoRoom(ref why) if why.contains("cannot be read")),
+            matches!(err, RuntimeError::RoomUnknown(ref why) if why.contains("cannot be read")),
             "{err}"
         );
         assert!(

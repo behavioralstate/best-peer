@@ -246,10 +246,13 @@ pub enum RuntimeError {
     /// by how much. It was given up, or the image it made removed.
     #[error("image larger than allowed: {0}")]
     TooLarge(String),
-    /// The engine's disk has, or fell to, less free than a pull's floor, or its room cannot be read to hold one: the
-    /// pull was given up, or never begun.
+    /// The engine's disk has, or fell to, less free than a pull's floor: the pull was given up, or never begun.
     #[error("no room on the engine's disk: {0}")]
     NoRoom(String),
+    /// The room on the engine's disk cannot be read where this runtime runs, so a pull's floor cannot be held: the pull
+    /// was never begun.
+    #[error("the room on the engine's disk is not known: {0}")]
+    RoomUnknown(String),
     /// A job's disk could not be made, or this runtime makes none: the words say which.
     #[error("{0}")]
     NoDisk(String),
@@ -345,7 +348,7 @@ pub trait Runtime: Send + Sync {
     /// the limit it passed: an image the engine did not hold is removed; a reference the engine held that the pull
     /// moved to a new image names the image it named before again, the new one removed; an image the pull left as the
     /// engine held it is the owner's and stays. A layer the engine already holds takes no room while it pulls, and
-    /// counts in the unpacked size. A floor where the room cannot be read is refused with [`RuntimeError::NoRoom`]
+    /// counts in the unpacked size. A floor where the room cannot be read is refused with [`RuntimeError::RoomUnknown`]
     /// before anything is pulled. A runtime that cannot hold a pull to limits refuses any rather than ignore them.
     async fn pull_bounded(&self, image: &ImageRef, progress: Progress, limits: PullLimits) -> Result<(), RuntimeError> {
         match limits == PullLimits::default() {
@@ -827,7 +830,7 @@ impl Runtime for Fake {
         let unpacked = self.unpacked.lock().unwrap().get(image).copied().filter(|_| fresh);
         let start = *self.image_room.lock().unwrap();
         if limits.floor_bytes.is_some() && start.is_none() {
-            return Err(RuntimeError::NoRoom(format!(
+            return Err(RuntimeError::RoomUnknown(format!(
                 "{}: the room on the engine's disk cannot be read, so its floor cannot be held",
                 image.0
             )));
@@ -1399,7 +1402,7 @@ mod tests {
         };
         let err = rt.pull_bounded(&image, Arc::new(|_| {}), floor).await.unwrap_err();
         assert!(
-            matches!(err, RuntimeError::NoRoom(ref why) if why.contains("cannot be read")),
+            matches!(err, RuntimeError::RoomUnknown(ref why) if why.contains("cannot be read")),
             "{err}"
         );
         assert!(!rt.holds(&image).await.unwrap());

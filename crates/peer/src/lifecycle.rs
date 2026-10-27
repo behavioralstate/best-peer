@@ -343,6 +343,42 @@ impl Drop for Promise {
 /// sees, readable by the peer alone: what a restart reads back. It goes with the disk.
 const RECORD: &str = "job.json";
 
+/// Makes everything under `dir` readable by the job, whatever user it runs as and whatever the peer's umask made it:
+/// every file readable by all, and runnable by all when its owner may run it, every directory readable and searchable
+/// by all, nothing else of its mode changed. A link is left as it is and not followed.
+fn open_to_the_job(dir: &std::path::Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let open = |path: &std::path::Path, more: u32| -> Result<(), String> {
+            let meta = std::fs::symlink_metadata(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+            let mode = meta.permissions().mode();
+            if mode & more != more {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode((mode | more) & 0o7777))
+                    .map_err(|e| format!("cannot open {} to the job: {e}", path.display()))?;
+            }
+            Ok(())
+        };
+        open(dir, 0o555)?;
+        for entry in std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))? {
+            let entry = entry.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+            let kind = entry.file_type().map_err(|e| e.to_string())?;
+            if kind.is_dir() {
+                open_to_the_job(&entry.path())?;
+            } else if kind.is_file() {
+                let runs = entry
+                    .metadata()
+                    .map(|m| m.permissions().mode() & 0o100 != 0)
+                    .unwrap_or(false);
+                open(&entry.path(), if runs { 0o555 } else { 0o444 })?;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 fn keep_record(disk: &std::path::Path, outputs: Option<&OutputData>) -> Result<(), String> {
     let record = json!({ "outputs": outputs.map(|o| json!({ "url": o.url, "key": o.key })) });
     crate::tls::write_private(&disk.join(RECORD), &serde_json::to_vec(&record).unwrap_or_default())
@@ -1968,6 +2004,7 @@ impl Peer {
                     bytes += crate::store::fetch(&i.url, &disk.join("in").join(&i.path), i.bytes)
                         .map_err(|why| format!("input {} could not be fetched: {why}", i.path))?;
                 }
+                open_to_the_job(&disk.join("in"))?;
                 Ok((bytes, started.elapsed().as_secs_f64()))
             })
             .await
@@ -3263,6 +3300,9 @@ fn fix_for_runtime(e: &RuntimeError) -> &'static str {
         RuntimeError::NoRoom(_) => {
             "the machine's disk has too little room for the image: ask whoever runs the peer to free some, or order a smaller one"
         }
+        RuntimeError::RoomUnknown(_) => {
+            "the peer cannot read the room on the container engine's disk: ask whoever runs it to run it on the engine's host, where it can read the engine's root directory, or to hold its pulls to no floor"
+        }
         RuntimeError::NoFollow(_) => "this runtime does not tell what a container writes: run it where Docker does",
     }
 }
@@ -3393,6 +3433,54 @@ mod tests {
         assert_eq!(
             fix_for_runtime(&RuntimeError::Engine("anything else".into())),
             "read the container engine's logs on the host"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_input_and_directory_under_in_is_readable_by_the_job_whatever_the_peers_umask_made_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let disk = tempfile::tempdir().unwrap();
+        let input = disk.path().join("in");
+        std::fs::create_dir_all(input.join("a/b")).unwrap();
+        std::fs::write(input.join("top.txt"), "x").unwrap();
+        std::fs::write(input.join("a/b/deep.bin"), "y").unwrap();
+        std::fs::write(input.join("a/run.sh"), "z").unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let set =
+            |p: &std::path::Path, m: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        for f in ["top.txt", "a/b/deep.bin"] {
+            set(&input.join(f), 0o600);
+        }
+        set(&input.join("a/run.sh"), 0o700);
+        for d in ["a/b", "a"] {
+            set(&input.join(d), 0o700);
+        }
+        set(&input, 0o777);
+        std::os::unix::fs::symlink("/etc/hostname", input.join("link")).unwrap();
+        open_to_the_job(&input).unwrap();
+        assert_eq!(mode(&input.join("top.txt")), 0o644);
+        assert_eq!(mode(&input.join("a/b/deep.bin")), 0o644);
+        assert_eq!(
+            mode(&input.join("a/run.sh")),
+            0o755,
+            "what the owner may run, the job may too"
+        );
+        assert_eq!(mode(&input.join("a")), 0o755);
+        assert_eq!(mode(&input.join("a/b")), 0o755);
+        assert_eq!(mode(&input), 0o777, "what was more open stays so");
+    }
+
+    #[test]
+    fn a_disk_too_full_and_a_disk_whose_room_cannot_be_read_are_each_given_their_own_fix() {
+        let full = fix_for_runtime(&RuntimeError::NoRoom("x: under its floor".into()));
+        assert!(full.contains("free some"), "{full}");
+        let unknown = fix_for_runtime(&RuntimeError::RoomUnknown("x: cannot be read".into()));
+        assert!(
+            unknown.contains("engine's root directory")
+                && unknown.contains("no floor")
+                && !unknown.contains("free some"),
+            "{unknown}"
         );
     }
 
