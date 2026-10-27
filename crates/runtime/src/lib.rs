@@ -30,6 +30,27 @@ impl ImageRef {
         }
     }
 
+    /// [`ImageRef::repository`] as the engine's default registry spells it in full, so two spellings of one
+    /// repository compare equal: `nvidia/cuda`, `docker.io/nvidia/cuda` and `index.docker.io/nvidia/cuda` are all
+    /// `docker.io/nvidia/cuda`, and `busybox` is `docker.io/library/busybox`. A first part with a dot or a port, or
+    /// `localhost`, is a registry of its own.
+    pub fn canonical_repository(&self) -> String {
+        let repo = self.repository();
+        let (registry, path) = match repo.split_once('/') {
+            Some((first, rest)) if first.contains('.') || first.contains(':') || first == "localhost" => (first, rest),
+            _ => ("docker.io", repo),
+        };
+        let registry = if registry == "index.docker.io" {
+            "docker.io"
+        } else {
+            registry
+        };
+        match registry == "docker.io" && !path.contains('/') {
+            true => format!("docker.io/library/{path}"),
+            false => format!("{registry}/{path}"),
+        }
+    }
+
     /// Its digest, when it is pinned by one.
     pub fn digest(&self) -> Option<&str> {
         self.0.split_once('@').map(|(_, d)| d)
@@ -385,15 +406,20 @@ pub trait Runtime: Send + Sync {
     /// The reference pinned by digest to the image the registry serves under `image` now, asked of the registry and
     /// nothing pulled: an image the registry does not serve is [`RuntimeError::ImageNotFound`] whatever the engine
     /// holds, so the answer tells a caller nothing of the host. Pulling, running and removing what it answers never
-    /// touches a tag on the engine. A runtime that cannot ask a registry errs.
+    /// touches a tag on the engine. A caller that wants the registry's answer resolves every reference first, one
+    /// already pinned by digest too, and only then asks [`Runtime::holds`] of what it answers. A runtime that cannot
+    /// ask a registry errs.
     async fn resolve(&self, _image: &ImageRef) -> Result<ImageRef, RuntimeError> {
         Err(RuntimeError::Engine(
             "this runtime cannot resolve a reference at its registry".into(),
         ))
     }
     /// Whether the engine holds the image now, so starting it needs no registry: a reference pinned by digest is held
-    /// when the engine holds that digest under that repository, whatever its tags name. An error is the engine's,
-    /// never "not held". An engine that cannot tell says no, and every image is pulled.
+    /// when the engine holds that digest under that repository, however the repository is spelled
+    /// ([`ImageRef::canonical_repository`]), whatever its tags name. It is the engine's answer alone, never the
+    /// registry's: a caller that must not run what the registry no longer serves, nor tell what the host holds,
+    /// asks [`Runtime::resolve`] first, for a reference pinned by digest too. An error is the engine's, never
+    /// "not held". An engine that cannot tell says no, and every image is pulled.
     async fn holds(&self, _image: &ImageRef) -> Result<bool, RuntimeError> {
         Ok(false)
     }
@@ -726,9 +752,9 @@ impl Fake {
         }
         image.digest().is_some()
             && local.iter().any(|tag| {
-                tag.digest().is_none() && tag.repository() == image.repository() && {
+                tag.digest().is_none() && tag.canonical_repository() == image.canonical_repository() && {
                     let generation = self.generation.lock().unwrap().get(tag).copied().unwrap_or(0);
-                    tag.pinned(&Self::digest_at(tag, generation)) == *image
+                    image.digest() == Some(Self::digest_at(tag, generation).as_str())
                 }
             })
     }
@@ -1611,6 +1637,40 @@ mod tests {
         }
         assert_eq!(ImageRef("busybox@sha256:abc".into()).digest(), Some("sha256:abc"));
         assert_eq!(ImageRef("busybox:1".into()).digest(), None);
+    }
+
+    #[test]
+    fn a_repository_is_spelled_in_full_whatever_registry_or_library_it_leaves_out() {
+        for (r, full) in [
+            ("busybox", "docker.io/library/busybox"),
+            ("busybox:1", "docker.io/library/busybox"),
+            ("library/busybox@sha256:a", "docker.io/library/busybox"),
+            ("docker.io/busybox", "docker.io/library/busybox"),
+            ("index.docker.io/library/busybox", "docker.io/library/busybox"),
+            ("nvidia/cuda:12", "docker.io/nvidia/cuda"),
+            ("docker.io/nvidia/cuda@sha256:a", "docker.io/nvidia/cuda"),
+            ("ghcr.io/example/train:1", "ghcr.io/example/train"),
+            ("registry.example:5000/team/train", "registry.example:5000/team/train"),
+            ("localhost/own", "localhost/own"),
+            ("private/other", "docker.io/private/other"),
+        ] {
+            assert_eq!(ImageRef(r.into()).canonical_repository(), full, "{r}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_digest_is_held_under_its_repository_however_spelled_and_never_under_another() {
+        let tag = ImageRef("docker.io/library/busybox:1".into());
+        let rt = Fake::new(vec!["gpu-0".into()], vec![tag.clone()]).with_open_registry();
+        let pinned = rt.resolve(&tag).await.unwrap();
+        let digest = pinned.digest().unwrap();
+        assert!(rt.holds(&ImageRef(format!("busybox@{digest}"))).await.unwrap());
+        assert!(rt.holds(&ImageRef(format!("library/busybox@{digest}"))).await.unwrap());
+        assert!(!rt.holds(&ImageRef(format!("private/other@{digest}"))).await.unwrap());
+        assert!(!rt
+            .holds(&ImageRef(format!("ghcr.io/library/busybox@{digest}")))
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

@@ -484,15 +484,17 @@ fn unpacked_past(
 }
 
 /// Whether an image whose repository digests are `repo_digests` is the one `image` names: always for a reference by
-/// tag, which the engine found it by; for one pinned by digest, only when that digest is among them, as
-/// `repository@digest`.
+/// tag, which the engine found it by; for one pinned by digest, only when that digest is among them under the same
+/// repository, however either spells it ([`ImageRef::canonical_repository`]).
 fn lists_digest(image: &ImageRef, repo_digests: &[String]) -> bool {
-    match image.digest() {
-        None => true,
-        Some(digest) => repo_digests
-            .iter()
-            .any(|r| r.split_once('@').is_some_and(|(_, d)| d == digest)),
-    }
+    let Some(digest) = image.digest() else {
+        return true;
+    };
+    let repository = image.canonical_repository();
+    repo_digests.iter().any(|r| {
+        let listed = ImageRef(r.clone());
+        listed.digest() == Some(digest) && listed.canonical_repository() == repository
+    })
 }
 
 /// `past` with `note` on what became of the image it made added to its words.
@@ -837,7 +839,8 @@ impl Runtime for DockerRuntime {
     }
 
     /// By the reference; one pinned by digest is held only when the image the engine finds by it lists that digest
-    /// among its repository digests, whatever its tags.
+    /// under that repository among its repository digests, whatever its tags. The engine's answer alone: see
+    /// [`Runtime::holds`] on resolving first.
     async fn holds(&self, image: &ImageRef) -> Result<bool, RuntimeError> {
         match self.docker.inspect_image(&image.0).await {
             Ok(inspected) => Ok(lists_digest(
@@ -2096,6 +2099,18 @@ mod tests {
         assert!(lists_digest(&pinned, &["docker.io/nvidia/cuda@sha256:aaa".into()]));
         assert!(!lists_digest(&pinned, &["nvidia/cuda@sha256:bbb".into()]));
         assert!(!lists_digest(&pinned, &[]), "a local build lists no digest");
+        assert!(lists_digest(
+            &ImageRef("busybox@sha256:aaa".into()),
+            &["docker.io/library/busybox@sha256:aaa".into()]
+        ));
+        assert!(
+            !lists_digest(
+                &ImageRef("owners/own-build@sha256:aaa".into()),
+                &["private/other@sha256:aaa".into()]
+            ),
+            "the digest under another repository is not this one"
+        );
+        assert!(!lists_digest(&pinned, &["ghcr.io/nvidia/cuda@sha256:aaa".into()]));
         assert!(lists_digest(&ImageRef("nvidia/cuda:12".into()), &[]));
     }
 
