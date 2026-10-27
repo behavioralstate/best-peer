@@ -115,8 +115,8 @@ decides who is in, as with SSH keys, and what they may do: approved with nothing
 `--may deploy,prompt --memory 40G` makes one that may deploy models and prompt them but run no job, and hold 40 GiB
 of device memory at most across its workloads, which it alone sees, prompts and ends. `--deployments 2 --jobs 2` lets it
 run two of each at once at most; a key may own 8 workspaces when not said, and `--workspaces N` sets how many. A key
-with a share runs its jobs in a closed box (no network, a read-only filesystem, ceilings on host memory, cores,
-tasks and open files) unless you add `--open-jobs`. `--expires 8h` ends the key after eight hours, so access lent for an afternoon
+with a share runs its jobs in a closed box (no network, a read-only filesystem, uid 65534 rather than root, ceilings
+on host memory, cores, tasks and open files) unless you add `--open-jobs`. `--expires 8h` ends the key after eight hours, so access lent for an afternoon
 ends without anyone remembering to take it back. To take a key back sooner, at your machine:
 
 ```bash
@@ -343,7 +343,9 @@ NVIDIA driver's compute and utility capabilities alone when it is handed a card,
 credential approved with a share, a tenant's, runs code the owner did not write, so it also gets a closed box: a
 read-only filesystem with a private `/tmp` of 1 GiB, which counts in its memory, no network, and a ceiling on host
 memory with swap counted in, half the host's cores and 65536 open files at most; a volume its image declares is a
-private `/tmp`-sized tmpfs too, never a volume on the host. No container dumps a core, which the
+private `/tmp`-sized tmpfs too, never a volume on the host. It runs as uid 65534 and gid 65534 (`nobody`), whatever user
+its image names and whatever the host's Docker settings, with `/tmp` as its `HOME` unless the job sets one; `/tmp`,
+those volumes and a job's disk are where it may write. No container dumps a core, which the
 host's own core handler would write outside it, and each is given by name the seccomp profile and AppArmor's
 `docker-default` the engine has, as its `info` says them. The owner's own jobs, from a credential with no share, keep the network, a writable
 filesystem and the host's memory, as before; so do a tenant's whose approver said `best-peer approve --open-jobs`,

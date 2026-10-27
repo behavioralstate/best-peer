@@ -63,11 +63,30 @@ pub struct Confinement {
     /// The most files the container may hold open at once; none for the engine's own default.
     #[serde(default)]
     pub open_files: Option<u64>,
+    /// The user every process of the container runs as, whatever its image names; none for the image's own, which is
+    /// root for most images.
+    #[serde(default)]
+    pub user: Option<User>,
+}
+
+/// A user and its group by number, never by name: a name is resolved by the image's own files, which may make it
+/// root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct User {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+impl User {
+    /// `nobody` and `nogroup`: unprivileged, named in the passwd file of most images, so a program that looks its user
+    /// up finds one, and inside the 65536 ids a remapped or rootless engine maps.
+    pub const NOBODY: User = User { uid: 65534, gid: 65534 };
 }
 
 impl Confinement {
     /// What an engine serving a model gets: the same rules on capabilities and privileges, but its network, which
-    /// it needs to pull models, and a writable filesystem, which it keeps them on, with a ceiling on processes alone.
+    /// it needs to pull models, and a writable filesystem, which it keeps them on, with a ceiling on processes alone,
+    /// run as its image's own user, which keeps its models where that user's home is.
     pub fn serving() -> Self {
         Self {
             drop_capabilities: true,
@@ -78,12 +97,13 @@ impl Confinement {
             network: Network::Default,
             cpus: None,
             open_files: None,
+            user: None,
         }
     }
 }
 
 /// The closed box a job gets: no network, no capabilities, no new privileges, a read-only root, 4096 tasks, 4 GiB of
-/// host memory, half the host's cores and 65536 open files at most.
+/// host memory, half the host's cores and 65536 open files at most, run as [`User::NOBODY`] whatever its image names.
 impl Default for Confinement {
     fn default() -> Self {
         Self {
@@ -95,6 +115,7 @@ impl Default for Confinement {
             network: Network::None,
             cpus: Some(half_the_cores()),
             open_files: Some(65536),
+            user: Some(User::NOBODY),
         }
     }
 }
@@ -420,6 +441,8 @@ pub struct Fake {
     no_disks: Mutex<bool>,
     /// What each container it started wrote, and who follows it while it runs.
     written: Mutex<HashMap<ContainerId, Writing>>,
+    /// The user an image names, where a test sets one; root otherwise, as an image that names none runs.
+    image_users: Mutex<HashMap<ImageRef, String>>,
 }
 
 /// One container's output on the fake: all it wrote, its followers while it runs, and whether it has ended.
@@ -464,7 +487,29 @@ impl Fake {
             room_unread: Mutex::new(false),
             no_disks: Mutex::new(false),
             written: Mutex::new(HashMap::new()),
+            image_users: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The image names `user` as its own (a Dockerfile's `USER`).
+    pub fn image_runs_as(&self, image: ImageRef, user: &str) {
+        self.image_users.lock().unwrap().insert(image, user.to_string());
+    }
+
+    /// Who a running container's processes run as, as an engine decides it: the confinement's user, `uid:gid`, when it
+    /// sets one, whatever the image names; else the image's own, root when it names none.
+    pub fn user_of(&self, id: &ContainerId) -> Option<String> {
+        let spec = self.spec_of(id)?;
+        Some(match spec.confinement.user {
+            Some(User { uid, gid }) => format!("{uid}:{gid}"),
+            None => self
+                .image_users
+                .lock()
+                .unwrap()
+                .get(&spec.image)
+                .cloned()
+                .unwrap_or_else(|| "root".into()),
+        })
     }
 
     /// From now on its room cannot be read, or can again.
@@ -934,6 +979,29 @@ mod tests {
         let serving = Confinement::serving();
         assert_eq!(serving.cpus, None, "an engine serving a model keeps the host's cores");
         assert_eq!(serving.open_files, None);
+    }
+
+    #[test]
+    fn the_closed_box_runs_as_nobody_and_an_engine_serving_a_model_as_its_image_says() {
+        assert_eq!(Confinement::default().user, Some(User { uid: 65534, gid: 65534 }));
+        assert_eq!(Confinement::serving().user, None);
+    }
+
+    #[tokio::test]
+    async fn a_job_runs_as_its_boxs_user_even_from_an_image_that_names_root() {
+        let rt = fake();
+        let image = ImageRef("ollama/ollama:0.6".into());
+        rt.image_runs_as(image.clone(), "root");
+        let boxed = rt.start(spec("ollama/ollama:0.6", "gpu-0")).await.unwrap();
+        assert_eq!(rt.user_of(&boxed.id).as_deref(), Some("65534:65534"));
+        let mut open = spec("ollama/ollama:0.6", "gpu-0");
+        open.confinement = Confinement::serving();
+        let open = rt.start(open).await.unwrap();
+        assert_eq!(
+            rt.user_of(&open.id).as_deref(),
+            Some("root"),
+            "with no user of its own, the image's stands"
+        );
     }
 
     #[tokio::test]

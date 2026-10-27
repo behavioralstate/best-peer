@@ -4,7 +4,8 @@
 //! card (`MIG-...`), which the toolkit hands over alone, with the driver's compute and utility capabilities and no
 //! other; other accelerators wait for their own adapter. A mount is a bind the engine refuses when its source is not there. A container is confined as its spec
 //! says, in the engine's own words: capabilities dropped, no new privileges, a read-only root with a private `/tmp`,
-//! ceilings on processes, on memory with swap counted in, on cores and on open files, no core dump, and its network;
+//! ceilings on processes, on memory with swap counted in, on cores and on open files, no core dump, its network, and
+//! the box's user over any the image names, with `/tmp` as that user's home;
 //! with a read-only root, a volume the image declares is a private tmpfs, never a volume on the host; and the seccomp
 //! and AppArmor profiles the engine has, named; and the engine's own copy of what it writes rotated at two files of
 //! ten megabytes. What a container writes is followed from its first byte, out and error apart. A container that exits
@@ -702,64 +703,12 @@ impl Runtime for DockerRuntime {
     }
 
     async fn start(&self, spec: Spec) -> Result<Started, RuntimeError> {
-        let device_requests = spec
-            .devices
-            .iter()
-            .map(|d| handed_over(&d.0))
-            .collect::<Result<Vec<_>, _>>()?;
-        let port_bindings: HashMap<String, Option<Vec<PortBinding>>> = spec
-            .ports
-            .iter()
-            .map(|p| {
-                (
-                    format!("{p}/tcp"),
-                    Some(vec![PortBinding {
-                        host_ip: Some(self.bind_ip.clone()),
-                        host_port: Some(String::new()),
-                    }]),
-                )
-            })
-            .collect();
         let offered = self.security_options().await;
         let volumes = match spec.confinement.read_only_root {
             true => unmounted(self.volumes_of(&spec.image).await?, &spec.mounts),
             false => Vec::new(),
         };
-        let body = ContainerCreateBody {
-            image: Some(spec.image.0.clone()),
-            cmd: (!spec.args.is_empty()).then(|| spec.args.clone()),
-            env: Some(env_of(&spec)),
-            exposed_ports: Some(spec.ports.iter().map(|p| format!("{p}/tcp")).collect()),
-            labels: Some({
-                let mut labels = HashMap::from([(LABEL.to_string(), "1".to_string())]);
-                if let Some(name) = &spec.name {
-                    labels.insert(NAME_LABEL.to_string(), name.clone());
-                }
-                labels
-            }),
-            host_config: Some(HostConfig {
-                // Not removed by the engine on exit: the adapter reads its last lines first, then removes it.
-                auto_remove: Some(false),
-                port_bindings: Some(port_bindings),
-                device_requests: (!device_requests.is_empty()).then_some(device_requests),
-                // A bind as a mount, not a `-v` string: the engine refuses a source that is not there instead of
-                // making an empty one, and reads the path as its own host's.
-                mounts: (!spec.mounts.is_empty()).then(|| {
-                    spec.mounts
-                        .iter()
-                        .map(|m| Mount {
-                            target: Some(m.container.clone()),
-                            source: Some(m.host.clone()),
-                            typ: Some(MountType::BIND),
-                            read_only: Some(m.read_only),
-                            ..Default::default()
-                        })
-                        .collect()
-                }),
-                ..confined(&spec.confinement, &volumes, &offered)
-            }),
-            ..Default::default()
-        };
+        let body = create_body(&spec, &self.bind_ip, &volumes, &offered)?;
         let created = self.docker.create_container(None, body).await.map_err(|e| match e {
             bollard::errors::Error::DockerResponseServerError { status_code: 404, .. } => {
                 RuntimeError::ImageNotFound(spec.image.0.clone())
@@ -930,11 +879,82 @@ impl Runtime for DockerRuntime {
     }
 }
 
+/// What the engine is asked to create for `spec`: its image, arguments, environment and user, its labels, its devices
+/// and published ports bound to `bind_ip`, its mounts, and its box, with the image's declared `volumes` and the
+/// engine's `offered` security options as [`confined`] takes them.
+fn create_body(
+    spec: &Spec,
+    bind_ip: &str,
+    volumes: &[String],
+    offered: &[String],
+) -> Result<ContainerCreateBody, RuntimeError> {
+    let device_requests = spec
+        .devices
+        .iter()
+        .map(|d| handed_over(&d.0))
+        .collect::<Result<Vec<_>, _>>()?;
+    let port_bindings: HashMap<String, Option<Vec<PortBinding>>> = spec
+        .ports
+        .iter()
+        .map(|p| {
+            (
+                format!("{p}/tcp"),
+                Some(vec![PortBinding {
+                    host_ip: Some(bind_ip.to_string()),
+                    host_port: Some(String::new()),
+                }]),
+            )
+        })
+        .collect();
+    Ok(ContainerCreateBody {
+        image: Some(spec.image.0.clone()),
+        cmd: (!spec.args.is_empty()).then(|| spec.args.clone()),
+        env: Some(env_of(spec)),
+        // Over the image's own `USER`, which the engine takes only when the body names none.
+        user: spec.confinement.user.map(|u| format!("{}:{}", u.uid, u.gid)),
+        exposed_ports: Some(spec.ports.iter().map(|p| format!("{p}/tcp")).collect()),
+        labels: Some({
+            let mut labels = HashMap::from([(LABEL.to_string(), "1".to_string())]);
+            if let Some(name) = &spec.name {
+                labels.insert(NAME_LABEL.to_string(), name.clone());
+            }
+            labels
+        }),
+        host_config: Some(HostConfig {
+            // Not removed by the engine on exit: the adapter reads its last lines first, then removes it.
+            auto_remove: Some(false),
+            port_bindings: Some(port_bindings),
+            device_requests: (!device_requests.is_empty()).then_some(device_requests),
+            // A bind as a mount, not a `-v` string: the engine refuses a source that is not there instead of
+            // making an empty one, and reads the path as its own host's.
+            mounts: (!spec.mounts.is_empty()).then(|| {
+                spec.mounts
+                    .iter()
+                    .map(|m| Mount {
+                        target: Some(m.container.clone()),
+                        source: Some(m.host.clone()),
+                        typ: Some(MountType::BIND),
+                        read_only: Some(m.read_only),
+                        ..Default::default()
+                    })
+                    .collect()
+            }),
+            ..confined(&spec.confinement, volumes, offered)
+        }),
+        ..Default::default()
+    })
+}
+
 /// A container's environment: the spec's and, for one handed a device, the NVIDIA driver's compute and utility
 /// capabilities alone, in place of any the spec names, which the engine sets over the image's entry of that name: no
-/// video codec, display or graphics library of the host's driver is mounted in.
+/// video codec, display or graphics library of the host's driver is mounted in. A container run as a user of its box
+/// has `/tmp` as its home unless the spec names one, since that user's own home in the image is not there or not its
+/// to write, and `/tmp` is.
 fn env_of(spec: &Spec) -> Vec<String> {
     let mut env: Vec<String> = spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    if spec.confinement.user.is_some() && !spec.env.iter().any(|(k, _)| k == "HOME") {
+        env.push("HOME=/tmp".into());
+    }
     if !spec.devices.is_empty() {
         env.retain(|e| !e.starts_with("NVIDIA_DRIVER_CAPABILITIES="));
         env.push("NVIDIA_DRIVER_CAPABILITIES=compute,utility".into());
@@ -1654,11 +1674,51 @@ mod tests {
             )),
             vec![
                 "A=1".to_string(),
+                "HOME=/tmp".to_string(),
                 "NVIDIA_DRIVER_CAPABILITIES=compute,utility".to_string(),
             ],
             "the adapter's word, once"
         );
-        assert_eq!(env_of(&with_devices(&[], &[("A", "1")])), vec!["A=1".to_string()]);
+        assert_eq!(
+            env_of(&with_devices(&[], &[("A", "1")])),
+            vec!["A=1".to_string(), "HOME=/tmp".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_boxed_container_is_created_as_nobody_whatever_its_image_names_and_an_engine_as_its_image_says() {
+        let job = with_devices(&[], &[]);
+        let body = create_body(&job, "127.0.0.1", &[], &[]).unwrap();
+        assert_eq!(
+            body.user.as_deref(),
+            Some("65534:65534"),
+            "named in the body, the engine never takes the image's USER, root or any other"
+        );
+        let mut engine = with_devices(&[], &[]);
+        engine.confinement = Confinement::serving();
+        assert_eq!(create_body(&engine, "127.0.0.1", &[], &[]).unwrap().user, None);
+        let mut other = with_devices(&[], &[]);
+        other.confinement.user = Some(best_peer_runtime::User { uid: 1234, gid: 5678 });
+        assert_eq!(
+            create_body(&other, "127.0.0.1", &[], &[]).unwrap().user.as_deref(),
+            Some("1234:5678")
+        );
+    }
+
+    #[test]
+    fn a_container_run_as_its_boxs_user_has_tmp_for_its_home_unless_the_spec_names_one() {
+        assert!(env_of(&with_devices(&[], &[])).contains(&"HOME=/tmp".to_string()));
+        assert_eq!(
+            env_of(&with_devices(&[], &[("HOME", "/work")])),
+            vec!["HOME=/work".to_string()],
+            "the spec's own home stands"
+        );
+        let mut engine = with_devices(&[], &[]);
+        engine.confinement = Confinement::serving();
+        assert!(
+            env_of(&engine).is_empty(),
+            "an image run as its own user keeps its own home"
+        );
     }
 
     fn offered(options: &[&str]) -> Vec<String> {
