@@ -14,25 +14,29 @@
 //! not heard (the peer was down, or the event feed broke) is removed by a sweep, every minute and after the feed
 //! reconnects, once this adapter has seen it exited for a minute, so a peer that shares the engine has read its own
 //! first. A container goes with its anonymous volumes, as the engine's own removal on exit took them. An image is
-//! removed by the reference it was pulled as, never forced, a pull may be bounded by the sizes of the layers it
-//! downloads, and the room for images is read from the file system holding the engine's root directory on this host,
-//! found in the mount table when the directory itself cannot be reached, as an engine with user namespaces remapped
-//! keeps it; none when the engine is on another host. Thin; proven on a host by hand. What needs no engine is unit-tested: the share and the bytes
-//! of a pull over what the engine reports, the host config a confinement becomes, a container's environment, the
-//! profiles named from the engine's options, the room free at a directory, and the mount holding it.
+//! removed by the reference it was pulled as, never forced, and the room for images is read from the file system
+//! holding the engine's root directory on this host, found in the mount table when the directory itself cannot be
+//! reached, as an engine with user namespaces remapped keeps it; none when the engine is on another host. A pull may be
+//! held to limits on that disk: given up, its stream dropped, once the room it took there or the sizes of the layers
+//! it downloads pass a bound, or the room left falls under a floor, read every half second while it runs; and an image
+//! pulled whole whose unpacked size passes the bound is removed. Thin; proven on a host by hand. What needs no engine
+//! is unit-tested: the share and the bytes of a pull over what the engine reports, a pull held to its limits over a
+//! stream and readings of the room, the body a container is created from, the host config a confinement becomes, a
+//! container's environment, the profiles named from the engine's options, the room free at a directory, and the mount
+//! holding it.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use best_peer_runtime::{
-    Confinement, ContainerId, Event, Following, ImageRef, Isolation, Network, Output, Progress, Published, Runtime,
-    RuntimeError, Spec, Started, Written,
+    Confinement, ContainerId, Event, Following, ImageRef, Isolation, Network, Output, Progress, Published, PullLimits,
+    Runtime, RuntimeError, Spec, Started, Written,
 };
 use bollard::container::LogOutput;
 use bollard::models::{
-    ContainerCreateBody, ContainerTopResponse, DeviceRequest, EventMessageTypeEnum, HostConfig, HostConfigLogConfig,
-    Mount, MountType, PortBinding, ResourcesUlimits,
+    ContainerCreateBody, ContainerTopResponse, CreateImageInfo, DeviceRequest, EventMessageTypeEnum, HostConfig,
+    HostConfigLogConfig, Mount, MountType, PortBinding, ResourcesUlimits,
 };
 use bollard::query_parameters::{
     CreateImageOptionsBuilder, EventsOptionsBuilder, ListContainersOptionsBuilder, LogsOptionsBuilder,
@@ -348,6 +352,103 @@ fn image_error(image: &ImageRef, message: &str) -> RuntimeError {
     }
 }
 
+/// How often a pull held to limits reads the room on the engine's disk while it runs: a layer extracted at disk speed
+/// passes a bound by no more than this much of its writing before the pull is given up.
+const ROOM_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How long one reading of that room may take: a file system that does not answer has no room known.
+const ROOM_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The room free for anyone on the file system holding the engine's root directory `root`, read off the executor; none
+/// when there is no root here or it cannot be read in time.
+async fn room_under(root: Option<String>) -> Option<u64> {
+    let root = root?;
+    let read = tokio::task::spawn_blocking(move || {
+        room_at(std::path::Path::new(&root), || {
+            std::fs::read_to_string("/proc/self/mountinfo")
+        })
+        .ok()
+    });
+    tokio::time::timeout(ROOM_WITHIN, read).await.ok()?.ok()?
+}
+
+/// Reads the engine's pull `stream` to its end, telling `progress` the share done, and holds it to `limits`: the
+/// `room` free on the engine's disk is read once before the first line and every `every` after, while the first
+/// reading said one, and the layers' sizes the engine says are held to the bound as they come. Returning before the
+/// end drops the stream, which gives the engine's pull up. A floor with no room read at the start is refused before
+/// a line is read; a reading that fails later is skipped, said once.
+async fn watched<S, R, F>(
+    image: &ImageRef,
+    mut stream: S,
+    progress: &Progress,
+    limits: PullLimits,
+    mut room: R,
+    every: std::time::Duration,
+) -> Result<(), RuntimeError>
+where
+    S: futures::Stream<Item = Result<CreateImageInfo, bollard::errors::Error>> + Unpin,
+    R: FnMut() -> F,
+    F: std::future::Future<Output = Option<u64>>,
+{
+    let start = match limits != PullLimits::default() {
+        true => room().await,
+        false => None,
+    };
+    match start {
+        Some(start) => limits.hold(image, start, start)?,
+        None if limits.floor_bytes.is_some() => {
+            return Err(RuntimeError::NoRoom(format!(
+                "{}: the room on the engine's disk cannot be read on this host, so its floor cannot be held",
+                image.0
+            )))
+        }
+        None => {}
+    }
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut unread = false;
+    let mut layers = Layers::default();
+    let mut last: Option<u8> = None;
+    loop {
+        tokio::select! {
+            next = stream.next() => {
+                let Some(next) = next else { break };
+                let info = next.map_err(|e| image_error(image, &e.to_string()))?;
+                if let Some(err) = info.error_detail.and_then(|d| d.message) {
+                    return Err(image_error(image, &err));
+                }
+                if let Some(layer) = info.id {
+                    let (current, total) = info.progress_detail.map(|p| (p.current, p.total)).unwrap_or_default();
+                    layers.report(&layer, info.status.as_deref().unwrap_or_default(), current, total);
+                    if let Some(most) = limits.most_bytes.filter(|most| layers.downloads() > *most) {
+                        return Err(RuntimeError::TooLarge(format!(
+                            "{}: its layers download {} bytes, past its bound of {most}",
+                            image.0,
+                            layers.downloads()
+                        )));
+                    }
+                }
+                let pct = layers.share();
+                if pct.is_some() && pct != last {
+                    last = pct;
+                    progress(pct);
+                }
+            }
+            _ = ticks.tick(), if start.is_some() => {
+                match (start, room().await) {
+                    (Some(start), Some(now)) => limits.hold(image, start, now)?,
+                    _ if !unread => {
+                        unread = true;
+                        tracing::warn!(image = %image.0, "the room on the engine's disk could not be read during a pull; it is read again at the next tick");
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The share of a pull across every layer, not per layer. The engine reports each layer twice over its own bytes:
 /// downloading it, then extracting it, each from 0 to the layer's size. So a layer counts half when downloaded and
 /// whole when extracted, and the start of its extraction is not read as a fall back to nothing.
@@ -433,42 +534,57 @@ fn run(program: &str, args: &[&str]) -> Result<(), RuntimeError> {
 #[async_trait]
 impl Runtime for DockerRuntime {
     async fn pull(&self, image: &ImageRef, progress: Progress) -> Result<(), RuntimeError> {
-        self.pull_bounded(image, progress, None).await
+        self.pull_bounded(image, progress, PullLimits::default()).await
     }
 
-    /// Gives the pull up as soon as the layers' sizes the engine has said pass `most_bytes`: the stream is dropped,
-    /// which ends the engine's pull; what it downloaded is the engine's own to release, and no image is made for it.
-    async fn pull_bounded(
-        &self,
-        image: &ImageRef,
-        progress: Progress,
-        most_bytes: Option<u64>,
-    ) -> Result<(), RuntimeError> {
+    /// Gives the pull up as soon as it passes `limits`, by dropping the engine's stream, which ends the request and,
+    /// with it, the engine's pull: the room on the file system holding the engine's root directory is read when the
+    /// pull begins and every [`ROOM_EVERY`] while it runs, where it can be read on this host, and the layers' sizes
+    /// the engine says are counted as they come. What it downloaded is the engine's own to release, and no image is
+    /// made for it. An image pulled whole whose unpacked size passes the bound is removed, unless the engine held that
+    /// very image before the pull; one the engine will not remove is left there, said in the log, and the pull still
+    /// answers [`RuntimeError::TooLarge`].
+    async fn pull_bounded(&self, image: &ImageRef, progress: Progress, limits: PullLimits) -> Result<(), RuntimeError> {
+        let watching = limits != PullLimits::default();
+        let root = match watching && self.engine_here {
+            true => self.docker.info().await.ok().and_then(|i| i.docker_root_dir),
+            false => None,
+        };
+        let before = match limits.most_bytes {
+            Some(_) => self.image_id_and_size(image).await?.map(|(id, _)| id),
+            None => None,
+        };
         let (name, tag) = name_and_tag(image);
         let mut options = CreateImageOptionsBuilder::new().from_image(&name);
         if let Some(tag) = &tag {
             options = options.tag(tag);
         }
-        let mut stream = self.docker.create_image(Some(options.build()), None, None);
-        let mut layers = Layers::default();
-        let mut last: Option<u8> = None;
-        while let Some(next) = stream.next().await {
-            let info = next.map_err(|e| image_error(image, &e.to_string()))?;
-            if let Some(err) = info.error_detail.and_then(|d| d.message) {
-                return Err(image_error(image, &err));
-            }
-            if let Some(layer) = info.id {
-                let (current, total) = info.progress_detail.map(|p| (p.current, p.total)).unwrap_or_default();
-                layers.report(&layer, info.status.as_deref().unwrap_or_default(), current, total);
-                if most_bytes.is_some_and(|most| layers.downloads() > most) {
-                    return Err(RuntimeError::TooLarge(image.0.clone()));
+        let stream = self.docker.create_image(Some(options.build()), None, None);
+        watched(
+            image,
+            stream,
+            &progress,
+            limits,
+            || room_under(root.clone()),
+            ROOM_EVERY,
+        )
+        .await?;
+        if limits.most_bytes.is_none() {
+            return Ok(());
+        }
+        let Some((id, size)) = self.image_id_and_size(image).await? else {
+            return Err(RuntimeError::Engine(format!(
+                "the engine does not hold {} after pulling it, so its size cannot be held to a bound",
+                image.0
+            )));
+        };
+        if let Err(e) = limits.hold_unpacked(image, size) {
+            if before.as_ref() != Some(&id) {
+                if let Err(why) = self.remove_image(image).await {
+                    tracing::warn!(image = %image.0, error = %why, "an image pulled past its bound could not be removed: it is left on the engine");
                 }
             }
-            let pct = layers.share();
-            if pct.is_some() && pct != last {
-                last = pct;
-                progress(pct);
-            }
+            return Err(e);
         }
         Ok(())
     }
@@ -1057,6 +1173,24 @@ fn profiles(offered: &[String]) -> Vec<String> {
 }
 
 impl DockerRuntime {
+    /// The id and unpacked size, every layer counted, of the image the engine holds by `image`; none when it holds none.
+    async fn image_id_and_size(&self, image: &ImageRef) -> Result<Option<(String, u64)>, RuntimeError> {
+        match self.docker.inspect_image(&image.0).await {
+            Ok(inspected) => match (inspected.id, inspected.size) {
+                (Some(id), Some(size)) => Ok(Some((id, size.max(0) as u64))),
+                _ => Err(RuntimeError::Engine(format!(
+                    "the engine does not say the id and size of {}, so its size cannot be held to a bound",
+                    image.0
+                ))),
+            },
+            Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => Ok(None),
+            Err(e) => Err(RuntimeError::Engine(format!(
+                "the engine cannot say the size of {}: {e}",
+                image.0
+            ))),
+        }
+    }
+
     /// The engine's security options as its `info` says them; none when it does not answer, so no profile is named
     /// and the engine's own defaults stand.
     async fn security_options(&self) -> Vec<String> {
@@ -1515,6 +1649,255 @@ mod tests {
         assert!(e.since.is_empty());
         // Seen again later, a container is counted from then.
         assert!(e.due(&ids(&["b"]), t0 + Duration::from_secs(130)).is_empty());
+    }
+
+    /// An engine's pull stream: `lines`, one a second, then nothing more, as a pull still extracting says nothing for a
+    /// while. It says whether it was read, and whether it was dropped, which is how the engine's pull is given up.
+    struct Pulling {
+        lines: std::pin::Pin<Box<dyn futures::Stream<Item = Result<CreateImageInfo, bollard::errors::Error>> + Send>>,
+        read: Arc<std::sync::atomic::AtomicBool>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl futures::Stream for Pulling {
+        type Item = Result<CreateImageInfo, bollard::errors::Error>;
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            self.read.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.lines.as_mut().poll_next(cx)
+        }
+    }
+
+    impl Drop for Pulling {
+        fn drop(&mut self) {
+            self.dropped.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn pulling(lines: Vec<CreateImageInfo>, ends: bool) -> Pulling {
+        let lines = futures::stream::iter(lines).then(|line| async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Ok(line)
+        });
+        let rest = match ends {
+            true => futures::stream::empty().boxed(),
+            false => futures::stream::pending().boxed(),
+        };
+        Pulling {
+            lines: lines.chain(rest).boxed(),
+            read: Arc::default(),
+            dropped: Arc::default(),
+        }
+    }
+
+    fn line(layer: &str, status: &str, current: i64, total: i64) -> CreateImageInfo {
+        CreateImageInfo {
+            id: Some(layer.into()),
+            status: Some(status.into()),
+            progress_detail: Some(bollard::models::ProgressDetail {
+                current: Some(current),
+                total: Some(total),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A small layer extracting a little more each second, its compressed size far under any bound.
+    fn extracting() -> Vec<CreateImageInfo> {
+        (1..=30).map(|n| line("a", "Extracting", n, 100)).collect()
+    }
+
+    /// The room free on the engine's disk, one reading per call, in order, the last for ever after.
+    fn readings(free: &[Option<u64>]) -> (impl FnMut() -> std::future::Ready<Option<u64>>, Arc<Mutex<usize>>) {
+        let (free, asked) = (free.to_vec(), Arc::new(Mutex::new(0)));
+        let count = asked.clone();
+        let room = move || {
+            let mut n = count.lock().unwrap();
+            *n += 1;
+            std::future::ready(free[(*n - 1).min(free.len() - 1)])
+        };
+        (room, asked)
+    }
+
+    const GIB: u64 = 1 << 30;
+
+    fn limits(most: Option<u64>, floor: Option<u64>) -> PullLimits {
+        PullLimits {
+            most_bytes: most,
+            floor_bytes: floor,
+        }
+    }
+
+    fn told() -> (Progress, Arc<Mutex<Vec<Option<u8>>>>) {
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let sink = told.clone();
+        (Arc::new(move |p| sink.lock().unwrap().push(p)), told)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pull_whose_room_taken_on_disk_passes_its_bound_is_given_up_by_dropping_the_engines_stream() {
+        let image = ImageRef("big/unpacks:1".into());
+        let stream = pulling(extracting(), false);
+        let dropped = stream.dropped.clone();
+        let (room, _) = readings(&[Some(100 * GIB), Some(90 * GIB), Some(80 * GIB), Some(70 * GIB)]);
+        let (progress, said) = told();
+        let err = watched(
+            &image,
+            stream,
+            &progress,
+            limits(Some(25 * GIB), None),
+            room,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::TooLarge(ref why) if why.contains("took") && why.contains("bound")),
+            "{err}"
+        );
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "the engine's stream is let go"
+        );
+        assert!(!said.lock().unwrap().is_empty(), "its share was told while it ran");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pull_that_brings_the_engines_disk_under_its_floor_is_given_up() {
+        let image = ImageRef("big/unpacks:1".into());
+        let stream = pulling(extracting(), false);
+        let dropped = stream.dropped.clone();
+        let (room, _) = readings(&[Some(100 * GIB), Some(95 * GIB), Some(89 * GIB)]);
+        let (progress, _) = told();
+        let err = watched(
+            &image,
+            stream,
+            &progress,
+            limits(Some(50 * GIB), Some(90 * GIB)),
+            room,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::NoRoom(ref why) if why.contains("floor")),
+            "{err}"
+        );
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reading_of_the_room_that_fails_midway_is_skipped_and_the_next_still_gives_the_pull_up() {
+        let image = ImageRef("big/unpacks:1".into());
+        let (room, _) = readings(&[Some(100 * GIB), None, Some(70 * GIB)]);
+        let (progress, _) = told();
+        let err = watched(
+            &image,
+            pulling(extracting(), false),
+            &progress,
+            limits(Some(25 * GIB), None),
+            room,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, RuntimeError::TooLarge(_)), "{err}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_floor_with_no_room_read_at_the_start_is_refused_before_the_engine_is_read() {
+        let image = ImageRef("any/image:1".into());
+        let stream = pulling(extracting(), true);
+        let read = stream.read.clone();
+        let (room, _) = readings(&[None]);
+        let (progress, _) = told();
+        let err = watched(
+            &image,
+            stream,
+            &progress,
+            limits(None, Some(GIB)),
+            room,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::NoRoom(ref why) if why.contains("cannot be read")),
+            "{err}"
+        );
+        assert!(
+            !read.load(std::sync::atomic::Ordering::SeqCst),
+            "nothing of the pull is read"
+        );
+        let (room, _) = readings(&[Some(GIB - 1)]);
+        let err = watched(
+            &image,
+            pulling(extracting(), true),
+            &progress,
+            limits(None, Some(GIB)),
+            room,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::NoRoom(_)),
+            "a disk under the floor at the start"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_bound_with_no_room_read_still_holds_the_layers_sizes_and_the_pull_ends_when_the_engine_does() {
+        let image = ImageRef("any/image:1".into());
+        let (room, asked) = readings(&[None]);
+        let (progress, said) = told();
+        watched(
+            &image,
+            pulling(extracting(), true),
+            &progress,
+            limits(Some(GIB), None),
+            room,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*asked.lock().unwrap(), 1, "no room at the start, none read after");
+        assert_eq!(said.lock().unwrap().last(), Some(&Some(65)));
+        let (room, _) = readings(&[None]);
+        let big = vec![line("a", "Downloading", 1, 2 * GIB as i64)];
+        let err = watched(
+            &image,
+            pulling(big, false),
+            &progress,
+            limits(Some(GIB), None),
+            room,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::TooLarge(ref why) if why.contains("download")),
+            "{err}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pull_with_no_limits_never_reads_the_room() {
+        let (room, asked) = readings(&[Some(0)]);
+        let (progress, _) = told();
+        watched(
+            &ImageRef("any/image:1".into()),
+            pulling(extracting(), true),
+            &progress,
+            PullLimits::default(),
+            room,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*asked.lock().unwrap(), 0);
     }
 
     #[test]

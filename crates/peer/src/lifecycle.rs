@@ -3260,6 +3260,9 @@ fn fix_for_runtime(e: &RuntimeError) -> &'static str {
         }
         RuntimeError::NoName(_) => "this runtime does not find a container by name: keep the id that start answered",
         RuntimeError::TooLarge(_) => "the image is larger than this peer pulls: order a smaller one",
+        RuntimeError::NoRoom(_) => {
+            "the machine's disk has too little room for the image: ask whoever runs the peer to free some, or order a smaller one"
+        }
         RuntimeError::NoFollow(_) => "this runtime does not tell what a container writes: run it where Docker does",
     }
 }

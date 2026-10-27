@@ -158,6 +158,50 @@ pub struct Started {
     pub ports: Vec<Published>,
 }
 
+/// What a pull may take of the engine's disk, held from its start to its end. Both are read on the file system where
+/// the engine keeps its images, the room it takes counting whatever else lands there meanwhile.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PullLimits {
+    /// The most the pull may put on that disk: the room it has taken there since it began, while it runs, and the
+    /// image's unpacked size, every layer counted, once it is pulled; none for no bound.
+    pub most_bytes: Option<u64>,
+    /// The fewest bytes that disk keeps free while the pull runs; none for no floor.
+    pub floor_bytes: Option<u64>,
+}
+
+impl PullLimits {
+    /// Whether a pull begun with `free_at_start` bytes free on the engine's disk may go on with `free_now`:
+    /// [`RuntimeError::TooLarge`] once it has taken more than the bound, [`RuntimeError::NoRoom`] once what is free is
+    /// under the floor.
+    pub fn hold(&self, image: &ImageRef, free_at_start: u64, free_now: u64) -> Result<(), RuntimeError> {
+        let taken = free_at_start.saturating_sub(free_now);
+        if let Some(most) = self.most_bytes.filter(|most| taken > *most) {
+            return Err(RuntimeError::TooLarge(format!(
+                "{}: the pull took {taken} bytes of the engine's disk, past its bound of {most}",
+                image.0
+            )));
+        }
+        if let Some(floor) = self.floor_bytes.filter(|floor| free_now < *floor) {
+            return Err(RuntimeError::NoRoom(format!(
+                "{}: the engine's disk has {free_now} bytes free, under its floor of {floor}",
+                image.0
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether an image pulled whole, `unpacked` bytes once its layers are extracted, is within the bound.
+    pub fn hold_unpacked(&self, image: &ImageRef, unpacked: u64) -> Result<(), RuntimeError> {
+        match self.most_bytes.filter(|most| unpacked > *most) {
+            Some(most) => Err(RuntimeError::TooLarge(format!(
+                "{}: the image unpacks to {unpacked} bytes, past its bound of {most}",
+                image.0
+            ))),
+            None => Ok(()),
+        }
+    }
+}
+
 /// What a long call tells while it runs: progress in percent, where the engine says. Called in order, before the
 /// call returns, so the caller tells each step as a fact before the outcome.
 pub type Progress = Arc<dyn Fn(Option<u8>) + Send + Sync>;
@@ -198,10 +242,14 @@ pub enum RuntimeError {
     Unreachable(String),
     #[error("the engine failed: {0}")]
     Engine(String),
-    /// A pull would download more than its caller allows; what it downloaded is the engine's own to release, and no
-    /// image is made for it.
+    /// A pull took, or would take, more of the engine's disk than its caller allows: the words say which image and
+    /// by how much. It was given up, or the image it made removed.
     #[error("image larger than allowed: {0}")]
     TooLarge(String),
+    /// The engine's disk has, or fell to, less free than a pull's floor, or its room cannot be read to hold one: the
+    /// pull was given up, or never begun.
+    #[error("no room on the engine's disk: {0}")]
+    NoRoom(String),
     /// A job's disk could not be made, or this runtime makes none: the words say which.
     #[error("{0}")]
     NoDisk(String),
@@ -290,19 +338,18 @@ impl Isolation {
 pub trait Runtime: Send + Sync {
     /// Makes the image present, telling `progress` as it goes: from the registry, whether or not it is held.
     async fn pull(&self, image: &ImageRef, progress: Progress) -> Result<(), RuntimeError>;
-    /// [`Runtime::pull`], given up with [`RuntimeError::TooLarge`] once what it downloads would pass `most_bytes`,
-    /// the layers' sizes counted as the engine says them; none for no bound. Layers the engine already holds count for
-    /// nothing. A runtime that cannot count what a pull downloads refuses a bound rather than ignore it.
-    async fn pull_bounded(
-        &self,
-        image: &ImageRef,
-        progress: Progress,
-        most_bytes: Option<u64>,
-    ) -> Result<(), RuntimeError> {
-        match most_bytes {
-            None => self.pull(image, progress).await,
-            Some(_) => Err(RuntimeError::Engine(
-                "this runtime cannot count what a pull downloads, so it takes no bound on it".into(),
+    /// [`Runtime::pull`], held to `limits` from its start to its end. It is given up with [`RuntimeError::TooLarge`]
+    /// once the room it has taken on the engine's disk, or the layers' sizes the engine says it downloads, pass the
+    /// bound, and with [`RuntimeError::NoRoom`] once that disk's free room falls under the floor; an image it pulled
+    /// whose unpacked size passes the bound is removed, and the pull answers [`RuntimeError::TooLarge`]. A layer the
+    /// engine already holds takes no room while it pulls, and counts in the unpacked size. A floor where the room
+    /// cannot be read is refused with [`RuntimeError::NoRoom`] before anything is pulled. A runtime that cannot hold a
+    /// pull to limits refuses any rather than ignore them.
+    async fn pull_bounded(&self, image: &ImageRef, progress: Progress, limits: PullLimits) -> Result<(), RuntimeError> {
+        match limits == PullLimits::default() {
+            true => self.pull(image, progress).await,
+            false => Err(RuntimeError::Engine(
+                "this runtime cannot hold a pull to limits on its disk, so it takes none".into(),
             )),
         }
     }
@@ -412,6 +459,10 @@ pub struct Fake {
     removed: Mutex<Vec<ImageRef>>,
     /// What a pull of an image downloads, where a test sets it; nothing for one it holds.
     sizes: Mutex<HashMap<ImageRef, u64>>,
+    /// What an image takes on its disk once pulled, where a test sets it: its unpacked size.
+    unpacked: Mutex<HashMap<ImageRef, u64>>,
+    /// What each image a pull made took from the room for images, given back when it is removed.
+    landed: Mutex<HashMap<ImageRef, u64>>,
     /// The room it says it has for images, as a test sets it; `None` for an engine that cannot tell.
     image_room: Mutex<Option<u64>>,
     devices: Vec<DeviceId>,
@@ -471,6 +522,8 @@ impl Fake {
             pulled: Mutex::new(Vec::new()),
             removed: Mutex::new(Vec::new()),
             sizes: Mutex::new(HashMap::new()),
+            unpacked: Mutex::new(HashMap::new()),
+            landed: Mutex::new(HashMap::new()),
             image_room: Mutex::new(Some(1 << 40)),
             devices,
             next: Mutex::new(0),
@@ -568,6 +621,12 @@ impl Fake {
     /// A pull of `image`, while the engine does not hold it, downloads `bytes`.
     pub fn sized(&self, image: ImageRef, bytes: u64) {
         self.sizes.lock().unwrap().insert(image, bytes);
+    }
+
+    /// A pull of `image`, while the engine does not hold it, unpacks to `bytes` on its disk: its room for images falls
+    /// by that in step with what the pull reports, while it can be read, and the image's size once pulled is that.
+    pub fn unpacks(&self, image: ImageRef, bytes: u64) {
+        self.unpacked.lock().unwrap().insert(image, bytes);
     }
 
     /// Sets the room it says it has for images from now on, or `None` for an engine that cannot tell.
@@ -718,15 +777,10 @@ fn uuid_like() -> String {
 #[async_trait]
 impl Runtime for Fake {
     async fn pull(&self, image: &ImageRef, progress: Progress) -> Result<(), RuntimeError> {
-        self.pull_bounded(image, progress, None).await
+        self.pull_bounded(image, progress, PullLimits::default()).await
     }
 
-    async fn pull_bounded(
-        &self,
-        image: &ImageRef,
-        progress: Progress,
-        most_bytes: Option<u64>,
-    ) -> Result<(), RuntimeError> {
+    async fn pull_bounded(&self, image: &ImageRef, progress: Progress, limits: PullLimits) -> Result<(), RuntimeError> {
         self.pulled.lock().unwrap().push(image.clone());
         let gate = self.gate.lock().unwrap().clone();
         if let Some(gate) = gate {
@@ -739,17 +793,55 @@ impl Runtime for Fake {
         }
         let held = self.local.lock().unwrap().contains(image);
         let downloads = self.sizes.lock().unwrap().get(image).copied().filter(|_| !held);
-        if let (Some(bytes), Some(most)) = (downloads, most_bytes) {
+        if let (Some(bytes), Some(most)) = (downloads, limits.most_bytes) {
             if bytes > most {
                 return Err(RuntimeError::TooLarge(image.0.clone()));
             }
         }
-        for &step in &self.steps {
-            progress(step);
+        let unpacked = self.unpacked.lock().unwrap().get(image).copied().filter(|_| !held);
+        let start = *self.image_room.lock().unwrap();
+        if limits.floor_bytes.is_some() && start.is_none() {
+            return Err(RuntimeError::NoRoom(format!(
+                "{}: the room on the engine's disk cannot be read, so its floor cannot be held",
+                image.0
+            )));
         }
-        let mut local = self.local.lock().unwrap();
-        if !local.contains(image) {
-            local.push(image.clone());
+        if let Some(start) = start {
+            limits.hold(image, start, start)?;
+        }
+        let steps = self.steps.len() as u64;
+        for (i, &step) in self.steps.iter().enumerate() {
+            progress(step);
+            if let (Some(start), Some(unpacked)) = (start, unpacked) {
+                let now = start.saturating_sub(unpacked * (i as u64 + 1) / steps.max(1));
+                *self.image_room.lock().unwrap() = Some(now);
+                if let Err(e) = limits.hold(image, start, now) {
+                    // Given up: what it downloaded is the engine's to release.
+                    *self.image_room.lock().unwrap() = Some(start);
+                    return Err(e);
+                }
+            }
+        }
+        if let Some(start) = start.filter(|_| unpacked.is_some()) {
+            let now = self.image_room.lock().unwrap().unwrap_or(start);
+            self.landed
+                .lock()
+                .unwrap()
+                .insert(image.clone(), start.saturating_sub(now));
+        }
+        {
+            let mut local = self.local.lock().unwrap();
+            if !local.contains(image) {
+                local.push(image.clone());
+            }
+        }
+        let size = self.unpacked.lock().unwrap().get(image).copied().unwrap_or(0);
+        if let Err(e) = limits.hold_unpacked(image, size) {
+            // An image the engine held before the pull is not the pull's to remove.
+            if !held {
+                let _ = self.remove_image(image).await;
+            }
+            return Err(e);
         }
         Ok(())
     }
@@ -767,6 +859,11 @@ impl Runtime for Fake {
             )));
         }
         self.local.lock().unwrap().retain(|i| i != image);
+        if let Some(taken) = self.landed.lock().unwrap().remove(image) {
+            if let Some(room) = self.image_room.lock().unwrap().as_mut() {
+                *room = room.saturating_add(taken);
+            }
+        }
         Ok(())
     }
 
@@ -1140,29 +1237,180 @@ mod tests {
         let big = ImageRef("vllm/vllm-openai:v0.8".into());
         rt.sized(big.clone(), 20 << 30);
         let err = rt
-            .pull_bounded(&big, Arc::new(|_| {}), Some(10 << 30))
+            .pull_bounded(&big, Arc::new(|_| {}), most(10 << 30))
             .await
             .unwrap_err();
         assert!(matches!(err, RuntimeError::TooLarge(ref i) if i == "vllm/vllm-openai:v0.8"));
         assert!(!rt.holds(&big).await.unwrap(), "nothing of it is kept");
-        rt.pull_bounded(&big, Arc::new(|_| {}), Some(20 << 30)).await.unwrap();
+        rt.pull_bounded(&big, Arc::new(|_| {}), most(20 << 30)).await.unwrap();
         assert!(rt.holds(&big).await.unwrap());
-        rt.pull_bounded(&big, Arc::new(|_| {}), Some(1)).await.unwrap();
+        rt.pull_bounded(&big, Arc::new(|_| {}), most(1)).await.unwrap();
         let held = ImageRef("ollama/ollama:0.6".into());
         rt.sized(held.clone(), 20 << 30);
-        rt.pull_bounded(&held, Arc::new(|_| {}), Some(1)).await.unwrap();
+        rt.pull_bounded(&held, Arc::new(|_| {}), most(1)).await.unwrap();
         let other = ImageRef("nobody/else:1".into());
         rt.sized(other.clone(), 20 << 30);
-        rt.pull_bounded(&other, Arc::new(|_| {}), None).await.unwrap();
+        rt.pull_bounded(&other, Arc::new(|_| {}), PullLimits::default())
+            .await
+            .unwrap();
+    }
+
+    fn most(bytes: u64) -> PullLimits {
+        PullLimits {
+            most_bytes: Some(bytes),
+            floor_bytes: None,
+        }
+    }
+
+    #[test]
+    fn a_pull_is_held_to_the_room_it_took_and_the_room_left_and_an_image_to_its_unpacked_size() {
+        let image = ImageRef("x".into());
+        let limits = PullLimits {
+            most_bytes: Some(10),
+            floor_bytes: Some(100),
+        };
+        assert!(limits.hold(&image, 200, 190).is_ok(), "the bound itself is within it");
+        assert!(
+            matches!(limits.hold(&image, 200, 189), Err(RuntimeError::TooLarge(why)) if why.contains("bound of 10"))
+        );
+        assert!(limits.hold(&image, 110, 100).is_ok(), "the floor itself is within it");
+        assert!(matches!(limits.hold(&image, 105, 99), Err(RuntimeError::NoRoom(why)) if why.contains("floor of 100")));
+        assert!(
+            limits.hold(&image, 100, 150).is_ok(),
+            "room freed meanwhile takes nothing"
+        );
+        assert!(limits.hold_unpacked(&image, 10).is_ok());
+        assert!(
+            matches!(limits.hold_unpacked(&image, 11), Err(RuntimeError::TooLarge(why)) if why.contains("unpacks"))
+        );
+        assert!(PullLimits::default().hold(&image, u64::MAX, 0).is_ok());
+        assert!(PullLimits::default().hold_unpacked(&image, u64::MAX).is_ok());
+    }
+
+    fn unpacking(image: &ImageRef, bytes: u64, room: Option<u64>) -> Fake {
+        let rt = Fake::new(vec!["gpu-0".into()], vec![])
+            .with_open_registry()
+            .reporting_every_percent();
+        rt.unpacks(image.clone(), bytes);
+        rt.set_image_room(room);
+        rt
+    }
+
+    #[tokio::test]
+    async fn a_pull_whose_room_on_disk_passes_its_bound_is_given_up_midway_and_its_room_given_back() {
+        let image = ImageRef("big/unpacks:1".into());
+        let rt = unpacking(&image, 30 << 30, Some(100 << 30));
+        rt.sized(image.clone(), 8 << 30);
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let sink = told.clone();
+        let err = rt
+            .pull_bounded(&image, Arc::new(move |p| sink.lock().unwrap().push(p)), most(25 << 30))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::TooLarge(ref why) if why.contains("took") && why.contains("bound")),
+            "{err}"
+        );
+        assert!(!told.lock().unwrap().contains(&Some(100)), "given up before it ended");
+        assert!(!rt.holds(&image).await.unwrap(), "no image is made for it");
+        assert_eq!(rt.image_room().await, Some(100 << 30));
+    }
+
+    #[tokio::test]
+    async fn a_pull_that_brings_the_disk_under_its_floor_is_given_up_midway() {
+        let image = ImageRef("big/unpacks:1".into());
+        let rt = unpacking(&image, 20 << 30, Some(100 << 30));
+        let limits = PullLimits {
+            most_bytes: Some(50 << 30),
+            floor_bytes: Some(90 << 30),
+        };
+        let err = rt.pull_bounded(&image, Arc::new(|_| {}), limits).await.unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::NoRoom(ref why) if why.contains("floor")),
+            "{err}"
+        );
+        assert!(!rt.holds(&image).await.unwrap());
+        rt.set_image_room(Some(200 << 30));
+        rt.pull_bounded(&image, Arc::new(|_| {}), limits).await.unwrap();
+        assert_eq!(
+            rt.image_room().await,
+            Some(180 << 30),
+            "what it unpacked is taken from the room"
+        );
+        rt.remove_image(&image).await.unwrap();
+        assert_eq!(rt.image_room().await, Some(200 << 30), "and given back with the image");
+    }
+
+    #[tokio::test]
+    async fn a_floor_where_the_room_cannot_be_read_is_refused_before_anything_is_pulled() {
+        let image = ImageRef("small/image:1".into());
+        let rt = unpacking(&image, 1 << 20, None);
+        let floor = PullLimits {
+            most_bytes: None,
+            floor_bytes: Some(1),
+        };
+        let err = rt.pull_bounded(&image, Arc::new(|_| {}), floor).await.unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::NoRoom(ref why) if why.contains("cannot be read")),
+            "{err}"
+        );
+        assert!(!rt.holds(&image).await.unwrap());
+        rt.set_image_room(Some(0));
+        let err = rt.pull_bounded(&image, Arc::new(|_| {}), floor).await.unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::NoRoom(_)),
+            "a disk under the floor at the start is refused at once"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_image_that_unpacks_past_its_bound_is_removed_once_pulled_and_the_pull_fails() {
+        let image = ImageRef("big/unpacks:1".into());
+        let rt = unpacking(&image, 30 << 30, None);
+        let err = rt
+            .pull_bounded(&image, Arc::new(|_| {}), most(25 << 30))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::TooLarge(ref why) if why.contains("unpacks")),
+            "{err}"
+        );
+        assert!(!rt.holds(&image).await.unwrap(), "the image it made is removed");
+        assert_eq!(rt.removed(), vec![image.clone()]);
+        rt.pull_bounded(&image, Arc::new(|_| {}), most(30 << 30)).await.unwrap();
+        assert!(rt.holds(&image).await.unwrap(), "at the bound it stays");
+    }
+
+    #[tokio::test]
+    async fn an_image_the_engine_held_before_its_pull_is_never_removed_by_it() {
+        let image = ImageRef("owners/own:latest".into());
+        let rt = Fake::new(vec!["gpu-0".into()], vec![image.clone()]).with_open_registry();
+        rt.unpacks(image.clone(), 30 << 30);
+        let err = rt
+            .pull_bounded(&image, Arc::new(|_| {}), most(25 << 30))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::TooLarge(_)));
+        assert!(rt.holds(&image).await.unwrap());
+        assert!(rt.removed().is_empty());
     }
 
     #[tokio::test]
     async fn a_runtime_that_cannot_bound_a_pull_refuses_one_with_a_bound() {
         let err = NoNames
-            .pull_bounded(&ImageRef("x".into()), Arc::new(|_| {}), Some(1))
+            .pull_bounded(&ImageRef("x".into()), Arc::new(|_| {}), most(1))
             .await
             .unwrap_err();
         assert!(matches!(err, RuntimeError::Engine(_)));
+        let floor = PullLimits {
+            most_bytes: None,
+            floor_bytes: Some(1),
+        };
+        let err = NoNames
+            .pull_bounded(&ImageRef("x".into()), Arc::new(|_| {}), floor)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::Engine(_)), "nor one with a floor");
     }
 
     #[tokio::test]
