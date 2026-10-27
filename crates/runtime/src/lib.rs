@@ -96,10 +96,17 @@ impl RegistryToken {
     /// Refused unless `image` is pulled from this credential's registry: a token is never sent to another. The registry
     /// is named by its host, with a dot or a port, or `localhost`; a name that is none is no registry, and is refused.
     pub fn for_image(&self, image: &ImageRef) -> Result<(), RuntimeError> {
-        let named = &self.registry;
+        let named = self.registry.as_str();
+        let bare = !named.is_empty()
+            && named
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'));
         let host = named.contains('.') || named.contains(':') || named == "localhost";
-        let registry = ImageRef(format!("{named}/x")).registry();
-        match host && !named.contains('/') && image.registry() == registry {
+        let registry = match named {
+            "index.docker.io" => "docker.io",
+            other => other,
+        };
+        match bare && host && image.registry().eq_ignore_ascii_case(registry) {
             true => Ok(()),
             false => Err(RuntimeError::Engine(format!(
                 "a credential for {} is not sent to {}, the registry of {}",
@@ -1490,7 +1497,14 @@ mod tests {
         assert!(rt.credentials().is_empty(), "refused before the registry is asked");
         assert!(rt.pulled().is_empty(), "and nothing pulled");
         let busybox = ImageRef("busybox:1.36".into());
-        for named in ["", "nvidia", "docker.io/library"] {
+        for named in [
+            "",
+            "nvidia",
+            "docker.io/library",
+            "user@evil.example.com",
+            "x@y.io",
+            "evil.io#docker.io",
+        ] {
             let unnamed = RegistryToken::new(named, "t0ken");
             assert!(
                 matches!(
