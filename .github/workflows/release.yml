@@ -2,7 +2,7 @@ name: release
 
 # A release is a tag `v<version>` on a commit of `main`, made by `scripts/release.sh`. The tag must say what
 # `Cargo.toml` says; the binaries must say it too. Three targets are built from the locked tree, archived with the
-# README and the licence, summed, attested (SLSA build provenance) and published with notes made from the release
+# README and the licence, the Linux one with the disk helper and its units, summed, attested (SLSA build provenance) and published with notes made from the release
 # commit's message and the commits since the previous release. Run by hand (workflow_dispatch) it builds and keeps the archives
 # as run artifacts without publishing anything: that is how a change to this file is tried.
 
@@ -115,6 +115,8 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - run: cargo build --release --locked -p best-peer --target ${{ matrix.target }}
+      - if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo build --release --locked -p best-peer-disk --target ${{ matrix.target }}
       - name: The binary says the version the tag says
         shell: bash
         run: |
@@ -123,6 +125,10 @@ jobs:
           [[ "${{ matrix.os }}" == windows-latest ]] && bin="$bin.exe"
           said=$("$bin" --version)
           [[ "$said" == "best-peer ${{ needs.check.outputs.version }}" ]] || { echo "::error::the binary says '$said'"; exit 1; }
+          if [[ "${{ matrix.target }}" == x86_64-unknown-linux-gnu ]]; then
+            said=$(target/${{ matrix.target }}/release/best-peer-disk --version)
+            [[ "$said" == "best-peer-disk ${{ needs.check.outputs.version }}" ]] || { echo "::error::the disk helper says '$said'"; exit 1; }
+          fi
       - name: Archive
         shell: bash
         run: |
@@ -134,6 +140,9 @@ jobs:
             (cd dist && 7z a -tzip "$NAME.zip" "$ALIAS" > /dev/null)
           else
             cp target/${{ matrix.target }}/release/best-peer "dist/$ALIAS/"
+            if [[ "${{ matrix.target }}" == x86_64-unknown-linux-gnu ]]; then
+              cp target/${{ matrix.target }}/release/best-peer-disk packaging/best-peer-disk.socket packaging/best-peer-disk@.service "dist/$ALIAS/"
+            fi
             tar -C dist -czf "dist/$NAME.tar.gz" "$ALIAS"
           fi
           cp "dist/$NAME.${{ matrix.archive }}" "dist/$ALIAS.${{ matrix.archive }}"
@@ -199,7 +208,7 @@ jobs:
             echo
             echo "## Run it"
             echo
-            echo "One binary. Download the archive for the machine, check it against \`SHA256SUMS\`, unpack it and run \`best-peer\` with the environment the README's Run section names; \`best-peer --version\` says \`best-peer $version\`. Each archive is here twice, byte for byte the same: under the name with the version, for pinning, and under the name without it, which \`releases/latest/download/<name>\` resolves to the newest release, as the README's commands use."
+            echo "One binary, and on Linux the disk helper \`best-peer-disk\` with its two systemd units beside it, for a peer run as a user of its own (the README's \"Run as a service with the disk helper\"). Download the archive for the machine, check it against \`SHA256SUMS\`, unpack it and run \`best-peer\` with the environment the README's Run section names; \`best-peer --version\` says \`best-peer $version\`. Each archive is here twice, byte for byte the same: under the name with the version, for pinning, and under the name without it, which \`releases/latest/download/<name>\` resolves to the newest release, as the README's commands use."
             echo
             echo "| Machine | Archive | Same file, unversioned |"
             echo "|---|---|---|"
