@@ -865,11 +865,7 @@ impl Runtime for DockerRuntime {
             run("mount", &["-o", "loop", &img, &mnt]).map_err(|e| {
                 RuntimeError::NoDisk(format!("{e}; a job's disk is mounted by the peer, which needs the capability to mount (CAP_SYS_ADMIN) and the loop devices"))
             })?;
-            let device = std::fs::read_to_string("/proc/self/mountinfo")
-                .map_err(|e| e.to_string())
-                .and_then(|table| {
-                    loop_device_of(&mount, &table).ok_or_else(|| format!("no device is mounted at {mnt}"))
-                });
+            let device = best_peer_disk::loop_device_behind(&mount);
             if let Err(why) = device.and_then(|d| best_peer_disk::no_discard(&d)) {
                 let _ = run("umount", &[&mnt]);
                 return Err(RuntimeError::NoDisk(format!(
@@ -1677,17 +1673,6 @@ fn mount_holding(path: &std::path::Path, mountinfo: &str) -> Option<std::path::P
         })
 }
 
-/// The device mounted at `mount` in `mountinfo`, the text of `/proc/self/mountinfo`: the source of the mount there
-/// that was mounted last; none when nothing is mounted there.
-fn loop_device_of(mount: &std::path::Path, mountinfo: &str) -> Option<String> {
-    mountinfo.lines().rev().find_map(|line| {
-        let (mine, theirs) = line.split_once(" - ")?;
-        let at = unescaped(mine.split(' ').nth(4)?);
-        let source = theirs.split(' ').nth(1)?;
-        (at == mount).then(|| unescaped(source).to_string_lossy().into_owned())
-    })
-}
-
 /// A path as the mount table writes it, with a space, a tab, a newline or a backslash as an octal escape (`\040`).
 fn unescaped(field: &str) -> std::path::PathBuf {
     let bytes = field.as_bytes();
@@ -2063,25 +2048,6 @@ mod tests {
             .enumerate()
             .map(|(i, p)| format!("{} 1 8:2 / {p} rw,relatime shared:1 - ext4 /dev/sda2 rw\n", 20 + i))
             .collect()
-    }
-
-    #[test]
-    fn the_loop_device_behind_a_disk_is_the_source_of_its_mount_point_mounted_last() {
-        let p = std::path::Path::new;
-        let table = "20 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw\n\
-            31 20 7:3 / /data/disks/job-0123456789ab rw,relatime - ext4 /dev/loop3 rw\n\
-            32 20 7:4 / /data/my\\040disks/job-0123456789ab rw,relatime shared:9 - ext4 /dev/loop4 rw\n\
-            33 31 7:5 / /data/disks/job-0123456789ab rw,relatime - ext4 /dev/loop5 rw\n";
-        assert_eq!(
-            loop_device_of(p("/data/disks/job-0123456789ab"), table),
-            Some("/dev/loop5".into())
-        );
-        assert_eq!(
-            loop_device_of(p("/data/my disks/job-0123456789ab"), table),
-            Some("/dev/loop4".into())
-        );
-        assert_eq!(loop_device_of(p("/data/disks/job-ffffffffffff"), table), None);
-        assert_eq!(loop_device_of(p("/"), table), Some("/dev/sda2".into()));
     }
 
     #[test]

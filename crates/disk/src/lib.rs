@@ -215,6 +215,38 @@ pub fn no_discard_at(sys: &Path, device: &str) -> Result<(), String> {
     std::io::Write::write_all(&mut file, b"0").map_err(said)
 }
 
+/// The loop device mounted at `mount`, by the device number of what is there, however the path to it is reached, and
+/// the block device that number names under `sys_dev_block` (`/sys/dev/block/<major>:<minor>`, a link to it);
+/// refused when that is no loop device, or nothing says.
+#[cfg(target_os = "linux")]
+pub fn loop_device_behind_at(mount: &Path, sys_dev_block: &Path) -> Result<String, String> {
+    use std::os::unix::fs::MetadataExt;
+    let dev = std::fs::metadata(mount)
+        .map_err(|e| format!("{} cannot be read: {e}", mount.display()))?
+        .dev();
+    let number = format!("{}:{}", rustix::fs::major(dev), rustix::fs::minor(dev));
+    let device = std::fs::read_link(sys_dev_block.join(&number))
+        .map_err(|e| format!("no block device {number} is behind {}: {e}", mount.display()))?;
+    let name = device
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("the block device {number} has no name"))?
+        .to_string();
+    discard_limit_of(Path::new("/"), &name)?;
+    Ok(name)
+}
+
+/// [`loop_device_behind_at`] in the host's `/sys/dev/block`.
+#[cfg(target_os = "linux")]
+pub fn loop_device_behind(mount: &Path) -> Result<String, String> {
+    loop_device_behind_at(mount, Path::new("/sys/dev/block"))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn loop_device_behind(_mount: &Path) -> Result<String, String> {
+    Err("a job's disk is a file system on a loop device, which is made on Linux only".into())
+}
+
 /// [`no_discard_at`] in the host's `/sys/block`.
 pub fn no_discard(device: &str) -> Result<(), String> {
     no_discard_at(Path::new("/sys/block"), device)
@@ -779,6 +811,34 @@ mod tests {
             !sys.path().join("loop8").exists(),
             "nothing is made where the attribute is missing"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_device_behind_a_mount_is_found_by_its_number_however_its_path_is_reached() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("data/disks");
+        std::fs::create_dir_all(real.join("job-0123456789ab")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("data"), tmp.path().join("linked")).unwrap();
+        let mount = tmp.path().join("linked/disks/job-0123456789ab");
+        let dev = std::fs::metadata(real.join("job-0123456789ab")).unwrap().dev();
+        let number = format!("{}:{}", rustix::fs::major(dev), rustix::fs::minor(dev));
+        let sys = tmp.path().join("sys-dev-block");
+        std::fs::create_dir_all(&sys).unwrap();
+        std::os::unix::fs::symlink("../../devices/virtual/block/loop5", sys.join(&number)).unwrap();
+        assert_eq!(loop_device_behind_at(&mount, &sys), Ok("loop5".to_string()));
+
+        std::fs::remove_file(sys.join(&number)).unwrap();
+        std::os::unix::fs::symlink("../../devices/pci0000:00/block/sda/sda2", sys.join(&number)).unwrap();
+        let not_loop = loop_device_behind_at(&mount, &sys).unwrap_err();
+        assert!(
+            not_loop.contains("sda2") && not_loop.contains("no loop device"),
+            "{not_loop}"
+        );
+        std::fs::remove_file(sys.join(&number)).unwrap();
+        assert!(loop_device_behind_at(&mount, &sys).is_err());
+        assert!(loop_device_behind_at(&tmp.path().join("none"), &sys).is_err());
     }
 
     #[test]
