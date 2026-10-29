@@ -315,8 +315,8 @@ before any room is reserved. A disk holds `peer/`, the peer's alone, with where 
 which the job reads; and `out/`, which it writes. A disk is never promised the last of its file system: 1 GiB, or a twentieth of it when that is
 more, stays free for the peer's own log and the engine: the free room and the size `get-hardware-state` tells are each
 what is left after that, so the size is the largest disk the peer could ever make. Under the disk helper both are
-also held to its `--most-bytes`, and nothing is free while its `--most-disks` are there, so an order waits for a
-disk to go rather than fail; a `run-job` at the peer's own door asking for more than `--most-bytes` is refused
+also held to its `--most-bytes`, and nothing is free while its `--most-disks` are made or promised to orders
+admitted, so an order waits for a disk to go rather than fail; a `run-job` at the peer's own door asking for more than `--most-bytes` is refused
 (`NO_DISK_ROOM`, with the bound as `most_bytes`). At
 start the peer removes every disk there that no running job has, such as one whose job ended while it was down. Its inputs are fetched and its outputs sent over `https://`
 only; `BEST_PEER_STORE_CLEARTEXT=loopback` also allows a store on this machine's loopback over `http://`, for a test

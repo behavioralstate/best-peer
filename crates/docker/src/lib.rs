@@ -685,6 +685,21 @@ fn not_answered(answer: best_peer_disk::Answer, expected: &str) -> RuntimeError 
     }
 }
 
+/// How many disks' images are in `dir`, each `<id>.img` with an id a disk may have.
+fn images_in(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .and_then(|n| n.strip_suffix(".img"))
+                .is_some_and(|id| best_peer_disk::valid_id(id).is_ok())
+        })
+        .count()
+}
+
 /// The room for disks in `dir`, as `df` reads it there within ten seconds, less what is kept free.
 fn room_for_disks(dir: std::path::PathBuf) -> Option<(u64, u64)> {
     if !cfg!(target_os = "linux") {
@@ -902,6 +917,10 @@ impl Runtime for DockerRuntime {
         self.helper_limits.map(|l| l.most_bytes)
     }
 
+    fn most_disks(&self) -> Option<usize> {
+        self.helper_limits.map(|l| l.most_disks)
+    }
+
     /// Through the disk helper when there is one: what the job left under `out/` given to this peer's user. Without
     /// one, this peer mounted the disk itself, and reads what is on it.
     async fn release(&self, id: &str) -> Result<(), RuntimeError> {
@@ -940,6 +959,11 @@ impl Runtime for DockerRuntime {
             .collect()
     }
 
+    /// The images in the disks' directory, read there, so a disk helper is not asked for a count.
+    fn disks_made(&self) -> usize {
+        self.disks.as_deref().map(images_in).unwrap_or(0)
+    }
+
     fn disk_at(&self, id: &str) -> Option<std::path::PathBuf> {
         let mount = self.disks.clone()?.join(id);
         // Mounted: its own file system, on another device than the directory it is in. After a reboot it is not.
@@ -967,18 +991,7 @@ impl Runtime for DockerRuntime {
         let Some(limits) = self.helper_limits else {
             return Some((free, total));
         };
-        let made = std::fs::read_dir(&dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|e| {
-                e.file_name()
-                    .to_str()
-                    .and_then(|n| n.strip_suffix(".img"))
-                    .is_some_and(|id| best_peer_disk::valid_id(id).is_ok())
-            })
-            .count();
-        let free = match made >= limits.most_disks {
+        let free = match images_in(&dir) >= limits.most_disks {
             true => 0,
             false => free.min(limits.most_bytes),
         };
@@ -1895,7 +1908,7 @@ mod tests {
             Some("/var/lib/best-peer-disk".into()),
             "the helper's directory"
         );
-        assert_eq!(rt.most_disk_bytes(), Some(1 << 40));
+        assert_eq!((rt.most_disk_bytes(), rt.most_disks()), (Some(1 << 40), Some(16)));
         assert_eq!(
             rt.make_disk("job-0123456789ab", 1 << 30).await.unwrap(),
             std::path::PathBuf::from("/var/lib/best-peer-disk/job-0123456789ab")
@@ -1965,12 +1978,13 @@ mod tests {
         std::fs::write(disks.join("job-0123456789ab.img"), "").unwrap();
         assert_eq!(rt.disk_room().unwrap().0, 16 << 20);
         std::fs::write(disks.join("job-ffffffffffff.img"), "").unwrap();
-        std::fs::write(disks.join("notes.img"), "").unwrap();
+        std::fs::write(disks.join("Notes.img"), "").unwrap();
         assert_eq!(
             rt.disk_room().unwrap(),
             (0, 16 << 20),
             "none is free while --most-disks are there"
         );
+        assert_eq!(rt.disks_made(), 2, "counted in the directory, the helper not asked");
         assert_eq!(
             unconnected(&socket).most_disk_bytes(),
             None,

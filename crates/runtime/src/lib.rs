@@ -598,6 +598,10 @@ pub trait Runtime: Send + Sync {
     fn most_disk_bytes(&self) -> Option<u64> {
         None
     }
+    /// How many disks this runtime keeps at once, as a disk helper's bound; none for no bound but the room.
+    fn most_disks(&self) -> Option<usize> {
+        None
+    }
     /// Whether this runtime makes jobs' disks at all; answered at once, without asking the file system.
     fn makes_disks(&self) -> bool {
         false
@@ -610,6 +614,11 @@ pub trait Runtime: Send + Sync {
     /// The jobs whose disks this runtime made and has not removed, as a restart finds them.
     fn disks(&self) -> Vec<String> {
         vec![]
+    }
+    /// How many disks this runtime has made and not removed, counted where it makes them: what [`Runtime::disks`]
+    /// lists, unless the runtime counts them more cheaply. Called off the executor.
+    fn disks_made(&self) -> usize {
+        self.disks().len()
     }
     /// Where the job `id`'s disk is mounted on the host, when it is.
     fn disk_at(&self, _id: &str) -> Option<std::path::PathBuf> {
@@ -682,8 +691,9 @@ pub struct Fake {
     released: Mutex<Vec<String>>,
     /// Why the next release fails, as a disk helper that does not answer.
     broken_release: Mutex<Option<String>>,
-    /// The largest disk it makes, as a disk helper bounds it, where a test sets one.
+    /// The largest disk it makes, and how many it keeps at once, as a disk helper bounds them, where a test sets them.
     most_disk_bytes: Mutex<Option<u64>>,
+    most_disks: Mutex<Option<usize>>,
     /// What each container it started wrote, and who follows it while it runs.
     written: Mutex<HashMap<ContainerId, Writing>>,
     /// The user an image names, where a test sets one; root otherwise, as an image that names none runs.
@@ -744,6 +754,7 @@ impl Fake {
             released: Mutex::new(Vec::new()),
             broken_release: Mutex::new(None),
             most_disk_bytes: Mutex::new(None),
+            most_disks: Mutex::new(None),
             written: Mutex::new(HashMap::new()),
             image_users: Mutex::new(HashMap::new()),
             guarded: Mutex::new(HashMap::new()),
@@ -828,6 +839,12 @@ impl Fake {
     /// The largest disk it makes from now on, as a disk helper's `--most-bytes`; none for no bound but the room.
     pub fn set_most_disk_bytes(&self, most: Option<u64>) {
         *self.most_disk_bytes.lock().unwrap() = most;
+    }
+
+    /// How many disks it keeps at once from now on, as a disk helper's `--most-disks`; none for no bound but the
+    /// room.
+    pub fn set_most_disks(&self, most: Option<usize>) {
+        *self.most_disks.lock().unwrap() = most;
     }
 
     /// The next release fails with `why`, as a disk helper that does not answer.
@@ -1439,6 +1456,10 @@ impl Runtime for Fake {
 
     fn most_disk_bytes(&self) -> Option<u64> {
         *self.most_disk_bytes.lock().unwrap()
+    }
+
+    fn most_disks(&self) -> Option<usize> {
+        *self.most_disks.lock().unwrap()
     }
 
     fn disk_room(&self) -> Option<(u64, u64)> {

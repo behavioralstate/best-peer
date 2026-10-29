@@ -11739,6 +11739,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn orders_past_the_most_disks_a_member_makes_wait_for_a_disk_to_go_and_never_fail_at_make() {
+        let (site, ws, _s3, _logs) = site_with_store().await;
+        let member = &site.members[0];
+        member.runtime.set_most_disks(Some(1));
+        let first = site.order(&ws, "j1", 4, with_io()).await;
+        assert_eq!(first["waiting"], false, "{first}");
+        let second = site.order(&ws, "j2", 4, with_io()).await;
+        assert_eq!(second["waiting"], true, "{second}");
+        let started = site.events(&ws, "j1", "JobStarted").await.last().unwrap()["data"].clone();
+        let hs = site.query(&ws, "get-hardware-state").await;
+        assert_eq!(hs["peers"][0]["disk"]["free_bytes"], 0, "{hs}");
+        member
+            .runtime
+            .stop(&ContainerId(started["container"].as_str().unwrap().into()))
+            .await
+            .unwrap();
+        site.events(&ws, "j1", "JobFinished").await;
+        let disk = member.runtime.disk_of(started["job"].as_str().unwrap());
+        until("the first job's disk is removed", || !disk.exists()).await;
+        site.live_cloud(&ws, "lab").step(later(0)).await;
+        let events = site.events(&ws, "j2", "JobStarted").await;
+        assert_eq!(
+            facts(&events),
+            ["JobQueued", "JobPlaced", "InputsFetched", "JobStarted"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disk_promised_and_not_yet_made_counts_against_the_most_disks() {
+        let bed = bed(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        bed.runtime.set_most_disks(Some(1));
+        let (first, second) = tokio::join!(bed.peer.claim_disk("job-a", GB), bed.peer.claim_disk("job-b", GB));
+        let (held, refused) = match (first, second) {
+            (Ok(p), Err(e)) | (Err(e), Ok(p)) => (p, e),
+            (a, b) => panic!("one of two is promised a disk: {:?} {:?}", a.is_ok(), b.is_ok()),
+        };
+        assert_eq!(refused.code, "INSUFFICIENT_DISK", "{refused:?}");
+        drop(held);
+        assert!(
+            bed.peer.claim_disk("job-c", GB).await.is_ok(),
+            "the promise let go frees its place"
+        );
+    }
+
+    #[tokio::test]
     async fn an_order_whose_store_was_replaced_while_it_waited_fails_when_its_turn_comes_rather_than_read_another() {
         let (site, ws, _s3, _logs) = site_with_store().await;
         site.order(&ws, "j1", 20, json!({ "args": ["sleep", "100"] })).await;
