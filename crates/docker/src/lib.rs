@@ -25,7 +25,9 @@
 //! is unit-tested: the share and the bytes of a pull over what the engine reports, a pull held to its limits over a
 //! stream and readings of the room, the body a container is created from, the host config a confinement becomes, a
 //! container's environment, the profiles named from the engine's options, the room free at a directory, and the mount
-//! holding it.
+//! holding it. A job's disk is made, released and removed by the disk helper when the peer has one
+//! ([`DockerRuntime::with_disk_helper`], behavioralstate/spec#169), and mounted by the peer itself otherwise; what goes
+//! to the helper is unit-tested over a socket that stands in for it, and a disk's layout on a directory.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -64,7 +66,11 @@ pub struct DockerRuntime {
     /// Where jobs' disks are made: each a file system of its own on a loop device, capped at the size asked for.
     disks: Option<std::path::PathBuf>,
     /// Whether this peer can mount a disk there; one that cannot makes none, and still clears what is left there.
+    /// With a disk helper: whether the helper answered at start.
     mounts: bool,
+    /// The socket of the disk helper (`best-peer-disk`) that makes, releases and removes jobs' disks for this peer,
+    /// when it has one.
+    helper: Option<std::path::PathBuf>,
     /// Whether the engine runs on this host, so the room for its images can be read here: published ports bound to
     /// loopback, as they are when the peer reaches the engines on this host.
     engine_here: bool,
@@ -89,6 +95,7 @@ impl DockerRuntime {
             tx,
             disks: None,
             mounts: false,
+            helper: None,
             engine_here: engine_is_here(bind_ip),
             followers: Arc::new(Followers::default()),
         };
@@ -595,6 +602,80 @@ impl DockerRuntime {
     }
 }
 
+impl DockerRuntime {
+    /// The same engine, its jobs' disks made, released and removed by the disk helper listening on `socket`
+    /// (`best-peer-disk`, behavioralstate/spec#169), in the directory the helper names when it is asked for its
+    /// disks now, which this peer reads for where a disk is and the room there. A helper that does not answer then
+    /// leaves this peer making no disk, as one that cannot mount, and says so at start.
+    pub fn with_disk_helper(mut self, socket: std::path::PathBuf) -> Self {
+        match ask_helper(&socket, &best_peer_disk::Request::List, HELPER_LISTS_WITHIN) {
+            Ok(best_peer_disk::Answer::Listed { dir, .. }) => {
+                self.disks = Some(dir);
+                self.mounts = true;
+            }
+            Ok(other) => {
+                tracing::warn!(socket = %socket.display(), answer = ?other, "this peer makes no disk for a job: its disk helper did not list its disks");
+                self.mounts = false;
+            }
+            Err(why) => {
+                tracing::warn!(socket = %socket.display(), %why, "this peer makes no disk for a job: its disk helper did not answer");
+                self.mounts = false;
+            }
+        }
+        self.helper = Some(socket);
+        self
+    }
+
+    /// Asks this peer's disk helper `request`, off the executor, waiting [`HELPER_WITHIN`] at most.
+    async fn ask_disk_helper(
+        &self,
+        socket: &std::path::Path,
+        request: best_peer_disk::Request,
+    ) -> Result<best_peer_disk::Answer, RuntimeError> {
+        let socket = socket.to_path_buf();
+        tokio::task::spawn_blocking(move || ask_helper(&socket, &request, HELPER_WITHIN))
+            .await
+            .map_err(|e| RuntimeError::NoDisk(e.to_string()))?
+    }
+}
+
+/// How long the disk helper may take over listing its disks, which reads one directory.
+const HELPER_LISTS_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long the disk helper may take over a disk: making one formats it, and releasing one walks all a job left.
+const HELPER_WITHIN: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The disk helper's answer to `request`, a refusal included; why there is none, in words that name the helper.
+#[cfg(unix)]
+fn ask_helper(
+    socket: &std::path::Path,
+    request: &best_peer_disk::Request,
+    within: std::time::Duration,
+) -> Result<best_peer_disk::Answer, RuntimeError> {
+    best_peer_disk::ask(socket, request, within).map_err(RuntimeError::NoDisk)
+}
+
+#[cfg(not(unix))]
+fn ask_helper(
+    _socket: &std::path::Path,
+    _request: &best_peer_disk::Request,
+    _within: std::time::Duration,
+) -> Result<best_peer_disk::Answer, RuntimeError> {
+    Err(RuntimeError::NoDisk(
+        "a job's disk is a file system on a loop device, which this peer makes on Linux only".into(),
+    ))
+}
+
+/// What the disk helper answered other than `expected`: its refusal by name and in its words, or the answer itself.
+fn not_answered(answer: best_peer_disk::Answer, expected: &str) -> RuntimeError {
+    match answer {
+        best_peer_disk::Answer::Refused { code, reason } => {
+            RuntimeError::NoDisk(format!("the disk helper refused ({code}): {reason}"))
+        }
+        other => RuntimeError::NoDisk(format!("the disk helper answered {other:?}, not {expected}")),
+    }
+}
+
 /// How many `df`s killed past their time have not ended: each counted until its own reaper sees it end, so the room
 /// stays unknown, and no other is started, while any is stuck.
 static DF_STUCK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -672,6 +753,22 @@ impl Runtime for DockerRuntime {
     /// long as its job does not need, and keeps nothing for root, so the job has all of it. Linux only, and the peer
     /// needs the capability to mount and the loop devices.
     async fn make_disk(&self, id: &str, bytes: u64) -> Result<std::path::PathBuf, RuntimeError> {
+        if let Some(socket) = &self.helper {
+            if !self.mounts {
+                return Err(RuntimeError::NoDisk(
+                    "this peer makes no disk for a job: its disk helper did not answer at start, as its log said"
+                        .into(),
+                ));
+            }
+            let request = best_peer_disk::Request::Make {
+                id: id.to_string(),
+                bytes,
+            };
+            return match self.ask_disk_helper(socket, request).await? {
+                best_peer_disk::Answer::Made { path } => Ok(path),
+                other => Err(not_answered(other, "made")),
+            };
+        }
         let Some(dir) = self.disks.clone() else {
             return Err(RuntimeError::NoDisk(
                 "this peer makes no disk for a job: it was started without a place for them".into(),
@@ -712,6 +809,13 @@ impl Runtime for DockerRuntime {
     }
 
     async fn remove_disk(&self, id: &str) -> Result<(), RuntimeError> {
+        if let Some(socket) = &self.helper {
+            let request = best_peer_disk::Request::Remove { id: id.to_string() };
+            return match self.ask_disk_helper(socket, request).await? {
+                best_peer_disk::Answer::Removed => Ok(()),
+                other => Err(not_answered(other, "removed")),
+            };
+        }
         let Some(dir) = self.disks.clone() else {
             return Ok(());
         };
@@ -733,7 +837,33 @@ impl Runtime for DockerRuntime {
         self.disks.is_some() && self.mounts && cfg!(target_os = "linux")
     }
 
+    /// Through the disk helper when there is one: what the job left under `out/` given to this peer's user. Without
+    /// one, this peer mounted the disk itself, and reads what is on it.
+    async fn release(&self, id: &str) -> Result<(), RuntimeError> {
+        let Some(socket) = &self.helper else {
+            return Ok(());
+        };
+        let request = best_peer_disk::Request::Release { id: id.to_string() };
+        match self.ask_disk_helper(socket, request).await? {
+            best_peer_disk::Answer::Released => Ok(()),
+            other => Err(not_answered(other, "released")),
+        }
+    }
+
     fn disks(&self) -> Vec<String> {
+        if let Some(socket) = &self.helper {
+            return match ask_helper(socket, &best_peer_disk::Request::List, HELPER_LISTS_WITHIN) {
+                Ok(best_peer_disk::Answer::Listed { ids, .. }) => ids,
+                Ok(other) => {
+                    tracing::warn!(error = %not_answered(other, "listed"), "the disk helper did not list its disks");
+                    vec![]
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "the disk helper did not list its disks");
+                    vec![]
+                }
+            };
+        }
         let Some(dir) = self.disks.clone() else {
             return vec![];
         };
@@ -1648,6 +1778,136 @@ mod tests {
             credentials_for(&elsewhere, Some(&token)),
             Err(RuntimeError::Engine(_))
         ));
+    }
+
+    /// A disk helper on a socket in a temporary directory: each connection's line is kept, and answered as `answers`
+    /// says for it. Answers the socket's path, its directory, and the lines it was sent.
+    #[cfg(unix)]
+    fn helper(
+        answers: impl Fn(&str) -> String + Send + 'static,
+    ) -> (std::path::PathBuf, std::path::PathBuf, Arc<Mutex<Vec<String>>>) {
+        use std::io::{BufRead, Write};
+        let dir = std::env::temp_dir().join(format!(
+            "best-peer-helper-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("disk.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let asked = Arc::new(Mutex::new(vec![]));
+        let kept = asked.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let mut conn = conn.unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(&conn).read_line(&mut line).unwrap();
+                let line = line.trim_end().to_string();
+                let answer = answers(&line);
+                kept.lock().unwrap().push(line);
+                conn.write_all(format!("{answer}\n").as_bytes()).unwrap();
+            }
+        });
+        (socket, dir, asked)
+    }
+
+    /// A runtime that never reaches an engine: enough for what goes to the disk helper alone.
+    #[cfg(unix)]
+    fn unconnected(socket: &std::path::Path) -> DockerRuntime {
+        let (tx, _) = broadcast::channel(1);
+        DockerRuntime {
+            docker: Docker::connect_with_unix(&socket.to_string_lossy(), 1, bollard::API_DEFAULT_VERSION).unwrap(),
+            exited: Arc::new(Mutex::new(Exited::default())),
+            bind_ip: "127.0.0.1".into(),
+            tx,
+            disks: None,
+            mounts: false,
+            helper: None,
+            engine_here: true,
+            followers: Arc::new(Followers::default()),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn with_a_disk_helper_a_jobs_disk_is_made_released_listed_and_removed_by_it_in_the_directory_it_names() {
+        let (socket, dir, asked) = helper(|line| {
+            let request: serde_json::Value = serde_json::from_str(line).unwrap();
+            match request["request"].as_str().unwrap() {
+                "list" => r#"{"answer":"listed","dir":"/var/lib/best-peer-disk","ids":["job-0123456789ab"]}"#.into(),
+                "make" if request["bytes"] == 1u64 << 40 => {
+                    r#"{"answer":"refused","code":"too_large","reason":"past --most-bytes"}"#.into()
+                }
+                "make" => format!(
+                    r#"{{"answer":"made","path":"/var/lib/best-peer-disk/{}"}}"#,
+                    request["id"].as_str().unwrap()
+                ),
+                "release" => r#"{"answer":"released"}"#.into(),
+                "remove" => r#"{"answer":"removed"}"#.into(),
+                _ => unreachable!(),
+            }
+        });
+        let rt = unconnected(&socket)
+            .with_disks(dir.join("unused"))
+            .with_disk_helper(socket.clone());
+        assert!(rt.makes_disks());
+        assert_eq!(
+            rt.disks,
+            Some("/var/lib/best-peer-disk".into()),
+            "the helper's directory"
+        );
+        assert_eq!(
+            rt.make_disk("job-0123456789ab", 1 << 30).await.unwrap(),
+            std::path::PathBuf::from("/var/lib/best-peer-disk/job-0123456789ab")
+        );
+        let refused = rt.make_disk("job-ffffffffffff", 1 << 40).await.unwrap_err();
+        assert!(
+            matches!(&refused, RuntimeError::NoDisk(why) if why.contains("too_large") && why.contains("past --most-bytes")),
+            "{refused:?}"
+        );
+        rt.release("job-0123456789ab").await.unwrap();
+        assert_eq!(rt.disks(), ["job-0123456789ab"]);
+        rt.remove_disk("job-0123456789ab").await.unwrap();
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [
+                r#"{"request":"list"}"#,
+                r#"{"request":"make","id":"job-0123456789ab","bytes":1073741824}"#,
+                r#"{"request":"make","id":"job-ffffffffffff","bytes":1099511627776}"#,
+                r#"{"request":"release","id":"job-0123456789ab"}"#,
+                r#"{"request":"list"}"#,
+                r#"{"request":"remove","id":"job-0123456789ab"}"#,
+            ]
+        );
+        assert!(
+            !dir.join("unused").exists(),
+            "nothing is made where the peer would mount"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_disk_helper_that_does_not_answer_at_start_leaves_the_peer_making_no_disk() {
+        let (socket, dir, _) = helper(|_| "not an answer".into());
+        let rt = unconnected(&socket).with_disk_helper(socket.clone());
+        assert!(!rt.makes_disks());
+        let refused = rt.make_disk("job-0123456789ab", 1 << 30).await.unwrap_err();
+        assert!(
+            matches!(&refused, RuntimeError::NoDisk(why) if why.contains("disk helper")),
+            "{refused:?}"
+        );
+        let gone = unconnected(&socket).with_disk_helper(dir.join("none.sock"));
+        assert!(!gone.makes_disks());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn without_a_disk_helper_there_is_nothing_to_release() {
+        let socket = std::env::temp_dir();
+        unconnected(&socket).release("job-0123456789ab").await.unwrap();
     }
 
     #[cfg(target_os = "linux")]

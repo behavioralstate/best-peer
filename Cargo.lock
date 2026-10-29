@@ -271,6 +271,7 @@ dependencies = [
  "bollard",
  "futures",
  "rustix",
+ "serde_json",
  "tokio",
  "tracing",
 ]

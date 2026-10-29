@@ -50,6 +50,13 @@ pub enum Refusal {
     Failed,
 }
 
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = serde_json::to_value(self).ok();
+        f.write_str(name.as_ref().and_then(|n| n.as_str()).unwrap_or("refused"))
+    }
+}
+
 /// A request refused, by name and in words.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refused(pub Refusal, pub String);
@@ -627,6 +634,7 @@ mod tests {
             r#"{"answer":"made","path":"/d/job-1abc"}"#
         );
         assert_eq!(line(&Answer::Released), r#"{"answer":"released"}"#);
+        assert_eq!(Refusal::TooManyDisks.to_string(), "too_many_disks");
         assert_eq!(
             line(&Answer::Refused {
                 code: Refusal::NotThePeer,
