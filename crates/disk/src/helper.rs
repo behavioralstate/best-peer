@@ -48,6 +48,12 @@ impl Helper {
             std::io::BufReader::new(std::io::Read::take(conn, MOST_LINE as u64))
                 .read_line(&mut line)
                 .map_err(|e| Refused(Refusal::UnknownRequest, format!("no request was read: {e}")))?;
+            if line.len() >= MOST_LINE && !line.ends_with('\n') {
+                return Err(Refused(
+                    Refusal::UnknownRequest,
+                    format!("the request is longer than {MOST_LINE} bytes"),
+                ));
+            }
             Ok(answer(
                 &line,
                 cred.uid.as_raw(),
@@ -369,6 +375,74 @@ mod tests {
     fn mode(path: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
         std::fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    /// What `helper` answers to a caller that sent `sent`, as the caller reads it back: the answer, and the line.
+    fn served(helper: &Helper, sent: &[u8]) -> (Answer, String) {
+        use std::io::{BufRead, Write};
+        let (theirs, mut ours) = std::os::unix::net::UnixStream::pair().unwrap();
+        ours.write_all(sent).unwrap();
+        let answered = helper.serve(&theirs);
+        let mut line = String::new();
+        std::io::BufReader::new(&ours).read_line(&mut line).unwrap();
+        (answered, line)
+    }
+
+    fn code(answer: &Answer) -> Refusal {
+        match answer {
+            Answer::Refused { code, .. } => *code,
+            other => panic!("not refused: {other:?}"),
+        }
+    }
+
+    const LIMITS: Limits = Limits {
+        most_bytes: 1 << 40,
+        most_disks: 16,
+    };
+
+    #[test]
+    fn a_connection_is_answered_once_with_one_json_line_and_a_caller_not_the_peer_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let helper = Helper::new(tmp.path().join("disks"), me(), LIMITS);
+        let (answered, line) = served(&helper, b"{\"request\":\"list\"}\n");
+        assert!(line.ends_with('\n') && line.matches('\n').count() == 1, "{line:?}");
+        assert_eq!(serde_json::from_str::<Answer>(&line).unwrap(), answered);
+        assert_eq!(code(&answered), Refusal::Failed, "a directory not root's is refused");
+
+        let stranger = Helper::new(
+            tmp.path().join("disks"),
+            Peer {
+                uid: me().uid + 1,
+                gid: me().gid,
+            },
+            LIMITS,
+        );
+        let (answered, line) = served(&stranger, b"{\"request\":\"list\"}\n");
+        assert_eq!(code(&answered), Refusal::NotThePeer);
+        assert_eq!(serde_json::from_str::<Answer>(&line).unwrap(), answered);
+        let other_group = Helper::new(
+            tmp.path().join("disks"),
+            Peer {
+                uid: me().uid,
+                gid: me().gid + 1,
+            },
+            LIMITS,
+        );
+        assert_eq!(
+            code(&served(&other_group, b"{\"request\":\"list\"}\n").0),
+            Refusal::NotThePeer
+        );
+    }
+
+    #[test]
+    fn a_line_past_the_longest_or_not_utf8_is_refused_and_never_waited_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let helper = Helper::new(tmp.path().join("disks"), me(), LIMITS);
+        let (answered, line) = served(&helper, &vec![b'a'; MOST_LINE + 100]);
+        assert_eq!(code(&answered), Refusal::UnknownRequest);
+        assert!(line.contains("longer than"), "{line}");
+        let (answered, _) = served(&helper, b"{\"request\":\"li\xff\xfest\"}\n");
+        assert_eq!(code(&answered), Refusal::UnknownRequest);
     }
 
     #[test]

@@ -69,8 +69,9 @@ pub struct DockerRuntime {
     /// With a disk helper: whether the helper answered at start.
     mounts: bool,
     /// The socket of the disk helper (`best-peer-disk`) that makes, releases and removes jobs' disks for this peer,
-    /// when it has one.
+    /// when it has one, and its bounds, as it listed them at start.
     helper: Option<std::path::PathBuf>,
+    helper_limits: Option<best_peer_disk::Limits>,
     /// Whether the engine runs on this host, so the room for its images can be read here: published ports bound to
     /// loopback, as they are when the peer reaches the engines on this host.
     engine_here: bool,
@@ -96,6 +97,7 @@ impl DockerRuntime {
             disks: None,
             mounts: false,
             helper: None,
+            helper_limits: None,
             engine_here: engine_is_here(bind_ip),
             followers: Arc::new(Followers::default()),
         };
@@ -605,13 +607,20 @@ impl DockerRuntime {
 impl DockerRuntime {
     /// The same engine, its jobs' disks made, released and removed by the disk helper listening on `socket`
     /// (`best-peer-disk`, behavioralstate/spec#169), in the directory the helper names when it is asked for its
-    /// disks now, which this peer reads for where a disk is and the room there. A helper that does not answer then
-    /// leaves this peer making no disk, as one that cannot mount, and says so at start.
+    /// disks now, which this peer reads for where a disk is and the room there, held to the bounds the helper lists
+    /// with them: no disk past its `--most-bytes`, and none free while its `--most-disks` are there. A helper that
+    /// does not answer then leaves this peer making no disk, as one that cannot mount, and says so at start.
     pub fn with_disk_helper(mut self, socket: std::path::PathBuf) -> Self {
         match ask_helper(&socket, &best_peer_disk::Request::List, HELPER_LISTS_WITHIN) {
-            Ok(best_peer_disk::Answer::Listed { dir, .. }) => {
+            Ok(best_peer_disk::Answer::Listed {
+                dir,
+                most_bytes,
+                most_disks,
+                ..
+            }) => {
                 self.disks = Some(dir);
                 self.mounts = true;
+                self.helper_limits = Some(best_peer_disk::Limits { most_bytes, most_disks });
             }
             Ok(other) => {
                 tracing::warn!(socket = %socket.display(), answer = ?other, "this peer makes no disk for a job: its disk helper did not list its disks");
@@ -674,6 +683,58 @@ fn not_answered(answer: best_peer_disk::Answer, expected: &str) -> RuntimeError 
         }
         other => RuntimeError::NoDisk(format!("the disk helper answered {other:?}, not {expected}")),
     }
+}
+
+/// The room for disks in `dir`, as `df` reads it there within ten seconds, less what is kept free.
+fn room_for_disks(dir: std::path::PathBuf) -> Option<(u64, u64)> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    // While a df is stuck in the file system, the room is not known and no other is started: the dfs left behind
+    // are those that were already asking when it stopped answering, never one per question after.
+    if DF_STUCK.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        return None;
+    }
+    let failed = |why: String| {
+        tracing::warn!(dir = %dir.display(), %why, "the room for jobs' disks could not be read");
+        None
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return failed(format!("the directory could not be made: {e}"));
+    }
+    // Asked for ten seconds at most: a file system that does not answer is one with no room known.
+    let mut df = match std::process::Command::new("df")
+        .args(["-B1", "--output=avail,size", &dir.to_string_lossy()])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(df) => df,
+        Err(e) => return failed(format!("df could not run: {e}")),
+    };
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match df.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < until => std::thread::sleep(std::time::Duration::from_millis(20)),
+            _ => {
+                // Killed, and left to a thread of its own to reap: one stuck in the file system may never end.
+                let _ = df.kill();
+                DF_STUCK.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let _ = df.wait();
+                    DF_STUCK.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                });
+                return failed("df did not answer within ten seconds".into());
+            }
+        }
+    }
+    let mut text = String::new();
+    let _ = df
+        .stdout
+        .take()
+        .map(|mut out| std::io::Read::read_to_string(&mut out, &mut text));
+    room_in(&text).or_else(|| failed(format!("df answered what does not read as room: {text:?}")))
 }
 
 /// How many `df`s killed past their time have not ended: each counted until its own reaper sees it end, so the room
@@ -837,6 +898,10 @@ impl Runtime for DockerRuntime {
         self.disks.is_some() && self.mounts && cfg!(target_os = "linux")
     }
 
+    fn most_disk_bytes(&self) -> Option<u64> {
+        self.helper_limits.map(|l| l.most_bytes)
+    }
+
     /// Through the disk helper when there is one: what the job left under `out/` given to this peer's user. Without
     /// one, this peer mounted the disk itself, and reads what is on it.
     async fn release(&self, id: &str) -> Result<(), RuntimeError> {
@@ -894,58 +959,30 @@ impl Runtime for DockerRuntime {
         }
     }
 
+    /// With a disk helper, held to its bounds: no disk past its `--most-bytes`, and none free while its `--most-disks`
+    /// are there, counted in its directory.
     fn disk_room(&self) -> Option<(u64, u64)> {
         let dir = self.disks.clone().filter(|_| self.mounts)?;
-        if !cfg!(target_os = "linux") {
-            return None;
-        }
-        // While a df is stuck in the file system, the room is not known and no other is started: the dfs left behind
-        // are those that were already asking when it stopped answering, never one per question after.
-        if DF_STUCK.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-            return None;
-        }
-        let failed = |why: String| {
-            tracing::warn!(dir = %dir.display(), %why, "the room for jobs' disks could not be read");
-            None
+        let (free, total) = room_for_disks(dir.clone())?;
+        let Some(limits) = self.helper_limits else {
+            return Some((free, total));
         };
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            return failed(format!("the directory could not be made: {e}"));
-        }
-        // Asked for ten seconds at most: a file system that does not answer is one with no room known.
-        let mut df = match std::process::Command::new("df")
-            .args(["-B1", "--output=avail,size", &dir.to_string_lossy()])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            Ok(df) => df,
-            Err(e) => return failed(format!("df could not run: {e}")),
+        let made = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .and_then(|n| n.strip_suffix(".img"))
+                    .is_some_and(|id| best_peer_disk::valid_id(id).is_ok())
+            })
+            .count();
+        let free = match made >= limits.most_disks {
+            true => 0,
+            false => free.min(limits.most_bytes),
         };
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            match df.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if std::time::Instant::now() < until => {
-                    std::thread::sleep(std::time::Duration::from_millis(20))
-                }
-                _ => {
-                    // Killed, and left to a thread of its own to reap: one stuck in the file system may never end.
-                    let _ = df.kill();
-                    DF_STUCK.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    std::thread::spawn(move || {
-                        let _ = df.wait();
-                        DF_STUCK.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                    });
-                    return failed("df did not answer within ten seconds".into());
-                }
-            }
-        }
-        let mut text = String::new();
-        let _ = df
-            .stdout
-            .take()
-            .map(|mut out| std::io::Read::read_to_string(&mut out, &mut text));
-        room_in(&text).or_else(|| failed(format!("df answered what does not read as room: {text:?}")))
+        Some((free, total.min(limits.most_bytes)))
     }
 
     /// A container, or a user namespace when the engine runs rootless or remaps its users, as its own `info` says.
@@ -1824,6 +1861,7 @@ mod tests {
             disks: None,
             mounts: false,
             helper: None,
+            helper_limits: None,
             engine_here: true,
             followers: Arc::new(Followers::default()),
         }
@@ -1835,7 +1873,7 @@ mod tests {
         let (socket, dir, asked) = helper(|line| {
             let request: serde_json::Value = serde_json::from_str(line).unwrap();
             match request["request"].as_str().unwrap() {
-                "list" => r#"{"answer":"listed","dir":"/var/lib/best-peer-disk","ids":["job-0123456789ab"]}"#.into(),
+                "list" => r#"{"answer":"listed","dir":"/var/lib/best-peer-disk","ids":["job-0123456789ab"],"most_bytes":1099511627776,"most_disks":16}"#.into(),
                 "make" if request["bytes"] == 1u64 << 40 => {
                     r#"{"answer":"refused","code":"too_large","reason":"past --most-bytes"}"#.into()
                 }
@@ -1857,6 +1895,7 @@ mod tests {
             Some("/var/lib/best-peer-disk".into()),
             "the helper's directory"
         );
+        assert_eq!(rt.most_disk_bytes(), Some(1 << 40));
         assert_eq!(
             rt.make_disk("job-0123456789ab", 1 << 30).await.unwrap(),
             std::path::PathBuf::from("/var/lib/best-peer-disk/job-0123456789ab")
@@ -1900,6 +1939,44 @@ mod tests {
         );
         let gone = unconnected(&socket).with_disk_helper(dir.join("none.sock"));
         assert!(!gone.makes_disks());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn with_a_disk_helper_the_room_for_disks_is_held_to_its_most_bytes_and_none_is_free_at_its_most_disks() {
+        let disks = std::env::temp_dir().join(format!("best-peer-helper-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&disks);
+        std::fs::create_dir_all(&disks).unwrap();
+        let listed = disks.clone();
+        let (socket, dir, _) = helper(move |_| {
+            format!(
+                r#"{{"answer":"listed","dir":"{}","ids":[],"most_bytes":16777216,"most_disks":2}}"#,
+                listed.display()
+            )
+        });
+        let rt = unconnected(&socket).with_disk_helper(socket.clone());
+        let (free, total) = rt.disk_room().expect("the room is read in the helper's directory");
+        assert_eq!(
+            (free, total),
+            (16 << 20, 16 << 20),
+            "no disk past --most-bytes is promised"
+        );
+        std::fs::write(disks.join("job-0123456789ab.img"), "").unwrap();
+        assert_eq!(rt.disk_room().unwrap().0, 16 << 20);
+        std::fs::write(disks.join("job-ffffffffffff.img"), "").unwrap();
+        std::fs::write(disks.join("notes.img"), "").unwrap();
+        assert_eq!(
+            rt.disk_room().unwrap(),
+            (0, 16 << 20),
+            "none is free while --most-disks are there"
+        );
+        assert_eq!(
+            unconnected(&socket).most_disk_bytes(),
+            None,
+            "without a helper, no bound but the room"
+        );
+        std::fs::remove_dir_all(&disks).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

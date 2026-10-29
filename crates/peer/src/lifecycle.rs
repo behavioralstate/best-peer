@@ -1871,6 +1871,13 @@ impl Peer {
                 "this peer makes no disk for a job: a job with inputs or outputs runs on a peer whose container engine is Docker on Linux, run so that it can mount one",
             ));
         }
+        if let Some(most) = self.runtime.most_disk_bytes().filter(|most| bytes > *most) {
+            return Err(BestError::bad_request(
+                "NO_DISK_ROOM",
+                format!("this peer makes a disk of {most} bytes at most, less than the {bytes} asked for: ask for less disk_bytes, or order where a larger disk is made"),
+            )
+            .with_details(json!({ "field": "disk_bytes", "most_bytes": most })));
+        }
         Ok(Some(JobIo {
             inputs: data.inputs.clone(),
             outputs: data.outputs.clone(),

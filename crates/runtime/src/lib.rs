@@ -594,6 +594,10 @@ pub trait Runtime: Send + Sync {
     async fn release(&self, _id: &str) -> Result<(), RuntimeError> {
         Ok(())
     }
+    /// The largest disk this runtime makes whatever the room, as a disk helper's bound; none for no bound but the room.
+    fn most_disk_bytes(&self) -> Option<u64> {
+        None
+    }
     /// Whether this runtime makes jobs' disks at all; answered at once, without asking the file system.
     fn makes_disks(&self) -> bool {
         false
@@ -676,6 +680,10 @@ pub struct Fake {
     /// remapped keeps it; and the disks released, in order.
     holds_outputs: Mutex<bool>,
     released: Mutex<Vec<String>>,
+    /// Why the next release fails, as a disk helper that does not answer.
+    broken_release: Mutex<Option<String>>,
+    /// The largest disk it makes, as a disk helper bounds it, where a test sets one.
+    most_disk_bytes: Mutex<Option<u64>>,
     /// What each container it started wrote, and who follows it while it runs.
     written: Mutex<HashMap<ContainerId, Writing>>,
     /// The user an image names, where a test sets one; root otherwise, as an image that names none runs.
@@ -734,6 +742,8 @@ impl Fake {
             no_disks: Mutex::new(false),
             holds_outputs: Mutex::new(false),
             released: Mutex::new(Vec::new()),
+            broken_release: Mutex::new(None),
+            most_disk_bytes: Mutex::new(None),
             written: Mutex::new(HashMap::new()),
             image_users: Mutex::new(HashMap::new()),
             guarded: Mutex::new(HashMap::new()),
@@ -813,6 +823,16 @@ impl Fake {
     /// The disks released, in order.
     pub fn released(&self) -> Vec<String> {
         self.released.lock().unwrap().clone()
+    }
+
+    /// The largest disk it makes from now on, as a disk helper's `--most-bytes`; none for no bound but the room.
+    pub fn set_most_disk_bytes(&self, most: Option<u64>) {
+        *self.most_disk_bytes.lock().unwrap() = most;
+    }
+
+    /// The next release fails with `why`, as a disk helper that does not answer.
+    pub fn break_next_release(&self, why: &str) {
+        *self.broken_release.lock().unwrap() = Some(why.to_string());
     }
 
     /// The next disk is begun, its directory made, and then fails with `why`.
@@ -1390,6 +1410,9 @@ impl Runtime for Fake {
     }
 
     async fn release(&self, id: &str) -> Result<(), RuntimeError> {
+        if let Some(why) = self.broken_release.lock().unwrap().take() {
+            return Err(RuntimeError::NoDisk(why));
+        }
         self.released.lock().unwrap().push(id.to_string());
         let disk = self.disk_of(id);
         if disk.join("out.held").exists() {
@@ -1412,6 +1435,10 @@ impl Runtime for Fake {
 
     fn makes_disks(&self) -> bool {
         !*self.no_disks.lock().unwrap()
+    }
+
+    fn most_disk_bytes(&self) -> Option<u64> {
+        *self.most_disk_bytes.lock().unwrap()
     }
 
     fn disk_room(&self) -> Option<(u64, u64)> {

@@ -65,11 +65,21 @@ pub struct Refused(pub Refusal, pub String);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "answer", rename_all = "snake_case")]
 pub enum Answer {
-    Made { path: PathBuf },
+    Made {
+        path: PathBuf,
+    },
     Released,
     Removed,
-    Listed { dir: PathBuf, ids: Vec<String> },
-    Refused { code: Refusal, reason: String },
+    Listed {
+        dir: PathBuf,
+        ids: Vec<String>,
+        most_bytes: u64,
+        most_disks: usize,
+    },
+    Refused {
+        code: Refusal,
+        reason: String,
+    },
 }
 
 impl From<Refused> for Answer {
@@ -306,7 +316,12 @@ pub fn answer(line: &str, uid: u32, gid: u32, peer: Peer, limits: Limits, disks:
             Request::Remove { id } => disks.remove(&id).map(|_| Answer::Removed)?,
             Request::List => {
                 let (dir, ids) = disks.list()?;
-                Answer::Listed { dir, ids }
+                Answer::Listed {
+                    dir,
+                    ids,
+                    most_bytes: limits.most_bytes,
+                    most_disks: limits.most_disks,
+                }
             }
         })
     };
@@ -495,8 +510,8 @@ mod tests {
 
     #[test]
     fn the_peer_is_found_in_the_passwd_file_by_its_name_or_its_uid_with_its_primary_group() {
-        let passwd = "root:x:0:0:root:/root:/bin/bash\nwindlet:x:990:985::/var/lib/windlet:/usr/sbin/nologin\n";
-        assert_eq!(peer_in(passwd, "windlet"), Some(PEER));
+        let passwd = "root:x:0:0:root:/root:/bin/bash\nbest-peer:x:990:985::/var/lib/best-peer:/usr/sbin/nologin\n";
+        assert_eq!(peer_in(passwd, "best-peer"), Some(PEER));
         assert_eq!(peer_in(passwd, "990"), Some(PEER));
         assert_eq!(peer_in(passwd, "nobody"), None);
         assert_eq!(peer_in(passwd, "985"), None);
@@ -508,11 +523,11 @@ mod tests {
         let given = |s: &str| s.split_whitespace().map(str::to_string).collect::<Vec<_>>();
         assert_eq!(
             args(&given(
-                "--dir /var/lib/best-peer-disk --peer-user windlet --most-bytes 1T --most-disks 16"
+                "--dir /var/lib/best-peer-disk --peer-user best-peer --most-bytes 1T --most-disks 16"
             )),
             Ok(Args {
                 dir: "/var/lib/best-peer-disk".into(),
-                peer_user: "windlet".into(),
+                peer_user: "best-peer".into(),
                 limits: Limits {
                     most_bytes: 1 << 40,
                     most_disks: 16
@@ -610,7 +625,9 @@ mod tests {
             answer(r#"{"request":"list"}"#, 990, 985, PEER, LIMITS, &asked),
             Answer::Listed {
                 dir: "/var/lib/best-peer-disk".into(),
-                ids: vec!["job-0123456789ab".into()]
+                ids: vec!["job-0123456789ab".into()],
+                most_bytes: 1 << 40,
+                most_disks: 8
             }
         );
         assert_eq!(
@@ -655,8 +672,10 @@ mod tests {
             let (mut conn, _) = listener.accept().unwrap();
             let mut line = String::new();
             std::io::BufReader::new(&conn).read_line(&mut line).unwrap();
-            conn.write_all(b"{\"answer\":\"listed\",\"dir\":\"/d\",\"ids\":[\"job-1abc\"]}\n")
-                .unwrap();
+            conn.write_all(
+                b"{\"answer\":\"listed\",\"dir\":\"/d\",\"ids\":[\"job-1abc\"],\"most_bytes\":1099511627776,\"most_disks\":16}\n",
+            )
+            .unwrap();
             line
         });
         let answered = ask(&socket, &Request::List, std::time::Duration::from_secs(5)).unwrap();
@@ -664,7 +683,9 @@ mod tests {
             answered,
             Answer::Listed {
                 dir: "/d".into(),
-                ids: vec!["job-1abc".into()]
+                ids: vec!["job-1abc".into()],
+                most_bytes: 1 << 40,
+                most_disks: 16
             }
         );
         assert_eq!(serving.join().unwrap(), "{\"request\":\"list\"}\n");

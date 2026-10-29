@@ -11136,6 +11136,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_job_whose_outputs_cannot_be_released_fails_naming_the_release_and_its_disk_still_goes() {
+        let (site, ws, s3, _logs) = site_with_store().await;
+        let member = &site.members[0];
+        member.runtime.break_next_release("the disk helper did not answer");
+        let queued = site.order(&ws, "j1", 4, with_io()).await;
+        let started = site.events(&ws, "j1", "JobStarted").await.last().unwrap()["data"].clone();
+        let disk = member.runtime.disk_of(started["job"].as_str().unwrap());
+        std::fs::write(disk.join("out/frame.png"), b"frame").unwrap();
+        member
+            .runtime
+            .exit(
+                &ContainerId(started["container"].as_str().unwrap().into()),
+                0,
+                "rendered",
+            )
+            .unwrap();
+        let events = site.events(&ws, "j1", "JobFailed").await;
+        assert!(
+            !facts(&events).contains(&"OutputsStored".to_string()),
+            "{:?}",
+            facts(&events)
+        );
+        let failed = &events.last().unwrap()["data"];
+        let reason = failed["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("released") && reason.contains("the disk helper did not answer"),
+            "{failed}"
+        );
+        assert_eq!(failed["exit_code"], 0);
+        let key = format!("renders/shot-12/{}.tar", queued["job"].as_str().unwrap());
+        assert!(s3.get(&key).is_none());
+        until("the job's disk is removed", || !disk.exists()).await;
+    }
+
+    #[tokio::test]
     async fn outputs_the_store_does_not_take_fail_the_job_with_its_exit_code_and_a_stop_while_they_are_sent_ends_it() {
         let (site, ws, s3, _logs) = site_with_store().await;
         let member = &site.members[0];
@@ -11502,6 +11537,20 @@ mod tests {
             pair("INSUFFICIENT_DISK", "disk_bytes")
         );
         bed.runtime.set_disk_room(1 << 40);
+        // A disk past the most the runtime makes is refused at once, naming the bound, never promised room.
+        bed.runtime.set_most_disk_bytes(Some(GB / 2));
+        let (s, b) = bed.send("rbig", "RunJob", "run-job", job.clone()).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(
+            (
+                &b["error"]["code"],
+                &b["error"]["details"]["field"],
+                &b["error"]["details"]["most_bytes"]
+            ),
+            (&json!("NO_DISK_ROOM"), &json!("disk_bytes"), &json!(GB / 2)),
+            "{b}"
+        );
+        bed.runtime.set_most_disk_bytes(None);
         let get = job["inputs"][0]["url"].clone();
         let mut clash = job.clone();
         clash["inputs"] = json!([{ "url": get, "path": "a" }, { "url": get, "path": "a/b" }]);
