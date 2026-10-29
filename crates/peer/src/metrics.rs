@@ -156,7 +156,7 @@ async fn families(peer: &Peer, who: &Credential) -> Vec<Family> {
     let mut disk_total = Family::new(
         "best_peer_disk_total_bytes",
         Kind::Gauge,
-        "The room for jobs' disks in all.",
+        "The largest disk one job may be given here: the file system less what is kept free, held to the disk helper's --most-bytes; the free room may exceed it.",
     )
     .unit("bytes");
 

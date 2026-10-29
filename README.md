@@ -477,7 +477,7 @@ workspace and who joined one. The series, every one named `best_peer_…` in bas
 | `best_peer_device_memory_promised_bytes` | `device`, `vendor`, `api` | Memory promised to every holder's workloads there (all or metrics keys) |
 | `best_peer_device_utilisation_ratio`, `…_temperature_celsius`, `…_power_watts` | `device`, `vendor`, `api` | Where the driver reports them; a MIG instance has none of its own |
 | `best_peer_device_energy_joules_total` | `device`, `vendor`, `api` | Energy used since the driver loaded, where it says: what a stretch used is the difference, which sampled power misses |
-| `best_peer_disk_free_bytes`, `…_total_bytes` | | The room for jobs' disks, where the peer makes them |
+| `best_peer_disk_free_bytes`, `…_total_bytes` | | The room for jobs' disks free now, where the peer makes them; and the largest disk one job may be given there, the file system less what is kept free, held to the disk helper's `--most-bytes`, so the free room may exceed it |
 | `best_peer_deployment_info`, `best_peer_job_info` | the workload, `device`, `holder` (and `model`, `engine`) | What each workload is, while it lives |
 | `best_peer_deployment_phase`, `best_peer_job_phase` | the workload, `phase` | Each workload's phases as a set, 1 for the one it is in and 0 for the others; gone when it ends |
 | `best_peer_deployment_memory_promised_bytes`, `best_peer_job_memory_promised_bytes` | the workload, `device`, `holder` | Device memory promised to it |

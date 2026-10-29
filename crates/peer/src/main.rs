@@ -11834,6 +11834,21 @@ mod tests {
             .1
             .to_string();
         assert!(doc.contains("most_bytes") && doc.contains("NO_DISK_ROOM"), "{doc}");
+        // The size told is the largest disk one job may be given, and the free room may be more.
+        assert_eq!(hs["disk"]["total_bytes"], 100 * GB, "{hs}");
+        let told = get_as(&bed.app, "", &bed.key, "/queries/get-hardware-state/1.0")
+            .await
+            .1
+            .to_string();
+        assert!(
+            told.contains("total_bytes is the largest disk one job may be given here") && told.contains("--most-bytes"),
+            "{told}"
+        );
+        let (_, _, metrics) = scrape(&bed.app, Some(&bed.key), false, None).await;
+        assert!(
+            metrics.contains("# HELP best_peer_disk_total_bytes The largest disk one job may be given here"),
+            "{metrics}"
+        );
     }
 
     #[tokio::test]
