@@ -132,6 +132,32 @@ pub fn valid_id(id: &str) -> Result<(), Refused> {
     }
 }
 
+/// The disk an entry of the helper's directory named `name` stands for: an image `<id>.img`, or a mount point `<id>`
+/// that is a directory, a link never; none for anything else. The one rule the helper counts disks by, and the peer
+/// with it.
+pub fn id_of(name: &str, is_dir: bool) -> Option<&str> {
+    let id = match name.strip_suffix(".img") {
+        Some(id) => id,
+        None if is_dir => name,
+        None => return None,
+    };
+    valid_id(id).ok().map(|_| id)
+}
+
+/// The ids of the disks in the directory `dir`, each once, by [`id_of`]; none when it cannot be read.
+pub fn ids_at(dir: &Path) -> Vec<String> {
+    let ids: std::collections::BTreeSet<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+            id_of(e.file_name().to_str()?, is_dir).map(str::to_string)
+        })
+        .collect();
+    ids.into_iter().collect()
+}
+
 /// The request one line holds, its id checked; refused by name when it is none of the four, or its id cannot name a
 /// disk.
 pub fn parse(line: &str) -> Result<Request, Refused> {
@@ -659,6 +685,24 @@ mod tests {
             }),
             r#"{"answer":"refused","code":"not_the_peer","reason":"r"}"#
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_disks_in_a_directory_are_its_images_and_its_mount_points_named_by_an_id_each_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        for file in ["job-0123456789ab.img", "job-ffffffffffff.img", "notes.txt", "Bad.img"] {
+            std::fs::write(tmp.path().join(file), "").unwrap();
+        }
+        for dir in ["job-0123456789ab", "job-aaaaaaaaaaaa", "lost+found"] {
+            std::fs::create_dir(tmp.path().join(dir)).unwrap();
+        }
+        std::os::unix::fs::symlink("/etc", tmp.path().join("job-bbbbbbbbbbbb")).unwrap();
+        assert_eq!(
+            ids_at(tmp.path()),
+            ["job-0123456789ab", "job-aaaaaaaaaaaa", "job-ffffffffffff"]
+        );
+        assert!(ids_at(&tmp.path().join("none")).is_empty());
     }
 
     #[cfg(unix)]

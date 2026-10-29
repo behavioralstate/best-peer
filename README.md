@@ -314,10 +314,11 @@ can do neither says so at start and makes none, so anywhere else a job with inpu
 before any room is reserved. A disk holds `peer/`, the peer's alone, with where its outputs go; `in/`, the peer's,
 which the job reads; and `out/`, which it writes. A disk is never promised the last of its file system: 1 GiB, or a twentieth of it when that is
 more, stays free for the peer's own log and the engine: the free room and the size `get-hardware-state` tells are each
-what is left after that, so the size is the largest disk the peer could ever make. Under the disk helper both are
-also held to its `--most-bytes`, and nothing is free while its `--most-disks` are made or promised to orders
-admitted, so an order waits for a disk to go rather than fail; a `run-job` at the peer's own door asking for more than `--most-bytes` is refused
-(`NO_DISK_ROOM`, with the bound as `most_bytes`). At
+what is left after that, so without the disk helper the size is the largest disk the peer could ever make. Under the
+helper the room told stays the file system's, and nothing is free while its `--most-disks` are there or promised to
+orders admitted, each counted once, as the helper counts them, so an order waits for a disk to go rather than fail;
+its `--most-bytes` bounds each disk alone, never the room for all: a `run-job` at the peer's own door asking for more
+is refused (`NO_DISK_ROOM`, with the bound as `most_bytes`). At
 start the peer removes every disk there that no running job has, such as one whose job ended while it was down. Its inputs are fetched and its outputs sent over `https://`
 only; `BEST_PEER_STORE_CLEARTEXT=loopback` also allows a store on this machine's loopback over `http://`, for a test
 or a developer's own store, on the cloud's door and on its members alike.
@@ -434,7 +435,7 @@ that user alone, by its uid and its primary group, and gives it what it releases
   `/home`, `/root`, `/run/user` or `/tmp`, which the peer's hardening hides from it.
 - `--most-bytes 1T`: the largest disk it makes; `--most-disks 16`: how many there may be at once. A disk also never
   takes the room kept free (1 GiB, or a twentieth of the file system). The helper lists both to the peer at start,
-  which holds the room it tells to them.
+  which refuses a larger disk at ingest and promises no disk past the count.
 
 The service is confined by its capabilities (`CAP_SYS_ADMIN CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER`), its devices
 (the loop devices alone), its address families (`AF_UNIX`) and its system calls, and has no namespacing option at

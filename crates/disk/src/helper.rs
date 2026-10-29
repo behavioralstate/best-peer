@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use rustix::fs::{AtFlags, Dir, FileType, FlockOperation, Mode, OFlags};
 
-use crate::{answer, room, valid_id, Answer, Disks, Limits, Peer, Refusal, Refused, MOST_LINE};
+use crate::{answer, id_of, room, Answer, Disks, Limits, Peer, Refusal, Refused, MOST_LINE};
 
 /// How long `remove` keeps trying to unmount a disk that is busy, as one the engine is still letting go of is.
 const BUSY_FOR: Duration = Duration::from_secs(5);
@@ -248,18 +248,14 @@ pub fn trusted(uid: u32, mode: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// The ids of the disks in the directory `dir`: each image `<id>.img`, and each mount point `<id>` without one.
+/// The ids of the disks in the directory `dir`, each once, by [`id_of`]: each image `<id>.img`, and each mount point
+/// `<id>`, with its image or without.
 pub fn ids_in(dir: BorrowedFd<'_>) -> Result<Vec<String>, String> {
     let mut ids = std::collections::BTreeSet::new();
     for entry in Dir::read_from(dir).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name().to_string_lossy();
-        let id = match name.strip_suffix(".img") {
-            Some(id) => id,
-            None if entry.file_type() == FileType::Directory => &name,
-            None => continue,
-        };
-        if valid_id(id).is_ok() {
+        if let Some(id) = id_of(&name, entry.file_type() == FileType::Directory) {
             ids.insert(id.to_string());
         }
     }

@@ -607,9 +607,10 @@ impl DockerRuntime {
 impl DockerRuntime {
     /// The same engine, its jobs' disks made, released and removed by the disk helper listening on `socket`
     /// (`best-peer-disk`, behavioralstate/spec#169), in the directory the helper names when it is asked for its
-    /// disks now, which this peer reads for where a disk is and the room there, held to the bounds the helper lists
-    /// with them: no disk past its `--most-bytes`, and none free while its `--most-disks` are there. A helper that
-    /// does not answer then leaves this peer making no disk, as one that cannot mount, and says so at start.
+    /// disks now, which this peer reads for where a disk is and the room there; the bounds the helper lists with them,
+    /// its `--most-bytes` and `--most-disks`, are told by [`Runtime::most_disk_bytes`] and [`Runtime::most_disks`]. A
+    /// helper that does not answer then leaves this peer making no disk, as one that cannot mount, and says so at
+    /// start.
     pub fn with_disk_helper(mut self, socket: std::path::PathBuf) -> Self {
         match ask_helper(&socket, &best_peer_disk::Request::List, HELPER_LISTS_WITHIN) {
             Ok(best_peer_disk::Answer::Listed {
@@ -683,21 +684,6 @@ fn not_answered(answer: best_peer_disk::Answer, expected: &str) -> RuntimeError 
         }
         other => RuntimeError::NoDisk(format!("the disk helper answered {other:?}, not {expected}")),
     }
-}
-
-/// How many disks' images are in `dir`, each `<id>.img` with an id a disk may have.
-fn images_in(dir: &std::path::Path) -> usize {
-    std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .and_then(|n| n.strip_suffix(".img"))
-                .is_some_and(|id| best_peer_disk::valid_id(id).is_ok())
-        })
-        .count()
 }
 
 /// The room for disks in `dir`, as `df` reads it there within ten seconds, less what is kept free.
@@ -959,9 +945,12 @@ impl Runtime for DockerRuntime {
             .collect()
     }
 
-    /// The images in the disks' directory, read there, so a disk helper is not asked for a count.
-    fn disks_made(&self) -> usize {
-        self.disks.as_deref().map(images_in).unwrap_or(0)
+    /// With a disk helper, read in its directory by the rule it counts by, so it is not asked at every admission.
+    fn disk_ids(&self) -> Vec<String> {
+        match (&self.helper, &self.disks) {
+            (Some(_), Some(dir)) => best_peer_disk::ids_at(dir),
+            _ => self.disks(),
+        }
     }
 
     fn disk_at(&self, id: &str) -> Option<std::path::PathBuf> {
@@ -983,19 +972,10 @@ impl Runtime for DockerRuntime {
         }
     }
 
-    /// With a disk helper, held to its bounds: no disk past its `--most-bytes`, and none free while its `--most-disks`
-    /// are there, counted in its directory.
+    /// The room on the file system the disks are made on, whole: a disk helper's bound on one disk holds each order
+    /// at ingest ([`Runtime::most_disk_bytes`]), never the room for all.
     fn disk_room(&self) -> Option<(u64, u64)> {
-        let dir = self.disks.clone().filter(|_| self.mounts)?;
-        let (free, total) = room_for_disks(dir.clone())?;
-        let Some(limits) = self.helper_limits else {
-            return Some((free, total));
-        };
-        let free = match images_in(&dir) >= limits.most_disks {
-            true => 0,
-            false => free.min(limits.most_bytes),
-        };
-        Some((free, total.min(limits.most_bytes)))
+        room_for_disks(self.disks.clone().filter(|_| self.mounts)?)
     }
 
     /// A container, or a user namespace when the engine runs rootless or remaps its users, as its own `info` says.
@@ -1957,7 +1937,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn with_a_disk_helper_the_room_for_disks_is_held_to_its_most_bytes_and_none_is_free_at_its_most_disks() {
+    async fn with_a_disk_helper_the_room_for_disks_is_the_file_systems_and_its_disks_are_counted_as_it_counts_them() {
         let disks = std::env::temp_dir().join(format!("best-peer-helper-dir-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&disks);
         std::fs::create_dir_all(&disks).unwrap();
@@ -1969,22 +1949,23 @@ mod tests {
             )
         });
         let rt = unconnected(&socket).with_disk_helper(socket.clone());
-        let (free, total) = rt.disk_room().expect("the room is read in the helper's directory");
+        let room = rt.disk_room().expect("the room is read in the helper's directory");
         assert_eq!(
-            (free, total),
-            (16 << 20, 16 << 20),
-            "no disk past --most-bytes is promised"
+            Some(room),
+            room_for_disks(disks.clone()),
+            "the whole room, never held to the bound on one disk"
         );
+        assert!(room.1 > 16 << 20);
         std::fs::write(disks.join("job-0123456789ab.img"), "").unwrap();
-        assert_eq!(rt.disk_room().unwrap().0, 16 << 20);
-        std::fs::write(disks.join("job-ffffffffffff.img"), "").unwrap();
+        std::fs::create_dir(disks.join("job-0123456789ab")).unwrap();
+        std::fs::create_dir(disks.join("job-ffffffffffff")).unwrap();
         std::fs::write(disks.join("Notes.img"), "").unwrap();
         assert_eq!(
-            rt.disk_room().unwrap(),
-            (0, 16 << 20),
-            "none is free while --most-disks are there"
+            rt.disk_ids(),
+            ["job-0123456789ab", "job-ffffffffffff"],
+            "read in the directory as the helper counts them, a mount point left without its image included"
         );
-        assert_eq!(rt.disks_made(), 2, "counted in the directory, the helper not asked");
+        assert_eq!(rt.most_disks(), Some(2));
         assert_eq!(
             unconnected(&socket).most_disk_bytes(),
             None,

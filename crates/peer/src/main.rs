@@ -11767,6 +11767,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_bound_on_one_disk_holds_each_order_alone_and_never_the_room_for_all() {
+        let bed = bed(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        bed.runtime.set_disk_room(2 << 40);
+        bed.runtime.set_most_disk_bytes(Some(100 * GB));
+        let mut held = vec![];
+        for id in ["job-a", "job-b", "job-c"] {
+            held.push(bed.peer.claim_disk(id, 50 * GB).await.unwrap());
+        }
+        let hs = bed.query("get-hardware-state").await;
+        assert_eq!(hs["disk"]["free_bytes"], (2u64 << 40) - 150 * GB, "{hs}");
+        let doc = get_as(&bed.app, "", &bed.key, "/commands/run-job/1.0")
+            .await
+            .1
+            .to_string();
+        assert!(doc.contains("most_bytes") && doc.contains("NO_DISK_ROOM"), "{doc}");
+    }
+
+    #[tokio::test]
     async fn a_disk_promised_and_not_yet_made_counts_against_the_most_disks() {
         let bed = bed(
             card(),
@@ -11782,6 +11805,26 @@ mod tests {
         };
         assert_eq!(refused.code, "INSUFFICIENT_DISK", "{refused:?}");
         drop(held);
+        // A disk being made counts once, by its image and its promise alike: a second place is still free.
+        bed.runtime.set_most_disks(Some(2));
+        let making = bed.peer.claim_disk("job-m", GB).await.unwrap();
+        bed.runtime.make_disk("job-m", GB).await.unwrap();
+        let second = bed.peer.claim_disk("job-n", GB).await;
+        assert!(second.is_ok(), "{:?}", second.err());
+        assert_eq!(
+            bed.peer.claim_disk("job-o", GB).await.err().map(|e| e.code),
+            Some("INSUFFICIENT_DISK")
+        );
+        drop((making, second));
+        bed.runtime.remove_disk("job-m").await.unwrap();
+        // A mount point left without its image counts too, as the helper counts it.
+        std::fs::create_dir_all(bed.runtime.disk_of("job-stale")).unwrap();
+        bed.runtime.set_most_disks(Some(1));
+        assert_eq!(
+            bed.peer.claim_disk("job-p", GB).await.err().map(|e| e.code),
+            Some("INSUFFICIENT_DISK")
+        );
+        bed.runtime.remove_disk("job-stale").await.unwrap();
         assert!(
             bed.peer.claim_disk("job-c", GB).await.is_ok(),
             "the promise let go frees its place"

@@ -427,13 +427,14 @@ fn read_record(disk: &std::path::Path) -> Option<Option<OutputData>> {
     serde_json::from_value(record["outputs"].clone()).ok()
 }
 
-/// The most disks `runtime` keeps at once, when as many are made already or promised to jobs admitted (`promised`):
-/// a disk past it would be refused when it is made, so none is promised. Asks the file system: call it off the
-/// executor.
-fn at_most_disks(runtime: &dyn Runtime, promised: usize) -> Option<usize> {
-    runtime
-        .most_disks()
-        .filter(|most| runtime.disks_made() + promised >= *most)
+/// The most disks `runtime` keeps at once, when as many are there already or promised to jobs admitted (`promised`),
+/// each job counted once, so a disk being made, there and promised alike, is one: a disk past it would be refused
+/// when it is made, so none is promised. Asks the file system: call it off the executor.
+fn at_most_disks<'a>(runtime: &dyn Runtime, promised: impl IntoIterator<Item = &'a String>) -> Option<usize> {
+    let most = runtime.most_disks()?;
+    let mut ids: std::collections::HashSet<String> = runtime.disk_ids().into_iter().collect();
+    ids.extend(promised.into_iter().cloned());
+    (ids.len() >= most).then_some(most)
 }
 
 /// The first input whose path another's takes too, or that lies under another's, which is a file and so no
@@ -1898,10 +1899,10 @@ impl Peer {
     /// what is promised to jobs admitted and not given theirs yet.
     async fn disk_room(&self) -> Option<(u64, u64)> {
         let runtime = self.runtime.clone();
-        let promises = self.promised_disks.lock().unwrap().len();
+        let promises: Vec<String> = self.promised_disks.lock().unwrap().keys().cloned().collect();
         let (free, total, full) = tokio::task::spawn_blocking(move || {
             let (free, total) = runtime.disk_room()?;
-            Some((free, total, at_most_disks(runtime.as_ref(), promises).is_some()))
+            Some((free, total, at_most_disks(runtime.as_ref(), &promises).is_some()))
         })
         .await
         .ok()
@@ -1931,7 +1932,7 @@ impl Peer {
                 )
                 .with_details(json!({ "field": "disk_bytes" })));
             };
-            if let Some(most) = at_most_disks(runtime.as_ref(), promised.len()) {
+            if let Some(most) = at_most_disks(runtime.as_ref(), promised.keys()) {
                 return Err(BestError::bad_request(
                     "INSUFFICIENT_DISK",
                     format!("this peer keeps {most} disks at once, and as many are made or promised: wait for one to go"),

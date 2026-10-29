@@ -615,10 +615,11 @@ pub trait Runtime: Send + Sync {
     fn disks(&self) -> Vec<String> {
         vec![]
     }
-    /// How many disks this runtime has made and not removed, counted where it makes them: what [`Runtime::disks`]
-    /// lists, unless the runtime counts them more cheaply. Called off the executor.
-    fn disks_made(&self) -> usize {
-        self.disks().len()
+    /// The jobs whose disks are where this runtime makes them, each once, as a disk helper counts them against its
+    /// most disks: what [`Runtime::disks`] lists, unless the runtime reads them more cheaply. Called off the
+    /// executor.
+    fn disk_ids(&self) -> Vec<String> {
+        self.disks()
     }
     /// Where the job `id`'s disk is mounted on the host, when it is.
     fn disk_at(&self, _id: &str) -> Option<std::path::PathBuf> {
