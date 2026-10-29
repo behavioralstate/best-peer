@@ -850,8 +850,7 @@ impl Runtime for DockerRuntime {
         }
         let id = id.to_string();
         tokio::task::spawn_blocking(move || {
-            std::fs::create_dir_all(&dir)
-                .map_err(|e| RuntimeError::NoDisk(format!("cannot make {}: {e}", dir.display())))?;
+            disks_dir(&dir).map_err(|e| RuntimeError::NoDisk(format!("cannot make {}: {e}", dir.display())))?;
             let image = dir.join(format!("{id}.img"));
             let mount = dir.join(&id);
             std::fs::File::create(&image)
@@ -1721,7 +1720,20 @@ fn room_in(df: &str) -> Option<(u64, u64)> {
     Some((free.saturating_sub(kept), total.saturating_sub(kept)))
 }
 
-/// Lays a disk this peer mounted out as the helper does: `peer/` and `in/` this peer's, `out/` open to the job.
+/// The directory this peer makes its disks in, made when it is not there and its own alone, `0700`: no other user
+/// reaches a job's inputs or outputs through it.
+fn disks_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Lays a disk this peer mounted out as the helper does: `peer/` and `in/` this peer's, `out/` open to the job; the
+/// root `0700`, since this peer owns it, so no other user reaches what is on it.
 #[cfg(target_os = "linux")]
 fn lay_out(mount: &std::path::Path) -> Result<(), RuntimeError> {
     use rustix::fs::{Mode, OFlags};
@@ -1735,7 +1747,7 @@ fn lay_out(mount: &std::path::Path) -> Result<(), RuntimeError> {
         uid: rustix::process::getuid().as_raw(),
         gid: rustix::process::getgid().as_raw(),
     };
-    best_peer_disk::helper::lay_out(std::os::fd::AsFd::as_fd(&root), me)
+    best_peer_disk::helper::lay_out(std::os::fd::AsFd::as_fd(&root), me, 0o700)
         .map_err(|e| RuntimeError::NoDisk(format!("the disk at {} cannot be laid out: {e}", mount.display())))
 }
 
@@ -2001,9 +2013,24 @@ mod tests {
         let mode = |p: &str| std::fs::metadata(root.join(p)).unwrap().permissions().mode() & 0o777;
         assert_eq!(
             (mode(""), mode("peer"), mode("in"), mode("out")),
-            (0o755, 0o700, 0o755, 0o777)
+            (0o700, 0o700, 0o755, 0o777),
+            "the peer owns the root, so it alone and root reach in/ and out/"
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_disks_directory_this_peer_mounts_in_is_its_own_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("best-peer-disks-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        disks_dir(&dir).unwrap();
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777, 0o700);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        disks_dir(&dir).unwrap();
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777, 0o700);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

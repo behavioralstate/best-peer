@@ -5,7 +5,8 @@
 //! `LO_FLAGS_AUTOCLEAR`, so it goes when the disk is unmounted or the mount fails; and the disk is mounted with
 //! `mount(2)`, `nosuid,nodev`; unmounted plainly, never lazily, and only its mount point removed with `rmdir`.
 //! Everything under the directory is reached from a descriptor of it, without following a link, and the directory
-//! itself must be root's and writable by no one else.
+//! itself must be root's and writable by no one else, and is closed to all but the peer's group, as each disk's root
+//! is.
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -73,9 +74,10 @@ impl Helper {
         answered
     }
 
-    /// The directory, made root's `0755` when it is not there, open; refused when it is a link, or not root's alone.
+    /// The directory, made when it is not there, open, and closed to all but root and the peer's group; refused when
+    /// it is a link, not root's, or writable by another.
     fn dir(&self) -> Result<(OwnedFd, u64), Refused> {
-        match rustix::fs::mkdir(&self.dir, Mode::from_raw_mode(0o755)) {
+        match rustix::fs::mkdir(&self.dir, Mode::from_raw_mode(0o750)) {
             Ok(()) | Err(rustix::io::Errno::EXIST) => {}
             Err(e) => return Err(failed(&format!("{} cannot be made", self.dir.display()), e)),
         }
@@ -87,6 +89,7 @@ impl Helper {
         .map_err(|e| failed(&format!("{} cannot be opened as a directory", self.dir.display()), e))?;
         let st = rustix::fs::fstat(&fd).map_err(|e| failed(&self.dir.display().to_string(), e))?;
         trusted(st.st_uid, st.st_mode).map_err(|why| failed(&self.dir.display().to_string(), why))?;
+        close_to_the_peer(fd.as_fd(), self.peer).map_err(|why| failed(&self.dir.display().to_string(), why))?;
         Ok((fd, st.st_dev))
     }
 
@@ -118,7 +121,7 @@ impl Helper {
         let (device, number) = attach(image.as_fd()).map_err(|e| failed("no loop device could be attached", e))?;
         crate::no_discard(&format!("loop{number}"))
             .map_err(|e| failed("the disk's room could not be kept reserved", e))?;
-        rustix::fs::mkdirat(dir, id, Mode::from_raw_mode(0o755)).map_err(|e| failed("the mount point", e))?;
+        rustix::fs::mkdirat(dir, id, Mode::from_raw_mode(0o750)).map_err(|e| failed("the mount point", e))?;
         let mount = self.dir.join(id);
         rustix::mount::mount(
             format!("/dev/loop{number}"),
@@ -143,7 +146,7 @@ impl Helper {
         {
             return Err(failed("the disk's root", "it is not mounted"));
         }
-        lay_out(root.as_fd(), self.peer).map_err(|e| failed("the disk cannot be laid out", e))?;
+        lay_out(root.as_fd(), self.peer, 0o750).map_err(|e| failed("the disk cannot be laid out", e))?;
         Ok(mount)
     }
 }
@@ -254,10 +257,19 @@ pub fn ids_in(dir: BorrowedFd<'_>) -> Result<Vec<String>, String> {
     Ok(ids.into_iter().collect())
 }
 
-/// Lays a disk's root out: the root itself `0755`; `peer/`, the peer's `0700`, for the job's record; `in/`, the
-/// peer's `0755`, for its inputs; and `out/`, `0777`, for whoever the job runs as.
-pub fn lay_out(root: BorrowedFd<'_>, peer: Peer) -> Result<(), String> {
-    rustix::fs::fchmod(root, Mode::from_raw_mode(0o755)).map_err(|e| format!("the root: {e}"))?;
+/// Closes the directory `dir` to all but its owner and the peer's group: the peer's group, `0750`. Only root, the
+/// engine and the peer reach what is under it; a job reaches its `in/` and `out/` through its binds alone.
+pub fn close_to_the_peer(dir: BorrowedFd<'_>, peer: Peer) -> Result<(), String> {
+    rustix::fs::fchown(dir, None, Some(rustix::fs::Gid::from_raw(peer.gid))).map_err(|e| e.to_string())?;
+    rustix::fs::fchmod(dir, Mode::from_raw_mode(0o750)).map_err(|e| e.to_string())
+}
+
+/// Lays a disk's root out: the root itself the peer's group's, `root_mode` (`0750` where root owns it, `0700` where
+/// the peer does), so no other user reaches what is on it; `peer/`, the peer's `0700`, for the job's record; `in/`,
+/// the peer's `0755`, for its inputs; and `out/`, `0777`, for whoever the job runs as, reached through its bind.
+pub fn lay_out(root: BorrowedFd<'_>, peer: Peer, root_mode: u32) -> Result<(), String> {
+    rustix::fs::fchown(root, None, Some(rustix::fs::Gid::from_raw(peer.gid))).map_err(|e| format!("the root: {e}"))?;
+    rustix::fs::fchmod(root, Mode::from_raw_mode(root_mode)).map_err(|e| format!("the root: {e}"))?;
     for (name, mode, owned) in [("peer", 0o700, true), ("in", 0o755, true), ("out", 0o777, false)] {
         let said = |e: rustix::io::Errno| format!("{name}/: {e}");
         rustix::fs::mkdirat(root, name, Mode::from_raw_mode(mode)).map_err(said)?;
@@ -465,16 +477,37 @@ mod tests {
         );
     }
 
+    fn group(path: &Path) -> u32 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path).unwrap().gid()
+    }
+
     #[test]
-    fn a_disk_is_laid_out_with_the_peers_record_and_inputs_and_an_out_for_anyone() {
+    fn a_disk_is_laid_out_closed_to_all_but_root_and_the_peer_with_its_record_inputs_and_an_out_for_the_job() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("disk");
         std::fs::create_dir(&root).unwrap();
-        lay_out(open(&root).as_fd(), me()).unwrap();
-        assert_eq!(mode(&root), 0o755);
+        lay_out(open(&root).as_fd(), me(), 0o750).unwrap();
+        assert_eq!((mode(&root), group(&root)), (0o750, me().gid));
         assert_eq!(mode(&root.join("peer")), 0o700);
         assert_eq!(mode(&root.join("in")), 0o755);
         assert_eq!(mode(&root.join("out")), 0o777);
-        assert!(lay_out(open(&root).as_fd(), me()).is_err(), "a disk is laid out once");
+        assert!(
+            lay_out(open(&root).as_fd(), me(), 0o750).is_err(),
+            "a disk is laid out once"
+        );
+    }
+
+    #[test]
+    fn the_directory_is_closed_to_all_but_root_and_the_peers_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("disks");
+        std::fs::create_dir(&dir).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        }
+        close_to_the_peer(open(&dir).as_fd(), me()).unwrap();
+        assert_eq!((mode(&dir), group(&dir)), (0o750, me().gid));
     }
 }

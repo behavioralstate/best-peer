@@ -368,7 +368,7 @@ pub const USAGE: &str =
 
 Run by systemd (best-peer-disk.socket, Accept=yes), the connection on its standard input and output.
 
-  --dir <absolute path>   where the disks are made; root's, and writable by no one else
+  --dir <absolute path>   where the disks are made; root's, closed to all but the peer's group (0750)
   --peer-user <name|uid>  the one caller it answers, by uid and primary group, and the owner of what it releases
   --most-bytes <size>     the largest disk it makes, in bytes or with K, M, G or T
   --most-disks <count>    how many disks there may be at once

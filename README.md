@@ -312,7 +312,8 @@ as a user of its own instead names the disk helper's socket, `BEST_PEER_DISK_HEL
 removes each disk in its own directory, which it names to the peer at start, and the peer never mounts. A peer that
 can do neither says so at start and makes none, so anywhere else a job with inputs or outputs is refused (`NO_DISK`)
 before any room is reserved. A disk holds `peer/`, the peer's alone, with where its outputs go; `in/`, the peer's,
-which the job reads; and `out/`, which it writes. A disk is never promised the last of its file system: 1 GiB, or a twentieth of it when that is
+which the job reads; and `out/`, which it writes; its root is closed to every other user of the host (`0700`, or
+`0750` to the peer's group under the disk helper), and so is the directory the disks are in. A disk is never promised the last of its file system: 1 GiB, or a twentieth of it when that is
 more, stays free for the peer's own log and the engine: the free room and the size `get-hardware-state` tells are each
 what is left after that, so the size is the largest disk the peer could ever make. Under the disk helper the size is
 also held to its `--most-bytes`, which bounds each disk alone, never the free room, which stays the file system's: a
@@ -431,8 +432,10 @@ The units name the peer's user and group `best-peer`; a peer run as another chan
 and `--peer-user` in the service to its own, by an override (`systemctl edit`) or in the files. The helper answers
 that user alone, by its uid and its primary group, and gives it what it releases. What else the service names:
 
-- `--dir /var/lib/best-peer-disk`: where the disks are made, root's and writable by no one else; the helper makes
-  it so when it is not there, and refuses one that is a link or that others may write. It must not lie under
+- `--dir /var/lib/best-peer-disk`: where the disks are made, root's and the peer's group's, `0750`, and so is each
+  disk's root: no other user on the host reaches a job's inputs or outputs, and the job reaches its `/in` and `/out`
+  through its binds alone. The helper makes the directory so when it is not there, closes it so when it is, and
+  refuses one that is a link, is not root's, or that another may write. It must not lie under
   `/home`, `/root`, `/run/user` or `/tmp`, which the peer's hardening hides from it.
 - `--most-bytes 1T`: the largest disk it makes; `--most-disks 16`: how many there may be at once. A disk also never
   takes the room kept free (1 GiB, or a twentieth of the file system). The helper lists both to the peer at start,
