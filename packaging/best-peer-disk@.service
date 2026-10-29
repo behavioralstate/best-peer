@@ -1,0 +1,22 @@
+[Unit]
+Description=best-peer's disk helper, answering one request
+CollectMode=inactive-or-failed
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/best-peer-disk --dir /var/lib/best-peer-disk --peer-user best-peer --most-bytes 1T --most-disks 16
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+User=root
+TimeoutStartSec=15min
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+NoNewPrivileges=yes
+DevicePolicy=closed
+DeviceAllow=/dev/loop-control rw
+DeviceAllow=block-loop rw
+RestrictAddressFamilies=AF_UNIX
+SystemCallFilter=@system-service @mount
+SystemCallArchitectures=native
+LockPersonality=yes
+RestrictSUIDSGID=yes

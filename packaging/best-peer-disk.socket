@@ -1,0 +1,13 @@
+[Unit]
+Description=best-peer's disk helper, which makes, releases and removes a job's disk for the peer
+
+[Socket]
+ListenStream=/run/best-peer-disk.sock
+SocketUser=root
+SocketGroup=best-peer
+SocketMode=0660
+Accept=yes
+MaxConnections=16
+
+[Install]
+WantedBy=sockets.target

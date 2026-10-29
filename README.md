@@ -76,8 +76,9 @@ holds the same archives under names that carry the version, for pinning one, wit
 
 It prints one line, `best-peer is serving its door`, with where it listens and its data folder, and then waits:
 nothing else appears until a client talks to it. On Linux, a peer run without root (or the capability to mount and
-the loop devices) prints one more first, `this peer makes no disk for a job`: it runs every other job, and refuses one
-with inputs or outputs (`NO_DISK`), since a job's disk is one it mounts. If it exits instead, the message names what is missing (the
+the loop devices) and without the disk helper (`BEST_PEER_DISK_HELPER`) prints one more first, `this peer makes no
+disk for a job`: it runs every other job, and refuses one with inputs or outputs (`NO_DISK`), since a job's disk is
+one it mounts. If it exits instead, the message names what is missing (the
 driver, Docker) and the variable that serves without it. `http://127.0.0.1:7777/.well-known/best` in a browser is
 the manifest, the one document an agent needs.
 
@@ -204,6 +205,7 @@ reads and how a collector is set up.
 | `crates/host` | The host itself as a device: a `Gpu` adapter reporting the CPU and system memory, so a peer with no accelerator serves the whole lifecycle. |
 | `crates/nvml` | The `Gpu` adapter for NVIDIA cards through NVML: memory, temperature, power, utilisation and the CUDA version, read live, and the processes on each card, so the peer tells its owner's use from its own; the peer refuses to start without the driver unless told the host has none. |
 | `crates/docker` | The `Runtime` adapter over the Docker Engine API: NVIDIA devices handed over through the container toolkit by their NVML UUID, and the processes of its containers as the engine's `top` lists them. A reference is resolved through the engine's distribution endpoint, which asks the registry and pulls nothing; a credential travels in the resolve's and the pull's `X-Registry-Auth` as a registry token, which the engine sends that registry as a bearer token; one pinned by digest is held only when the image it finds lists that digest under its own repository, however spelled (`docker.io/`, `index.docker.io/`, `library/` and an implicit registry all match), which is the engine's answer alone, so a caller wanting the registry's answer resolves first, pinned references included; it is pulled with no tag made, and is removed as that reference alone, leaving any tag on the image. The peer itself still pulls by tag. A pull held to limits reads the room under the engine's root directory at its start, every half second and at its end, and is given up by dropping the engine's stream; an image it made past them is removed, a reference the engine held given back to the image it named, and an image the engine held before the pull and still holds is never held to the bound by its unpacked size, since none of it landed. An exited container is removed once its followers have read all it wrote, ten seconds at most, and the engine keeps at most two files of 10 MB of each container's output on the host. |
+| `crates/disk` | `best-peer-disk`, the helper that makes, releases and removes a job's disk for a peer that may not mount, run as root by systemd for one request at a time, and the client the Docker adapter asks it with (`with_disk_helper`). Its checks, the walk of a release and the client are unit-tested; its mounts are proven on a host by hand. |
 | `crates/native` | The `Runtime` adapter for engines already running on the host outside any container (an installed Ollama): a deploy binds to the engine's own port; jobs need Docker. |
 | `crates/engine-http` | The `Engine` adapter over the engines' own HTTP APIs. |
 
@@ -304,9 +306,13 @@ outside any container (an installed Ollama; no jobs), `fake` serves the whole su
 (what CI runs).
 A job's disk, for its inputs and outputs, is a file system of its own on a loop device, capped at its size and
 allocated whole when it is made (16 MiB at least), under `disks/` in the data folder. The peer makes it where Docker
-runs on Linux and it can mount one: run as root, or with the capability to mount and the loop devices. A peer that
-cannot says so at start and makes none, so anywhere else a job with inputs or outputs is refused (`NO_DISK`) before
-any room is reserved. A disk is never promised the last of its file system: 1 GiB, or a twentieth of it when that is
+runs on Linux and it can mount one: run as root, or with the capability to mount and the loop devices. A peer run
+as a user of its own instead names the disk helper's socket, `BEST_PEER_DISK_HELPER=/run/best-peer-disk.sock`
+([Run as a service with the disk helper](#run-as-a-service-with-the-disk-helper)): the helper makes, releases and
+removes each disk in its own directory, which it names to the peer at start, and the peer never mounts. A peer that
+can do neither says so at start and makes none, so anywhere else a job with inputs or outputs is refused (`NO_DISK`)
+before any room is reserved. A disk holds `peer/`, the peer's alone, with where its outputs go; `in/`, the peer's,
+which the job reads; and `out/`, which it writes. A disk is never promised the last of its file system: 1 GiB, or a twentieth of it when that is
 more, stays free for the peer's own log and the engine: the free room and the size `get-hardware-state` tells are each
 what is left after that, so the size is the largest disk the peer could ever make. At
 start the peer removes every disk there that no running job has, such as one whose job ended while it was down. Its inputs are fetched and its outputs sent over `https://`
@@ -399,6 +405,44 @@ cannot read refuses the start. vLLM is not served from a store: it pulls as befo
 `BEST_PEER_RUNTIME=native` or `fake` the peer refuses to start. An embedding model cannot be deployed from it, since
 a deployment answers conversations. A tenant told that a model failed reads of "the operator's model store", never
 its path.
+
+### Run as a service with the disk helper
+
+A peer run as a user of its own under systemd, hardened (`NoNewPrivileges`, `ProtectSystem=full`, `ProtectHome`,
+`PrivateTmp`), can never mount a disk the engine sees: `mount(8)` refuses any user but root, and the unit's own
+namespace keeps what it mounts from dockerd. `best-peer-disk` mounts in its place. It is in the Linux archive beside
+`best-peer`, with its two units: `best-peer-disk.socket` listens on `/run/best-peer-disk.sock`, `root` and the
+peer's group, `0660`; for each connection systemd runs `best-peer-disk@.service` as root, which answers one request
+and exits, so nothing of it stays running. Install it:
+
+```bash
+sudo install -m 0755 best-peer-disk /usr/local/bin/best-peer-disk
+sudo install -m 0644 best-peer-disk.socket best-peer-disk@.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now best-peer-disk.socket
+```
+
+The units name the peer's user and group `best-peer`; a peer run as another changes `SocketGroup=` in the socket
+and `--peer-user` in the service to its own, by an override (`systemctl edit`) or in the files. The helper answers
+that user alone, by its uid and its primary group, and gives it what it releases. What else the service names:
+
+- `--dir /var/lib/best-peer-disk`: where the disks are made, root's and writable by no one else; the helper makes
+  it so when it is not there, and refuses one that is a link or that others may write. It must not lie under
+  `/home`, `/root`, `/run/user` or `/tmp`, which the peer's hardening hides from it.
+- `--most-bytes 1T`: the largest disk it makes; `--most-disks 16`: how many there may be at once. A disk also never
+  takes the room kept free (1 GiB, or a twentieth of the file system).
+
+The service is confined by its capabilities (`CAP_SYS_ADMIN CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER`), its devices
+(the loop devices alone), its address families (`AF_UNIX`) and its system calls, and has no namespacing option at
+all: any of them (`PrivateNetwork`, `ProtectSystem`, `ProtectHome`, `PrivateTmp`, `ReadOnlyPaths`, `ProtectProc`
+and their kind) gives it a mount namespace of its own, whose mounts are slaves dockerd never sees. Keep it so when
+overriding the unit.
+
+The peer then needs one setting, `BEST_PEER_DISK_HELPER=/run/best-peer-disk.sock`, and runs under all the hardening
+above. At start it asks the helper for its disks, which also names the helper's directory, and reads that directory
+for where each disk is and the room there; a helper that does not answer leaves it making no disk, as its log says.
+The peer's user is in the `docker` group, which reaches the host as root: the helper takes away the peer's own
+right to mount, not that.
 
 ### Metrics
 

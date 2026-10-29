@@ -342,6 +342,8 @@ settings, as environment variables:
   BEST_PEER_DATA       the folder for the credentials, the event log and the certificate (default ~/.best-peer)
   BEST_PEER_RUNTIME    docker (default), native (an Ollama already running here, no jobs) or fake (no engine)
   BEST_PEER_GPU        nvml (default: the NVIDIA cards, through the driver) or none (the CPU alone)
+  BEST_PEER_DISK_HELPER  the socket of best-peer-disk, which makes jobs' disks for a peer that may not mount
+                       (default: none; a peer run as root mounts them itself)
 
 Every setting, the sign-in and a first deploy: https://github.com/behavioralstate/best-peer#readme";
 
@@ -414,11 +416,40 @@ pub fn model_store(text: Option<&str>, runtime: Option<&str>) -> Result<Option<S
     }
 }
 
+/// The disk helper's socket, from `BEST_PEER_DISK_HELPER`: `best-peer-disk`, run by systemd as root, makes, releases
+/// and removes jobs' disks for a peer that may not mount (behavioralstate/spec#169), in a directory it names itself.
+/// An absolute path, and for the Docker runtime alone, the one that makes disks.
+pub fn disk_helper(text: Option<&str>, runtime: Option<&str>) -> Result<Option<PathBuf>, String> {
+    let Some(socket) = text.map(str::trim).filter(|t| !t.is_empty()) else {
+        return Ok(None);
+    };
+    if let Some(other) = runtime.map(str::trim).filter(|r| *r != "docker") {
+        return Err(format!(
+            "BEST_PEER_DISK_HELPER is set with BEST_PEER_RUNTIME={other}, which makes no disk for a job: the helper serves the Docker runtime, so unset it or run with BEST_PEER_RUNTIME=docker"
+        ));
+    }
+    let socket = PathBuf::from(socket);
+    if !socket.is_absolute() {
+        return Err(format!(
+            "BEST_PEER_DISK_HELPER is {}, not an absolute path: name the helper's socket as its unit does, /run/best-peer-disk.sock",
+            socket.display()
+        ));
+    }
+    Ok(Some(socket))
+}
+
 /// The container engine and the inference engine's client, by `BEST_PEER_RUNTIME`: `docker` (the default) talks to
 /// the Docker Engine on this host and refuses to start when it cannot; `native` deploys to engines already running
 /// on this host outside any container (an installed Ollama), with no jobs; `fake` serves the whole surface against
-/// the in-memory fakes, for CI and for a machine with no engine.
-async fn engines(bind_ip: &str, engine_host: &str, disks: PathBuf) -> (Arc<dyn Runtime>, Arc<dyn Engine>) {
+/// the in-memory fakes, for CI and for a machine with no engine. Under `docker`, a job with inputs or outputs gets a
+/// disk of its own, made by the disk `helper` where there is one, in its directory, else mounted by the peer under
+/// `disks`.
+async fn engines(
+    bind_ip: &str,
+    engine_host: &str,
+    disks: PathBuf,
+    helper: Option<PathBuf>,
+) -> (Arc<dyn Runtime>, Arc<dyn Engine>) {
     match std::env::var("BEST_PEER_RUNTIME").as_deref() {
         Ok("native") => (
             Arc::new(best_peer_native::NativeRuntime::new(engine_host)),
@@ -439,11 +470,11 @@ async fn engines(bind_ip: &str, engine_host: &str, disks: PathBuf) -> (Arc<dyn R
                         "{e}; set BEST_PEER_RUNTIME=native to deploy to an engine already running here, or fake to serve without one"
                     ))
                 });
-            // A job with inputs or outputs gets a disk of its own under the peer's data directory.
-            (
-                Arc::new(docker.with_disks(disks)),
-                Arc::new(best_peer_engine_http::HttpEngine::new()),
-            )
+            let docker = match helper {
+                Some(socket) => docker.with_disk_helper(socket),
+                None => docker.with_disks(disks),
+            };
+            (Arc::new(docker), Arc::new(best_peer_engine_http::HttpEngine::new()))
         }
         Ok(other) => fail(&format!(
             "BEST_PEER_RUNTIME must be docker, native or fake, not {other:?}"
@@ -563,7 +594,12 @@ async fn peer_app(
     } else {
         "0.0.0.0"
     };
-    let (runtime, engine) = engines(bind_ip, &engine_host, dir.join("disks")).await;
+    let helper = disk_helper(
+        std::env::var("BEST_PEER_DISK_HELPER").ok().as_deref(),
+        std::env::var("BEST_PEER_RUNTIME").ok().as_deref(),
+    )
+    .unwrap_or_else(|why| fail(&why));
+    let (runtime, engine) = engines(bind_ip, &engine_host, dir.join("disks"), helper).await;
     let images = Images {
         ollama: std::env::var("BEST_PEER_OLLAMA_IMAGE").ok(),
         vllm: std::env::var("BEST_PEER_VLLM_IMAGE").ok(),
@@ -9891,6 +9927,29 @@ mod tests {
         );
         for runtime in ["native", "fake"] {
             let refused = model_store(Some(&at), Some(runtime)).unwrap_err();
+            assert!(refused.contains(&format!("BEST_PEER_RUNTIME={runtime}")), "{refused}");
+        }
+    }
+
+    #[test]
+    fn the_disk_helper_is_a_socket_named_by_its_absolute_path_for_a_docker_runtime_alone() {
+        assert_eq!(disk_helper(None, None), Ok(None));
+        assert_eq!(disk_helper(Some(" "), Some("docker")), Ok(None));
+        assert_eq!(
+            disk_helper(Some("/run/best-peer-disk.sock"), None),
+            Ok(Some(PathBuf::from("/run/best-peer-disk.sock")))
+        );
+        assert_eq!(
+            disk_helper(Some("/run/best-peer-disk.sock"), Some("docker")),
+            Ok(Some(PathBuf::from("/run/best-peer-disk.sock")))
+        );
+        let relative = disk_helper(Some("best-peer-disk.sock"), None).unwrap_err();
+        assert!(
+            relative.contains("BEST_PEER_DISK_HELPER") && relative.contains("absolute"),
+            "{relative}"
+        );
+        for runtime in ["native", "fake"] {
+            let refused = disk_helper(Some("/run/best-peer-disk.sock"), Some(runtime)).unwrap_err();
             assert!(refused.contains(&format!("BEST_PEER_RUNTIME={runtime}")), "{refused}");
         }
     }

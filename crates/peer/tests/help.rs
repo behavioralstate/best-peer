@@ -34,6 +34,7 @@ fn help_names_every_command_and_the_settings_an_operator_starts_with() {
             "BEST_PEER_DATA",
             "BEST_PEER_RUNTIME",
             "BEST_PEER_GPU",
+            "BEST_PEER_DISK_HELPER",
             "default 127.0.0.1:7777",
         ] {
             assert!(text.contains(named), "{flag} does not name {named}: {text}");
