@@ -314,11 +314,12 @@ can do neither says so at start and makes none, so anywhere else a job with inpu
 before any room is reserved. A disk holds `peer/`, the peer's alone, with where its outputs go; `in/`, the peer's,
 which the job reads; and `out/`, which it writes. A disk is never promised the last of its file system: 1 GiB, or a twentieth of it when that is
 more, stays free for the peer's own log and the engine: the free room and the size `get-hardware-state` tells are each
-what is left after that, so without the disk helper the size is the largest disk the peer could ever make. Under the
-helper the room told stays the file system's, and nothing is free while its `--most-disks` are there or promised to
-orders admitted, each counted once, as the helper counts them, so an order waits for a disk to go rather than fail;
-its `--most-bytes` bounds each disk alone, never the room for all: a `run-job` at the peer's own door asking for more
-is refused (`NO_DISK_ROOM`, with the bound as `most_bytes`). At
+what is left after that, so the size is the largest disk the peer could ever make. Under the disk helper the size is
+also held to its `--most-bytes`, which bounds each disk alone, never the free room, which stays the file system's: a
+cloud places a disk only on a member whose size holds it, and a `run-job` at the peer's own door asking for more is
+refused (`NO_DISK_ROOM`, with the bound as `most_bytes`). Nothing is free while its `--most-disks` are there or
+promised to orders admitted, each counted once, as the helper counts them, so an order waits for a disk to go rather
+than fail. At
 start the peer removes every disk there that no running job has, such as one whose job ended while it was down. Its inputs are fetched and its outputs sent over `https://`
 only; `BEST_PEER_STORE_CLEARTEXT=loopback` also allows a store on this machine's loopback over `http://`, for a test
 or a developer's own store, on the cloud's door and on its members alike.
@@ -654,8 +655,9 @@ sending at its next read; a store that stops answering fails the transfer, ten m
 which also bounds a sending without a deadline. The disk goes with the job, whatever its end, and a peer restarted under a running job finds
 its disk again and still sends its outputs. A job with outputs
 sends `deadline_seconds`, six days at most, because the URL its outputs are sent with lives seven days at most. A
-member says the room it has for disks in `get-hardware-state` as `disk`, and an order is placed only on a member with
-its disk free, and waits for one; a disk no member could ever make is refused (`NO_DISK_ROOM`). At a peer's own door
+member says the room it has for disks in `get-hardware-state` as `disk`, free and its size, the largest disk it could
+ever make, and an order is placed only on a member with its disk free and of that size, and waits for one; a disk no
+member could ever make is refused (`NO_DISK_ROOM`). At a peer's own door
 `run-job` takes the URLs themselves (`inputs` with a `url`, a `path` and their `bytes` when known, `outputs` with a
 `url` and a `key`), records none of them on its log, and does not wait; where the outputs go is kept on the
 job's disk in `peer/`, readable by the peer alone, for a restart, and goes with it; a disk an older peer made keeps

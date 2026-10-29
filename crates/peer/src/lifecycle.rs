@@ -1896,7 +1896,8 @@ impl Peer {
     }
 
     /// The room for jobs' disks here, free and in all: what the runtime says is free, the disks it made counted, less
-    /// what is promised to jobs admitted and not given theirs yet.
+    /// what is promised to jobs admitted and not given theirs yet; and the size, the largest disk that could ever be
+    /// made here, held to the most one disk may be.
     async fn disk_room(&self) -> Option<(u64, u64)> {
         let runtime = self.runtime.clone();
         let promises: Vec<String> = self.promised_disks.lock().unwrap().keys().cloned().collect();
@@ -1908,6 +1909,7 @@ impl Peer {
         .ok()
         .flatten()?;
         let promised: u64 = self.promised_disks.lock().unwrap().values().sum();
+        let total = self.runtime.most_disk_bytes().map_or(total, |most| total.min(most));
         match full {
             true => Some((0, total)),
             false => Some((free.saturating_sub(promised), total)),

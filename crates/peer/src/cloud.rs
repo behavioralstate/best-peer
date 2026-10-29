@@ -397,8 +397,9 @@ pub(crate) fn usable(bytes: u64) -> u64 {
     }
 }
 
-/// `host` without the devices of the members that have not `needed` bytes free for a job's disk now, as `peers`
-/// (each member's row, with the room it says it has) tells; all of it for a job with no disk.
+/// `host` without the devices of the members that have not `needed` bytes free for a job's disk now, or that make no
+/// disk that large, as `peers` (each member's row, with the room it says it has and the size of the largest disk it
+/// makes) tells; all of it for a job with no disk.
 fn with_disk_room(
     host: Host,
     peers: &[Value],
@@ -419,6 +420,7 @@ fn with_disk_room(
             p["disk"]["free_bytes"]
                 .as_u64()
                 .is_some_and(|f| f.saturating_sub(held) >= needed)
+                && p["disk"]["total_bytes"].as_u64().is_none_or(|t| t >= needed)
         })
         .filter_map(|p| Some(format!("{cloud}/{}/", p["peer"].as_str()?)))
         .collect();

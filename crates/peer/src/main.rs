@@ -11739,6 +11739,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cloud_places_a_disk_on_a_member_that_makes_one_that_large_and_refuses_one_no_member_makes() {
+        let (a, _s3, endpoint, _logs) = member_and_store().await;
+        let b = bed(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        b.peer.allow_store_cleartext();
+        // a has all the room, and makes no disk past half a GiB; b makes the GiB the order asks for.
+        a.runtime.set_most_disk_bytes(Some(GB / 2));
+        b.runtime.set_disk_room(2 * GB);
+        let (key_a, key_b) = (a.key.clone(), b.key.clone());
+        let site = site(vec![(A, a), (B, b)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a), ("b", B, &key_b)])
+            .await;
+        let (s, body) = site.store(&ws, "st1", &endpoint).await;
+        assert_eq!(s, StatusCode::CREATED, "{body}");
+        site.events(&ws, "st1", "StoreSetV1").await;
+        let hs = site.query(&ws, "get-hardware-state").await;
+        let a_row = hs["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["peer"] == "a")
+            .unwrap()
+            .clone();
+        assert_eq!(a_row["disk"]["total_bytes"], GB / 2, "the largest disk a makes: {hs}");
+        assert!(a_row["disk"]["free_bytes"].as_u64().unwrap() > GB, "{hs}");
+        site.order(&ws, "j1", 4, with_io()).await;
+        let events = site.events(&ws, "j1", "JobStarted").await;
+        let placed = events.iter().find(|e| e["type"] == "JobPlaced").unwrap();
+        assert_eq!(placed["data"]["peer"], "b", "{placed}");
+    }
+
+    #[tokio::test]
+    async fn a_disk_past_the_most_every_member_makes_is_refused_by_the_cloud_at_once() {
+        let (site, ws, _s3, _logs) = site_with_store().await;
+        site.members[0].runtime.set_most_disk_bytes(Some(GB / 2));
+        assert_eq!(
+            site.refused(&ws, "r1", with_io()).await,
+            ("NO_DISK_ROOM".to_string(), "disk_bytes".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn orders_past_the_most_disks_a_member_makes_wait_for_a_disk_to_go_and_never_fail_at_make() {
         let (site, ws, _s3, _logs) = site_with_store().await;
         let member = &site.members[0];
