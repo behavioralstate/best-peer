@@ -250,6 +250,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "best-peer-disk"
+version = "0.0.30"
+dependencies = [
+ "linux-raw-sys",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "best-peer-docker"
 version = "0.0.30"
 dependencies = [
