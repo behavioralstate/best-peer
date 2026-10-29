@@ -754,6 +754,16 @@ fn room_for_disks(dir: std::path::PathBuf) -> Option<(u64, u64)> {
     room_in(&text).or_else(|| failed(format!("df answered what does not read as room: {text:?}")))
 }
 
+/// What a job's order is told when this peer could not make its disk itself: what went wrong names the host's paths,
+/// so it goes to this peer's log alone.
+const DISK_FAILED: &str = "this peer could not make the job's disk; its operator finds why in the peer's log";
+
+/// `e`, from making a disk this peer mounts itself, as the order is told it: [`DISK_FAILED`], `e` in this peer's log.
+fn as_told_to_the_order(e: RuntimeError) -> RuntimeError {
+    tracing::warn!(error = %e, "this peer could not make a job's disk");
+    RuntimeError::NoDisk(DISK_FAILED.into())
+}
+
 /// How many `df`s killed past their time have not ended: each counted until its own reaper sees it end, so the room
 /// stays unknown, and no other is started, while any is stuck.
 static DF_STUCK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -891,7 +901,9 @@ impl Runtime for DockerRuntime {
             Ok(mount)
         })
         .await
-        .map_err(|e| RuntimeError::NoDisk(e.to_string()))?
+        .map_err(|e| RuntimeError::NoDisk(e.to_string()))
+        .and_then(|made| made)
+        .map_err(as_told_to_the_order)
     }
 
     async fn remove_disk(&self, id: &str) -> Result<(), RuntimeError> {
@@ -1954,6 +1966,17 @@ mod tests {
             "nothing is made where the peer would mount"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_disk_this_peer_could_not_make_is_told_in_words_that_name_nothing_of_the_host() {
+        let said = as_told_to_the_order(RuntimeError::NoDisk(
+            "cannot make /home/u/.best-peer/disks: Permission denied".into(),
+        ))
+        .to_string();
+        assert!(!said.contains('/') && said.contains("log"), "{said}");
+        let other = as_told_to_the_order(RuntimeError::Engine("x".into()));
+        assert!(matches!(other, RuntimeError::NoDisk(_)), "{other:?}");
     }
 
     #[cfg(target_os = "linux")]

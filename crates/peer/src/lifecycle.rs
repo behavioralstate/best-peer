@@ -437,6 +437,33 @@ fn at_most_disks<'a>(runtime: &dyn Runtime, promised: impl IntoIterator<Item = &
     (ids.len() >= most).then_some(most)
 }
 
+/// `why`, with every path on the job's disk at `disk` named as the job sees it: its `/in` and `/out` by those names,
+/// anything else on it as the job's disk. A reason is told to whoever ordered the job, who has no business knowing
+/// where on this host the disk is.
+fn as_the_job_sees_it(why: &str, disk: &std::path::Path) -> String {
+    let disk = disk.to_string_lossy();
+    let mut told = String::new();
+    let mut rest = why;
+    while let Some(at) = rest.find(disk.as_ref()) {
+        told.push_str(&rest[..at]);
+        let after = &rest[at + disk.len()..];
+        let end = after
+            .find(|c: char| c == ':' || c.is_whitespace())
+            .unwrap_or(after.len());
+        let tail = &after[..end];
+        match ["/in", "/out"]
+            .iter()
+            .any(|d| tail == *d || tail.starts_with(&format!("{d}/")))
+        {
+            true => told.push_str(tail),
+            false => told.push_str("the job's disk"),
+        }
+        rest = &after[end..];
+    }
+    told.push_str(rest);
+    told
+}
+
 /// The first input whose path another's takes too, or that lies under another's, which is a file and so no
 /// directory: its index and why.
 pub(crate) fn path_clash<'a>(paths: impl IntoIterator<Item = &'a str>) -> Option<(usize, String)> {
@@ -2086,7 +2113,7 @@ impl Peer {
                 self.job_disks.lock().unwrap().remove(id);
                 let _ = self.runtime.remove_disk(id).await;
                 Err((
-                    why,
+                    as_the_job_sees_it(&why, &disk),
                     "check the input is in the store and the disk holds every input, then order it again",
                 ))
             }
@@ -2155,7 +2182,7 @@ impl Peer {
                 (Stored::Done, None)
             }
             Some(Err(_)) if storing.stop.load(std::sync::atomic::Ordering::SeqCst) => (Stored::Stopped, None),
-            Some(Err(why)) => (Stored::Failed(why), None),
+            Some(Err(why)) => (Stored::Failed(as_the_job_sees_it(&why, &disk.path)), None),
             None => (Stored::Stopped, Some(sending)),
         }
     }
@@ -3448,6 +3475,25 @@ pub(crate) fn new_id(prefix: &str) -> String {
 mod tests {
     use super::Pace;
     use std::time::Duration;
+
+    #[test]
+    fn a_reason_names_a_jobs_disk_as_the_job_sees_it_and_never_where_it_is_on_the_host() {
+        let disk = std::path::Path::new("/home/u/.best-peer/disks/job-0123456789ab");
+        let said = |why: &str| super::as_the_job_sees_it(why, disk);
+        assert_eq!(
+            said("cannot write /home/u/.best-peer/disks/job-0123456789ab/in/scene/a.txt: Permission denied"),
+            "cannot write /in/scene/a.txt: Permission denied"
+        );
+        assert_eq!(
+            said("cannot read /home/u/.best-peer/disks/job-0123456789ab/out: Permission denied"),
+            "cannot read /out: Permission denied"
+        );
+        assert_eq!(
+            said("cannot read /home/u/.best-peer/disks/job-0123456789ab/peer/job.json"),
+            "cannot read the job's disk"
+        );
+        assert_eq!(said("the store answered 403"), "the store answered 403");
+    }
 
     #[test]
     fn progress_is_told_at_steps_of_ten_at_the_end_and_when_it_went_back_whatever_the_engine_reports() {
