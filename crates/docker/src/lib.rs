@@ -636,7 +636,8 @@ impl DockerRuntime {
         self
     }
 
-    /// Asks this peer's disk helper `request`, off the executor, waiting [`HELPER_WITHIN`] at most.
+    /// Asks this peer's disk helper `request`, off the executor, waiting [`HELPER_WITHIN`] at most. Why there is no
+    /// answer goes to this peer's log, and the error says [`HELPER_FAILED`], naming nothing of the host.
     async fn ask_disk_helper(
         &self,
         socket: &std::path::Path,
@@ -646,6 +647,10 @@ impl DockerRuntime {
         tokio::task::spawn_blocking(move || ask_helper(&socket, &request, HELPER_WITHIN))
             .await
             .map_err(|e| RuntimeError::NoDisk(e.to_string()))?
+            .map_err(|e| {
+                tracing::warn!(error = %e, "the disk helper did not answer");
+                RuntimeError::NoDisk(HELPER_FAILED.into())
+            })
     }
 }
 
@@ -676,13 +681,24 @@ fn ask_helper(
     ))
 }
 
-/// What the disk helper answered other than `expected`: its refusal by name and in its words, or the answer itself.
+/// What a job's order is told when the disk helper failed, or answered what it should not: the helper's own words
+/// may name the host's paths and users, so they go to this peer's log alone.
+const HELPER_FAILED: &str =
+    "the disk helper could not do what the job's disk needed; its operator finds why in the helper's journal";
+
+/// What the disk helper answered other than `expected`: a refusal of the request by name and in its words, which name
+/// only the request and the helper's bounds; a failure, a refusal of this peer itself, or another answer, as
+/// [`HELPER_FAILED`], its words in this peer's log.
 fn not_answered(answer: best_peer_disk::Answer, expected: &str) -> RuntimeError {
+    use best_peer_disk::Refusal;
     match answer {
-        best_peer_disk::Answer::Refused { code, reason } => {
+        best_peer_disk::Answer::Refused { code, reason } if !matches!(code, Refusal::Failed | Refusal::NotThePeer) => {
             RuntimeError::NoDisk(format!("the disk helper refused ({code}): {reason}"))
         }
-        other => RuntimeError::NoDisk(format!("the disk helper answered {other:?}, not {expected}")),
+        other => {
+            tracing::warn!(answer = ?other, expected, "the disk helper did not do what it was asked");
+            RuntimeError::NoDisk(HELPER_FAILED.into())
+        }
     }
 }
 
@@ -1937,6 +1953,32 @@ mod tests {
             !dir.join("unused").exists(),
             "nothing is made where the peer would mount"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn what_the_disk_helper_says_of_the_host_stays_in_the_peers_log_and_never_reaches_the_order() {
+        let (socket, dir, _) = helper(|line| {
+            let request: serde_json::Value = serde_json::from_str(line).unwrap();
+            match (request["request"].as_str().unwrap(), request["id"].as_str()) {
+                ("list", _) => r#"{"answer":"listed","dir":"/var/lib/best-peer-disk","ids":[],"most_bytes":1099511627776,"most_disks":16}"#.into(),
+                (_, Some("job-0123456789ab")) => r#"{"answer":"refused","code":"failed","reason":"/var/lib/best-peer-disk/job-0123456789ab.img: mkfs.ext4 failed"}"#.into(),
+                (_, Some("job-111111111111")) => r#"{"answer":"refused","code":"not_the_peer","reason":"the caller is uid 990 gid 985, not the peer"}"#.into(),
+                (_, Some("job-222222222222")) => "/var/lib/best-peer-disk is not an answer".into(),
+                _ => r#"{"answer":"refused","code":"too_large","reason":"a disk of 2199023255552 bytes is past the most this helper makes, 1099511627776 (--most-bytes)"}"#.into(),
+            }
+        });
+        let rt = unconnected(&socket).with_disk_helper(socket.clone());
+        for id in ["job-0123456789ab", "job-111111111111", "job-222222222222"] {
+            let said = rt.make_disk(id, 1 << 30).await.unwrap_err().to_string();
+            assert!(!said.contains('/') && !said.contains("990"), "{id}: {said}");
+            assert!(said.contains("journal"), "{id}: {said}");
+            let said = rt.release(id).await.unwrap_err().to_string();
+            assert!(!said.contains('/'), "{id}: {said}");
+        }
+        let named = rt.make_disk("job-333333333333", 2 << 40).await.unwrap_err().to_string();
+        assert!(named.contains("too_large") && named.contains("--most-bytes"), "{named}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
