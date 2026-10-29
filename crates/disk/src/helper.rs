@@ -1,5 +1,6 @@
 //! The helper's work on the host, by syscalls: a disk's image reserved whole with `fallocate` under a lock on the
-//! directory, formatted by `mkfs.ext4` (a program: writing ext4 by hand is no part of this helper), attached to a free
+//! directory, formatted by `mkfs.ext4` without discard ([`crate::format`]; a program: writing ext4 by hand is no part
+//! of this helper), so the room reserved stays reserved, attached to a free
 //! loop device with `LOOP_CONFIGURE` and `LO_FLAGS_AUTOCLEAR`, so the device goes when the disk is unmounted or the
 //! mount fails, and mounted with `mount(2)`, `nosuid,nodev`; unmounted plainly, never lazily, and only its mount
 //! point removed with `rmdir`. Everything under the directory is reached from a descriptor of it, without following a
@@ -112,19 +113,7 @@ impl Helper {
 
     /// The disk `id`, once its image is reserved: formatted, attached, mounted and laid out.
     fn ready(&self, dir: BorrowedFd<'_>, dev: u64, id: &str, image: &OwnedFd) -> Result<PathBuf, Refused> {
-        let out = std::process::Command::new("mkfs.ext4")
-            .args(["-q", "-F", "-m", "0", "-O", "^has_journal"])
-            .arg(self.dir.join(image_of(id)))
-            .env_clear()
-            .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .map_err(|e| failed("mkfs.ext4 could not run", e))?;
-        if !out.status.success() {
-            return Err(failed("mkfs.ext4 failed", String::from_utf8_lossy(&out.stderr).trim()));
-        }
+        crate::format(&self.dir.join(image_of(id))).map_err(|e| failed("the disk cannot be formatted", e))?;
         let (device, number) = attach(image.as_fd()).map_err(|e| failed("no loop device could be attached", e))?;
         rustix::fs::mkdirat(dir, id, Mode::from_raw_mode(0o755)).map_err(|e| failed("the mount point", e))?;
         let mount = self.dir.join(id);

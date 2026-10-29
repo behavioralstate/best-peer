@@ -32,7 +32,7 @@ pub enum Request {
     Make { id: String, bytes: u64 },
     Release { id: String },
     Remove { id: String },
-    List,
+    List {},
 }
 
 /// Why a request was refused, by name.
@@ -158,6 +158,33 @@ pub fn ids_at(dir: &Path) -> Vec<String> {
     ids.into_iter().collect()
 }
 
+/// The arguments a disk's image is formatted with: ext4 with no journal, which a disk that lives as long as its job
+/// does not need, nothing kept for root, and no discard, which on an image file would punch out the room reserved
+/// for it.
+pub const MKFS_ARGS: &[&str] = &["-q", "-F", "-m", "0", "-O", "^has_journal", "-E", "nodiscard"];
+
+/// Formats the image at `image` with `mkfs.ext4` and [`MKFS_ARGS`], run with a cleared environment and no standard
+/// input or output of this process; why not, in its words.
+pub fn format(image: &Path) -> Result<(), String> {
+    let out = std::process::Command::new("mkfs.ext4")
+        .args(MKFS_ARGS)
+        .arg(image)
+        .env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("mkfs.ext4 could not run: {e}"))?;
+    match out.status.success() {
+        true => Ok(()),
+        false => Err(format!(
+            "mkfs.ext4 failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+    }
+}
+
 /// The request one line holds, its id checked; refused by name when it is none of the four, or its id cannot name a
 /// disk.
 pub fn parse(line: &str) -> Result<Request, Refused> {
@@ -169,7 +196,7 @@ pub fn parse(line: &str) -> Result<Request, Refused> {
     })?;
     match &request {
         Request::Make { id, .. } | Request::Release { id } | Request::Remove { id } => valid_id(id)?,
-        Request::List => {}
+        Request::List {} => {}
     }
     Ok(request)
 }
@@ -340,7 +367,7 @@ pub fn answer(line: &str, uid: u32, gid: u32, peer: Peer, limits: Limits, disks:
             }
             Request::Release { id } => disks.release(&id).map(|_| Answer::Released)?,
             Request::Remove { id } => disks.remove(&id).map(|_| Answer::Removed)?,
-            Request::List => {
+            Request::List {} => {
                 let (dir, ids) = disks.list()?;
                 Answer::Listed {
                     dir,
@@ -463,13 +490,14 @@ mod tests {
                 id: "job-0123456789ab".into()
             })
         );
-        assert_eq!(parse(r#"{"request":"list"}"#), Ok(Request::List));
+        assert_eq!(parse(r#"{"request":"list"}"#), Ok(Request::List {}));
         for unknown in [
             r#"{"request":"mount","id":"job-0123456789ab"}"#,
             r#"{"request":"make","id":"job-0123456789ab"}"#,
             r#"{"request":"make","id":"job-0123456789ab","bytes":-1}"#,
             r#"{"request":"make","id":"job-0123456789ab","bytes":1073741824,"path":"/etc"}"#,
             r#"{"request":"remove","id":"job-0123456789ab","options":"bind"}"#,
+            r#"{"request":"list","path":"/"}"#,
             r#"{"id":"job-0123456789ab"}"#,
             "make job-0123456789ab",
             "",
@@ -687,6 +715,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn list_is_sent_and_read_as_the_bare_request() {
+        assert_eq!(
+            serde_json::to_string(&Request::List {}).unwrap(),
+            r#"{"request":"list"}"#
+        );
+        assert_eq!(parse(r#"{"request":"list"}"#), Ok(Request::List {}));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_disk_formatted_keeps_the_room_reserved_for_it() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let image = tmp.path().join("job-0123456789ab.img");
+        let file = std::fs::File::create(&image).unwrap();
+        rustix::fs::fallocate(&file, rustix::fs::FallocateFlags::empty(), 0, 64 << 20).unwrap();
+        drop(file);
+        format(&image).unwrap();
+        let allocated = std::fs::metadata(&image).unwrap().blocks() * 512;
+        assert!(allocated >= 64 << 20, "{allocated} bytes allocated of a disk of 64 MiB");
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_disks_in_a_directory_are_its_images_and_its_mount_points_named_by_an_id_each_once() {
@@ -722,7 +773,7 @@ mod tests {
             .unwrap();
             line
         });
-        let answered = ask(&socket, &Request::List, std::time::Duration::from_secs(5)).unwrap();
+        let answered = ask(&socket, &Request::List {}, std::time::Duration::from_secs(5)).unwrap();
         assert_eq!(
             answered,
             Answer::Listed {
@@ -736,7 +787,7 @@ mod tests {
 
         let gone = ask(
             &dir.path().join("none.sock"),
-            &Request::List,
+            &Request::List {},
             std::time::Duration::from_secs(1),
         )
         .unwrap_err();
