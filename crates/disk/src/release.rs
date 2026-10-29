@@ -1,14 +1,17 @@
 //! The walk of a release: everything under a disk's `out/` given to the peer, by descriptor and never by path. `out`
-//! is opened from a descriptor of the disk's root with `openat2`, beneath it, through no link and on no other mount;
-//! each directory under it is opened with `O_NOFOLLOW | O_DIRECTORY` and checked after it is opened to be on the
-//! disk's device; each entry is changed with `fchownat(AT_SYMLINK_NOFOLLOW)`, so a link is changed itself and never
-//! what it names, and a FIFO is never opened. What holds the walk to the disk is the device: nothing enters the disk
-//! but by a mount, and only root mounts. The directories open at once are one per level, at most [`MOST_DEPTH`].
+//! is opened from a descriptor of the disk's root, and each directory under it from its parent's, with `openat` and
+//! `O_NOFOLLOW | O_DIRECTORY`, so never through a link, and each is checked after it is opened to be on the disk's
+//! device, so never on another mount. Not `openat2`: systemd's `RestrictSUIDSGID`, which the helper's unit sets,
+//! cannot read its flags and answers it `ENOSYS`; and the disk's root is root's and the peer's group's `0750`, so
+//! neither the peer nor the job can put anything else where `out` is. Each entry is changed with
+//! `fchownat(AT_SYMLINK_NOFOLLOW)`, so a link is changed itself and never what it names, and a FIFO is never opened.
+//! What holds the walk to the disk is the device: nothing enters the disk but by a mount, and only root mounts. The
+//! directories open at once are one per level, at most [`MOST_DEPTH`].
 
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
-use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, ResolveFlags};
+use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
 
 use crate::{Peer, MOST_DEPTH};
 
@@ -23,12 +26,11 @@ pub fn release(
     let dev = rustix::fs::fstat(root)
         .map_err(|e| format!("the disk's root cannot be read: {e}"))?
         .st_dev;
-    let out = rustix::fs::openat2(
+    let out = rustix::fs::openat(
         root,
         "out",
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
         Mode::empty(),
-        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV | ResolveFlags::NO_MAGICLINKS,
     )
     .map_err(|e| format!("the disk's out/ cannot be opened as a directory of its own: {e}"))?;
     let mut open = vec![(on_the_disk(out, dev)?, PathBuf::new())];
