@@ -576,7 +576,9 @@ pub trait Runtime: Send + Sync {
         None
     }
     /// A disk of `bytes` for the job `id`, capped at that size so the job cannot fill the host, and the directory on
-    /// the host where it is mounted (behavioralstate/spec#66). A runtime that makes none refuses, in words.
+    /// the host where it is mounted (behavioralstate/spec#66), laid out: `peer/` the peer's alone, for its record of
+    /// the job; `in/` the peer's, for the job to read; `out/` for the job to write (behavioralstate/spec#169). A
+    /// runtime that makes none refuses, in words.
     async fn make_disk(&self, _id: &str, _bytes: u64) -> Result<std::path::PathBuf, RuntimeError> {
         Err(RuntimeError::NoDisk(
             "this peer's container engine makes no disk for a job: a job with inputs or outputs runs where Docker does, on Linux".into(),
@@ -584,6 +586,12 @@ pub trait Runtime: Send + Sync {
     }
     /// Removes the job `id`'s disk and everything on it; one already gone is no error.
     async fn remove_disk(&self, _id: &str) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+    /// Gives the peer what the job `id` left under its disk's `out/`, once its container has exited and before its
+    /// outputs are packed: with the engine's users remapped, a file the job wrote `0600` is not the peer's to read
+    /// until then. A runtime whose peer reads them as they are has nothing to release.
+    async fn release(&self, _id: &str) -> Result<(), RuntimeError> {
         Ok(())
     }
     /// Whether this runtime makes jobs' disks at all; answered at once, without asking the file system.
@@ -664,6 +672,10 @@ pub struct Fake {
     room_unread: Mutex<bool>,
     /// Whether it makes no disk, as an engine whose peer cannot mount one.
     no_disks: Mutex<bool>,
+    /// Whether what a job wrote under `out/` is kept from the peer until it is released, as an engine with its users
+    /// remapped keeps it; and the disks released, in order.
+    holds_outputs: Mutex<bool>,
+    released: Mutex<Vec<String>>,
     /// What each container it started wrote, and who follows it while it runs.
     written: Mutex<HashMap<ContainerId, Writing>>,
     /// The user an image names, where a test sets one; root otherwise, as an image that names none runs.
@@ -720,6 +732,8 @@ impl Fake {
             processes: Mutex::new(Some(Vec::new())),
             room_unread: Mutex::new(false),
             no_disks: Mutex::new(false),
+            holds_outputs: Mutex::new(false),
+            released: Mutex::new(Vec::new()),
             written: Mutex::new(HashMap::new()),
             image_users: Mutex::new(HashMap::new()),
             guarded: Mutex::new(HashMap::new()),
@@ -788,6 +802,17 @@ impl Fake {
     /// From now on it makes no disk, as a peer that cannot mount one, or does again.
     pub fn makes_no_disks(&self, none: bool) {
         *self.no_disks.lock().unwrap() = none;
+    }
+
+    /// From now on what a job wrote under `out/` is not the peer's until its disk is released, as with an engine
+    /// whose users are remapped: once the job ends, `out/` is found empty until then.
+    pub fn holds_outputs(&self, holds: bool) {
+        *self.holds_outputs.lock().unwrap() = holds;
+    }
+
+    /// The disks released, in order.
+    pub fn released(&self) -> Vec<String> {
+        self.released.lock().unwrap().clone()
     }
 
     /// The next disk is begun, its directory made, and then fails with `why`.
@@ -954,24 +979,26 @@ impl Fake {
 
     /// Drives a running container out of memory, as the engine would report it.
     pub fn out_of_memory(&self, id: &ContainerId) -> Result<(), RuntimeError> {
-        self.containers
+        let spec = self
+            .containers
             .lock()
             .unwrap()
             .remove(id)
             .ok_or_else(|| RuntimeError::NoSuchContainer(id.0.clone()))?;
-        self.ended(id);
+        self.ended(id, &spec);
         let _ = self.tx.send(Event::OutOfMemory { id: id.clone() });
         Ok(())
     }
 
     /// Makes a running container fail, as the engine would report it.
     pub fn fail(&self, id: &ContainerId, reason: &str) -> Result<(), RuntimeError> {
-        self.containers
+        let spec = self
+            .containers
             .lock()
             .unwrap()
             .remove(id)
             .ok_or_else(|| RuntimeError::NoSuchContainer(id.0.clone()))?;
-        self.ended(id);
+        self.ended(id, &spec);
         let _ = self.tx.send(Event::Failed {
             id: id.clone(),
             reason: reason.to_string(),
@@ -981,12 +1008,13 @@ impl Fake {
 
     /// Ends a container on its own, as a process that exits does, with its exit code and the last lines it wrote.
     pub fn exit(&self, id: &ContainerId, code: i64, last_words: &str) -> Result<(), RuntimeError> {
-        self.containers
+        let spec = self
+            .containers
             .lock()
             .unwrap()
             .remove(id)
             .ok_or_else(|| RuntimeError::NoSuchContainer(id.0.clone()))?;
-        self.ended(id);
+        self.ended(id, &spec);
         let _ = self.tx.send(Event::Exited {
             id: id.clone(),
             code,
@@ -1019,17 +1047,49 @@ impl Fake {
         Ok(())
     }
 
-    /// Ends what a container writes: its followers read what is left and close.
-    fn ended(&self, id: &ContainerId) {
+    /// Ends what a container writes: its followers read what is left and close. What it wrote under `out/` is held
+    /// from the peer while the fake holds outputs.
+    fn ended(&self, id: &ContainerId, spec: &Spec) {
         if let Some(writing) = self.written.lock().unwrap().get_mut(id) {
             writing.ended = true;
             writing.followers.clear();
+        }
+        if !*self.holds_outputs.lock().unwrap() {
+            return;
+        }
+        if let Some(out) = spec.mounts.iter().find(|m| m.container == "/out") {
+            let out = std::path::Path::new(&out.host);
+            let held = out.with_file_name("out.held");
+            if std::fs::rename(out, &held).is_ok() {
+                let _ = std::fs::create_dir(out);
+            }
         }
     }
 
     pub fn spec_of(&self, id: &ContainerId) -> Option<Spec> {
         self.containers.lock().unwrap().get(id).cloned()
     }
+}
+
+/// Makes every directory under `dir` writable by its owner, as a disk unmounted whole would not need: what a job
+/// left in a directory it closed goes with the fake's disk all the same. A link is not followed.
+fn writable(dir: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(meta) = std::fs::symlink_metadata(dir) else {
+            return;
+        };
+        if !meta.is_dir() {
+            return;
+        }
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(meta.permissions().mode() | 0o700));
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            writable(&entry.path());
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 /// A name no other fake in this process or another uses: the fake's disks of one test stay apart from another's.
@@ -1248,12 +1308,13 @@ impl Runtime for Fake {
         if let Some(why) = self.stop_refusal.lock().unwrap().clone() {
             return Err(RuntimeError::Engine(why));
         }
-        self.containers
+        let spec = self
+            .containers
             .lock()
             .unwrap()
             .remove(id)
             .ok_or_else(|| RuntimeError::NoSuchContainer(id.0.clone()))?;
-        self.ended(id);
+        self.ended(id, &spec);
         let _ = self.tx.send(Event::Exited {
             id: id.clone(),
             code: 0,
@@ -1313,12 +1374,35 @@ impl Runtime for Fake {
         if let Some(why) = self.broken_disk.lock().unwrap().take() {
             return Err(RuntimeError::NoDisk(why));
         }
+        for (sub, mode) in [("peer", 0o700), ("in", 0o755), ("out", 0o777)] {
+            std::fs::create_dir(dir.join(sub)).map_err(|e| RuntimeError::NoDisk(e.to_string()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(dir.join(sub), std::fs::Permissions::from_mode(mode))
+                    .map_err(|e| RuntimeError::NoDisk(e.to_string()))?;
+            }
+            #[cfg(not(unix))]
+            let _ = mode;
+        }
         self.disks_made.lock().unwrap().insert(id.to_string(), bytes);
         Ok(dir)
     }
 
+    async fn release(&self, id: &str) -> Result<(), RuntimeError> {
+        self.released.lock().unwrap().push(id.to_string());
+        let disk = self.disk_of(id);
+        if disk.join("out.held").exists() {
+            std::fs::remove_dir(disk.join("out")).map_err(|e| RuntimeError::NoDisk(e.to_string()))?;
+            std::fs::rename(disk.join("out.held"), disk.join("out"))
+                .map_err(|e| RuntimeError::NoDisk(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     async fn remove_disk(&self, id: &str) -> Result<(), RuntimeError> {
         self.disks_made.lock().unwrap().remove(id);
+        writable(&self.disk_of(id));
         match std::fs::remove_dir_all(self.disk_of(id)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -2316,5 +2400,45 @@ mod tests {
         rt.stop(&id).await.unwrap();
         assert_eq!(all_of(first).await, vec![out("a"), err("b")]);
         assert_eq!(all_of(second).await, vec![out("a"), err("b")]);
+    }
+
+    #[tokio::test]
+    async fn a_runtime_that_keeps_the_default_release_has_nothing_to_release() {
+        NoNames.release("job-0123456789ab").await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_fakes_disk_is_laid_out_and_what_its_job_wrote_is_the_peers_once_released() {
+        use std::os::unix::fs::PermissionsExt;
+        let rt = fake();
+        let disk = rt.make_disk("job-0123456789ab", 16 << 20).await.unwrap();
+        let mode = |p: &str| std::fs::metadata(disk.join(p)).unwrap().permissions().mode() & 0o777;
+        assert_eq!((mode("peer"), mode("in"), mode("out")), (0o700, 0o755, 0o777));
+
+        rt.holds_outputs(true);
+        let mounted = |at: &str, dir: &str| Mount {
+            host: disk.join(dir).to_string_lossy().to_string(),
+            container: at.into(),
+            read_only: at == "/in",
+        };
+        let id = rt
+            .start(Spec {
+                mounts: vec![mounted("/in", "in"), mounted("/out", "out")],
+                ..spec("ollama/ollama:0.6", "gpu-0")
+            })
+            .await
+            .unwrap()
+            .id;
+        std::fs::write(disk.join("out/frame.png"), "frame").unwrap();
+        rt.exit(&id, 0, "").unwrap();
+        assert!(
+            std::fs::read_dir(disk.join("out")).unwrap().next().is_none(),
+            "what the job wrote is not the peer's before it is released"
+        );
+        rt.release("job-0123456789ab").await.unwrap();
+        assert_eq!(std::fs::read_to_string(disk.join("out/frame.png")).unwrap(), "frame");
+        assert_eq!(rt.released(), ["job-0123456789ab"]);
+        rt.remove_disk("job-0123456789ab").await.unwrap();
     }
 }

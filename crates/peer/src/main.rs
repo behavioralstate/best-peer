@@ -10949,6 +10949,20 @@ mod tests {
         let mount = |at: &str| spec.mounts.iter().find(|m| m.container == at).unwrap().clone();
         assert!(mount("/in").read_only && mount("/in").host == disk.join("in").to_string_lossy());
         assert!(!mount("/out").read_only && mount("/out").host == disk.join("out").to_string_lossy());
+        assert_eq!(spec.mounts.len(), 2, "the job sees /in and /out, never its record");
+        // Laid out as the runtime made it: the record in peer/, /in left the peer's to write.
+        assert!(disk.join("peer/job.json").is_file() && !disk.join("job.json").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &str| std::fs::metadata(disk.join(p)).unwrap().permissions().mode() & 0o777;
+            assert_eq!((mode("peer"), mode("in"), mode("out")), (0o700, 0o755, 0o777));
+            assert_eq!(
+                mode("in/scene/scene.txt") & 0o444,
+                0o444,
+                "its inputs are open to the job"
+            );
+        }
         // The member records the order's command without the URLs it carried.
         assert_eq!(
             holding(logs.path(), "\"disk_bytes\""),
@@ -11009,6 +11023,57 @@ mod tests {
         assert!(kept[0].ends_with("store.json"), "{kept:?}");
         assert!(holding(site.data.path(), "X-Amz").is_empty());
         assert!(holding(logs.path(), "X-Amz").is_empty() && holding(logs.path(), SECRET).is_empty());
+    }
+
+    #[tokio::test]
+    async fn what_a_job_left_is_released_to_the_peer_and_opened_to_it_before_it_is_packed() {
+        let (site, ws, s3, _logs) = site_with_store().await;
+        let member = &site.members[0];
+        // As an engine with its users remapped: what the job wrote is not the peer's until its disk is released.
+        member.runtime.holds_outputs(true);
+        let queued = site.order(&ws, "j1", 4, with_io()).await;
+        let started = site.events(&ws, "j1", "JobStarted").await.last().unwrap()["data"].clone();
+        let job = started["job"].as_str().unwrap().to_string();
+        let disk = member.runtime.disk_of(&job);
+        std::fs::create_dir_all(disk.join("out/logs")).unwrap();
+        std::fs::write(disk.join("out/logs/render.log"), b"done").unwrap();
+        std::fs::write(disk.join("out/secret.bin"), b"0600").unwrap();
+        std::fs::write(disk.join("out/none.bin"), b"0000").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let set = |p: &str, mode: u32| {
+                std::fs::set_permissions(disk.join(p), std::fs::Permissions::from_mode(mode)).unwrap()
+            };
+            set("out/secret.bin", 0o600);
+            set("out/none.bin", 0o000);
+            set("out/logs", 0o000);
+            std::os::unix::fs::symlink("/etc/hostname", disk.join("out/link")).unwrap();
+        }
+        member
+            .runtime
+            .stop(&ContainerId(started["container"].as_str().unwrap().into()))
+            .await
+            .unwrap();
+        let events = site.events(&ws, "j1", "JobFinished").await;
+        assert!(
+            facts(&events).contains(&"OutputsStored".to_string()),
+            "{:?}",
+            facts(&events)
+        );
+        assert_eq!(member.runtime.released(), std::slice::from_ref(&job));
+        let key = format!("renders/shot-12/{}.tar", queued["job"].as_str().unwrap());
+        assert_eq!(
+            unpacked(&s3.get(&key).expect("the archive is in the store")),
+            [
+                ("logs/render.log", "done"),
+                ("none.bin", "0000"),
+                ("secret.bin", "0600")
+            ]
+            .map(|(p, t)| (p.to_string(), t.to_string()))
+            .into()
+        );
+        until("the job's disk is removed", || !disk.exists()).await;
     }
 
     #[tokio::test]
@@ -11500,7 +11565,9 @@ mod tests {
         first.peer.halt();
         let credentials = first.door.auth.clone();
         drop(first);
-        std::fs::remove_file(disk(1).join("job.json")).unwrap();
+        std::fs::remove_file(disk(1).join("peer/job.json")).unwrap();
+        // The first's record is where an older peer kept it, at the disk's root: it is found there too.
+        std::fs::rename(disk(0).join("peer/job.json"), disk(0).join("job.json")).unwrap();
         std::fs::write(disk(0).join("out/result.txt"), b"42").unwrap();
         let again = bed_with(
             card(),

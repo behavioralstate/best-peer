@@ -31,6 +31,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use best_peer_disk::kept_free;
 use best_peer_runtime::{
     Confinement, ContainerId, Event, Following, ImageRef, Isolation, Network, Output, Progress, Published, PullLimits,
     RegistryToken, Runtime, RuntimeError, Spec, Started, Written,
@@ -703,8 +704,7 @@ impl Runtime for DockerRuntime {
             run("mount", &["-o", "loop", &img, &mnt]).map_err(|e| {
                 RuntimeError::NoDisk(format!("{e}; a job's disk is mounted by the peer, which needs the capability to mount (CAP_SYS_ADMIN) and the loop devices"))
             })?;
-            // Whoever the job's image runs as writes there.
-            run("chmod", &["0777", &mnt])?;
+            lay_out(&mount)?;
             Ok(mount)
         })
         .await
@@ -1552,10 +1552,29 @@ fn room_in(df: &str) -> Option<(u64, u64)> {
     Some((free.saturating_sub(kept), total.saturating_sub(kept)))
 }
 
-/// What a disk is never promised of the file system it is made on: 1 GiB, or a twentieth of it when that is more, so
-/// the peer's own log and the engine can always still write there.
-fn kept_free(total: u64) -> u64 {
-    (total / 20).max(1 << 30)
+/// Lays a disk this peer mounted out as the helper does: `peer/` and `in/` this peer's, `out/` open to the job.
+#[cfg(target_os = "linux")]
+fn lay_out(mount: &std::path::Path) -> Result<(), RuntimeError> {
+    use rustix::fs::{Mode, OFlags};
+    let root = rustix::fs::open(
+        mount,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| RuntimeError::NoDisk(format!("{}: {e}", mount.display())))?;
+    let me = best_peer_disk::Peer {
+        uid: rustix::process::getuid().as_raw(),
+        gid: rustix::process::getgid().as_raw(),
+    };
+    best_peer_disk::helper::lay_out(std::os::fd::AsFd::as_fd(&root), me)
+        .map_err(|e| RuntimeError::NoDisk(format!("the disk at {} cannot be laid out: {e}", mount.display())))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn lay_out(_mount: &std::path::Path) -> Result<(), RuntimeError> {
+    Err(RuntimeError::NoDisk(
+        "a job's disk is a file system on a loop device, which this peer makes on Linux only".into(),
+    ))
 }
 
 /// Whether this process can mount a disk: the capability to mount, and the loop devices to mount one on. Linux only.
@@ -1629,6 +1648,21 @@ mod tests {
             credentials_for(&elsewhere, Some(&token)),
             Err(RuntimeError::Engine(_))
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_disk_this_peer_mounted_is_laid_out_as_the_helper_lays_one_out() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("best-peer-lay-out-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        lay_out(&root).unwrap();
+        let mode = |p: &str| std::fs::metadata(root.join(p)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            (mode(""), mode("peer"), mode("in"), mode("out")),
+            (0o755, 0o700, 0o755, 0o777)
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

@@ -339,9 +339,11 @@ impl Drop for Promise {
     }
 }
 
-/// The record a job's disk keeps of where its outputs go, beside /in and /out and outside what the job's container
-/// sees, readable by the peer alone: what a restart reads back. It goes with the disk.
-const RECORD: &str = "job.json";
+/// The record a job's disk keeps of where its outputs go, in the disk's `peer/` beside /in and /out and outside what
+/// the job's container sees, readable by the peer alone: what a restart reads back. It goes with the disk. A disk an
+/// older peer made keeps it at its root, where it is read too.
+const RECORD: &str = "peer/job.json";
+const OLDER_RECORD: &str = "job.json";
 
 /// Makes everything under `dir` readable by the job, whatever user it runs as and whatever the peer's umask made it:
 /// every file readable by all, and runnable by all when its owner may run it, every directory readable and searchable
@@ -379,6 +381,38 @@ fn open_to_the_job(dir: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Makes everything under `dir` readable by the peer, once it is the peer's: every file readable by its owner, every
+/// directory readable and searchable by its owner, nothing else of its mode changed. A link is left as it is and not
+/// followed. A file the job left `0000` is packed so.
+fn open_to_the_peer(dir: &std::path::Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let open = |path: &std::path::Path, more: u32| -> Result<(), String> {
+            let meta = std::fs::symlink_metadata(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+            let mode = meta.permissions().mode();
+            if mode & more != more {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode((mode | more) & 0o7777))
+                    .map_err(|e| format!("cannot open {} to the peer: {e}", path.display()))?;
+            }
+            Ok(())
+        };
+        open(dir, 0o500)?;
+        for entry in std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))? {
+            let entry = entry.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+            let kind = entry.file_type().map_err(|e| e.to_string())?;
+            if kind.is_dir() {
+                open_to_the_peer(&entry.path())?;
+            } else if kind.is_file() {
+                open(&entry.path(), 0o400)?;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 fn keep_record(disk: &std::path::Path, outputs: Option<&OutputData>) -> Result<(), String> {
     let record = json!({ "outputs": outputs.map(|o| json!({ "url": o.url, "key": o.key })) });
     crate::tls::write_private(&disk.join(RECORD), &serde_json::to_vec(&record).unwrap_or_default())
@@ -388,7 +422,8 @@ fn keep_record(disk: &std::path::Path, outputs: Option<&OutputData>) -> Result<(
 /// Where a disk's job sends its outputs, as its record says: none when it has none to send, and nothing at all when
 /// the record is gone.
 fn read_record(disk: &std::path::Path) -> Option<Option<OutputData>> {
-    let record: Value = serde_json::from_slice(&std::fs::read(disk.join(RECORD)).ok()?).ok()?;
+    let kept = std::fs::read(disk.join(RECORD)).or_else(|_| std::fs::read(disk.join(OLDER_RECORD)));
+    let record: Value = serde_json::from_slice(&kept.ok()?).ok()?;
     serde_json::from_value(record["outputs"].clone()).ok()
 }
 
@@ -1990,14 +2025,6 @@ impl Peer {
             let (disk, inputs, outputs) = (disk.clone(), io.inputs.clone(), io.outputs.clone());
             tokio::task::spawn_blocking(move || -> Result<(u64, f64), String> {
                 keep_record(&disk, outputs.as_ref())?;
-                for dir in ["in", "out"] {
-                    std::fs::create_dir_all(disk.join(dir)).map_err(|e| e.to_string())?;
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = std::fs::set_permissions(disk.join(dir), std::fs::Permissions::from_mode(0o777));
-                    }
-                }
                 let started = Instant::now();
                 let mut bytes = 0;
                 for i in &inputs {
@@ -2034,7 +2061,7 @@ impl Peer {
     }
 
     /// Sends what the job `job` left under /out where its outputs go, packed as it is sent, telling `OutputsStored`;
-    /// or why not. It takes `within` at most, and a stop ends it; then the transfer is cut and handed back, to be
+    /// or why not. What it left is released to the peer by the runtime first, and opened to the peer. It takes `within` at most, and a stop ends it; then the transfer is cut and handed back, to be
     /// waited for before the disk it reads goes.
     async fn store_outputs(
         &self,
@@ -2063,7 +2090,19 @@ impl Peer {
         let started = Instant::now();
         let mut sending = {
             let (out, stop) = (disk.path.join("out"), storing.stop.clone());
-            tokio::task::spawn_blocking(move || crate::store::send_outputs(&out, &outputs.url, stop))
+            let (runtime, job) = (self.runtime.clone(), job.to_string());
+            tokio::spawn(async move {
+                runtime
+                    .release(&job)
+                    .await
+                    .map_err(|e| format!("what the job left could not be released to the peer: {e}"))?;
+                tokio::task::spawn_blocking(move || {
+                    open_to_the_peer(&out)?;
+                    crate::store::send_outputs(&out, &outputs.url, stop)
+                })
+                .await
+                .map_err(|e| e.to_string())?
+            })
         };
         let stored = tokio::select! {
             sent = &mut sending => Some(sent.map_err(|e| e.to_string()).and_then(|r| r)),

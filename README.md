@@ -593,8 +593,9 @@ while it waits fails when its turn comes.
 The member it places the order on gets only URLs the cloud signed for that order: one to read each input, one to
 write the outputs. Before the job starts, the member makes it a disk of its own, of `disk_bytes` (a size names its
 default in the menu, and an order may name its own), fetches the inputs there and tells `InputsFetched`. The job
-reads `/in`, read-only, and writes `/out`. When it exits, its directories, regular files and links under `/out` are
-packed as one tar archive and sent to `<prefix>/<order>.tar` as they are packed, so nothing is written beside the disk,
+reads `/in`, read-only, and writes `/out`. When it exits, what it left under `/out` is made the peer's (by the
+disk helper where there is one) and readable by it, a file the job left `0600` or `0000` included, and its
+directories, regular files and links under `/out` are packed as one tar archive and sent to `<prefix>/<order>.tar` as they are packed, so nothing is written beside the disk,
 and `OutputsStored` says so, with the key, before `JobFinished`. A link is kept as a link, never followed; a pipe, a
 device or a socket it left is not an output. A store that does not take it ends the job in `JobFailed`, its exit code
 kept. The order's `deadline_seconds` covers the sending too: one still running past it is cut and the job ends, its
@@ -607,8 +608,9 @@ sends `deadline_seconds`, six days at most, because the URL its outputs are sent
 member says the room it has for disks in `get-hardware-state` as `disk`, and an order is placed only on a member with
 its disk free, and waits for one; a disk no member could ever make is refused (`NO_DISK_ROOM`). At a peer's own door
 `run-job` takes the URLs themselves (`inputs` with a `url`, a `path` and their `bytes` when known, `outputs` with a
-`url` and a `key`), records none of them on its log, and does not wait; where the outputs go is kept beside the
-job's disk, readable by the peer alone, for a restart, and goes with it.
+`url` and a `key`), records none of them on its log, and does not wait; where the outputs go is kept on the
+job's disk in `peer/`, readable by the peer alone, for a restart, and goes with it; a disk an older peer made keeps
+it at its root, where it is read too.
 
 The peer's state is the fold of the events it told. After a restart it is rebuilt from the log and squared with what
 the engine still runs; a workload that ended while the peer was down is told so then.

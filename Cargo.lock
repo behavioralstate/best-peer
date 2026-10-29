@@ -265,6 +265,7 @@ name = "best-peer-docker"
 version = "0.0.30"
 dependencies = [
  "async-trait",
+ "best-peer-disk",
  "best-peer-gpu",
  "best-peer-runtime",
  "bollard",
