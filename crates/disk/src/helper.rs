@@ -1,10 +1,11 @@
 //! The helper's work on the host, by syscalls: a disk's image reserved whole with `fallocate` under a lock on the
 //! directory, formatted by `mkfs.ext4` without discard ([`crate::format`]; a program: writing ext4 by hand is no part
-//! of this helper), so the room reserved stays reserved, attached to a free
-//! loop device with `LOOP_CONFIGURE` and `LO_FLAGS_AUTOCLEAR`, so the device goes when the disk is unmounted or the
-//! mount fails, and mounted with `mount(2)`, `nosuid,nodev`; unmounted plainly, never lazily, and only its mount
-//! point removed with `rmdir`. Everything under the directory is reached from a descriptor of it, without following a
-//! link, and the directory itself must be root's and writable by no one else.
+//! of this helper), attached to a free loop device that passes no discard on ([`crate::no_discard`]), so neither the
+//! format nor a later trim gives the room reserved back; the device is attached with `LOOP_CONFIGURE` and
+//! `LO_FLAGS_AUTOCLEAR`, so it goes when the disk is unmounted or the mount fails; and the disk is mounted with
+//! `mount(2)`, `nosuid,nodev`; unmounted plainly, never lazily, and only its mount point removed with `rmdir`.
+//! Everything under the directory is reached from a descriptor of it, without following a link, and the directory
+//! itself must be root's and writable by no one else.
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -115,6 +116,8 @@ impl Helper {
     fn ready(&self, dir: BorrowedFd<'_>, dev: u64, id: &str, image: &OwnedFd) -> Result<PathBuf, Refused> {
         crate::format(&self.dir.join(image_of(id))).map_err(|e| failed("the disk cannot be formatted", e))?;
         let (device, number) = attach(image.as_fd()).map_err(|e| failed("no loop device could be attached", e))?;
+        crate::no_discard(&format!("loop{number}"))
+            .map_err(|e| failed("the disk's room could not be kept reserved", e))?;
         rustix::fs::mkdirat(dir, id, Mode::from_raw_mode(0o755)).map_err(|e| failed("the mount point", e))?;
         let mount = self.dir.join(id);
         rustix::mount::mount(

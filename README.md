@@ -437,6 +437,9 @@ that user alone, by its uid and its primary group, and gives it what it releases
 - `--most-bytes 1T`: the largest disk it makes; `--most-disks 16`: how many there may be at once. A disk also never
   takes the room kept free (1 GiB, or a twentieth of the file system). The helper lists both to the peer at start,
   which refuses a larger disk at ingest and promises no disk past the count.
+- Each disk's room is reserved whole and stays so: its image is formatted without discard, and its loop device is
+  set to pass none on (`/sys/block/loopN/queue/discard_max_bytes` 0), so a host's `fstrim` timer never punches it
+  back out; a disk whose device cannot be set so is not made. A peer that mounts its disks itself does the same.
 
 The service is confined by its capabilities (`CAP_SYS_ADMIN CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER`), its devices
 (the loop devices alone), its address families (`AF_UNIX`) and its system calls, and has no namespacing option at

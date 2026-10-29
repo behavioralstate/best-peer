@@ -185,6 +185,41 @@ pub fn format(image: &Path) -> Result<(), String> {
     }
 }
 
+/// The attribute under the sysfs block directory `sys` that bounds the discards the loop device `device`
+/// (`/dev/loopN` or `loopN`) passes on; refused for any device but a loop device.
+pub fn discard_limit_of(sys: &Path, device: &str) -> Result<PathBuf, String> {
+    let name = device.strip_prefix("/dev/").unwrap_or(device);
+    let number = name.strip_prefix("loop").unwrap_or_default();
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("{device} is no loop device"));
+    }
+    Ok(sys.join(name).join("queue").join("discard_max_bytes"))
+}
+
+/// Lets the loop device `device` pass no discard on, by its attribute under the sysfs block directory `sys`: a trim
+/// of the disk's file system (fstrim, run by a timer on many hosts) would otherwise punch holes in its image and give
+/// back the room reserved for it. The attribute is written, never made; why not, in words.
+pub fn no_discard_at(sys: &Path, device: &str) -> Result<(), String> {
+    let limit = discard_limit_of(sys, device)?;
+    let said = |e: std::io::Error| {
+        format!(
+            "the discard limit of {device} ({}) cannot be set to none: {e}",
+            limit.display()
+        )
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&limit)
+        .map_err(said)?;
+    std::io::Write::write_all(&mut file, b"0").map_err(said)
+}
+
+/// [`no_discard_at`] in the host's `/sys/block`.
+pub fn no_discard(device: &str) -> Result<(), String> {
+    no_discard_at(Path::new("/sys/block"), device)
+}
+
 /// The request one line holds, its id checked; refused by name when it is none of the four, or its id cannot name a
 /// disk.
 pub fn parse(line: &str) -> Result<Request, Refused> {
@@ -712,6 +747,37 @@ mod tests {
                 reason: "r".into()
             }),
             r#"{"answer":"refused","code":"not_the_peer","reason":"r"}"#
+        );
+    }
+
+    #[test]
+    fn a_loop_devices_discard_limit_is_set_to_none_in_its_own_attribute_and_nothing_else_is_written() {
+        let sys = tempfile::tempdir().unwrap();
+        let queue = sys.path().join("loop7/queue");
+        std::fs::create_dir_all(&queue).unwrap();
+        std::fs::write(queue.join("discard_max_bytes"), "4294966784\n").unwrap();
+        assert_eq!(
+            discard_limit_of(sys.path(), "/dev/loop7"),
+            Ok(sys.path().join("loop7/queue/discard_max_bytes"))
+        );
+        no_discard_at(sys.path(), "/dev/loop7").unwrap();
+        assert_eq!(std::fs::read_to_string(queue.join("discard_max_bytes")).unwrap(), "0");
+        for not_loop in [
+            "/dev/sda",
+            "loop",
+            "/dev/loop",
+            "/dev/loopx",
+            "/dev/loop7/../sda",
+            "/dev/loop-control",
+            "/dev/loop 1",
+        ] {
+            assert!(no_discard_at(sys.path(), not_loop).is_err(), "{not_loop}");
+        }
+        let missing = no_discard_at(sys.path(), "/dev/loop8").unwrap_err();
+        assert!(missing.contains("loop8") && missing.contains("discard"), "{missing}");
+        assert!(
+            !sys.path().join("loop8").exists(),
+            "nothing is made where the attribute is missing"
         );
     }
 

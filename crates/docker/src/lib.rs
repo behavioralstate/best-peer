@@ -811,8 +811,9 @@ impl Runtime for DockerRuntime {
     }
 
     /// A file system of its own for the job `id`: an ext4 file of `bytes`, allocated whole and formatted without
-    /// discard ([`best_peer_disk::format`]), so the room it takes is taken now and stays taken, on a loop device
-    /// mounted under the disks' directory. It has no journal, which a disk that lives as
+    /// discard ([`best_peer_disk::format`]), on a loop device that passes no discard on
+    /// ([`best_peer_disk::no_discard`]), so the room it takes is taken now and no trim gives it back, mounted under the
+    /// disks' directory. It has no journal, which a disk that lives as
     /// long as its job does not need, and keeps nothing for root, so the job has all of it. Linux only, and the peer
     /// needs the capability to mount and the loop devices.
     async fn make_disk(&self, id: &str, bytes: u64) -> Result<std::path::PathBuf, RuntimeError> {
@@ -864,6 +865,17 @@ impl Runtime for DockerRuntime {
             run("mount", &["-o", "loop", &img, &mnt]).map_err(|e| {
                 RuntimeError::NoDisk(format!("{e}; a job's disk is mounted by the peer, which needs the capability to mount (CAP_SYS_ADMIN) and the loop devices"))
             })?;
+            let device = std::fs::read_to_string("/proc/self/mountinfo")
+                .map_err(|e| e.to_string())
+                .and_then(|table| {
+                    loop_device_of(&mount, &table).ok_or_else(|| format!("no device is mounted at {mnt}"))
+                });
+            if let Err(why) = device.and_then(|d| best_peer_disk::no_discard(&d)) {
+                let _ = run("umount", &[&mnt]);
+                return Err(RuntimeError::NoDisk(format!(
+                    "the disk's room could not be kept reserved: {why}"
+                )));
+            }
             lay_out(&mount)?;
             Ok(mount)
         })
@@ -1665,6 +1677,17 @@ fn mount_holding(path: &std::path::Path, mountinfo: &str) -> Option<std::path::P
         })
 }
 
+/// The device mounted at `mount` in `mountinfo`, the text of `/proc/self/mountinfo`: the source of the mount there
+/// that was mounted last; none when nothing is mounted there.
+fn loop_device_of(mount: &std::path::Path, mountinfo: &str) -> Option<String> {
+    mountinfo.lines().rev().find_map(|line| {
+        let (mine, theirs) = line.split_once(" - ")?;
+        let at = unescaped(mine.split(' ').nth(4)?);
+        let source = theirs.split(' ').nth(1)?;
+        (at == mount).then(|| unescaped(source).to_string_lossy().into_owned())
+    })
+}
+
 /// A path as the mount table writes it, with a space, a tab, a newline or a backslash as an octal escape (`\040`).
 fn unescaped(field: &str) -> std::path::PathBuf {
     let bytes = field.as_bytes();
@@ -2040,6 +2063,25 @@ mod tests {
             .enumerate()
             .map(|(i, p)| format!("{} 1 8:2 / {p} rw,relatime shared:1 - ext4 /dev/sda2 rw\n", 20 + i))
             .collect()
+    }
+
+    #[test]
+    fn the_loop_device_behind_a_disk_is_the_source_of_its_mount_point_mounted_last() {
+        let p = std::path::Path::new;
+        let table = "20 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw\n\
+            31 20 7:3 / /data/disks/job-0123456789ab rw,relatime - ext4 /dev/loop3 rw\n\
+            32 20 7:4 / /data/my\\040disks/job-0123456789ab rw,relatime shared:9 - ext4 /dev/loop4 rw\n\
+            33 31 7:5 / /data/disks/job-0123456789ab rw,relatime - ext4 /dev/loop5 rw\n";
+        assert_eq!(
+            loop_device_of(p("/data/disks/job-0123456789ab"), table),
+            Some("/dev/loop5".into())
+        );
+        assert_eq!(
+            loop_device_of(p("/data/my disks/job-0123456789ab"), table),
+            Some("/dev/loop4".into())
+        );
+        assert_eq!(loop_device_of(p("/data/disks/job-ffffffffffff"), table), None);
+        assert_eq!(loop_device_of(p("/"), table), Some("/dev/sda2".into()));
     }
 
     #[test]
