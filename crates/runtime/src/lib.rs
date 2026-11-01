@@ -241,13 +241,21 @@ fn half_the_cores() -> u32 {
     (cores / 2).max(1)
 }
 
-/// Where a container's network goes: nowhere, what a job gets, or the container engine's own default, what an
-/// engine gets to pull its models.
+/// Where a container's network goes: nowhere, what a job gets; the container engine's own default, what an engine
+/// gets to pull its models; or a closed network ([`Runtime::make_closed_network`]) a caller made, with a door on it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Network {
     None,
     Default,
+    /// The closed network of this name alone: the container reaches a door on it, and nothing else.
+    Closed(String),
+    /// The engine's own default as well as the closed network named, where a closed container finds it by `alias`:
+    /// the one way out of that network, and whatever it lets through is the container's to decide.
+    Door {
+        network: String,
+        alias: String,
+    },
 }
 
 /// A directory of the container engine's host at a path in the container. The path is the engine host's, in its
@@ -577,7 +585,8 @@ pub trait Runtime: Send + Sync {
     }
     /// A disk of `bytes` for the job `id`, capped at that size so the job cannot fill the host, and the directory on
     /// the host where it is mounted (behavioralstate/spec#66), laid out: `peer/` the peer's alone, for its record of
-    /// the job; `in/` the peer's, for the job to read; `out/` for the job to write (behavioralstate/spec#169). A
+    /// the job; `in/` the peer's, for the job to read; `out/` for the job to write (behavioralstate/spec#169); `work/`
+    /// for the job to write what is deleted with the disk, never packed or released (behavioralstate/spec#212). A
     /// runtime that makes none refuses, in words.
     async fn make_disk(&self, _id: &str, _bytes: u64) -> Result<std::path::PathBuf, RuntimeError> {
         Err(RuntimeError::NoDisk(
@@ -587,6 +596,21 @@ pub trait Runtime: Send + Sync {
     /// Removes the job `id`'s disk and everything on it; one already gone is no error.
     async fn remove_disk(&self, _id: &str) -> Result<(), RuntimeError> {
         Ok(())
+    }
+    /// Makes a network of `name` that goes nowhere: a container on it alone ([`Network::Closed`]) reaches a door on
+    /// it ([`Network::Door`]) and neither the host, nor anything the host reaches, by address or by name. A name
+    /// already taken is refused, never reused, since what holds it may not be closed. A runtime that cannot make one
+    /// refuses, in words.
+    async fn make_closed_network(&self, _name: &str) -> Result<(), RuntimeError> {
+        Err(RuntimeError::Engine("this runtime makes no closed network".into()))
+    }
+    /// Removes the network of `name`, every container on it stopped first; one already gone is no error.
+    async fn remove_network(&self, _name: &str) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+    /// Whether this engine holds a closed network closed. One that says no is not offered a job that asks for one.
+    async fn closes_networks(&self) -> bool {
+        false
     }
     /// Gives the peer what the job `id` left under its disk's `out/`, once its container has exited and before its
     /// outputs are packed: with the engine's users remapped, a file the job wrote `0600` is not the peer's to read
@@ -703,6 +727,12 @@ pub struct Fake {
     guarded: Mutex<HashMap<String, String>>,
     /// Every resolve and pull, in order, with the credential it carried.
     credentials: Mutex<Vec<(ImageRef, Option<RegistryToken>)>>,
+    /// The closed networks it holds.
+    networks: Mutex<std::collections::BTreeSet<String>>,
+    /// Why the next closed network it is asked for is refused, where a test sets it.
+    broken_network: Mutex<Option<String>>,
+    /// Whether this engine holds a closed network closed.
+    closes_networks: Mutex<bool>,
 }
 
 /// One container's output on the fake: all it wrote, its followers while it runs, and whether it has ended.
@@ -760,7 +790,25 @@ impl Fake {
             image_users: Mutex::new(HashMap::new()),
             guarded: Mutex::new(HashMap::new()),
             credentials: Mutex::new(Vec::new()),
+            networks: Mutex::new(std::collections::BTreeSet::new()),
+            broken_network: Mutex::new(None),
+            closes_networks: Mutex::new(true),
         }
+    }
+
+    /// The closed networks it holds now.
+    pub fn networks(&self) -> Vec<String> {
+        self.networks.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// The next closed network it is asked for is refused, saying `why`.
+    pub fn break_next_network(&self, why: &str) {
+        *self.broken_network.lock().unwrap() = Some(why.to_string());
+    }
+
+    /// Whether this engine holds a closed network closed: yes until a test says no.
+    pub fn set_closes_networks(&self, closes: bool) {
+        *self.closes_networks.lock().unwrap() = closes;
     }
 
     /// Its registry serves `image`'s repository, under any tag or digest, only to a request carrying `token`: one
@@ -1316,6 +1364,11 @@ impl Runtime for Fake {
         if let Some(d) = spec.devices.iter().find(|d| !self.devices.contains(d)) {
             return Err(RuntimeError::DeviceUnavailable(d.0.clone()));
         }
+        if let Network::Closed(network) | Network::Door { network, .. } = &spec.confinement.network {
+            if !self.networks.lock().unwrap().contains(network) {
+                return Err(RuntimeError::Engine(format!("no network named {network}")));
+            }
+        }
         let n = {
             let mut next = self.next.lock().unwrap();
             *next += 1;
@@ -1412,7 +1465,7 @@ impl Runtime for Fake {
         if let Some(why) = self.broken_disk.lock().unwrap().take() {
             return Err(RuntimeError::NoDisk(why));
         }
-        for (sub, mode) in [("peer", 0o700), ("in", 0o755), ("out", 0o777)] {
+        for (sub, mode) in [("peer", 0o700), ("in", 0o755), ("out", 0o777), ("work", 0o777)] {
             std::fs::create_dir(dir.join(sub)).map_err(|e| RuntimeError::NoDisk(e.to_string()))?;
             #[cfg(unix)]
             {
@@ -1425,6 +1478,36 @@ impl Runtime for Fake {
         }
         self.disks_made.lock().unwrap().insert(id.to_string(), bytes);
         Ok(dir)
+    }
+
+    async fn make_closed_network(&self, name: &str) -> Result<(), RuntimeError> {
+        if let Some(why) = self.broken_network.lock().unwrap().take() {
+            return Err(RuntimeError::Engine(why));
+        }
+        match self.networks.lock().unwrap().insert(name.to_string()) {
+            true => Ok(()),
+            false => Err(RuntimeError::Engine(format!("a network named {name} is already there"))),
+        }
+    }
+
+    async fn remove_network(&self, name: &str) -> Result<(), RuntimeError> {
+        let held = self.containers.lock().unwrap().values().any(|spec| {
+            matches!(
+                &spec.confinement.network,
+                Network::Closed(network) | Network::Door { network, .. } if network == name
+            )
+        });
+        if held {
+            return Err(RuntimeError::Engine(format!(
+                "the network {name} still has a container on it"
+            )));
+        }
+        self.networks.lock().unwrap().remove(name);
+        Ok(())
+    }
+
+    async fn closes_networks(&self) -> bool {
+        *self.closes_networks.lock().unwrap()
     }
 
     async fn release(&self, id: &str) -> Result<(), RuntimeError> {
@@ -1496,6 +1579,90 @@ impl Runtime for Fake {
 
     async fn processes(&self) -> Option<Vec<u32>> {
         self.processes.lock().unwrap().clone()
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+
+    fn on(network: Network) -> Spec {
+        Spec {
+            image: ImageRef("a:1".into()),
+            args: vec![],
+            env: vec![],
+            devices: vec![],
+            ports: vec![],
+            mounts: vec![],
+            confinement: Confinement {
+                network,
+                ..Confinement::default()
+            },
+            name: None,
+        }
+    }
+
+    fn fake() -> Fake {
+        Fake::new(vec![], vec![ImageRef("a:1".into())])
+    }
+
+    #[tokio::test]
+    async fn a_closed_network_is_made_once_and_a_name_taken_is_refused() {
+        let runtime = fake();
+        runtime.make_closed_network("n").await.unwrap();
+        assert_eq!(runtime.networks(), vec!["n".to_string()]);
+        assert!(runtime.make_closed_network("n").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_container_on_a_network_that_is_not_there_does_not_start() {
+        let runtime = fake();
+        assert!(runtime.start(on(Network::Closed("n".into()))).await.is_err());
+        let door = Network::Door {
+            network: "n".into(),
+            alias: "side".into(),
+        };
+        assert!(runtime.start(on(door)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_network_is_removed_only_once_its_containers_are_stopped_and_one_gone_is_no_error() {
+        let runtime = fake();
+        runtime.make_closed_network("n").await.unwrap();
+        let started = runtime.start(on(Network::Closed("n".into()))).await.unwrap();
+        assert!(runtime.remove_network("n").await.is_err());
+        runtime.stop(&started.id).await.unwrap();
+        runtime.remove_network("n").await.unwrap();
+        runtime.remove_network("n").await.unwrap();
+        assert!(runtime.networks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_refused_network_says_why_and_the_next_is_made() {
+        let runtime = fake();
+        runtime.break_next_network("no room");
+        assert!(runtime.make_closed_network("n").await.is_err());
+        runtime.make_closed_network("n").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_disk_has_a_work_directory_beside_out() {
+        let runtime = fake();
+        let disk = runtime.make_disk("o", 1024).await.unwrap();
+        assert!(disk.join("work").is_dir() && disk.join("out").is_dir());
+        std::fs::remove_dir_all(disk).unwrap();
+    }
+
+    #[test]
+    fn the_networks_read_and_write_in_kebab_case() {
+        let door = Network::Door {
+            network: "n".into(),
+            alias: "side".into(),
+        };
+        let text = serde_json::to_string(&door).unwrap();
+        assert_eq!(text, r#"{"door":{"network":"n","alias":"side"}}"#);
+        assert_eq!(serde_json::from_str::<Network>(&text).unwrap(), door);
+        assert_eq!(serde_json::to_string(&Network::None).unwrap(), r#""none""#);
     }
 }
 

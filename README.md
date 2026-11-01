@@ -434,7 +434,7 @@ that user alone, by its uid and its primary group, and gives it what it releases
 
 - `--dir /var/lib/best-peer-disk`: where the disks are made, root's and the peer's group's, `0750`, and so is each
   disk's root: no other user on the host reaches a job's inputs or outputs, and the job reaches its `/in` and `/out`
-  through its binds alone. The helper makes the directory so when it is not there, closes it so when it is, and
+  through its binds alone. The disk also holds `work/`, for a runtime's caller to bind where a job writes what is deleted with the disk: it is never packed or released. The helper makes the directory so when it is not there, closes it so when it is, and
   refuses one that is a link, is not root's, or that another may write. It must not lie under
   `/home`, `/root`, `/run/user` or `/tmp`, which the peer's hardening hides from it.
 - `--most-bytes 1T`: the largest disk it makes; `--most-disks 16`: how many there may be at once. A disk also never

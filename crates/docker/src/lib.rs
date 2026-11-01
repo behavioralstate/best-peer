@@ -41,8 +41,9 @@ use best_peer_runtime::{
 use bollard::auth::DockerCredentials;
 use bollard::container::LogOutput;
 use bollard::models::{
-    ContainerCreateBody, ContainerTopResponse, CreateImageInfo, DeviceRequest, EventMessageTypeEnum, HostConfig,
-    HostConfigLogConfig, Mount, MountType, PortBinding, ResourcesUlimits,
+    ContainerCreateBody, ContainerTopResponse, CreateImageInfo, DeviceRequest, EndpointSettings, EventMessageTypeEnum,
+    HostConfig, HostConfigLogConfig, Mount, MountType, NetworkConnectRequest, NetworkCreateRequest, PortBinding,
+    ResourcesUlimits,
 };
 use bollard::query_parameters::{
     CreateImageOptionsBuilder, EventsOptionsBuilder, ListContainersOptionsBuilder, LogsOptionsBuilder,
@@ -1014,6 +1015,34 @@ impl Runtime for DockerRuntime {
         room_for_disks(self.disks.clone().filter(|_| self.mounts)?)
     }
 
+    /// An `internal` network with no address on the host: `internal` alone gives the host one, and a container
+    /// reaches a service on the host through it.
+    async fn make_closed_network(&self, name: &str) -> Result<(), RuntimeError> {
+        self.docker
+            .create_network(closed_network(name))
+            .await
+            .map(|_| ())
+            .map_err(|e| RuntimeError::Engine(format!("the closed network was not made: {e}")))
+    }
+
+    async fn remove_network(&self, name: &str) -> Result<(), RuntimeError> {
+        match self.docker.remove_network(name).await {
+            Ok(()) | Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => Ok(()),
+            Err(e) => Err(RuntimeError::Engine(format!("the closed network was not removed: {e}"))),
+        }
+    }
+
+    /// An engine of at least [`CLOSES_NETWORKS_FROM`] by its own `version`; one that does not answer says no.
+    async fn closes_networks(&self) -> bool {
+        match self.docker.version().await {
+            Ok(version) => closes_networks(version.version.as_deref().unwrap_or_default()),
+            Err(e) => {
+                tracing::warn!(error = %e, "the container engine did not say its version, so a closed network is not offered");
+                false
+            }
+        }
+    }
+
     /// A container, or a user namespace when the engine runs rootless or remaps its users, as its own `info` says.
     /// An engine that does not answer is still the one the peer confines every container in.
     async fn isolation(&self) -> Isolation {
@@ -1156,6 +1185,32 @@ impl Runtime for DockerRuntime {
             }
         })?;
         let id = ContainerId(created.id);
+        // A door joins its closed network before it starts, so a closed container never finds it missing once it runs.
+        if let Network::Door { network, alias } = &spec.confinement.network {
+            let joined = self
+                .docker
+                .connect_network(
+                    network,
+                    NetworkConnectRequest {
+                        container: id.0.clone(),
+                        endpoint_config: Some(EndpointSettings {
+                            aliases: Some(vec![alias.clone()]),
+                            ..Default::default()
+                        }),
+                    },
+                )
+                .await;
+            if let Err(e) = joined {
+                let _ = self
+                    .docker
+                    .remove_container(
+                        &id.0,
+                        Some(RemoveContainerOptionsBuilder::new().force(true).v(true).build()),
+                    )
+                    .await;
+                return Err(RuntimeError::Engine(format!("the door did not join its network: {e}")));
+            }
+        }
         if let Err(e) = self.docker.start_container(&id.0, None).await {
             let _ = self
                 .docker
@@ -1373,6 +1428,34 @@ fn create_body(
     })
 }
 
+/// The first major version of the engine that holds an `internal` network's DNS in: below it a container on one
+/// asks the world through the engine (CVE-2024-29018).
+const CLOSES_NETWORKS_FROM: u32 = 26;
+
+fn closes_networks(version: &str) -> bool {
+    version
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u32>().ok())
+        .is_some_and(|major| major >= CLOSES_NETWORKS_FROM)
+}
+
+/// What the engine is asked for to make a closed network: `internal` takes away the way out, and `inhibit_ipv4` the
+/// host's own address on it.
+fn closed_network(name: &str) -> NetworkCreateRequest {
+    NetworkCreateRequest {
+        name: name.to_string(),
+        driver: Some("bridge".into()),
+        internal: Some(true),
+        options: Some(HashMap::from([(
+            "com.docker.network.bridge.inhibit_ipv4".to_string(),
+            "true".to_string(),
+        )])),
+        labels: Some(HashMap::from([(LABEL.to_string(), "1".to_string())])),
+        ..Default::default()
+    }
+}
+
 /// A container's environment: the spec's and, for one handed a device, the NVIDIA driver's compute and utility
 /// capabilities alone, in place of any the spec names, which the engine sets over the image's entry of that name: no
 /// video codec, display or graphics library of the host's driver is mounted in. A container run as a user of its box
@@ -1445,7 +1528,8 @@ fn confined(confinement: &Confinement, volumes: &[String], offered: &[String]) -
         ulimits: Some(ulimits),
         network_mode: match &confinement.network {
             Network::None => Some("none".into()),
-            Network::Default => None,
+            Network::Default | Network::Door { .. } => None,
+            Network::Closed(name) => Some(name.clone()),
         },
         // An init as PID 1 reaps and forwards signals, so a stop reaches an image that did not expect to be it.
         init: Some(true),
@@ -1817,6 +1901,57 @@ fn may_mount(status: &str) -> bool {
 }
 
 #[cfg(test)]
+mod network_tests {
+    use super::*;
+
+    fn network_of(network: Network) -> Option<String> {
+        let confinement = best_peer_runtime::Confinement {
+            network,
+            ..Default::default()
+        };
+        confined(&confinement, &[], &[]).network_mode
+    }
+
+    #[test]
+    fn each_network_is_the_engines_own_word_for_it() {
+        assert_eq!(network_of(Network::None).as_deref(), Some("none"));
+        assert_eq!(network_of(Network::Default), None);
+        assert_eq!(network_of(Network::Closed("n".into())).as_deref(), Some("n"));
+        let door = Network::Door {
+            network: "n".into(),
+            alias: "side".into(),
+        };
+        assert_eq!(network_of(door), None);
+    }
+
+    #[test]
+    fn a_closed_network_is_internal_and_the_host_holds_no_address_on_it() {
+        let asked = closed_network("n");
+        assert_eq!(asked.name, "n");
+        assert_eq!(asked.driver.as_deref(), Some("bridge"));
+        assert_eq!(asked.internal, Some(true));
+        assert_eq!(
+            asked
+                .options
+                .unwrap()
+                .get("com.docker.network.bridge.inhibit_ipv4")
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn an_engine_closes_a_network_from_26_and_one_it_cannot_read_does_not() {
+        for version in ["26.0.0", "29.9.2", "26.1.3+dfsg1", "100.0"] {
+            assert!(closes_networks(version), "{version}");
+        }
+        for version in ["25.0.5", "24.0.7-0ubuntu2", "", "dev", "master"] {
+            assert!(!closes_networks(version), "{version}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn a_containers_processes_are_read_from_its_pid_column_wherever_it_stands() {
@@ -2077,9 +2212,9 @@ mod tests {
         lay_out(&root).unwrap();
         let mode = |p: &str| std::fs::metadata(root.join(p)).unwrap().permissions().mode() & 0o777;
         assert_eq!(
-            (mode(""), mode("peer"), mode("in"), mode("out")),
-            (0o700, 0o700, 0o755, 0o777),
-            "the peer owns the root, so it alone and root reach in/ and out/"
+            (mode(""), mode("peer"), mode("in"), mode("out"), mode("work")),
+            (0o700, 0o700, 0o755, 0o777, 0o777),
+            "the peer owns the root, so it alone and root reach in/, out/ and work/"
         );
         std::fs::remove_dir_all(&root).unwrap();
     }

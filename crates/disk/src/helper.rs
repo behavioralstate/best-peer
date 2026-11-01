@@ -266,11 +266,17 @@ pub fn close_to_the_peer(dir: BorrowedFd<'_>, peer: Peer) -> Result<(), String> 
 
 /// Lays a disk's root out: the root itself the peer's group's, `root_mode` (`0750` where root owns it, `0700` where
 /// the peer does), so no other user reaches what is on it; `peer/`, the peer's `0700`, for the job's record; `in/`,
-/// the peer's `0755`, for its inputs; and `out/`, `0777`, for whoever the job runs as, reached through its bind.
+/// the peer's `0755`, for its inputs; and `out/` and `work/`, `0777`, for whoever the job runs as, reached through
+/// its binds.
 pub fn lay_out(root: BorrowedFd<'_>, peer: Peer, root_mode: u32) -> Result<(), String> {
     rustix::fs::fchown(root, None, Some(rustix::fs::Gid::from_raw(peer.gid))).map_err(|e| format!("the root: {e}"))?;
     rustix::fs::fchmod(root, Mode::from_raw_mode(root_mode)).map_err(|e| format!("the root: {e}"))?;
-    for (name, mode, owned) in [("peer", 0o700, true), ("in", 0o755, true), ("out", 0o777, false)] {
+    for (name, mode, owned) in [
+        ("peer", 0o700, true),
+        ("in", 0o755, true),
+        ("out", 0o777, false),
+        ("work", 0o777, false),
+    ] {
         let said = |e: rustix::io::Errno| format!("{name}/: {e}");
         rustix::fs::mkdirat(root, name, Mode::from_raw_mode(mode)).map_err(said)?;
         rustix::fs::chmodat(root, name, Mode::from_raw_mode(mode), AtFlags::empty()).map_err(said)?;
@@ -492,6 +498,7 @@ mod tests {
         assert_eq!(mode(&root.join("peer")), 0o700);
         assert_eq!(mode(&root.join("in")), 0o755);
         assert_eq!(mode(&root.join("out")), 0o777);
+        assert_eq!(mode(&root.join("work")), 0o777);
         assert!(
             lay_out(open(&root).as_fd(), me(), 0o750).is_err(),
             "a disk is laid out once"
