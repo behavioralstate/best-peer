@@ -605,7 +605,8 @@ pub trait Runtime: Send + Sync {
     async fn make_closed_network(&self, _name: &str) -> Result<(), RuntimeError> {
         Err(RuntimeError::Engine("this runtime makes no closed network".into()))
     }
-    /// Removes the network of `name`, every container on it stopped first; one already gone is no error.
+    /// Removes the closed network of `name`, every container on it stopped first; one already gone is no error, and a
+    /// network under that name that is not a closed one is refused and left.
     async fn remove_network(&self, _name: &str) -> Result<(), RuntimeError> {
         Ok(())
     }

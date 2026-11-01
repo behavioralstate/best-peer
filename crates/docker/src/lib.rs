@@ -1017,7 +1017,14 @@ impl Runtime for DockerRuntime {
 
     /// An `internal` network with no address on the host: `internal` alone gives the host one, and a container
     /// reaches a service on the host through it.
+    /// An engine that does not hold a network closed makes none, so a door is never opened on one whose name lookups
+    /// reach the world.
     async fn make_closed_network(&self, name: &str) -> Result<(), RuntimeError> {
+        if !self.closes_networks().await {
+            return Err(RuntimeError::Engine(format!(
+                "this engine does not hold a network closed: it needs Docker {CLOSES_NETWORKS_FROM} or later"
+            )));
+        }
         self.docker
             .create_network(closed_network(name))
             .await
@@ -1026,6 +1033,16 @@ impl Runtime for DockerRuntime {
     }
 
     async fn remove_network(&self, name: &str) -> Result<(), RuntimeError> {
+        match self.docker.inspect_network(name, None).await {
+            Ok(network) if is_closed(&network) => {}
+            Ok(_) => {
+                return Err(RuntimeError::Engine(format!(
+                    "{name} is not a closed network of this peer's"
+                )))
+            }
+            Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => return Ok(()),
+            Err(e) => return Err(RuntimeError::Engine(format!("the closed network was not removed: {e}"))),
+        }
         match self.docker.remove_network(name).await {
             Ok(()) | Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => Ok(()),
             Err(e) => Err(RuntimeError::Engine(format!("the closed network was not removed: {e}"))),
@@ -1863,7 +1880,7 @@ fn disks_dir(dir: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Lays a disk this peer mounted out as the helper does: `peer/` and `in/` this peer's, `out/` open to the job; the
+/// Lays a disk this peer mounted out as the helper does: `peer/` and `in/` this peer's, `out/` and `work/` open to the job; the
 /// root `0700`, since this peer owns it, so no other user reaches what is on it.
 #[cfg(target_os = "linux")]
 fn lay_out(mount: &std::path::Path) -> Result<(), RuntimeError> {
