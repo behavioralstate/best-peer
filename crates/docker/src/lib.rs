@@ -1178,9 +1178,14 @@ impl Runtime for DockerRuntime {
 
     async fn start(&self, spec: Spec) -> Result<Started, RuntimeError> {
         if let Network::Closed(network) | Network::Door { network, .. } = &spec.confinement.network {
-            let inspected = self.docker.inspect_network(network, None).await;
-            if !inspected.as_ref().is_ok_and(is_closed) {
-                return Err(RuntimeError::Engine(format!("no closed network named {network}")));
+            match self.docker.inspect_network(network, None).await {
+                Ok(held) if is_closed(&held) => {}
+                Ok(_) | Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => {
+                    return Err(RuntimeError::Engine(format!("no closed network named {network}")));
+                }
+                Err(e) => {
+                    return Err(RuntimeError::Engine(format!("the network {network} was not read: {e}")));
+                }
             }
         }
         if matches!(spec.confinement.network, Network::Closed(_)) && !spec.ports.is_empty() {

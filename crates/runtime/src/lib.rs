@@ -1491,6 +1491,11 @@ impl Runtime for Fake {
         if let Some(why) = self.broken_network.lock().unwrap().take() {
             return Err(RuntimeError::Engine(why));
         }
+        if !*self.closes_networks.lock().unwrap() {
+            return Err(RuntimeError::Engine(
+                "this engine does not hold a network closed".into(),
+            ));
+        }
         match self.networks.lock().unwrap().insert(name.to_string()) {
             true => Ok(()),
             false => Err(RuntimeError::Engine(format!("a network named {name} is already there"))),
@@ -1611,6 +1616,14 @@ mod network_tests {
 
     fn fake() -> Fake {
         Fake::new(vec![], vec![ImageRef("a:1".into())])
+    }
+
+    #[tokio::test]
+    async fn an_engine_that_does_not_hold_a_network_closed_makes_none() {
+        let runtime = fake();
+        runtime.set_closes_networks(false);
+        assert!(runtime.make_closed_network("n").await.is_err());
+        assert!(runtime.networks().is_empty());
     }
 
     #[tokio::test]
