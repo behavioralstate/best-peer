@@ -248,7 +248,8 @@ fn half_the_cores() -> u32 {
 pub enum Network {
     None,
     Default,
-    /// The closed network of this name alone: the container reaches a door on it, and nothing else.
+    /// The closed network of this name alone: the container reaches a door on it, and nothing else, and publishes no
+    /// port. A name that is not a closed network is refused, whatever else the engine calls by it.
     Closed(String),
     /// The engine's own default as well as the closed network named, where a closed container finds it by `alias`:
     /// the one way out of that network, and whatever it lets through is the container's to decide.
@@ -1366,8 +1367,13 @@ impl Runtime for Fake {
         }
         if let Network::Closed(network) | Network::Door { network, .. } = &spec.confinement.network {
             if !self.networks.lock().unwrap().contains(network) {
-                return Err(RuntimeError::Engine(format!("no network named {network}")));
+                return Err(RuntimeError::Engine(format!("no closed network named {network}")));
             }
+        }
+        if matches!(spec.confinement.network, Network::Closed(_)) && !spec.ports.is_empty() {
+            return Err(RuntimeError::Engine(
+                "a container on a closed network publishes no port".into(),
+            ));
         }
         let n = {
             let mut next = self.next.lock().unwrap();
@@ -1623,6 +1629,15 @@ mod network_tests {
             alias: "side".into(),
         };
         assert!(runtime.start(on(door)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_container_on_a_closed_network_publishes_no_port() {
+        let runtime = fake();
+        runtime.make_closed_network("n").await.unwrap();
+        let mut spec = on(Network::Closed("n".into()));
+        spec.ports = vec![8080];
+        assert!(runtime.start(spec).await.is_err());
     }
 
     #[tokio::test]

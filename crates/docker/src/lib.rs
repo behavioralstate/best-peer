@@ -42,8 +42,8 @@ use bollard::auth::DockerCredentials;
 use bollard::container::LogOutput;
 use bollard::models::{
     ContainerCreateBody, ContainerTopResponse, CreateImageInfo, DeviceRequest, EndpointSettings, EventMessageTypeEnum,
-    HostConfig, HostConfigLogConfig, Mount, MountType, NetworkConnectRequest, NetworkCreateRequest, PortBinding,
-    ResourcesUlimits,
+    HostConfig, HostConfigLogConfig, Mount, MountType, NetworkConnectRequest, NetworkCreateRequest, NetworkInspect,
+    PortBinding, ResourcesUlimits,
 };
 use bollard::query_parameters::{
     CreateImageOptionsBuilder, EventsOptionsBuilder, ListContainersOptionsBuilder, LogsOptionsBuilder,
@@ -1160,6 +1160,17 @@ impl Runtime for DockerRuntime {
     }
 
     async fn start(&self, spec: Spec) -> Result<Started, RuntimeError> {
+        if let Network::Closed(network) | Network::Door { network, .. } = &spec.confinement.network {
+            let inspected = self.docker.inspect_network(network, None).await;
+            if !inspected.as_ref().is_ok_and(is_closed) {
+                return Err(RuntimeError::Engine(format!("no closed network named {network}")));
+            }
+        }
+        if matches!(spec.confinement.network, Network::Closed(_)) && !spec.ports.is_empty() {
+            return Err(RuntimeError::Engine(
+                "a container on a closed network publishes no port".into(),
+            ));
+        }
         let offered = self.security_options().await;
         let volumes = match spec.confinement.read_only_root {
             true => unmounted(self.volumes_of(&spec.image).await?, &spec.mounts),
@@ -1432,6 +1443,8 @@ fn create_body(
 /// asks the world through the engine (CVE-2024-29018).
 const CLOSES_NETWORKS_FROM: u32 = 26;
 
+const INHIBIT_IPV4: &str = "com.docker.network.bridge.inhibit_ipv4";
+
 fn closes_networks(version: &str) -> bool {
     version
         .split('.')
@@ -1447,13 +1460,19 @@ fn closed_network(name: &str) -> NetworkCreateRequest {
         name: name.to_string(),
         driver: Some("bridge".into()),
         internal: Some(true),
-        options: Some(HashMap::from([(
-            "com.docker.network.bridge.inhibit_ipv4".to_string(),
-            "true".to_string(),
-        )])),
+        options: Some(HashMap::from([(INHIBIT_IPV4.to_string(), "true".to_string())])),
         labels: Some(HashMap::from([(LABEL.to_string(), "1".to_string())])),
         ..Default::default()
     }
+}
+
+/// Whether the engine's answer about a network is one [`closed_network`] asked for, so a name such as `host`, `bridge`
+/// or another's network never carries a container that was promised a closed one.
+fn is_closed(network: &NetworkInspect) -> bool {
+    let of = |map: &Option<HashMap<String, String>>, name: &str, value: &str| {
+        map.as_ref().and_then(|m| m.get(name)).is_some_and(|v| v == value)
+    };
+    network.internal == Some(true) && of(&network.options, INHIBIT_IPV4, "true") && of(&network.labels, LABEL, "1")
 }
 
 /// A container's environment: the spec's and, for one handed a device, the NVIDIA driver's compute and utility
@@ -1938,6 +1957,28 @@ mod network_tests {
                 .map(String::as_str),
             Some("true")
         );
+    }
+
+    #[test]
+    fn a_network_is_closed_only_when_the_engine_says_all_of_what_was_asked() {
+        let asked = closed_network("n");
+        let made = NetworkInspect {
+            internal: asked.internal,
+            options: asked.options,
+            labels: asked.labels,
+            ..Default::default()
+        };
+        assert!(is_closed(&made));
+        assert!(!is_closed(&NetworkInspect::default()), "host, bridge and the like");
+        assert!(!is_closed(&NetworkInspect {
+            internal: Some(false),
+            ..made.clone()
+        }));
+        assert!(!is_closed(&NetworkInspect {
+            options: None,
+            ..made.clone()
+        }));
+        assert!(!is_closed(&NetworkInspect { labels: None, ..made }));
     }
 
     #[test]
