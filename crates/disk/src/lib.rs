@@ -639,6 +639,7 @@ mod tests {
         assert_eq!(peer_in("broken:x:abc:1::/:/bin/sh\n", "broken"), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_arguments_are_every_one_required_and_checked() {
         let given = |s: &str| s.split_whitespace().map(str::to_string).collect::<Vec<_>>();

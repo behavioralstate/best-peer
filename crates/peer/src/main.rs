@@ -9931,6 +9931,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_disk_helper_is_a_socket_named_by_its_absolute_path_for_a_docker_runtime_alone() {
         assert_eq!(disk_helper(None, None), Ok(None));
