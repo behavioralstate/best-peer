@@ -974,7 +974,7 @@ impl Auth {
             "token_type": "apikey",
             "auth_header": AUTH_HEADER,
             "name": name,
-            "note": format!("{} This peer admitted you on the word of whoever controls the machine it runs on.", guidance::TOKEN_TEXT),
+            "note": format!("{} The key is in access_token alone. In the mcp block its place is <access_token>: write that block into your client's configuration with a command that reads the credential from where you saved it and puts it in that place, so the config holds the key and the key itself never appears in a command, a message or any output. This peer admitted you on the word of whoever controls the machine it runs on.", guidance::TOKEN_TEXT),
             "endpoint": self.endpoint,
             "manifest": format!("{}/.well-known/best", self.endpoint),
             "ready_check": format!("{}/queries", self.endpoint),
@@ -984,7 +984,7 @@ impl Auth {
                     "args": ["-y", "@behavioralstate/best-mcp"],
                     "env": {
                         "BEST_ENDPOINT": self.endpoint,
-                        "BEST_API_KEY": key,
+                        "BEST_API_KEY": "<access_token>",
                         "BEST_AUTH_TYPE": "apikey",
                         "BEST_AUTH_HEADER": AUTH_HEADER
                     }
@@ -1227,11 +1227,16 @@ mod tests {
             !answer["note"].as_str().unwrap().contains("revoke"),
             "no promise the peer cannot keep"
         );
-        assert_eq!(answer["mcp"]["my-peer"]["env"]["BEST_API_KEY"], key);
-        assert!(
-            !answer["http"].to_string().contains(&key),
-            "the key appears only in access_token and mcp"
+        assert_eq!(answer["mcp"]["my-peer"]["env"]["BEST_API_KEY"], "<access_token>");
+        assert_eq!(
+            answer.to_string().matches(&key).count(),
+            1,
+            "the key appears only in access_token"
         );
+        assert!(answer["note"]
+            .as_str()
+            .unwrap()
+            .contains("In the mcp block its place is <access_token>"));
         assert!(answer.get("expires_in").is_none(), "durable");
         let who = auth.authenticate(&key).unwrap();
         assert_eq!(who.name, "my-peer");
