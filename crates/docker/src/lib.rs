@@ -2234,10 +2234,14 @@ mod tests {
         });
         let rt = unconnected(&socket).with_disk_helper(socket.clone());
         let room = rt.disk_room().expect("the room is read in the helper's directory");
+        let measured = room_for_disks(disks.clone()).expect("the file system answers");
         assert_eq!(
-            Some(room),
-            room_for_disks(disks.clone()),
+            room.1, measured.1,
             "the whole room, never held to the bound on one disk"
+        );
+        assert!(
+            room.0.abs_diff(measured.0) < 1 << 30,
+            "what is free is the file system's, moving a little as anything writes on it"
         );
         assert!(room.1 > 16 << 20);
         std::fs::write(disks.join("job-0123456789ab.img"), "").unwrap();
