@@ -2488,7 +2488,7 @@ mod tests {
         pulls.left.store(true, Ordering::SeqCst);
         let dropped = tokio::time::timeout(
             std::time::Duration::from_millis(10),
-            pulls.asking(|| std::future::pending::<Result<(), String>>()),
+            pulls.asking(std::future::pending::<Result<(), String>>),
         )
         .await;
         assert!(dropped.is_err());
