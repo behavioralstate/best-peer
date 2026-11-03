@@ -847,13 +847,10 @@ impl Pulls {
     }
 }
 
-/// Whether a pull that ended so can have left bytes on the engine's disk: not one the engine made its image for, nor one
-/// that a registry refused or that was refused before it began.
-fn leaves_bytes(pulled: &Result<Pulled, RuntimeError>) -> bool {
-    !matches!(
-        pulled,
-        Ok(_) | Err(RuntimeError::ImageNotFound(_) | RuntimeError::RoomUnknown(_))
-    )
+/// Whether the engine says with this line that it has bytes of the pull. A pull that failed with none, refused before it
+/// began or by a registry, has left nothing on the engine's disk.
+fn says_bytes(line: &Result<CreateImageInfo, bollard::errors::Error>) -> bool {
+    matches!(line, Ok(info) if info.progress_detail.as_ref().is_some_and(|p| p.current.unwrap_or_default() > 0))
 }
 
 /// One pull under way. Dropped before it [`ended`](PullUnderWay::ended), its caller gave it up, stopped it or timed it out.
@@ -1731,9 +1728,14 @@ impl DockerRuntime {
             options = options.tag(tag);
         }
         let under_way = self.pulls.begin(&self.docker).await;
-        let stream = self.docker.create_image(Some(options.build()), None, credentials);
+        let mut bytes = false;
+        let stream = self
+            .docker
+            .create_image(Some(options.build()), None, credentials)
+            .inspect(|line| bytes |= says_bytes(line));
         let pulled = watched(image, stream, progress, limits, || room_under(root.clone()), ROOM_EVERY).await;
-        under_way.ended(leaves_bytes(&pulled)).await;
+        // A pull that ended whole, past its limits or not, has made its image and holds no lease.
+        under_way.ended(bytes && pulled.is_err()).await;
         pulled
     }
 
@@ -2333,18 +2335,18 @@ mod tests {
     }
 
     #[test]
-    fn only_a_pull_given_up_partway_can_have_left_bytes() {
-        let image = || "ghcr.io/example/train:1".to_string();
-        assert!(!leaves_bytes(&Ok(Pulled::Within)));
-        assert!(
-            !leaves_bytes(&Ok(Pulled::Past(RuntimeError::NoRoom(image())))),
-            "its image was made"
-        );
-        assert!(!leaves_bytes(&Err(RuntimeError::ImageNotFound(image()))));
-        assert!(!leaves_bytes(&Err(RuntimeError::RoomUnknown(image()))));
-        assert!(leaves_bytes(&Err(RuntimeError::NoRoom(image()))));
-        assert!(leaves_bytes(&Err(RuntimeError::TooLarge(image()))));
-        assert!(leaves_bytes(&Err(RuntimeError::Engine(image()))));
+    fn only_a_line_with_bytes_down_says_the_engine_has_any_of_the_pull() {
+        assert!(says_bytes(&Ok(line("a", "Downloading", 1, 100))));
+        assert!(!says_bytes(&Ok(line("a", "Downloading", 0, 100))));
+        assert!(!says_bytes(&Ok(CreateImageInfo {
+            status: Some("Pulling from library/train".into()),
+            id: Some("1".into()),
+            ..Default::default()
+        })));
+        assert!(!says_bytes(&Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "unauthorized: authentication required".into(),
+        })));
     }
 
     #[tokio::test]
