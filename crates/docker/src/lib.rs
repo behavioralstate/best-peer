@@ -811,6 +811,7 @@ impl Pulls {
             reading: Some(self.under_way.clone().read_owned().await),
             pulls: self.clone(),
             docker: docker.clone(),
+            bytes: Arc::default(),
         }
     }
 
@@ -853,17 +854,20 @@ fn says_bytes(line: &Result<CreateImageInfo, bollard::errors::Error>) -> bool {
     matches!(line, Ok(info) if info.progress_detail.as_ref().is_some_and(|p| p.current.unwrap_or_default() > 0))
 }
 
-/// One pull under way. Dropped before it [`ended`](PullUnderWay::ended), its caller gave it up, stopped it or timed it out.
+/// One pull under way, and whether the engine said it has bytes of it. Dropped before it
+/// [`ended`](PullUnderWay::ended), its caller gave it up, stopped it or timed it out.
 struct PullUnderWay {
     reading: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     pulls: Pulls,
     docker: Docker,
+    bytes: Arc<AtomicBool>,
 }
 
 impl PullUnderWay {
-    async fn ended(mut self, left: bool) {
+    /// A pull that ended whole, past its limits or not, has made its image and holds no lease.
+    async fn ended(mut self, whole: bool) {
         self.reading.take();
-        if left {
+        if !whole && self.bytes.load(Ordering::SeqCst) {
             self.pulls.left.store(true, Ordering::SeqCst);
         }
         self.pulls.let_go(&self.docker).await;
@@ -872,7 +876,7 @@ impl PullUnderWay {
 
 impl Drop for PullUnderWay {
     fn drop(&mut self) {
-        if self.reading.take().is_none() {
+        if self.reading.take().is_none() || !self.bytes.load(Ordering::SeqCst) {
             return;
         }
         self.pulls.left.store(true, Ordering::SeqCst);
@@ -1728,14 +1732,17 @@ impl DockerRuntime {
             options = options.tag(tag);
         }
         let under_way = self.pulls.begin(&self.docker).await;
-        let mut bytes = false;
+        let bytes = under_way.bytes.clone();
         let stream = self
             .docker
             .create_image(Some(options.build()), None, credentials)
-            .inspect(|line| bytes |= says_bytes(line));
+            .inspect(move |line| {
+                if says_bytes(line) {
+                    bytes.store(true, Ordering::SeqCst);
+                }
+            });
         let pulled = watched(image, stream, progress, limits, || room_under(root.clone()), ROOM_EVERY).await;
-        // A pull that ended whole, past its limits or not, has made its image and holds no lease.
-        under_way.ended(bytes && pulled.is_err()).await;
+        under_way.ended(pulled.is_ok()).await;
         pulled
     }
 
@@ -2203,9 +2210,14 @@ mod tests {
     /// A runtime that never reaches an engine: enough for what goes to the disk helper alone.
     #[cfg(unix)]
     fn unconnected(socket: &std::path::Path) -> DockerRuntime {
+        unconnected_over(Docker::connect_with_unix(&socket.to_string_lossy(), 1, bollard::API_DEFAULT_VERSION).unwrap())
+    }
+
+    /// A runtime over `docker`, with none of what `connect` starts.
+    fn unconnected_over(docker: Docker) -> DockerRuntime {
         let (tx, _) = broadcast::channel(1);
         DockerRuntime {
-            docker: Docker::connect_with_unix(&socket.to_string_lossy(), 1, bollard::API_DEFAULT_VERSION).unwrap(),
+            docker,
             exited: Arc::new(Mutex::new(Exited::default())),
             bind_ip: "127.0.0.1".into(),
             tx,
@@ -2265,8 +2277,8 @@ mod tests {
         assert!(!pulls.left.load(Ordering::SeqCst));
     }
 
-    /// An engine that answers every request with an empty prune and keeps each request's first line.
-    fn engine_that_prunes() -> (Docker, Arc<Mutex<Vec<String>>>) {
+    /// An engine that answers a pull with these lines and a prune with nothing pruned, keeping each request's first line.
+    fn engine_answering(pull: &'static str) -> (Docker, Arc<Mutex<Vec<String>>>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -2278,10 +2290,12 @@ mod tests {
                 let mut head = [0; 4096];
                 let read = conn.read(&mut head).unwrap();
                 let head = String::from_utf8_lossy(&head[..read]);
-                kept.lock()
-                    .unwrap()
-                    .push(head.lines().next().unwrap_or_default().to_string());
-                let body = r#"{"ImagesDeleted":[],"SpaceReclaimed":0}"#;
+                let first = head.lines().next().unwrap_or_default().to_string();
+                let body = match first.contains("/images/create") {
+                    true => pull,
+                    false => r#"{"ImagesDeleted":[],"SpaceReclaimed":0}"#,
+                };
+                kept.lock().unwrap().push(first);
                 let answer = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
@@ -2296,11 +2310,26 @@ mod tests {
         )
     }
 
+    fn engine_that_prunes() -> (Docker, Arc<Mutex<Vec<String>>>) {
+        engine_answering("")
+    }
+
+    fn prunes(asked: &Mutex<Vec<String>>) -> usize {
+        asked
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains("/images/prune"))
+            .count()
+    }
+
     #[tokio::test]
     async fn a_pull_given_up_asks_the_engine_for_a_prune_by_the_label_no_image_has() {
         let (docker, asked) = engine_that_prunes();
         let pulls = Pulls::default();
-        pulls.begin(&docker).await.ended(true).await;
+        let under_way = pulls.begin(&docker).await;
+        under_way.bytes.store(true, Ordering::SeqCst);
+        under_way.ended(false).await;
         let asked = asked.lock().unwrap().clone();
         assert_eq!(asked.len(), 1, "{asked:?}");
         assert!(
@@ -2315,23 +2344,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pull_that_left_nothing_asks_the_engine_for_nothing() {
+    async fn a_pull_dropped_with_bytes_down_asks_the_engine_all_the_same_and_one_with_none_asks_nothing() {
         let (docker, asked) = engine_that_prunes();
-        Pulls::default().begin(&docker).await.ended(false).await;
-        assert!(asked.lock().unwrap().is_empty());
-    }
+        let pulls = Pulls::default();
+        drop(pulls.begin(&docker).await);
+        assert!(!pulls.left.load(Ordering::SeqCst));
 
-    #[tokio::test]
-    async fn a_pull_dropped_before_it_ended_asks_the_engine_all_the_same() {
-        let (docker, asked) = engine_that_prunes();
-        drop(Pulls::default().begin(&docker).await);
+        let under_way = pulls.begin(&docker).await;
+        under_way.bytes.store(true, Ordering::SeqCst);
+        drop(under_way);
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while asked.lock().unwrap().is_empty() {
+            while prunes(&asked) == 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
         .await
         .unwrap();
+        assert_eq!(prunes(&asked), 1);
+    }
+
+    /// How many prunes the engine was asked for by one pull that it answers with these lines, and how that pull ended.
+    async fn pull_answered(pull: &'static str, floor: Option<u64>) -> (usize, Result<Pulled, RuntimeError>) {
+        let (docker, asked) = engine_answering(pull);
+        let runtime = unconnected_over(docker);
+        let (progress, _) = told();
+        let ended = runtime
+            .pull_whole(
+                &ImageRef("ghcr.io/example/train:1".into()),
+                &progress,
+                limits(None, floor),
+                None,
+                None,
+            )
+            .await;
+        (prunes(&asked), ended)
+    }
+
+    const BYTES_DOWN: &str = r#"{"status":"Downloading","id":"a","progressDetail":{"current":1,"total":100}}"#;
+
+    #[tokio::test]
+    async fn a_pull_that_failed_with_bytes_down_asks_the_engine_for_a_prune() {
+        let (docker, asked) = engine_answering(concat!(
+            r#"{"status":"Downloading","id":"a","progressDetail":{"current":1,"total":100}}"#,
+            "\n",
+            r#"{"errorDetail":{"message":"the connection was reset"}}"#,
+            "\n"
+        ));
+        let runtime = unconnected_over(docker);
+        let (progress, _) = told();
+        let ended = runtime
+            .pull_whole(
+                &ImageRef("ghcr.io/example/train:1".into()),
+                &progress,
+                PullLimits::default(),
+                None,
+                None,
+            )
+            .await;
+        assert!(ended.is_err());
+        assert_eq!(prunes(&asked), 1);
+    }
+
+    #[tokio::test]
+    async fn a_pull_with_no_bytes_down_or_whole_asks_the_engine_for_nothing() {
+        let (refused, ended) =
+            pull_answered(concat!(r#"{"errorDetail":{"message":"unauthorized"}}"#, "\n"), None).await;
+        assert!(ended.is_err());
+        assert_eq!(refused, 0, "a registry's refusal downloads nothing");
+
+        let (whole, ended) = pull_answered(BYTES_DOWN, None).await;
+        assert!(ended.is_ok());
+        assert_eq!(whole, 0, "a pull whole holds no lease");
+
+        let (before, ended) = pull_answered(BYTES_DOWN, Some(GIB)).await;
+        assert!(matches!(ended, Err(RuntimeError::RoomUnknown(_))));
+        assert_eq!(before, 0, "refused before the engine was read");
     }
 
     #[test]
