@@ -108,8 +108,6 @@ impl DockerRuntime {
             pulls: Pulls::default(),
         };
         sweep(&me.docker, &me.exited).await;
-        // A peer stopped during a pull left it as one given up, and nothing is pulling yet.
-        me.let_go_of_pulls_given_up().await;
         me.follow_events();
         let (docker, exited) = (me.docker.clone(), me.exited.clone());
         tokio::spawn(async move {
@@ -830,7 +828,7 @@ impl Pulls {
     }
 
     /// Asks only with something left and no pull under way; one under way asks when it ends, and an engine that did not
-    /// answer is asked again when the next pull does.
+    /// answer, or an asking dropped before it did, is asked again when the next pull ends.
     async fn asking<F, A>(&self, ask: F)
     where
         F: FnOnce() -> A,
@@ -839,14 +837,23 @@ impl Pulls {
         let Ok(_alone) = self.under_way.clone().try_write_owned() else {
             return;
         };
-        if !self.left.swap(false, Ordering::SeqCst) {
+        if !self.left.load(Ordering::SeqCst) {
             return;
         }
-        if let Err(why) = ask().await {
-            self.left.store(true, Ordering::SeqCst);
-            tracing::warn!("the engine did not let go of what pulls given up left on its disk: {why}");
+        match ask().await {
+            Ok(()) => self.left.store(false, Ordering::SeqCst),
+            Err(why) => tracing::warn!("the engine did not let go of what pulls given up left on its disk: {why}"),
         }
     }
+}
+
+/// Whether a pull that ended so can have left bytes on the engine's disk: not one the engine made its image for, nor one
+/// that a registry refused or that was refused before it began.
+fn leaves_bytes(pulled: &Result<Pulled, RuntimeError>) -> bool {
+    !matches!(
+        pulled,
+        Ok(_) | Err(RuntimeError::ImageNotFound(_) | RuntimeError::RoomUnknown(_))
+    )
 }
 
 /// One pull under way. Dropped before it [`ended`](PullUnderWay::ended), its caller gave it up, stopped it or timed it out.
@@ -857,9 +864,9 @@ struct PullUnderWay {
 }
 
 impl PullUnderWay {
-    async fn ended(mut self, whole: bool) {
+    async fn ended(mut self, left: bool) {
         self.reading.take();
-        if !whole {
+        if left {
             self.pulls.left.store(true, Ordering::SeqCst);
         }
         self.pulls.let_go(&self.docker).await;
@@ -889,8 +896,8 @@ impl Runtime for DockerRuntime {
     /// with it, the engine's pull: the room on the file system holding the engine's root directory is read when the
     /// pull begins, every [`ROOM_EVERY`] while it runs and once more at its end, where it can be read on this host, and
     /// the layers' sizes the engine says are counted as they come. What a pull given up downloaded stays on the engine's
-    /// disk until it is let go of, as [`Pulls`] says, and no image is made for it. An image pulled whole and past the limits by the room read at the end,
-    /// or by its unpacked size, is undone as [`DockerRuntime::undo_pull`] says, and the pull answers the limit it
+    /// disk until it is let go of, as [`Pulls`] says, and no image is made for it. An image pulled whole and past the
+    /// limits by the room read at the end, or by its unpacked size, is undone as [`DockerRuntime::undo_pull`] says, and the pull answers the limit it
     /// passed; the unpacked size of the very image the engine held before the pull is not held to the bound, since
     /// none of it landed on the disk.
     async fn pull_bounded(&self, image: &ImageRef, progress: Progress, limits: PullLimits) -> Result<(), RuntimeError> {
@@ -1726,7 +1733,7 @@ impl DockerRuntime {
         let under_way = self.pulls.begin(&self.docker).await;
         let stream = self.docker.create_image(Some(options.build()), None, credentials);
         let pulled = watched(image, stream, progress, limits, || room_under(root.clone()), ROOM_EVERY).await;
-        under_way.ended(matches!(pulled, Ok(Pulled::Within))).await;
+        under_way.ended(leaves_bytes(&pulled)).await;
         pulled
     }
 
@@ -2254,6 +2261,103 @@ mod tests {
         pulls.asking(ask).await;
         assert_eq!(count.load(Ordering::SeqCst), 1);
         assert!(!pulls.left.load(Ordering::SeqCst));
+    }
+
+    /// An engine that answers every request with an empty prune and keeps each request's first line.
+    fn engine_that_prunes() -> (Docker, Arc<Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let kept = asked.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let mut conn = conn.unwrap();
+                let mut head = [0; 4096];
+                let read = conn.read(&mut head).unwrap();
+                let head = String::from_utf8_lossy(&head[..read]);
+                kept.lock()
+                    .unwrap()
+                    .push(head.lines().next().unwrap_or_default().to_string());
+                let body = r#"{"ImagesDeleted":[],"SpaceReclaimed":0}"#;
+                let answer = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                conn.write_all(answer.as_bytes()).unwrap();
+            }
+        });
+        let url = format!("http://{address}");
+        (
+            Docker::connect_with_http(&url, 5, bollard::API_DEFAULT_VERSION).unwrap(),
+            asked,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_pull_given_up_asks_the_engine_for_a_prune_by_the_label_no_image_has() {
+        let (docker, asked) = engine_that_prunes();
+        let pulls = Pulls::default();
+        pulls.begin(&docker).await.ended(true).await;
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert!(
+            asked[0].starts_with("POST ") && asked[0].contains("/images/prune"),
+            "{asked:?}"
+        );
+        assert!(
+            asked[0].contains(&format!("filters=%7B%22label%22%3A%5B%22{NO_IMAGE_HAS_THIS}%22%5D%7D")),
+            "the label is what keeps the machine's images: {asked:?}"
+        );
+        assert!(!pulls.left.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_pull_that_left_nothing_asks_the_engine_for_nothing() {
+        let (docker, asked) = engine_that_prunes();
+        Pulls::default().begin(&docker).await.ended(false).await;
+        assert!(asked.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pull_dropped_before_it_ended_asks_the_engine_all_the_same() {
+        let (docker, asked) = engine_that_prunes();
+        drop(Pulls::default().begin(&docker).await);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while asked.lock().unwrap().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn only_a_pull_given_up_partway_can_have_left_bytes() {
+        let image = || "ghcr.io/example/train:1".to_string();
+        assert!(!leaves_bytes(&Ok(Pulled::Within)));
+        assert!(
+            !leaves_bytes(&Ok(Pulled::Past(RuntimeError::NoRoom(image())))),
+            "its image was made"
+        );
+        assert!(!leaves_bytes(&Err(RuntimeError::ImageNotFound(image()))));
+        assert!(!leaves_bytes(&Err(RuntimeError::RoomUnknown(image()))));
+        assert!(leaves_bytes(&Err(RuntimeError::NoRoom(image()))));
+        assert!(leaves_bytes(&Err(RuntimeError::TooLarge(image()))));
+        assert!(leaves_bytes(&Err(RuntimeError::Engine(image()))));
+    }
+
+    #[tokio::test]
+    async fn an_asking_dropped_before_the_engine_answered_is_asked_again() {
+        let pulls = Pulls::default();
+        pulls.left.store(true, Ordering::SeqCst);
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            pulls.asking(|| std::future::pending::<Result<(), String>>()),
+        )
+        .await;
+        assert!(dropped.is_err());
+        assert!(pulls.left.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
