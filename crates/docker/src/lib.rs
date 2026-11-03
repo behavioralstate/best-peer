@@ -851,7 +851,8 @@ impl Pulls {
 /// Whether the engine says with this line that it has bytes of the pull. A pull that failed with none, refused before it
 /// began or by a registry, has left nothing on the engine's disk.
 fn says_bytes(line: &Result<CreateImageInfo, bollard::errors::Error>) -> bool {
-    matches!(line, Ok(info) if info.progress_detail.as_ref().is_some_and(|p| p.current.unwrap_or_default() > 0))
+    matches!(line, Ok(info) if info.progress_detail.as_ref().is_some_and(|p| p.current.unwrap_or_default() > 0)
+        || matches!(info.status.as_deref(), Some("Download complete" | "Pull complete")))
 }
 
 /// One pull under way, and whether the engine said it has bytes of it. Dropped before it
@@ -876,10 +877,15 @@ impl PullUnderWay {
 
 impl Drop for PullUnderWay {
     fn drop(&mut self) {
-        if self.reading.take().is_none() || !self.bytes.load(Ordering::SeqCst) {
+        if self.reading.take().is_none() {
             return;
         }
-        self.pulls.left.store(true, Ordering::SeqCst);
+        if self.bytes.load(Ordering::SeqCst) {
+            self.pulls.left.store(true, Ordering::SeqCst);
+        }
+        if !self.pulls.left.load(Ordering::SeqCst) {
+            return;
+        }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let (pulls, docker) = (self.pulls.clone(), self.docker.clone());
             runtime.spawn(async move { pulls.let_go(&docker).await });
@@ -2363,6 +2369,39 @@ mod tests {
         assert_eq!(prunes(&asked), 1);
     }
 
+    #[tokio::test]
+    async fn a_pull_dropped_with_no_bytes_down_still_asks_for_what_another_pull_left() {
+        let (docker, asked) = engine_that_prunes();
+        let pulls = Pulls::default();
+        let under_way = pulls.begin(&docker).await;
+        let given_up = pulls.begin(&docker).await;
+        given_up.bytes.store(true, Ordering::SeqCst);
+        given_up.ended(false).await;
+        assert_eq!(prunes(&asked), 0, "a pull is still under way");
+        drop(under_way);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while prunes(&asked) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_caller_asking_is_answered_at_once_or_when_the_pull_under_way_ends() {
+        let (docker, asked) = engine_that_prunes();
+        let runtime = unconnected_over(docker.clone());
+        runtime.let_go_of_pulls_given_up().await;
+        assert_eq!(prunes(&asked), 1, "nothing is pulling");
+
+        let under_way = runtime.pulls.begin(&docker).await;
+        runtime.let_go_of_pulls_given_up().await;
+        assert_eq!(prunes(&asked), 1, "a prune would fail the pull under way");
+        under_way.ended(true).await;
+        assert_eq!(prunes(&asked), 2);
+    }
+
     /// How many prunes the engine was asked for by one pull that it answers with these lines, and how that pull ended.
     async fn pull_answered(pull: &'static str, floor: Option<u64>) -> (usize, Result<Pulled, RuntimeError>) {
         let (docker, asked) = engine_answering(pull);
@@ -2425,6 +2464,13 @@ mod tests {
     fn only_a_line_with_bytes_down_says_the_engine_has_any_of_the_pull() {
         assert!(says_bytes(&Ok(line("a", "Downloading", 1, 100))));
         assert!(!says_bytes(&Ok(line("a", "Downloading", 0, 100))));
+        for status in ["Download complete", "Pull complete"] {
+            assert!(says_bytes(&Ok(CreateImageInfo {
+                status: Some(status.into()),
+                id: Some("a".into()),
+                ..Default::default()
+            })));
+        }
         assert!(!says_bytes(&Ok(CreateImageInfo {
             status: Some("Pulling from library/train".into()),
             id: Some("1".into()),
