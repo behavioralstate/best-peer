@@ -546,6 +546,9 @@ pub trait Runtime: Send + Sync {
     async fn image_room(&self) -> Option<u64> {
         None
     }
+    /// Asks the engine to let go of what pulls given up left on its disk, so the room they hold comes back. A pull
+    /// under way keeps its bytes: the runtime asks once it has ended. A runtime that leaves nothing has nothing to do.
+    async fn let_go_of_pulls_given_up(&self) {}
     /// Creates and starts a container, answering its id and the published ports; emits `Started` too.
     async fn start(&self, spec: Spec) -> Result<Started, RuntimeError>;
     /// Stops and removes a container; emits `Exited`.

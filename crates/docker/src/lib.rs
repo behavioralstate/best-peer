@@ -30,6 +30,7 @@
 //! to the helper is unit-tested over a socket that stands in for it, and a disk's layout on a directory.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -47,7 +48,8 @@ use bollard::models::{
 };
 use bollard::query_parameters::{
     CreateImageOptionsBuilder, EventsOptionsBuilder, ListContainersOptionsBuilder, LogsOptionsBuilder,
-    RemoveContainerOptionsBuilder, RemoveImageOptionsBuilder, StopContainerOptionsBuilder, TagImageOptionsBuilder,
+    PruneImagesOptionsBuilder, RemoveContainerOptionsBuilder, RemoveImageOptionsBuilder, StopContainerOptionsBuilder,
+    TagImageOptionsBuilder,
 };
 use bollard::Docker;
 use futures::StreamExt;
@@ -78,6 +80,8 @@ pub struct DockerRuntime {
     engine_here: bool,
     /// Who follows each container's output now: a container that ends is removed once they have read it all.
     followers: Arc<Followers>,
+    /// The pulls under way on this engine, and whether one given up left bytes for the engine to let go of.
+    pulls: Pulls,
 }
 
 impl DockerRuntime {
@@ -101,8 +105,11 @@ impl DockerRuntime {
             helper_limits: None,
             engine_here: engine_is_here(bind_ip),
             followers: Arc::new(Followers::default()),
+            pulls: Pulls::default(),
         };
         sweep(&me.docker, &me.exited).await;
+        // A peer stopped during a pull left it as one given up, and nothing is pulling yet.
+        me.let_go_of_pulls_given_up().await;
         me.follow_events();
         let (docker, exited) = (me.docker.clone(), me.exited.clone());
         tokio::spawn(async move {
@@ -785,6 +792,93 @@ fn run(program: &str, args: &[&str]) -> Result<(), RuntimeError> {
     )))
 }
 
+/// No image has this label, so a prune filtered by it removes no image of anyone's and does the rest of its work.
+const NO_IMAGE_HAS_THIS: &str = "best-peer.no-image-has-this";
+
+/// The pulls under way on an engine. An engine that keeps its images in containerd holds what a pull whose request ended
+/// downloaded under a lease of eight hours, so a pull asked again can go on from it, and neither time nor removing an image
+/// frees it sooner. Only an image prune ends those leases and collects what they held, and it ends the lease of a pull
+/// under way too, which then fails. So the engine is asked once a pull given up has left something and none is under way:
+/// each pull reads this lock for as long as it runs, the asking writes it, and a pull begun meanwhile waits for the answer.
+/// A pull another client runs on the same engine at that moment is not known here and can fail.
+#[derive(Clone, Default)]
+struct Pulls {
+    under_way: Arc<tokio::sync::RwLock<()>>,
+    left: Arc<AtomicBool>,
+}
+
+impl Pulls {
+    async fn begin(&self, docker: &Docker) -> PullUnderWay {
+        PullUnderWay {
+            reading: Some(self.under_way.clone().read_owned().await),
+            pulls: self.clone(),
+            docker: docker.clone(),
+        }
+    }
+
+    async fn let_go(&self, docker: &Docker) {
+        self.asking(|| async {
+            let filters = HashMap::from([("label", vec![NO_IMAGE_HAS_THIS])]);
+            let options = PruneImagesOptionsBuilder::new().filters(&filters).build();
+            docker
+                .prune_images(Some(options))
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    /// Asks only with something left and no pull under way; one under way asks when it ends, and an engine that did not
+    /// answer is asked again when the next pull does.
+    async fn asking<F, A>(&self, ask: F)
+    where
+        F: FnOnce() -> A,
+        A: std::future::Future<Output = Result<(), String>>,
+    {
+        let Ok(_alone) = self.under_way.clone().try_write_owned() else {
+            return;
+        };
+        if !self.left.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        if let Err(why) = ask().await {
+            self.left.store(true, Ordering::SeqCst);
+            tracing::warn!("the engine did not let go of what pulls given up left on its disk: {why}");
+        }
+    }
+}
+
+/// One pull under way. Dropped before it [`ended`](PullUnderWay::ended), its caller gave it up, stopped it or timed it out.
+struct PullUnderWay {
+    reading: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    pulls: Pulls,
+    docker: Docker,
+}
+
+impl PullUnderWay {
+    async fn ended(mut self, whole: bool) {
+        self.reading.take();
+        if !whole {
+            self.pulls.left.store(true, Ordering::SeqCst);
+        }
+        self.pulls.let_go(&self.docker).await;
+    }
+}
+
+impl Drop for PullUnderWay {
+    fn drop(&mut self) {
+        if self.reading.take().is_none() {
+            return;
+        }
+        self.pulls.left.store(true, Ordering::SeqCst);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let (pulls, docker) = (self.pulls.clone(), self.docker.clone());
+            runtime.spawn(async move { pulls.let_go(&docker).await });
+        }
+    }
+}
+
 #[async_trait]
 impl Runtime for DockerRuntime {
     async fn pull(&self, image: &ImageRef, progress: Progress) -> Result<(), RuntimeError> {
@@ -794,8 +888,8 @@ impl Runtime for DockerRuntime {
     /// Gives the pull up as soon as it passes `limits`, by dropping the engine's stream, which ends the request and,
     /// with it, the engine's pull: the room on the file system holding the engine's root directory is read when the
     /// pull begins, every [`ROOM_EVERY`] while it runs and once more at its end, where it can be read on this host, and
-    /// the layers' sizes the engine says are counted as they come. What a pull given up downloaded is the engine's own
-    /// to release, and no image is made for it. An image pulled whole and past the limits by the room read at the end,
+    /// the layers' sizes the engine says are counted as they come. What a pull given up downloaded stays on the engine's
+    /// disk until it is let go of, as [`Pulls`] says, and no image is made for it. An image pulled whole and past the limits by the room read at the end,
     /// or by its unpacked size, is undone as [`DockerRuntime::undo_pull`] says, and the pull answers the limit it
     /// passed; the unpacked size of the very image the engine held before the pull is not held to the bound, since
     /// none of it landed on the disk.
@@ -1174,6 +1268,11 @@ impl Runtime for DockerRuntime {
         })
         .await
         .ok()?
+    }
+
+    async fn let_go_of_pulls_given_up(&self) {
+        self.pulls.left.store(true, Ordering::SeqCst);
+        self.pulls.let_go(&self.docker).await;
     }
 
     async fn start(&self, spec: Spec) -> Result<Started, RuntimeError> {
@@ -1624,8 +1723,11 @@ impl DockerRuntime {
         if let Some(tag) = &tag {
             options = options.tag(tag);
         }
+        let under_way = self.pulls.begin(&self.docker).await;
         let stream = self.docker.create_image(Some(options.build()), None, credentials);
-        watched(image, stream, progress, limits, || room_under(root.clone()), ROOM_EVERY).await
+        let pulled = watched(image, stream, progress, limits, || room_under(root.clone()), ROOM_EVERY).await;
+        under_way.ended(matches!(pulled, Ok(Pulled::Within))).await;
+        pulled
     }
 
     /// Undoes a pull that made an image past its limits, answering `past` with what became of it. An image the engine
@@ -2104,7 +2206,88 @@ mod tests {
             helper_limits: None,
             engine_here: true,
             followers: Arc::new(Followers::default()),
+            pulls: Pulls::default(),
         }
+    }
+
+    fn asks() -> (
+        Arc<std::sync::atomic::AtomicUsize>,
+        impl Fn() -> std::future::Ready<Result<(), String>> + Clone,
+    ) {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = count.clone();
+        (count, move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(()))
+        })
+    }
+
+    #[tokio::test]
+    async fn the_engine_is_asked_to_let_go_only_when_a_pull_left_something_and_none_is_under_way() {
+        let pulls = Pulls::default();
+        let (count, ask) = asks();
+
+        pulls.asking(ask.clone()).await;
+        assert_eq!(count.load(Ordering::SeqCst), 0, "no pull left anything");
+
+        pulls.left.store(true, Ordering::SeqCst);
+        let under_way = pulls.under_way.clone().read_owned().await;
+        pulls.asking(ask.clone()).await;
+        assert_eq!(count.load(Ordering::SeqCst), 0, "a prune would fail the pull under way");
+        assert!(pulls.left.load(Ordering::SeqCst), "and it is asked when that pull ends");
+
+        drop(under_way);
+        pulls.asking(ask.clone()).await;
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        pulls.asking(ask).await;
+        assert_eq!(count.load(Ordering::SeqCst), 1, "once");
+    }
+
+    #[tokio::test]
+    async fn an_engine_that_did_not_let_go_is_asked_again() {
+        let pulls = Pulls::default();
+        pulls.left.store(true, Ordering::SeqCst);
+        pulls.asking(|| std::future::ready(Err("no answer".to_string()))).await;
+        assert!(pulls.left.load(Ordering::SeqCst));
+        let (count, ask) = asks();
+        pulls.asking(ask).await;
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert!(!pulls.left.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_pull_begun_while_the_engine_is_asked_waits_for_the_answer() {
+        let pulls = Pulls::default();
+        pulls.left.store(true, Ordering::SeqCst);
+        let (answer, answered) = tokio::sync::oneshot::channel::<()>();
+        let (asked, was_asked) = tokio::sync::oneshot::channel::<()>();
+        let asking = {
+            let pulls = pulls.clone();
+            tokio::spawn(async move {
+                pulls
+                    .asking(|| async move {
+                        asked.send(()).unwrap();
+                        answered.await.unwrap();
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        was_asked.await.unwrap();
+        let begun = pulls.under_way.clone().read_owned();
+        tokio::pin!(begun);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut begun)
+                .await
+                .is_err(),
+            "its lease would be ended with the others"
+        );
+        answer.send(()).unwrap();
+        asking.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), begun)
+            .await
+            .unwrap();
     }
 
     #[cfg(target_os = "linux")]
