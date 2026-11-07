@@ -9974,6 +9974,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_engine_installed_on_the_host_tells_no_image_pulled_and_refuses_a_pull_at_ingest_with_the_fix() {
+        // As BEST_PEER_RUNTIME=native: an engine outside any container, so no image is pulled or run, and a registry
+        // that serves none, so a deploy that tried to pull one would fail.
+        let bed = bed(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(
+                best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])
+                    .without_jobs()
+                    .without_images(),
+            ),
+        )
+        .await;
+        bed.deployed("d1", "llama3.2:3b", 8).await;
+        let told = types(&bed.log_of("d1"));
+        assert!(
+            !told.iter().any(|t| t.starts_with("ImagePull")),
+            "no image was pulled, so none is told: {told:?}"
+        );
+        let (s, b) = bed
+            .send("p1", "PullImage", "pull-image", json!({ "image": "ollama/ollama:0.40.6" }))
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "NO_CONTAINER_ENGINE");
+        let msg = b["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("BEST_PEER_RUNTIME=docker"), "{msg}");
+        assert!(bed.log_of("p1").is_empty(), "a refused pull told nothing");
+    }
+
+    #[tokio::test]
     async fn an_engine_no_device_can_run_and_a_device_that_is_not_here_are_refused_by_name() {
         let cpu = best_peer_gpu::Device {
             compute: vec![best_peer_gpu::Compute::Cpu],

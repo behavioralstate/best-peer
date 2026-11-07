@@ -1409,9 +1409,16 @@ impl Peer {
 
     // ----- pull-image -----------------------------------------------------------------------------------------------
 
-    /// A pull is a deploy's first step and needs the same scope.
+    /// A pull is a deploy's first step and needs the same scope; an engine that pulls no image refuses it.
     pub fn admit_pull(&self, _cmd: Envelope, who: &Credential) -> Result<(), BestError> {
-        require(who, "deploy")
+        require(who, "deploy")?;
+        if !self.runtime.pulls_images() {
+            return Err(BestError::bad_request(
+                "NO_CONTAINER_ENGINE",
+                "no container engine on this host: an image is pulled where Docker runs it (BEST_PEER_RUNTIME=docker); this peer deploys to an engine already installed, which pulls its own models",
+            ));
+        }
+        Ok(())
     }
 
     pub async fn pull_image(self: Arc<Self>, cmd: Envelope, em: Emitter) {
@@ -1501,22 +1508,25 @@ impl Peer {
             });
         }
         let image = recipe.image.clone();
-        let held = match self.ensure(&em, &image).await {
-            Ok(held) => held,
-            Err(e) => {
-                self.fail_deployment(
-                    &em,
-                    &id,
-                    &data.model,
-                    &e.to_string(),
-                    fix_for_runtime(&e),
-                    Stage::BeforeStart(None),
-                )
-                .await;
-                return;
-            }
-        };
-        self.tell(&em, "ImagePulled", json!({ "image": image.0, "held": held }));
+        // An engine installed on the host has no image to pull, so no pull is told.
+        if self.runtime.pulls_images() {
+            let held = match self.ensure(&em, &image).await {
+                Ok(held) => held,
+                Err(e) => {
+                    self.fail_deployment(
+                        &em,
+                        &id,
+                        &data.model,
+                        &e.to_string(),
+                        fix_for_runtime(&e),
+                        Stage::BeforeStart(None),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            self.tell(&em, "ImagePulled", json!({ "image": image.0, "held": held }));
+        }
         let spec = Spec {
             image,
             args: recipe.args,

@@ -119,6 +119,11 @@ impl Runtime for NativeRuntime {
         false
     }
 
+    /// The engine is installed on the host and pulls its models itself: there is no image to pull.
+    fn pulls_images(&self) -> bool {
+        false
+    }
+
     /// An engine installed on the host runs its models as its own processes: nothing of the peer's stands between.
     async fn isolation(&self) -> Isolation {
         Isolation::Process

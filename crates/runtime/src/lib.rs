@@ -578,6 +578,12 @@ pub trait Runtime: Send + Sync {
     fn runs_jobs(&self) -> bool {
         true
     }
+    /// Whether this engine pulls the images it runs. One that runs none (an engine already installed on the host,
+    /// outside any container) says so here: the door tells no pull for its deploys, and refuses pull-image at ingest
+    /// with the fix, so no event says an image was pulled when none was.
+    fn pulls_images(&self) -> bool {
+        true
+    }
     /// What stands between a workload this engine runs and the host. An engine that cannot say claims the least.
     async fn isolation(&self) -> Isolation {
         Isolation::Process
@@ -667,6 +673,7 @@ pub struct Fake {
     open_registry: bool,
     /// Whether this engine runs jobs; an engine that only serves deployments says no.
     jobs: bool,
+    images: bool,
     /// Host ports chosen for container ports, over the fake's own numbering: where a test listens itself.
     published: BTreeMap<u16, u16>,
     /// What a pull reports as it goes; a real engine reports every percent, often more.
@@ -760,6 +767,7 @@ impl Fake {
             registry: Mutex::new(Vec::new()),
             open_registry: false,
             jobs: true,
+            images: true,
             published: BTreeMap::new(),
             steps: vec![Some(50)],
             containers: Mutex::new(BTreeMap::new()),
@@ -1034,6 +1042,12 @@ impl Fake {
     /// An engine that runs no job, as an engine installed on the host outside any container: deploys only.
     pub fn without_jobs(mut self) -> Self {
         self.jobs = false;
+        self
+    }
+
+    /// An engine that pulls and runs no image, as an engine installed on the host outside any container.
+    pub fn without_images(mut self) -> Self {
+        self.images = false;
         self
     }
 
@@ -1363,7 +1377,8 @@ impl Runtime for Fake {
         if let Some(why) = self.refusal.lock().unwrap().clone() {
             return Err(RuntimeError::Engine(why));
         }
-        if !self.held(&spec.image) {
+        // An engine installed on the host runs no image, so it needs none held.
+        if self.images && !self.held(&spec.image) {
             return Err(RuntimeError::ImageNotFound(spec.image.0.clone()));
         }
         if let Some(d) = spec.devices.iter().find(|d| !self.devices.contains(d)) {
@@ -1586,6 +1601,10 @@ impl Runtime for Fake {
 
     fn runs_jobs(&self) -> bool {
         self.jobs
+    }
+
+    fn pulls_images(&self) -> bool {
+        self.images
     }
 
     async fn isolation(&self) -> Isolation {
