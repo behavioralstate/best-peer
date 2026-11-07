@@ -116,6 +116,10 @@ const RECONCILE_EVERY: Duration = Duration::from_secs(30);
 /// engines answer a few at a time anyway; the rest wait their turn, accepted, in order.
 const PROMPTS_AT_ONCE: usize = 16;
 
+/// How many prompts fetch their images at once, apart from the engine's turns: an address that answers slowly holds
+/// one of these, never a turn other holders' prompts wait for.
+const FETCHING_AT_ONCE: usize = 4;
+
 /// The most runtime events kept for containers the state does not know yet: a job can exit before its start is
 /// told, and its exit is replayed once it is.
 const MAX_UNOWNED: usize = 64;
@@ -197,6 +201,9 @@ pub struct Peer {
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// The turns to prompt the engines, `PROMPTS_AT_ONCE` of them.
     prompts: Semaphore,
+    /// The places to fetch a prompt's images, `FETCHING_AT_ONCE` of them, each held until its prompt has a turn, so
+    /// the images in memory are bounded by both.
+    fetching: Semaphore,
     /// What a credential holds across the door, for its share: this peer's own promises and every workspace's.
     holdings: Arc<Holdings>,
     /// The peer itself, for the placement step its queue starts (behavioralstate/spec#76).
@@ -564,6 +571,7 @@ impl Peer {
             unowned: Mutex::new(HashMap::new()),
             tasks: Mutex::new(Vec::new()),
             prompts: Semaphore::new(PROMPTS_AT_ONCE),
+            fetching: Semaphore::new(FETCHING_AT_ONCE),
             holdings: Arc::new(Holdings::default()),
             me: std::sync::OnceLock::new(),
             stepper: crate::queue::Stepper::default(),
@@ -1320,6 +1328,8 @@ impl Peer {
     /// engine could not do is `PromptFailed` with the reason and the fix. The engine's API is reached here and
     /// nowhere else.
     pub async fn prompt(&self, cmd: Envelope, em: Emitter) {
+        // What the prompt showed is named on its outcome, whatever it is, by address and digest, as it named them.
+        let named = images::named(&cmd.data);
         let data = match parse::<PromptData>(&cmd.data) {
             Ok(d) => d,
             Err(e) => {
@@ -1327,7 +1337,7 @@ impl Peer {
                 self.tell(
                     &em,
                     "PromptFailed",
-                    json!({ "deployment": cmd.data["deployment"], "reason": format!("the prompt could not be read: {}", e.message), "fix": "send it as the schema at the catalogue's dataschema for prompt describes" }),
+                    images::on(json!({ "deployment": cmd.data["deployment"], "reason": format!("the prompt could not be read: {}", e.message), "fix": "send it as the schema at the catalogue's dataschema for prompt describes" }), &named),
                 );
                 return;
             }
@@ -1336,19 +1346,21 @@ impl Peer {
             self.tell(
                 &em,
                 "PromptFailed",
-                json!({ "deployment": data.deployment, "reason": "the deployment ended between the prompt's admission and now", "fix": "deploy the model again, then prompt it" }),
+                images::on(json!({ "deployment": data.deployment, "reason": "the deployment ended between the prompt's admission and now", "fix": "deploy the model again, then prompt it" }), &named),
             );
             return;
         };
-        // What the prompt showed is named on its outcome, by address and digest, as it named them.
-        let named = images::named(&cmd.data);
         let options = Options {
             max_tokens: data.max_tokens,
             temperature: data.temperature,
             stop: data.stop,
         };
-        // A turn: the engine is asked a few prompts at a time, the rest wait, accepted, their images not yet fetched.
-        let _turn = self.prompts.acquire().await;
+        // A prompt with images fetches them in a place of its own, kept until it has its turn; one of text alone needs
+        // none.
+        let fetching = match named.is_empty() {
+            true => None,
+            false => Some(self.fetching.acquire().await),
+        };
         let messages = match Self::shown(data.messages).await {
             Ok(m) => m,
             Err(reason) => {
@@ -1361,6 +1373,9 @@ impl Peer {
             }
         };
         let within = self.patience.prompt;
+        // A turn: the engine is asked a few prompts at a time, the rest wait, accepted.
+        let _turn = self.prompts.acquire().await;
+        drop(fetching);
         let asked = tokio::time::timeout(
             within,
             self.engine.complete(

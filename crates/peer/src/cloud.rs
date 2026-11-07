@@ -2094,8 +2094,10 @@ impl Cloud {
             } else if i.r#type == "Prompt" {
                 // The answer is not coming: the prompt is told as failed, to be sent again when the peer is back.
                 let mut failed = json!({ "reason": why, "fix": "prompt again once the peer answers: PeerJoined on this stream says so", "peer": m.name });
-                if let Some(d) = i.note.as_ref().and_then(|n| n.get("deployment")) {
-                    failed["deployment"] = d.clone();
+                for field in ["deployment", "images"] {
+                    if let Some(v) = i.note.as_ref().and_then(|n| n.get(field)) {
+                        failed[field] = v.clone();
+                    }
                 }
                 self.tell(&i.em, "PromptFailed", failed);
             } else if i.ends.is_some() || key.is_empty() {
@@ -3187,7 +3189,10 @@ impl Service for Cloud {
                     "Prompt",
                     "prompt",
                     cmd.data.clone(),
-                    Some(json!({ "deployment": id })),
+                    Some(crate::images::on(
+                        json!({ "deployment": id }),
+                        &crate::images::named(&cmd.data),
+                    )),
                 )
                 .await
             }

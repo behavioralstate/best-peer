@@ -4939,6 +4939,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_prompt_with_images_in_flight_on_a_member_lost_fails_naming_its_images() {
+        let (a, b) = two_members().await;
+        let key_a = a.key.clone();
+        a.peer.allow_store_cleartext();
+        let site = site(vec![(A, a), (B, b)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a)]).await;
+        let (s, b) = site
+            .send(
+                &ws,
+                "d1",
+                "DeployModel",
+                "deploy-model",
+                json!({ "cloud": "lab", "model": "llava:7b", "engine": "ollama", "memory_bytes": 4 * GB }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let ready = site.events(&ws, "d1", "DeploymentReady").await;
+        let dep = ready.last().unwrap()["data"]["deployment"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // An address that takes the connection and never answers: the member is still fetching when it is lost.
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/frame", silent.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = vec![];
+            while let Ok((socket, _)) = silent.accept().await {
+                held.push(socket);
+            }
+        });
+        let images = json!([{ "url": url, "sha256": "0".repeat(64) }]);
+        let ask = json!({ "deployment": dep, "messages": [{ "role": "user", "content": "what is there?", "images": images }] });
+        let (s, b) = site.send(&ws, "p1", "Prompt", "prompt", ask).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        // Once the member holds the prompt, fetching, it is lost.
+        for _ in 0..400 {
+            if site.members[0]
+                .peer
+                .log
+                .unfinished()
+                .iter()
+                .any(|u| u.envelope.r#type == "Prompt")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        site.down[A].store(true, std::sync::atomic::Ordering::SeqCst);
+        site.live_cloud(&ws, "lab").reconcile().await;
+        let told = site.events(&ws, "p1", "PromptFailed").await;
+        let failed = told.last().unwrap()["data"].clone();
+        assert!(
+            failed["fix"].as_str().unwrap().contains("once the peer answers"),
+            "{told:#?}"
+        );
+        assert_eq!(failed["deployment"], dep);
+        assert_eq!(failed["images"], images, "{failed}");
+    }
+
+    #[tokio::test]
     async fn forget_in_a_workspace_asks_a_member_it_could_not_reach_again_on_the_next() {
         let (a, b) = two_members().await;
         let key_a = a.key.clone();

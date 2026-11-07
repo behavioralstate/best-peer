@@ -1844,7 +1844,7 @@ impl Service for Workspace {
             None => {
                 em.emit(
                     "PromptFailed",
-                    json!({ "deployment": id, "reason": "the deployment ended between the prompt's admission and now", "fix": "deploy the model again, then prompt it" }),
+                    crate::images::on(json!({ "deployment": id, "reason": "the deployment ended between the prompt's admission and now", "fix": "deploy the model again, then prompt it" }), &crate::images::named(&cmd.data)),
                 );
             }
         }
