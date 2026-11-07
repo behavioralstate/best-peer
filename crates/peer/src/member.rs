@@ -47,6 +47,11 @@ impl Refusal {
         }
     }
 
+    /// The member refused, saying `code`.
+    pub fn refused_with(&self, code: &str) -> bool {
+        matches!(self, Refusal::Refused { body, .. } if body["error"]["code"] == code)
+    }
+
     /// The member no longer honours the credential this peer holds for it.
     pub fn is_unauthorized(&self) -> bool {
         matches!(self, Refusal::Refused { status, .. } if *status == StatusCode::UNAUTHORIZED)

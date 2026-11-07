@@ -341,7 +341,7 @@ settings, as environment variables:
   BEST_PEER_LISTEN     where the door listens (default 127.0.0.1:7777)
   BEST_PEER_ENDPOINT   the base URL agents reach it at (default: the listen address)
   BEST_PEER_DATA       the folder for the credentials, the event log and the certificate (default ~/.best-peer)
-  BEST_PEER_RUNTIME    docker (default), native (an Ollama already running here, no jobs) or fake (no engine)
+  BEST_PEER_RUNTIME    docker (default), native (an Ollama already running here, no jobs or images) or fake (no engine)
   BEST_PEER_GPU        nvml (default: the NVIDIA cards, through the driver) or none (the CPU alone)
   BEST_PEER_DISK_HELPER  the socket of best-peer-disk, which makes jobs' disks for a peer that may not mount
                        (default: none; a peer run as root mounts them itself)
@@ -7243,6 +7243,63 @@ mod tests {
         assert!(reason.contains("a:") && reason.contains("b:"), "{reason}");
     }
 
+    #[tokio::test]
+    async fn a_cloud_pull_leaves_out_a_member_whose_engine_is_installed_and_fails_with_the_fix_when_none_pulls() {
+        let a = bed(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])),
+        )
+        .await;
+        // As BEST_PEER_RUNTIME=native: it pulls no image, and refuses a pull at ingest.
+        let b = bed(
+            card(),
+            Arc::new(EventLog::ephemeral()),
+            Arc::new(
+                best_peer_runtime::Fake::new(vec!["gpu-0".into()], vec![])
+                    .without_jobs()
+                    .without_images(),
+            ),
+        )
+        .await;
+        let (key_a, key_b) = (a.key.clone(), b.key.clone());
+        let site = site(vec![(A, a), (B, b)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a), ("b", B, &key_b)])
+            .await;
+        // A machine serves one cloud per workspace: the cloud of b alone is in another.
+        let other = site.workspace("c2", "Other").await;
+        site.cloud(&other, "k2", "installed", &[("b", B, &key_b)]).await;
+        let pull = |ws: &str, id: &'static str, cloud: &'static str| {
+            let ws = ws.to_string();
+            let site = &site;
+            async move {
+                site.send(
+                    &ws,
+                    id,
+                    "PullImage",
+                    "pull-image",
+                    json!({ "image": "ollama/ollama:0.6", "cloud": cloud }),
+                )
+                .await
+            }
+        };
+        // The member with Docker pulls it; the one whose engine is installed has nothing to pull, which is no failure.
+        assert_eq!(pull(&ws, "p1", "lab").await.0, StatusCode::CREATED);
+        let events = site.events(&ws, "p1", "ImagePulled").await;
+        assert!(!events.iter().any(|e| e["type"] == "ImagePullFailed"), "{events:#?}");
+        // A cloud where no member pulls images says so, with the fix, rather than that the image was pulled.
+        assert_eq!(pull(&other, "p2", "installed").await.0, StatusCode::CREATED);
+        let events = site.events(&other, "p2", "ImagePullFailed").await;
+        assert!(!events.iter().any(|e| e["type"] == "ImagePulled"), "{events:#?}");
+        let failed = &events.last().unwrap()["data"];
+        assert!(failed["reason"].as_str().unwrap().contains("b"), "{failed}");
+        assert!(
+            failed["fix"].as_str().unwrap().contains("BEST_PEER_RUNTIME=docker"),
+            "{failed}"
+        );
+    }
+
     #[test]
     fn the_endpoint_defaults_to_the_listen_address_only_when_a_consumer_can_reach_it() {
         let (listen, endpoint, tls) = config(None, None, None, None, Cleartext::Loopback).unwrap();
@@ -9994,7 +10051,12 @@ mod tests {
             "no image was pulled, so none is told: {told:?}"
         );
         let (s, b) = bed
-            .send("p1", "PullImage", "pull-image", json!({ "image": "ollama/ollama:0.40.6" }))
+            .send(
+                "p1",
+                "PullImage",
+                "pull-image",
+                json!({ "image": "ollama/ollama:0.40.6" }),
+            )
             .await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
         assert_eq!(b["error"]["code"], "NO_CONTAINER_ENGINE");

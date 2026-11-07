@@ -302,8 +302,8 @@ start, with the fix. `none` says this host has no accelerator, and the CPU is th
 
 The container engine is Docker on the same host, reached through its socket or named pipe; the peer refuses to start
 without it unless `BEST_PEER_RUNTIME` says otherwise: `native` deploys to an engine already running on the host
-outside any container (an installed Ollama; no jobs), `fake` serves the whole surface against the in-memory fakes
-(what CI runs).
+outside any container (an installed Ollama; no jobs and no images), `fake` serves the whole surface against the
+in-memory fakes (what CI runs).
 A job's disk, for its inputs and outputs, is a file system of its own on a loop device, capped at its size and
 allocated whole when it is made (16 MiB at least), under `disks/` in the data folder. The peer makes it where Docker
 runs on Linux and it can mount one: run as root, or with the capability to mount and the loop devices. A peer run
@@ -526,17 +526,18 @@ On a workspace's door the same commands take the `cloud` to place in (or a `devi
 names it), the devices are every cloud's peers', and every row and event carries `cloud` and `peer`.
 The facts follow on the event stream under the command's correlation id, in order: `ImagePulling`, `ImagePulled`
 (`held: true` when the image was already here and not pulled, `ImagePulling` then told once, at 100),
-`DeploymentStarted`, `WeightsLoading`, then `DeploymentReady`, or `DeploymentFailed`. While an image is pulled,
+`DeploymentStarted`, `WeightsLoading`, then `DeploymentReady`, or `DeploymentFailed`; under `native` the engine is
+installed on the host and there is no image, so a deploy tells neither `ImagePulling` nor `ImagePulled`, and a
+cloud's `pull-image` leaves such a member out, failing with the fix when no member pulls. While an image is pulled,
 `ImagePulling` says 99 at most and may fall back, since the engine learns of more to fetch as it goes; 100 comes with
-the pull's end, just before `ImagePulled`. What the engine does on its own
-later (`OutOfMemory`, `DeploymentEnded`), and its end when you take its key back, is told under the same correlation id. An engine whose container exits before
-its model is ready fails the deploy: `DeploymentFailed` carries its exit code and the last lines it wrote. `prompt` names a ready deployment and
-the conversation so far, and `PromptAnswered` follows under its own correlation id with the answer whole, or
-`PromptFailed` with the reason and the fix. `run-job` runs an image once, a tenant's in a closed box, and tells
-`JobStarted` and `JobFinished` with the exit code and `output`, the last lines the job printed (twenty at most, 2000
-characters at most), as does a `JobFailed` that follows its exit (its outputs not stored); more than that belongs under
-`/out`, which goes to the workspace's store. `undeploy-model` and
-`stop-job` end them.
+the pull's end, just before `ImagePulled`. What the engine does on its own later (`OutOfMemory`, `DeploymentEnded`),
+and its end when you take its key back, is told under the same correlation id. An engine whose container exits before
+its model is ready fails the deploy: `DeploymentFailed` carries its exit code and the last lines it wrote. `prompt`
+names a ready deployment and the conversation so far, and `PromptAnswered` follows under its own correlation id with
+the answer whole, or `PromptFailed` with the reason and the fix. `run-job` runs an image once, a tenant's in a closed
+box, and tells `JobStarted` and `JobFinished` with the exit code and `output`, the last lines the job printed (twenty
+at most, 2000 characters at most), as does a `JobFailed` that follows its exit (its outputs not stored); more than
+that belongs under `/out`, which goes to the workspace's store. `undeploy-model` and `stop-job` end them.
 
 On a workspace's door `run-job` is an order, and a cloud with no room now takes it to wait its turn, as the
 serverless GPU platforms do. It is refused at once only when no device of the cloud's members that answer could ever

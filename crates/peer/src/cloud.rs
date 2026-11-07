@@ -187,7 +187,14 @@ struct Pull {
     image: String,
     pending: HashSet<String>,
     failed: Vec<String>,
+    /// The members that pulled it.
+    pulled: usize,
+    /// The members whose engine is installed on the host, which pull no image.
+    none: Vec<String>,
 }
+
+/// What the cloud marks for a member that pulls no image, its engine installed on the host; never told.
+const NO_IMAGE: &str = "NoImageToPull";
 
 /// What a member's answer at a reconcile tick meant for it.
 #[derive(PartialEq, Eq)]
@@ -1635,7 +1642,8 @@ impl Cloud {
     }
 
     /// A pull is on every member at once: progress is relayed as it comes, the outcome is told once all answered,
-    /// a member that fails or is lost counted as failed. A member that has its image is not the cloud's pull ended,
+    /// a member that fails or is lost counted as failed. A member whose engine is installed on the host pulls no
+    /// image and is left out, and a pull no member made is told failed, with the fix. A member that has its image is not the cloud's pull ended,
     /// so a member's share is relayed as 99 at most, and 100 is the cloud's own, told with ImagePulled.
     fn on_pull_fact(&self, member: &Member, key: &str, em: &Emitter, r#type: &str, mut data: Value) {
         if r#type == "ImagePulling" {
@@ -1651,6 +1659,11 @@ impl Cloud {
             match r#type {
                 "ImagePulled" => {
                     p.pending.remove(&member.name);
+                    p.pulled += 1;
+                }
+                NO_IMAGE => {
+                    p.pending.remove(&member.name);
+                    p.none.push(member.name.clone());
                 }
                 "ImagePullFailed" | "CommandFailed" => {
                     p.pending.remove(&member.name);
@@ -1669,7 +1682,13 @@ impl Cloud {
                 .lock()
                 .unwrap()
                 .retain(|_, i| i.pull.as_deref() != Some(key));
-            if p.failed.is_empty() {
+            if p.failed.is_empty() && p.pulled == 0 {
+                self.tell(
+                    em,
+                    "ImagePullFailed",
+                    json!({ "image": p.image, "reason": format!("no member pulls an image: {} each run an engine installed on the host", p.none.join(", ")), "fix": "pull where a member runs Docker (BEST_PEER_RUNTIME=docker); an installed engine pulls its own models when deployed to" }),
+                );
+            } else if p.failed.is_empty() {
                 self.tell(em, "ImagePulling", json!({ "image": p.image, "progress_pct": 100 }));
                 self.tell(em, "ImagePulled", json!({ "image": p.image }));
             } else {
@@ -2552,6 +2571,8 @@ impl Service for Cloud {
                 image: image.clone(),
                 pending: members.iter().map(|m| m.name.clone()).collect(),
                 failed: Vec::new(),
+                pulled: 0,
+                none: Vec::new(),
             },
         );
         for m in members {
@@ -2560,11 +2581,15 @@ impl Service for Cloud {
             self.listen_for(&m.name, &mc, &em, "PullImage", Some(key.clone()), None);
             if let Err(e) = m.send(&envelope).await {
                 self.issued.lock().unwrap().remove(&(m.name.clone(), mc));
+                let r#type = match e.refused_with("NO_CONTAINER_ENGINE") {
+                    true => NO_IMAGE,
+                    false => "ImagePullFailed",
+                };
                 self.on_pull_fact(
                     &m,
                     &key,
                     &em,
-                    "ImagePullFailed",
+                    r#type,
                     json!({ "image": image, "reason": e.relayed(&m.name).message }),
                 );
             }
