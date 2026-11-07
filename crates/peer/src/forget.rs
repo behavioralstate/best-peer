@@ -18,7 +18,7 @@ use time::OffsetDateTime;
 const CONTENT_EVENTS: &[&str] = &["PromptAnswered", "PromptFailed"];
 
 /// What is taken out of a forgotten event's or command's data; everything else stays.
-const CONTENT_FIELDS: &[&str] = &["messages", "content", "reason", "stop"];
+const CONTENT_FIELDS: &[&str] = &["messages", "content", "reason", "stop", "images"];
 
 #[derive(Deserialize)]
 struct ForgetData {
@@ -306,7 +306,7 @@ mod tests {
         assert!(Scope::Before(t).holds(None, &data, "2026-10-19T23:59:59Z"));
         assert!(!Scope::Before(t).holds(None, &data, "2026-10-20T00:00:00Z"));
         assert!(!Scope::Before(t).holds(None, &data, "not a time"));
-        let mut d = json!({ "deployment": "dep-1", "content": "x", "messages": [], "reason": "y", "prompt_tokens": 4 });
+        let mut d = json!({ "deployment": "dep-1", "content": "x", "messages": [], "reason": "y", "prompt_tokens": 4, "images": [{ "url": "https://robot/frames/ab", "sha256": "ab" }] });
         strip(&mut d);
         assert_eq!(
             d,

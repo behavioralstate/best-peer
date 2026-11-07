@@ -321,6 +321,7 @@ name = "best-peer-engine-http"
 version = "0.0.35"
 dependencies = [
  "async-trait",
+ "base64 0.23.1",
  "best-peer-engine",
  "serde_json",
  "tokio",

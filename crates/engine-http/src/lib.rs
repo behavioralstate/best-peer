@@ -10,6 +10,8 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use best_peer_engine::{Answer, Engine, EngineError, Kind, Message, Options, Progress, Source};
 
 #[derive(Clone)]
@@ -262,6 +264,7 @@ impl HttpEngine {
             .http_status_as_error(false)
             .build();
         let agent = ureq::Agent::new_with_config(config);
+        let messages: Vec<serde_json::Value> = messages.iter().map(openai_message).collect();
         let mut body = serde_json::json!({ "model": model, "messages": messages, "stream": false });
         if let Some(m) = options.max_tokens {
             body["max_tokens"] = serde_json::json!(m);
@@ -426,6 +429,20 @@ fn probe(agent: &ureq::Agent, url: &str) -> bool {
         .build()
         .call()
         .is_ok()
+}
+
+/// A turn as the OpenAI-compatible API takes it: its text alone, or, with images, the text first and each image after
+/// it as a data URL, which both engines read.
+fn openai_message(m: &Message) -> serde_json::Value {
+    if m.images.is_empty() {
+        return serde_json::json!({ "role": m.role, "content": m.content });
+    }
+    let mut parts = vec![serde_json::json!({ "type": "text", "text": m.content })];
+    parts.extend(m.images.iter().map(|i| {
+        let url = format!("data:{};base64,{}", i.media_type, STANDARD.encode(&i.bytes));
+        serde_json::json!({ "type": "image_url", "image_url": { "url": url } })
+    }));
+    serde_json::json!({ "role": m.role, "content": parts })
 }
 
 #[async_trait]
@@ -841,6 +858,34 @@ mod tests {
         assert!(
             matches!(&err, EngineError::Engine(m) if m.contains("did not complete in 3 attempts")),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn a_turn_with_images_is_its_text_then_each_image_as_a_data_url_and_one_without_is_its_text() {
+        let image = best_peer_engine::Image {
+            media_type: "image/jpeg".into(),
+            bytes: vec![0xff, 0xd8, 0xff],
+        };
+        let shown = Message {
+            role: "user".into(),
+            content: "where is the door?".into(),
+            images: vec![image],
+        };
+        assert_eq!(
+            openai_message(&shown),
+            serde_json::json!({ "role": "user", "content": [
+                { "type": "text", "text": "where is the door?" },
+                { "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,/9j/" } }
+            ] })
+        );
+        let said = Message {
+            images: vec![],
+            ..shown
+        };
+        assert_eq!(
+            openai_message(&said),
+            serde_json::json!({ "role": "user", "content": "where is the door?" })
         );
     }
 }

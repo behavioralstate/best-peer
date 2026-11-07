@@ -26,6 +26,7 @@ use tokio::sync::{broadcast, Semaphore};
 
 use crate::domain::Service;
 use crate::holdings::Holdings;
+use crate::images;
 use crate::state::{JobPhase, Owner, Phase, Reservation, State};
 
 /// The operator's say over the engines: their images (a pinned tag, a mirror; none means the engine's default), a
@@ -249,13 +250,29 @@ struct DeployData {
 #[derive(Deserialize)]
 struct PromptData {
     deployment: String,
-    messages: Vec<Message>,
+    messages: Vec<Said>,
     #[serde(default)]
     max_tokens: Option<u32>,
     #[serde(default)]
     temperature: Option<f64>,
     #[serde(default)]
     stop: Vec<String>,
+}
+
+/// A turn as a prompt sends it: the images it shows are named by their address and digest, never sent.
+#[derive(Deserialize)]
+struct Said {
+    role: String,
+    content: String,
+    #[serde(default)]
+    images: Vec<images::At>,
+}
+
+impl PromptData {
+    /// The images the prompt names, in the order the model is shown them.
+    fn images(&self) -> Vec<&images::At> {
+        self.messages.iter().flat_map(|m| &m.images).collect()
+    }
 }
 
 #[derive(Deserialize)]
@@ -1271,11 +1288,59 @@ impl Peer {
 
     // ----- prompt ---------------------------------------------------------------------------------------------------
 
-    /// A prompt needs the prompt scope and a deployment that is ready and the caller's.
+    /// A prompt needs the prompt scope and a deployment that is ready and the caller's, and shows at most
+    /// [`images::MOST`] images, each at an address this peer may fetch from.
     pub fn admit_prompt(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError> {
         require(who, "prompt")?;
         let id = cmd.data["deployment"].as_str().unwrap_or_default();
-        ready_deployment(&self.state.lock().unwrap(), id, who).map(|_| ())
+        ready_deployment(&self.state.lock().unwrap(), id, who)?;
+        let data: PromptData = parse(&cmd.data)?;
+        let bad = |code: &'static str, field: String, message: String| {
+            Err(BestError::bad_request(code, message).with_details(json!({ "field": field })))
+        };
+        if data.images().len() > images::MOST {
+            return bad(
+                "TOO_MANY_IMAGES",
+                "messages".into(),
+                format!("a prompt shows the model at most {} images: send fewer", images::MOST),
+            );
+        }
+        let cleartext = self.store_cleartext.load(std::sync::atomic::Ordering::SeqCst);
+        for (n, m) in data.messages.iter().enumerate() {
+            for (k, i) in m.images.iter().enumerate() {
+                if !crate::store::allowed(&i.url, cleartext) {
+                    return bad(
+                        "INVALID_IMAGE_URL",
+                        format!("messages/{n}/images/{k}/url"),
+                        "an image is fetched over https, or over plain http on this peer's own loopback where its operator allows it: send its address there".into(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The conversation as the engine takes it, each image fetched and checked against its digest; the first that is
+    /// not what its prompt names is the reason none is shown.
+    async fn shown(said: Vec<Said>) -> Result<Vec<Message>, String> {
+        let mut messages = Vec::with_capacity(said.len());
+        for s in said {
+            let mut shown = Vec::with_capacity(s.images.len());
+            for at in s.images {
+                let url = at.url.clone();
+                let image = tokio::task::spawn_blocking(move || images::fetch(&at))
+                    .await
+                    .map_err(|e| format!("the image at {url} could not be fetched: {e}"))?
+                    .map_err(|e| format!("the image at {url} cannot be shown: {e}"))?;
+                shown.push(image);
+            }
+            messages.push(Message {
+                role: s.role,
+                content: s.content,
+                images: shown,
+            });
+        }
+        Ok(messages)
     }
 
     /// Asks the deployment's engine for the answer and tells it whole, under the command's correlation id; what the
@@ -1302,10 +1367,23 @@ impl Peer {
             );
             return;
         };
+        // What the prompt showed is named on its outcome, by address and digest, as it named them.
+        let named: Vec<images::At> = data.images().into_iter().cloned().collect();
         let options = Options {
             max_tokens: data.max_tokens,
             temperature: data.temperature,
             stop: data.stop,
+        };
+        let messages = match Self::shown(data.messages).await {
+            Ok(m) => m,
+            Err(reason) => {
+                self.tell(
+                    &em,
+                    "PromptFailed",
+                    with_images(json!({ "deployment": d.id, "reason": reason, "fix": "send each image's address where the peer can fetch it and the SHA-256 of its bytes as they are there, a JPEG or a PNG of at most 8 MiB" }), &named),
+                );
+                return;
+            }
         };
         let within = self.patience.prompt;
         // A turn: the engine is asked a few prompts at a time, the rest wait, accepted.
@@ -1316,7 +1394,7 @@ impl Peer {
                 d.engine,
                 &self.engine_base(d.port),
                 &d.model,
-                &data.messages,
+                &messages,
                 &options,
                 within,
             ),
@@ -1326,17 +1404,17 @@ impl Peer {
             Ok(Ok(a)) => self.tell(
                 &em,
                 "PromptAnswered",
-                json!({ "deployment": d.id, "model": a.model, "content": a.content, "finish": a.finish, "prompt_tokens": a.prompt_tokens, "completion_tokens": a.completion_tokens }),
+                with_images(json!({ "deployment": d.id, "model": a.model, "content": a.content, "finish": a.finish, "prompt_tokens": a.prompt_tokens, "completion_tokens": a.completion_tokens }), &named),
             ),
             Ok(Err(e)) => self.tell(
                 &em,
                 "PromptFailed",
-                json!({ "deployment": d.id, "reason": e.to_string(), "fix": fix_for_engine(&e, Source::Registry) }),
+                with_images(json!({ "deployment": d.id, "reason": e.to_string(), "fix": fix_for_engine(&e, Source::Registry) }), &named),
             ),
             Err(_) => self.tell(
                 &em,
                 "PromptFailed",
-                json!({ "deployment": d.id, "reason": format!("the engine did not answer within {within:?}"), "fix": "send a shorter conversation or a smaller max_tokens; if the engine is stuck, DeploymentEnded follows when it stops" }),
+                with_images(json!({ "deployment": d.id, "reason": format!("the engine did not answer within {within:?}"), "fix": "send a shorter conversation or a smaller max_tokens; if the engine is stuck, DeploymentEnded follows when it stops" }), &named),
             ),
         };
     }
@@ -3445,6 +3523,14 @@ pub(crate) fn in_store(store: &std::path::Path, model: &str) -> bool {
         manifest.push(p);
     }
     manifest.is_file()
+}
+
+/// A prompt's outcome with the images it showed named, as the prompt named them; one of text alone is unchanged.
+fn with_images(mut outcome: Value, named: &[images::At]) -> Value {
+    if !named.is_empty() {
+        outcome["images"] = json!(named);
+    }
+    outcome
 }
 
 pub(crate) fn parse<T: serde::de::DeserializeOwned>(data: &Value) -> Result<T, BestError> {

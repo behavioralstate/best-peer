@@ -126,11 +126,21 @@ pub enum Source {
 /// returns, so the caller tells each step as a fact before the outcome.
 pub type Progress = Arc<dyn Fn(Option<u8>) + Send + Sync>;
 
-/// One turn of a conversation, as the engines take it: who said it and what.
+/// One turn of a conversation, as the engines take it: who said it, what, and the images it shows the model.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,
     pub content: String,
+    /// The images of this turn, in order; none for a turn of text alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<Image>,
+}
+
+/// An image a turn shows the model: its bytes and what they are (`image/jpeg`, `image/png`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Image {
+    pub media_type: String,
+    pub bytes: Vec<u8>,
 }
 
 /// What a prompt asks of the engine beyond the messages; absent means the engine's own default.

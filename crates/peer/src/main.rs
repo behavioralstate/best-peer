@@ -15,6 +15,7 @@ mod cloud;
 mod domain;
 mod forget;
 mod holdings;
+mod images;
 mod lifecycle;
 mod member;
 mod menu;
@@ -7768,6 +7769,72 @@ mod tests {
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert_eq!(b["error"]["code"], "SCHEMA_VALIDATION");
         assert!(b["error"]["message"].as_str().unwrap().contains("max_tokens"), "{b}");
+    }
+
+    #[tokio::test]
+    async fn a_prompt_shows_the_model_an_image_by_address_and_digest_and_bytes_not_the_named_ones_are_not_shown() {
+        use sha2::Digest;
+        let digest = |b: &[u8]| -> String { sha2::Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect() };
+        let bed = fresh().await;
+        let dep = bed.deployed("d1", "llava:7b", 8).await;
+        // A frame served on this host's loopback, as a robot's door serves its camera's.
+        let frame = [0xff, 0xd8, 0xff, 0xe0, 7, 7, 7];
+        let app = axum::Router::new().route(
+            "/frames/latest",
+            axum::routing::get(move || async move { frame.to_vec() }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/frames/latest", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let ask = |images: Value| json!({ "deployment": dep, "messages": [{ "role": "user", "content": "Where is the door?", "images": images }] });
+        let named = json!([{ "url": url, "sha256": digest(&frame) }]);
+        // Plain http is refused at ingest until the operator allows this host's loopback, naming the field.
+        let (s, b) = bed.send("p0", "Prompt", "prompt", ask(named.clone())).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "INVALID_IMAGE_URL");
+        assert_eq!(b["error"]["details"]["field"], "messages/0/images/0/url");
+        bed.peer.allow_store_cleartext();
+        // The image is fetched, checked and shown to the engine with what it is; the answer names it again.
+        let (s, b) = bed.send("p1", "Prompt", "prompt", ask(named.clone())).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let answered = &bed.events_of("p1", "PromptAnswered").await[0].data;
+        assert_eq!(answered["images"], named);
+        let asked = bed.engine.prompted_at("http://engines.local:41434");
+        let shown = &asked[0].1[0].images;
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].media_type, "image/jpeg");
+        assert_eq!(shown[0].bytes, frame);
+        // Bytes that are not the named ones are never shown: the prompt fails with the reason, naming the image.
+        let stale = json!([{ "url": url, "sha256": digest(b"an older frame") }]);
+        let (s, b) = bed.send("p2", "Prompt", "prompt", ask(stale.clone())).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let failed = &bed.events_of("p2", "PromptFailed").await[0].data;
+        assert!(
+            failed["reason"]
+                .as_str()
+                .unwrap()
+                .contains("not the one the prompt names"),
+            "{failed}"
+        );
+        assert_eq!(failed["images"], stale);
+        assert_eq!(bed.engine.prompted_at("http://engines.local:41434").len(), 1);
+        // A prompt shows at most four images, refused at ingest past that.
+        let five = json!([named[0], named[0], named[0], named[0], named[0]]);
+        let (s, b) = bed.send("p3", "Prompt", "prompt", ask(five)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        let (s, b) = bed
+            .send(
+                "p4",
+                "Prompt",
+                "prompt",
+                json!({ "deployment": dep, "messages": [
+                    { "role": "user", "content": "a", "images": [named[0], named[0], named[0]] },
+                    { "role": "user", "content": "b", "images": [named[0], named[0]] }
+                ] }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "TOO_MANY_IMAGES");
     }
 
     #[tokio::test]

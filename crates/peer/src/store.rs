@@ -147,11 +147,11 @@ pub fn within(bytes: Option<u64>) -> Duration {
 }
 
 /// What a transfer's client is built from.
-type Limits = ureq::config::ConfigBuilder<ureq::typestate::AgentScope>;
+pub(crate) type Limits = ureq::config::ConfigBuilder<ureq::typestate::AgentScope>;
 
 /// The HTTP client of the store's transfers, `limits` set on it: a minute to connect, every status but a success an
 /// error, and no redirect followed, so a URL cannot lead a machine on to a place it may not go.
-fn agent(limits: impl FnOnce(Limits) -> Limits) -> ureq::Agent {
+pub(crate) fn agent(limits: impl FnOnce(Limits) -> Limits) -> ureq::Agent {
     limits(
         ureq::Agent::config_builder()
             .timeout_connect(Some(ASKING))

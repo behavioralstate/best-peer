@@ -323,7 +323,8 @@ promised to orders admitted, each counted once, as the helper counts them, so an
 than fail. At
 start the peer removes every disk there that no running job has, such as one whose job ended while it was down. Its inputs are fetched and its outputs sent over `https://`
 only; `BEST_PEER_STORE_CLEARTEXT=loopback` also allows a store on this machine's loopback over `http://`, for a test
-or a developer's own store, on the cloud's door and on its members alike.
+or a developer's own store, on the cloud's door and on its members alike, and the images a prompt shows its model from
+an address on this machine's loopback, such as a robot's door beside the peer ([The data path](#the-data-path)).
 A deploy or a job pulls an image named by tag each time, since a tag may have moved, as before; one pinned by digest
 (`name@sha256:...`, handed to Docker whole) names one image for good and is pulled only when Docker does not hold it:
 Docker holds it when it keeps that digest under that name, as a pull by tag or by digest of that repository records it,
@@ -685,6 +686,15 @@ refused at ingest otherwise with what to do. The answer is one fact, not one per
 the machine, and streaming partial output is not here (behavioralstate/spec#54 says what is and what waits). What the
 engine is asked and what it answers are in the door's log like every other fact, read by the holder under its own
 correlations and by nobody else (behavioralstate/spec#53), and kept until the holder says otherwise.
+
+A turn may show the model images, four at most in one prompt, for a model that reads them (behavioralstate/spec#266).
+A turn names each by its address and the SHA-256 of its bytes, `images: [{ "url", "sha256" }]`, never the bytes, which
+would not fit a command and should not be in a log: the peer fetches the image under the rule a job's inputs follow
+(https, or plain http on its own loopback where `BEST_PEER_STORE_CLEARTEXT=loopback` allows it, no redirect followed),
+checks the digest, and shows it to the engine as a JPEG or a PNG of at most 8 MiB. An address that rule refuses is
+refused at ingest, naming the field; an image the peer cannot fetch, or whose bytes are not the ones named, is
+`PromptFailed` with the reason, and the engine is not asked. `PromptAnswered` and `PromptFailed` name the images again,
+as the prompt named them, so what the model was shown is a fact with its digest; `forget` removes them with the rest.
 
 `forget` is how the holder says so (behavioralstate/spec#68). It names one prompt's correlation, a deployment (every
 prompt of the holder's to it) or a time (every prompt of the holder's answered before it; where one correlation holds

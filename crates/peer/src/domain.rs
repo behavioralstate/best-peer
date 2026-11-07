@@ -449,8 +449,8 @@ fn cloud_property(what: &str) -> Value {
 fn prompt(peer: Arc<dyn Service>, at: Where) -> CommandDef {
     let admit = peer.clone();
     let description = match at {
-        Where::Root => "Asks a ready deployment on this peer to answer a conversation, whole. The messages are the conversation so far, each with its role (system, user, assistant) and content; max_tokens, temperature and stop are the engine's knobs, and are left to the engine when not given. Refused at once, with the reason and what to do, when the deployment is not there, not ready yet, ending, or another credential's. Otherwise PromptAnswered follows on the stream with this command's correlation id, carrying the answer and the token counts the engine reports, or PromptFailed with the reason and the fix; either completes the command. Nothing of the engine is reachable any other way: this command is the one data path. Needs the prompt scope.",
-        Where::Workspace => "Asks a ready deployment in a cloud of this workspace to answer a conversation, whole; the deployment names its cloud and peer. The messages are the conversation so far, each with its role (system, user, assistant) and content; max_tokens, temperature and stop are the engine's knobs, and are left to the engine when not given. Refused at once, with the reason and what to do, when the deployment is not this workspace's, not ready yet, ending, or another credential's. Otherwise PromptAnswered follows on this workspace's stream with this command's correlation id, the cloud and the peer named, carrying the answer and the token counts the engine reports, or PromptFailed with the reason and the fix; either completes the command. Needs the prompt scope.",
+        Where::Root => "Asks a ready deployment on this peer to answer a conversation, whole. The messages are the conversation so far, each with its role (system, user, assistant) and content; max_tokens, temperature and stop are the engine's knobs, and are left to the engine when not given. A turn may show the model images, at most four in a prompt, each named by its address and the SHA-256 of its bytes, never sent: the peer fetches it (https, or plain http on its own loopback where its operator allows it), checks the digest, and shows it to the model when it is a JPEG or a PNG of at most 8 MiB; the outcome names them again. An image the peer cannot fetch, or whose bytes are not the ones named, is PromptFailed with the reason. Refused at once, with the reason and what to do, when the deployment is not there, not ready yet, ending, or another credential's. Otherwise PromptAnswered follows on the stream with this command's correlation id, carrying the answer and the token counts the engine reports, or PromptFailed with the reason and the fix; either completes the command. Nothing of the engine is reachable any other way: this command is the one data path. Needs the prompt scope.",
+        Where::Workspace => "Asks a ready deployment in a cloud of this workspace to answer a conversation, whole; the deployment names its cloud and peer. The messages are the conversation so far, each with its role (system, user, assistant) and content; max_tokens, temperature and stop are the engine's knobs, and are left to the engine when not given. A turn may show the model images, at most four in a prompt, each named by its address and the SHA-256 of its bytes, never sent: the member peer that holds the deployment fetches it (https, or plain http on the member's own loopback where its operator allows it), checks the digest, and shows it to the model when it is a JPEG or a PNG of at most 8 MiB; the outcome names them again. An image the peer cannot fetch, or whose bytes are not the ones named, is PromptFailed with the reason. Refused at once, with the reason and what to do, when the deployment is not this workspace's, not ready yet, ending, or another credential's. Otherwise PromptAnswered follows on this workspace's stream with this command's correlation id, the cloud and the peer named, carrying the answer and the token counts the engine reports, or PromptFailed with the reason and the fix; either completes the command. Needs the prompt scope.",
     };
     CommandDef {
         schema: "prompt".into(),
@@ -469,7 +469,18 @@ fn prompt(peer: Arc<dyn Service>, at: Where) -> CommandDef {
                         "type": "object", "required": ["role", "content"], "additionalProperties": false,
                         "properties": {
                             "role": { "type": "string", "enum": ["system", "user", "assistant"] },
-                            "content": { "type": "string", "maxLength": 131072 }
+                            "content": { "type": "string", "maxLength": 131072 },
+                            "images": {
+                                "type": "array", "maxItems": 4,
+                                "description": "The images this turn shows the model, in order, each fetched by the peer and checked against its digest",
+                                "items": {
+                                    "type": "object", "required": ["url", "sha256"], "additionalProperties": false,
+                                    "properties": {
+                                        "url": { "type": "string", "minLength": 1, "maxLength": 2048, "description": "Where the peer fetches the image: https, or plain http on the peer's own loopback where its operator allows it" },
+                                        "sha256": { "type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$", "description": "The SHA-256 of the image's bytes, lowercase hex: bytes with another digest are not shown" }
+                                    }
+                                }
+                            }
                         }
                     }
                 },
@@ -1385,14 +1396,14 @@ pub fn event_defs() -> Vec<EventDef> {
             "PromptAnswered",
             "The model's answer to a prompt, whole, under the prompt's correlation id; the counts are what the engine reported, null where it did not. One its holder forgot has no content and says forgotten.",
             &["deployment", "model"],
-            placed(json!({ "deployment": s("The deployment that answered"), "model": s("The model that answered, as the engine names it"), "content": s("The answer; absent once its holder forgot it"), "forgotten": { "type": "boolean", "description": "True once its holder forgot its content" }, "finish": { "type": ["string", "null"], "description": "Why the answer stopped, as the engine says: stop, length, or its own word" }, "prompt_tokens": { "type": ["integer", "null"] }, "completion_tokens": { "type": ["integer", "null"] } })),
+            placed(json!({ "deployment": s("The deployment that answered"), "model": s("The model that answered, as the engine names it"), "content": s("The answer; absent once its holder forgot it"), "forgotten": { "type": "boolean", "description": "True once its holder forgot its content" }, "finish": { "type": ["string", "null"], "description": "Why the answer stopped, as the engine says: stop, length, or its own word" }, "prompt_tokens": { "type": ["integer", "null"] }, "completion_tokens": { "type": ["integer", "null"] }, "images": { "type": "array", "description": "The images the prompt showed the model, by address and digest as it named them; absent for a prompt of text alone, or once its holder forgot it", "items": { "type": "object", "properties": { "url": { "type": "string" }, "sha256": { "type": "string" } } } } })),
         ),
         event(
             "prompt-failed",
             "PromptFailed",
-            "The prompt was accepted and not answered: the deployment ended meanwhile, or the engine failed or did not answer in time. The reason says what happened and the fix what to do. One its holder forgot has no reason, since an engine's words may quote the prompt, and says forgotten.",
+            "The prompt was accepted and not answered: the deployment ended meanwhile, an image it named could not be fetched or was not the bytes named, or the engine failed or did not answer in time. The reason says what happened and the fix what to do. One its holder forgot has no reason, since an engine's words may quote the prompt, and says forgotten.",
             &["deployment", "fix"],
-            placed(json!({ "deployment": s("The deployment asked"), "reason": s("What happened; absent once its holder forgot it"), "fix": s("What to do"), "forgotten": { "type": "boolean", "description": "True once its holder forgot its content" } })),
+            placed(json!({ "deployment": s("The deployment asked"), "reason": s("What happened; absent once its holder forgot it"), "fix": s("What to do"), "forgotten": { "type": "boolean", "description": "True once its holder forgot its content" }, "images": { "type": "array", "description": "The images the prompt showed the model, by address and digest as it named them; absent for a prompt of text alone, or once its holder forgot it", "items": { "type": "object", "properties": { "url": { "type": "string" }, "sha256": { "type": "string" } } } } })),
         ),
         event(
             "deployment-failed",
