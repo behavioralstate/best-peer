@@ -4890,6 +4890,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_workspace_refuses_a_prompts_images_at_ingest_as_far_as_it_can_and_names_them_when_the_member_refuses() {
+        let (a, b) = two_members().await;
+        let key_a = a.key.clone();
+        let site = site(vec![(A, a), (B, b)]).await;
+        let ws = site.workspace("c1", "Research").await;
+        site.cloud(&ws, "k1", "lab", &[("a", A, &key_a)]).await;
+        let (s, b) = site
+            .send(
+                &ws,
+                "d1",
+                "DeployModel",
+                "deploy-model",
+                json!({ "cloud": "lab", "model": "llava:7b", "engine": "ollama", "memory_bytes": 4 * GB }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let ready = site.events(&ws, "d1", "DeploymentReady").await;
+        let dep = ready.last().unwrap()["data"]["deployment"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let ask = |url: &str, n: usize| {
+            let image = json!({ "url": url, "sha256": "0".repeat(64) });
+            json!({ "deployment": dep, "messages": [{ "role": "user", "content": "what is there?", "images": vec![image; n] }] })
+        };
+        // What the workspace's door can tell: too many images, and an address no peer fetches from.
+        let mut five = ask("https://robot.example/frame", 3);
+        let second = ask("https://robot.example/frame", 2)["messages"][0].clone();
+        five["messages"].as_array_mut().unwrap().push(second);
+        let (s, b) = site.send(&ws, "p1", "Prompt", "prompt", five).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "TOO_MANY_IMAGES");
+        let (s, b) = site
+            .send(&ws, "p2", "Prompt", "prompt", ask("http://robot.example/frame", 1))
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        assert_eq!(b["error"]["code"], "INVALID_IMAGE_URL");
+        assert_eq!(b["error"]["details"]["field"], "messages/0/images/0/url");
+        // Plain http on loopback is the member's to allow: this one does not, and the failure names the image.
+        let (s, b) = site
+            .send(&ws, "p3", "Prompt", "prompt", ask("http://127.0.0.1:9/frame", 1))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        let failed = site.events(&ws, "p3", "PromptFailed").await.last().unwrap()["data"].clone();
+        assert!(failed["reason"].as_str().unwrap().contains("https"), "{failed}");
+        assert_eq!(failed["images"][0]["url"], "http://127.0.0.1:9/frame", "{failed}");
+    }
+
+    #[tokio::test]
     async fn forget_in_a_workspace_asks_a_member_it_could_not_reach_again_on_the_next() {
         let (a, b) = two_members().await;
         let key_a = a.key.clone();
@@ -7813,7 +7862,7 @@ mod tests {
             failed["reason"]
                 .as_str()
                 .unwrap()
-                .contains("not the one the prompt names"),
+                .contains("not the ones the prompt names"),
             "{failed}"
         );
         assert_eq!(failed["images"], stale);

@@ -3156,10 +3156,13 @@ impl Service for Cloud {
         }
     }
 
+    /// A prompt's images are held to the address rule here as far as the cloud can: plain http on loopback is the
+    /// member's to allow or refuse, since its loopback is its own.
     fn admit_prompt(&self, cmd: Envelope, who: &Credential) -> Result<(), BestError> {
         require(who, "prompt")?;
         let id = cmd.data["deployment"].as_str().unwrap_or_default();
-        ready_deployment(&self.state.lock().unwrap(), id, who).map(|_| ())
+        ready_deployment(&self.state.lock().unwrap(), id, who)?;
+        crate::images::admit(&cmd.data, true)
     }
 
     /// A prompt goes to the member that holds the deployment, as the member's own prompt command; its answer comes
@@ -3194,7 +3197,7 @@ impl Service for Cloud {
             self.tell(
                 &em,
                 "PromptFailed",
-                json!({ "deployment": id, "reason": e.message, "fix": "read the peer's refusal in the reason, then prompt again", "peer": member.map(|m| m.name.clone()) }),
+                crate::images::on(json!({ "deployment": id, "reason": e.message, "fix": "read the peer's refusal in the reason, then prompt again", "peer": member.map(|m| m.name.clone()) }), &crate::images::named(&cmd.data)),
             );
         }
     }

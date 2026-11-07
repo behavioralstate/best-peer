@@ -692,7 +692,8 @@ A turn names each by its address and the SHA-256 of its bytes, `images: [{ "url"
 would not fit a command and should not be in a log: the peer fetches the image under the rule a job's inputs follow
 (https, or plain http on its own loopback where `BEST_PEER_STORE_CLEARTEXT=loopback` allows it, no redirect followed),
 checks the digest, and shows it to the engine as a JPEG or a PNG of at most 8 MiB. An address that rule refuses is
-refused at ingest, naming the field; an image the peer cannot fetch, or whose bytes are not the ones named, is
+refused at ingest, naming the field; on a workspace's door, plain http on loopback is the member's to allow, since its
+loopback is its own, and a member that refuses it is told as `PromptFailed` naming the images. An image the peer cannot fetch, or whose bytes are not the ones named, is
 `PromptFailed` with the reason, and the engine is not asked. `PromptAnswered` and `PromptFailed` name the images again,
 as the prompt named them, so what the model was shown is a fact with its digest; `forget` removes them with the rest.
 
