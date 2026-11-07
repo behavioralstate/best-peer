@@ -12062,11 +12062,13 @@ mod tests {
         member.runtime.set_most_disks(Some(1));
         let first = site.order(&ws, "j1", 4, with_io()).await;
         assert_eq!(first["waiting"], false, "{first}");
-        let second = site.order(&ws, "j2", 4, with_io()).await;
-        assert_eq!(second["waiting"], true, "{second}");
+        // The second is ordered once the first holds its disk on the member: ordered while the first is still on its
+        // way there, it may be placed, refused for the room by the member and queued again, which is no wait.
         let started = site.events(&ws, "j1", "JobStarted").await.last().unwrap()["data"].clone();
         let hs = site.query(&ws, "get-hardware-state").await;
         assert_eq!(hs["peers"][0]["disk"]["free_bytes"], 0, "{hs}");
+        let second = site.order(&ws, "j2", 4, with_io()).await;
+        assert_eq!(second["waiting"], true, "{second}");
         member
             .runtime
             .stop(&ContainerId(started["container"].as_str().unwrap().into()))
